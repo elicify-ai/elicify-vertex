@@ -227,6 +227,22 @@ export const ElicifyVertexPlugin = async (
 
   const queue = new DirectiveQueue(opts.maxPerSession)
   const gate = new SessionGate()
+
+  // Debug logging — set VERTEX_DEBUG=1 in the environment to enable.
+  // Writes to ~/.config/opencode/.vertex-debug.log
+  const DEBUG = process.env.VERTEX_DEBUG === "1"
+  const debugLog = DEBUG
+    ? `${process.env.HOME}/.config/opencode/.vertex-debug.log`
+    : ""
+  const debug = (msg: string) => {
+    if (!DEBUG) return
+    const ts = new Date().toISOString()
+    const line = `[${ts}] ${msg}\n`
+    try {
+      require("fs").appendFileSync(debugLog, line)
+    } catch {}
+  }
+  debug("plugin loaded — debug mode enabled")
   const alwaysOn = () => opts.systemDirectives().map((d) => ({ ...d }))
 
   return {
@@ -236,8 +252,10 @@ export const ElicifyVertexPlugin = async (
      * consent check on first use.
      */
     async config(input: any) {
+      debug("config hook fired")
       input.command = input.command ?? {}
       if (!input.command["elicify-vertex"]) {
+        debug("config: registering /elicify-vertex command")
         input.command["elicify-vertex"] = {
           description: "Activate elicify-vertex verification harness for this session.",
           template: `Activate the elicify-vertex verification harness.
@@ -285,11 +303,15 @@ verify before claiming done, control things manually, communicate calmly.`,
 
         if (agent === opts.activeAgent || triggerRe.test(text)) {
           gate.activate(input.sessionID)
+          debug(`chat.message: ACTIVATED session ${input.sessionID} (agent=${agent || "unknown"}, trigger=${triggerRe.test(text)})`)
         } else if (agent !== undefined && agent !== opts.activeAgent) {
           // User switched to a different known agent — deactivate.
           // (Skip when agent is undefined; the SDK can omit it and we don't
           // want a missing field to silently keep the gate active forever.)
           gate.deactivate(input.sessionID)
+          debug(`chat.message: DEACTIVATED session ${input.sessionID} (agent=${agent})`)
+        } else {
+          debug(`chat.message: no-op session ${input.sessionID} (agent=${agent || "undefined"})`)
         }
       } catch {}
     },
@@ -311,12 +333,16 @@ verify before claiming done, control things manually, communicate calmly.`,
      */
     async "experimental.chat.system.transform"(input, output) {
       const sessionID = input.sessionID
-      if (!gate.isActive(sessionID)) return
+      if (!gate.isActive(sessionID)) {
+        debug(`system.transform: SKIPPED session ${sessionID || "undefined"} (gate inactive)`)
+        return
+      }
       const queued = sessionID ? queue.drain(sessionID) : []
       const combined: Directive[] = [...alwaysOn(), ...queued]
       const block = formatDirectives(combined)
       if (!block) return
       output.system = [...output.system, block]
+      debug(`system.transform: INJECTED ${combined.length} directive(s) into session ${sessionID} (system prompt now ${output.system.length} blocks)`)
     },
 
     /**
