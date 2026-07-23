@@ -589,6 +589,23 @@ Stop when you have actually looked, not after a fixed number of checks. One clea
   }
 }
 
+// Fablize includes high-recall review wording only in its manually loaded skill
+// (/tmp/fablize-deep/skills/fablize/SKILL.md:52-54). Vertex routes it as an
+// independent signal so review+render and review+debug tasks retain both modes.
+export function isReviewTask(text: string): boolean {
+  return /\b(?:review|audit|critique|inspect|assessment|code[- ]review|red[- ]team)\b|검토|리뷰|감사|점검/i.test(text || "")
+}
+
+export function contextForReview(): Directive {
+  return {
+    id: "vertex:review-recall",
+    text: `[vertex:review-recall] Review in two explicit passes.
+1. COLLECT FOR RECALL: report EVERYTHING including low-confidence findings. List every plausible candidate without suppressing it during collection; attach file:line evidence and a confidence label.
+2. FILTER SEPARATELY: only after collection is complete, triage candidates in a separate section. Preserve the unfiltered list and state why each candidate was retained or rejected.
+Do not collapse collection and filtering into one pass, because early filtering hides potentially important findings.`,
+  }
+}
+
 // ===========================================================================
 // FORMATTING + CONSTANTS
 // ===========================================================================
@@ -773,6 +790,7 @@ export const ElicifyVertexPlugin = async (
   // Last-seen task classification per session (for signal routing).
   const taskModeBySession = new Map<string, TaskMode>()
   const stopModeBySession = new Map<string, StopModeResult>()
+  const reviewBySession = new Map<string, boolean>()
 
   // Last assistant text per session (for the promise-no-act guard).
   // Populated by experimental.chat.messages.transform; read by event(session.idle).
@@ -916,12 +934,15 @@ verify before claiming done, control things manually, communicate calmly.`,
           stopModeBySession.set(msgInput.sessionID, sigMode)
           const mode = classifyTask(text)
           taskModeBySession.set(msgInput.sessionID, mode)
+          const review = isReviewTask(text)
+          reviewBySession.set(msgInput.sessionID, review)
           debug(`chat.message: ACTIVATED session ${msgInput.sessionID} (agent=${agent || "?"}, mode=${mode}, stopMode=${sigMode.mode}, risks=${sigMode.risks.join(",") || "none"})`)
           logClassify(msgInput.sessionID, {
             mode,
             agent: agent || undefined,
             trigger: triggerRe.test(text) ? opts.activeSkillTrigger : undefined,
             risks: sigMode.risks,
+            review,
           })
         } else if (agent !== undefined && agent !== opts.activeAgent) {
           gate.deactivate(msgInput.sessionID)
@@ -1038,6 +1059,8 @@ verify before claiming done, control things manually, communicate calmly.`,
         const routed = contextForMode(mode)
         if (routed) combined.push(routed)
       }
+
+      if (reviewBySession.get(sid)) combined.push(contextForReview())
 
       const stopMode = stopModeBySession.get(sid)
       if (stopMode) {

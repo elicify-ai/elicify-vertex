@@ -169,6 +169,7 @@ export interface ClassifyPayload extends EventPayload {
   agent?: string
   trigger?: string
   risks?: readonly string[]
+  review?: boolean
 }
 
 export interface GateFirePayload extends EventPayload {
