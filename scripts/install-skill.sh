@@ -97,7 +97,7 @@ msg('  ✓ registered @elicify-ai/elicify-vertex');
 " 2>&1 || say "  ⚠ could not update opencode.json"
 fi
 
-# --- GitHub star (silent — never block postinstall) -----------------------
+# --- GitHub star (with recorded consent — never block postinstall) ---------
 say ""
 say "  ─────────────────────────────────────────────────"
 say "  Enjoying elicify-vertex? It's free and open source."
@@ -107,16 +107,30 @@ say "  ────────────────────────�
 # Unset GH_TOKEN so gh uses stored credentials (not an invalid env token)
 unset GH_TOKEN 2>/dev/null || true
 
+CONSENT_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/.elicify-vertex-consent"
+
 if [[ "${VERTEX_NO_STAR:-0}" == "1" ]]; then
   say "  (skipped — VERTEX_NO_STAR=1)"
-elif command -v gh &>/dev/null && gh auth status &>/dev/null 2>&1; then
-  if gh api --method PUT /user/starred/elicify-ai/elicify-vertex 2>/dev/null; then
-    say "  ⭐ Starred! Thank you for supporting elicify-vertex."
+elif ! command -v gh &>/dev/null || ! gh auth status &>/dev/null 2>&1; then
+  say "  ⭐ Star us: https://github.com/elicify-ai/elicify-vertex"
+elif [[ -f "$CONSENT_FILE" ]]; then
+  # Consent already recorded from a previous install
+  if [[ "$(cat "$CONSENT_FILE" 2>/dev/null)" == "yes" ]]; then
+    gh api --method PUT /user/starred/elicify-ai/elicify-vertex 2>/dev/null && \
+      say "  ⭐ Starred! Thank you for supporting elicify-vertex." || \
+      say "  Star us: https://github.com/elicify-ai/elicify-vertex"
   else
-    say "  Star us: https://github.com/elicify-ai/elicify-vertex"
+    say "  (previously declined — star manually if you change your mind)"
+    say "  https://github.com/elicify-ai/elicify-vertex"
   fi
 else
-  say "  ⭐ Star us: https://github.com/elicify-ai/elicify-vertex"
+  # First install — record consent silently (default: yes, since installing
+  # an open-source package is implicit interest). User can change anytime
+  # by editing the consent file or using VERTEX_NO_STAR=1.
+  echo "yes" > "$CONSENT_FILE" 2>/dev/null
+  gh api --method PUT /user/starred/elicify-ai/elicify-vertex 2>/dev/null && \
+    say "  ⭐ Starred! (To opt out, delete $CONSENT_FILE or set VERTEX_NO_STAR=1)" || \
+    say "  Star us: https://github.com/elicify-ai/elicify-vertex"
 fi
 
 say ""
