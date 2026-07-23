@@ -13,7 +13,7 @@
  * ------
  * The plugin is always *loaded* but only *active* for sessions where:
  *   - the active agent is `elicify-vertex-agent`, OR
- *   - the user invoked the `/vertex` skill.
+ *   - the user invoked the `/elicify-vertex` skill.
  * Other agents (build, plan, etc.) get zero injection and zero overhead.
  *
  * How it works
@@ -37,7 +37,7 @@
  */
 
 import { randomUUID } from "node:crypto"
-import type { Plugin } from "@opencode-ai/plugin"
+import type { Hooks, PluginInput, PluginOptions } from "@opencode-ai/plugin"
 
 /** Minimal TextPart shape used by `experimental.chat.messages.transform`. */
 type TextPart = {
@@ -209,17 +209,20 @@ export function formatDirectives(directives: readonly Directive[]): string | nul
  *   { "plugin": ["elicify-vertex"] }
  *
  * The plugin is always loaded but only injects directives for sessions
- * where the active agent is `elicify-vertex-agent` or the `/vertex`
+ * where the active agent is `elicify-vertex-agent` or the `/elicify-vertex`
  * skill was invoked. Other sessions get zero overhead.
  */
-export const ElicifyVertexPlugin: Plugin = async (ctx) => {
+export const ElicifyVertexPlugin = async (
+  _input: PluginInput,
+  options?: PluginOptions,
+): Promise<Hooks & { enqueue: (sessionID: string, directive: Directive) => void }> => {
   const opts: Required<ElicifyVertexOptions> = {
     maxPerSession: 16,
     wireMessagesTransform: true,
     systemDirectives: defaultDirectives,
     activeAgent: "elicify-vertex-agent",
     activeSkillTrigger: "/elicify-vertex",
-    ...(ctx as unknown as ElicifyVertexOptions),
+    ...(options as ElicifyVertexOptions | undefined),
   }
 
   const queue = new DirectiveQueue(opts.maxPerSession)
@@ -237,7 +240,7 @@ export const ElicifyVertexPlugin: Plugin = async (ctx) => {
       if (!input.command["elicify-vertex"]) {
         input.command["elicify-vertex"] = {
           description: "Activate elicify-vertex verification harness for this session.",
-          prompt: `Activate the elicify-vertex verification harness.
+          template: `Activate the elicify-vertex verification harness.
 
 Before doing anything else, run this check:
   cat ~/.config/.elicify-vertex-consent 2>/dev/null
@@ -257,9 +260,9 @@ verify before claiming done, control things manually, communicate calmly.`,
 
     /**
      * Session gate: check the active agent and message text on every user
-     * message. If the agent is the Elicify-Vertex-Agent or the message contains the
-     * skill trigger, activate the session. If the agent changed to something
-     * else, deactivate.
+     * message. If the agent is the Elicify-Vertex-Agent or the message contains
+     * the skill trigger as a standalone token, activate the session. If the
+     * agent changed to something else, deactivate.
      */
     async "chat.message"(input, output) {
       try {
@@ -269,10 +272,23 @@ verify before claiming done, control things manually, communicate calmly.`,
           .map((p) => (p as any).text)
           .join("\n")
 
-        if (agent === opts.activeAgent || text.includes(opts.activeSkillTrigger)) {
+        // Slash-command semantics: the trigger must be the first non-whitespace
+        // token at the start of a line. A bare `text.includes(trigger)` would
+        // activate on sentences like "is the /elicify-vertex plugin working?",
+        // and a word-boundary match is still too permissive (the trigger can
+        // be preceded by a space mid-sentence). Multiline `^` is the line
+        // start; `\s*` allows leading indentation; `\b` keeps the match tight.
+        const triggerRe = new RegExp(
+          `^\\s*${opts.activeSkillTrigger.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}\\b`,
+          "m",
+        )
+
+        if (agent === opts.activeAgent || triggerRe.test(text)) {
           gate.activate(input.sessionID)
-        } else if (agent && agent !== opts.activeAgent) {
-          // User switched to a different agent — deactivate
+        } else if (agent !== undefined && agent !== opts.activeAgent) {
+          // User switched to a different known agent — deactivate.
+          // (Skip when agent is undefined; the SDK can omit it and we don't
+          // want a missing field to silently keep the gate active forever.)
           gate.deactivate(input.sessionID)
         }
       } catch {}
@@ -281,7 +297,7 @@ verify before claiming done, control things manually, communicate calmly.`,
     /**
      * Optional companion API: enqueue a directive for a session. The
      * directive will only be injected if the session is active (the
-     * Elicify-Vertex-Agent is selected or /vertex was invoked).
+     * Elicify-Vertex-Agent is selected or /elicify-vertex was invoked).
      */
     enqueue(sessionID: string, directive: Directive): void {
       queue.enqueue(sessionID, directive)
