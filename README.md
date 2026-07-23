@@ -1,6 +1,6 @@
 # elicify-vertex
 
-**Make any model work like a senior engineer — not just answer like one.**
+**Make every model behave like a mythos-class model — the way people describe Claude Fable 5.**
 
 [![GitHub stars](https://img.shields.io/github/stars/elicify-ai/elicify-vertex?style=social)](https://github.com/elicify-ai/elicify-vertex)
 [![npm version](https://img.shields.io/npm/v/@elicify-ai/elicify-vertex)](https://www.npmjs.com/package/@elicify-ai/elicify-vertex)
@@ -10,9 +10,64 @@
 
 ---
 
-## What it is
+## The problem
 
-**elicify-vertex** is an [OpenCode](https://opencode.ai) plugin that holds the model to a simple standard: **verify before claiming done**. It injects harness directives into the LLM input (via OpenCode’s official chat transform hooks), so the assistant runs tests, surfaces failures honestly, and reports outcomes with evidence — instead of asserting success and moving on.
+Most coding models *sound* capable. They write plausible code, say “done,” and move on.
+
+What they often **don’t** do — unless you babysit them:
+
+- Run the test that would prove the fix
+- Look at the rendered UI instead of trusting a static file write
+- Stop after the same failure twice and form a new hypothesis
+- Finish the work instead of ending with “I’ll do X next”
+- Report calmly with evidence instead of enthusiasm theater
+
+That gap is why a few frontier models feel “mythos-class” (thorough, autonomous, honest) while cheaper or smaller models feel like junior interns with a megaphone.
+
+**elicify-vertex closes that gap with procedure, not luck.**
+
+---
+
+## The story in one line
+
+**elicify-vertex is an [OpenCode](https://opencode.ai) harness that makes *any* model behave more like a mythos-class engineer — the working habits people praise in models like Anthropic’s Claude Fable 5 — by enforcing verify-before-done, evidence-backed stops, and calm reporting.**
+
+It does **not** pretend to be Fable. It encodes the **behaviors** that make that class of work reliable:
+
+| Mythos-class habit | How Vertex enforces it |
+|---|---|
+| Prove it before you claim it | Stop gate blocks “done” after real code changes without observed verification |
+| Don’t promise work you didn’t do | Promise-no-act catches “TODO / I’ll finish later” after edits |
+| Investigate, don’t thrash | Repeat-failure inject after the same error twice |
+| Actually look at the artifact | Debug / render procedures when the task signals it |
+| High-recall review | Two-pass review inject (collect everything, then filter) |
+| Own the full arc | Optional multi-story goals with verification receipts |
+
+You keep your preferred model. Vertex raises the floor of how it *works*.
+
+---
+
+## How behaviour changes
+
+When Vertex is **active** for a session (agent or `/vertex`), the model’s behaviour shifts in concrete ways:
+
+| Situation | Without Vertex | With Vertex |
+|---|---|---|
+| Finishes a feature | “Implemented.” (no test run) | Runs an allowlisted verifier (`tsc`, `npm test`, …) and cites the result — or is blocked from stopping |
+| Edits code then says done | Session ends | **Deep** tasks: hard **stop-block** until verification (or explicit unverified statement); docs-only edits are exempt |
+| Says “I’ll add tests later” / leaves a TODO | Walks away | **Promise-no-act** continuation: finish it or state what remains unverified |
+| Same command fails twice | Retries the same fix silently | **Repeat-failure** directive: stop thrashing, new hypothesis or escalate |
+| Tool exits non-zero | Often ignored in the narrative | **Tool-failure** reminder: don’t claim completion until fixed or documented |
+| Debugging task | Guesses a fix | **Investigation** procedure: reproduce → hypotheses → evidence → causal chain |
+| UI / HTML / chart task | Ships markup unseen | **Grounding** loop: run it, observe output, fix what you see |
+| Code review | Sparse “looks fine” | **Review-recall**: collect low-confidence findings first, then filter with evidence |
+| Multi-step plan | Ad-hoc checklist | Optional **goals** tools + verification receipts so “complete” is earned |
+| Tone of the report | Verbose, hype, apology loops | Contract pushes **outcome-first, calm, short** reporting |
+| Other OpenCode sessions | — | **Untouched** — zero inject until you activate |
+
+Mechanically: Vertex injects directives into the system prompt, **observes** tools (edits, bash, verifiers), **records** evidence, and on `session.idle` can **block** completion and re-prompt until the bar is met. If the plugin itself errors, it **fails open** so a broken harness never freezes your session.
+
+Details: [docs/USAGE.md](./docs/USAGE.md) · [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md).
 
 ---
 
@@ -22,15 +77,12 @@
 npm install @elicify-ai/elicify-vertex
 ```
 
-Requires Node **≥ 20**. Package version on npm: **`@elicify-ai/elicify-vertex@0.8.0`**.
+Requires Node **≥ 20**. Current package: **`@elicify-ai/elicify-vertex@0.8.0`**.
 
-`postinstall` runs `scripts/install-skill.sh`, which copies the skill and agent into your OpenCode config dirs (`~/.config/opencode/skills/vertex` and `~/.config/opencode/agent[s]/`). Restart OpenCode after install.
-
-To re-run install later:
+`postinstall` runs `scripts/install-skill.sh` (skill + agent into `~/.config/opencode/…`). Restart OpenCode after install.
 
 ```bash
 npm run setup
-# or: bash scripts/install-skill.sh
 # SKILL_FORCE=1 bash scripts/install-skill.sh   # overwrite existing skill/agent
 ```
 
@@ -38,7 +90,7 @@ npm run setup
 
 ## Enable in OpenCode
 
-Add the package to your OpenCode config — global `~/.config/opencode/opencode.json`, or a project-level `opencode.json`:
+Global `~/.config/opencode/opencode.json` or project `opencode.json`:
 
 ```json
 {
@@ -46,11 +98,11 @@ Add the package to your OpenCode config — global `~/.config/opencode/opencode.
 }
 ```
 
-The postinstall script tries to append this for you; if `opencode.json` is missing or the plugin doesn’t load, set it manually.
+Postinstall tries to append this; set it manually if needed.
 
 ### If you see `Plugin export is not a function`
 
-Some OpenCode loaders fail on the bare package name. Point at the thin plugin entry instead (`dist/plugin.js` — default + `server` exports only):
+Point at the thin entry (`dist/plugin.js`):
 
 ```json
 {
@@ -72,42 +124,26 @@ From a git clone (after `npm run build`):
 
 ## How to use
 
-The plugin loads quietly. It **injects harness behavior only when activated** for a session:
+The plugin loads quietly. It **only changes behaviour when activated**:
 
-### 1. Agent (recommended for full workflow)
+### 1. Agent (full workflow)
 
-Select **Elicify-Vertex-Agent** (`elicify-vertex-agent`) in OpenCode. That primary agent plans, decomposes work, delegates when useful, and integrates only after verification.
+Select **Elicify-Vertex-Agent** (`elicify-vertex-agent`). Plans, decomposes, delegates when useful, integrates after verification.
 
-### 2. Slash commands
-
-In any session:
+### 2. Slash commands (any session)
 
 | Command | Effect |
 |--------|--------|
-| `/elicify-vertex` | Activate the verification harness for this session |
+| `/elicify-vertex` | Activate the harness for this session |
 | `/vertex` | Same (short alias) |
 
-Optional goal helpers (when the plugin is active): `/vertex-goal-create`, `/vertex-goal-next`, `/vertex-goal-checkpoint`, `/vertex-goal-status`.
+Optional goals: `/vertex-goal-create`, `/vertex-goal-next`, `/vertex-goal-checkpoint`, `/vertex-goal-status`.
 
 ### 3. Skill
 
-The installed skill is **`vertex`** (`~/.config/opencode/skills/vertex/SKILL.md`). Use it when you want the harness discipline without switching primary agents, or when wiring directives from other hooks.
+Installed skill **`vertex`** — harness discipline without switching primary agents.
 
-Agent + slash command can be used together: agent for strategy, harness for verification discipline.
-
----
-
-## What you’ll notice
-
-When Vertex is active for a session:
-
-1. **“Done” means evidence** — successful verification commands, not only “I wrote the file.”
-2. **Tests actually run** — you see the command and output.
-3. **Failures are surfaced** — no silent retry loops on the same broken approach.
-4. **Calmer reports** — result first, less filler.
-5. **Other sessions stay untouched** — zero harness injection until you activate agent or `/vertex`.
-
-If the plugin errors, it fails open (silent) so a broken harness never blocks your work.
+Agent + slash can be combined: strategy from the agent, enforcement from the harness.
 
 ---
 
@@ -116,10 +152,10 @@ If the plugin errors, it fails open (silent) so a broken harness never blocks yo
 | Doc | Topic |
 |-----|--------|
 | [docs/README.md](./docs/README.md) | Docs index |
-| [docs/USAGE.md](./docs/USAGE.md) | Day-to-day usage, goals, activation |
-| [docs/CONFIGURATION.md](./docs/CONFIGURATION.md) | Options (`maxPerSession`, agent/skill triggers, etc.) |
-| [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | Hooks, gates, directive IDs, measurement |
-| [docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md) | Build, test, UAT, local plugin development |
+| [docs/USAGE.md](./docs/USAGE.md) | Activation, stop gate, promise-no-act, env vars |
+| [docs/CONFIGURATION.md](./docs/CONFIGURATION.md) | Plugin options, `opencode.json` |
+| [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | Hooks, directive IDs, measurement |
+| [docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md) | Build, test, UAT |
 
 ---
 
