@@ -1,45 +1,23 @@
 /**
- * elicify-vertex
+ * elicify-vertex — feature-complete verification harness
  * --------------------------------------------------------------------------
- * An opencode plugin that injects harness directives into the **LLM input**
- * via the official `chat.system.transform` and `chat.messages.transform` hooks.
+ * A closed-loop harness: inject → observe → record → check → block.
  *
- * What it does
- * ------------
- * Makes the model prove its work before claiming done. Enforces verification,
- * evidence, and communication discipline as procedure — not as luck.
- *
- * Gating
- * ------
- * The plugin is always *loaded* but only *active* for sessions where:
- *   - the active agent is `elicify-vertex-agent`, OR
- *   - the user invoked the `/elicify-vertex` skill.
- * Other agents (build, plan, etc.) get zero injection and zero overhead.
- *
- * How it works
- * ------------
- * opencode's SDK exposes two transform hooks:
- *
- *   1. `experimental.chat.system.transform`  — append to the system prompt
- *      for the next turn. Has `sessionID` in its input. **Recommended.**
- *   2. `experimental.chat.messages.transform` — rewrite the full messages
- *      array. Does **not** expose `sessionID` in current typings; treat as
- *      a global, last-resort hook.
- *
- * This plugin implements both, with a tiny per-session queue so any hook
- * (Stop, PostToolUse, custom events) can enqueue a directive and have it
- * land as a *system instruction* on the next LLM call.
- *
- * Inspired by the behavioral patterns of Claude Fable 5 — but stands on its
- * own as a model-agnostic verification harness.
+ * Hooks wired:
+ *   config                              — registers /elicify-vertex command
+ *   chat.message                        — session gate (activate/deactivate)
+ *   tool.execute.after                  — READ PATH: observe tools, record evidence
+ *   experimental.chat.system.transform  — INJECT PATH: directives + signal routing
+ *   experimental.chat.messages.transform — fallback injection
+ *   event(session.idle)                 — STOP GATE: block unverified completion
  *
  * @see https://opencode.ai/docs/plugins/
  */
 
 import { randomUUID } from "node:crypto"
+import { appendFileSync } from "node:fs"
 import type { Hooks, PluginInput, PluginOptions } from "@opencode-ai/plugin"
 
-/** Minimal TextPart shape used by `experimental.chat.messages.transform`. */
 type TextPart = {
   id: string
   type: "text"
@@ -49,65 +27,29 @@ type TextPart = {
   synthetic?: boolean
 }
 
-// ---------------------------------------------------------------------------
-// Public types
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// PUBLIC TYPES
+// ===========================================================================
 
-/** A single directive to be appended to the LLM's input on the next turn. */
 export interface Directive {
-  /** Stable id (e.g. "post-tool:evidence" or "stop:block"). */
   readonly id: string
-  /** Text the LLM will see as part of the system prompt. */
   readonly text: string
-  /** Optional ISO timestamp for ordering + debugging. */
   readonly at?: string
 }
 
 export interface ElicifyVertexOptions {
-  /**
-   * Cap on how many directives can be queued per session. Once exceeded,
-   * the oldest directive is dropped. Default: 16.
-   */
   readonly maxPerSession?: number
-
-  /**
-   * If true, also wire `experimental.chat.messages.transform` as a global
-   * drain (uses the messages-array rewrite, no sessionID). Default: true.
-   * Set false to keep behaviour strictly per-session.
-   */
   readonly wireMessagesTransform?: boolean
-
-  /**
-   * A producer that returns a list of "always-on" directives to inject on
-   * every turn. Use this for the vertex contract block. Return []
-   * to disable. Default: a minimal verification-reminder.
-   */
   readonly systemDirectives?: () => readonly Directive[]
-
-  /**
-   * Agent name that activates the plugin for a session. When the active
-   * agent matches this name, the plugin injects directives. Default:
-   * "elicify-vertex-agent".
-   */
   readonly activeAgent?: string
-
-  /**
-   * Skill trigger text that activates the plugin for a session. When the
-   * user's message contains this string, the plugin activates. Default:
-   * "/vertex".
-   */
   readonly activeSkillTrigger?: string
+  readonly maxStopBlocks?: number
 }
 
-// ---------------------------------------------------------------------------
-// Per-session queue
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// DIRECTIVE QUEUE (unchanged from before)
+// ===========================================================================
 
-/**
- * Tiny FIFO queue of directives, keyed by sessionID. Thread-safe in the JS
- * sense — every operation is synchronous and opencode's plugin runtime is
- * single-threaded per session.
- */
 class DirectiveQueue {
   private readonly cap: number
   private readonly bySession = new Map<string, Directive[]>()
@@ -124,7 +66,6 @@ class DirectiveQueue {
     this.bySession.set(sessionID, q)
   }
 
-  /** Returns and clears all directives for the session. */
   drain(sessionID: string): Directive[] {
     const q = this.bySession.get(sessionID)
     if (!q || q.length === 0) return []
@@ -132,7 +73,6 @@ class DirectiveQueue {
     return q
   }
 
-  /** Returns and clears directives across ALL sessions. */
   drainAll(): Array<Directive & { sessionID: string }> {
     const out: Array<Directive & { sessionID: string }> = []
     for (const [sessionID, q] of this.bySession) {
@@ -143,14 +83,10 @@ class DirectiveQueue {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Session activation gate
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// SESSION GATE (unchanged from before)
+// ===========================================================================
 
-/**
- * Tracks which sessions have the vertex agent or skill active.
- * The `chat.message` hook sets/clears flags; the transform hooks read them.
- */
 class SessionGate {
   private readonly active = new Set<string>()
 
@@ -167,29 +103,161 @@ class SessionGate {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Formatting
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// EVIDENCE LEDGER — the READ PATH's memory
+// ===========================================================================
 
-const DEFAULT_BLOCK = `[vertex] Verification reminder: before reporting a task as done,
+interface SessionLedger {
+  changedFilesSeen: boolean
+  verificationCommands: string[]
+  verificationResults: Array<{ command: string; exitCode: number; success: boolean }>
+  failures: Array<{ signature: string; timestamp: string }>
+  stopBlocks: number
+}
+
+class EvidenceLedger {
+  private readonly ledgers = new Map<string, SessionLedger>()
+
+  /** Reset per-turn state (called on each new user message). */
+  reset(sessionID: string): void {
+    this.ledgers.set(sessionID, {
+      changedFilesSeen: false,
+      verificationCommands: [],
+      verificationResults: [],
+      failures: [],
+      stopBlocks: this.ledgers.get(sessionID)?.stopBlocks ?? 0,
+    })
+  }
+
+  recordChangedFiles(sessionID: string): void {
+    const l = this.ledgers.get(sessionID)
+    if (l) l.changedFilesSeen = true
+  }
+
+  recordVerification(sessionID: string, command: string, exitCode: number, success: boolean): void {
+    const l = this.ledgers.get(sessionID)
+    if (!l) return
+    l.verificationCommands.push(command)
+    l.verificationResults.push({ command, exitCode, success })
+  }
+
+  recordFailure(sessionID: string, signature: string): void {
+    const l = this.ledgers.get(sessionID)
+    if (!l) return
+    l.failures.push({ signature, timestamp: new Date().toISOString() })
+  }
+
+  hasVerification(sessionID: string): boolean {
+    const l = this.ledgers.get(sessionID)
+    return !!l && l.verificationResults.some((v) => v.success)
+  }
+
+  hasChangedFiles(sessionID: string): boolean {
+    return this.ledgers.get(sessionID)?.changedFilesSeen ?? false
+  }
+
+  /** Check if the same failure signature appeared >=2 times this turn. */
+  getRepeatFailure(sessionID: string): { signature: string; count: number } | null {
+    const l = this.ledgers.get(sessionID)
+    if (!l || l.failures.length < 2) return null
+    const counts = new Map<string, number>()
+    for (const f of l.failures) {
+      counts.set(f.signature, (counts.get(f.signature) ?? 0) + 1)
+    }
+    for (const [signature, count] of counts) {
+      if (count >= 2) return { signature, count }
+    }
+    return null
+  }
+
+  incrementStopBlocks(sessionID: string): number {
+    const l = this.ledgers.get(sessionID)
+    if (!l) return 0
+    l.stopBlocks++
+    return l.stopBlocks
+  }
+
+  getStopBlocks(sessionID: string): number {
+    return this.ledgers.get(sessionID)?.stopBlocks ?? 0
+  }
+
+  /** A compact summary for the model to see its own track record. */
+  summary(sessionID: string): string | null {
+    const l = this.ledgers.get(sessionID)
+    if (!l) return null
+    const verified = l.verificationResults.filter((v) => v.success).length
+    const failed = l.verificationResults.filter((v) => !v.success).length
+    if (verified === 0 && failed === 0 && !l.changedFilesSeen) return null
+    const parts: string[] = []
+    if (l.changedFilesSeen) parts.push("files changed: yes")
+    if (verified > 0) parts.push(`verified: ${verified}`)
+    if (failed > 0) parts.push(`failed: ${failed}`)
+    return parts.join(" · ")
+  }
+
+  /** Should the stop gate block? Files changed but no verification observed. */
+  shouldBlockStop(sessionID: string): boolean {
+    const l = this.ledgers.get(sessionID)
+    if (!l) return false
+    return l.changedFilesSeen && !l.verificationResults.some((v) => v.success)
+  }
+}
+
+// ===========================================================================
+// TASK CLASSIFIER — signal-routed injection
+// ===========================================================================
+
+type TaskMode = "debugging" | "render" | "build" | "baseline"
+
+function classifyTask(text: string): TaskMode {
+  const lower = text.toLowerCase()
+  if (/debug|bug|error|traceback|crash|failing|not working|broken|exception/.test(lower))
+    return "debugging"
+  if (/html|svg|game|canvas|chart|render|website|webpage|\bui\b|dashboard|landing/.test(lower))
+    return "render"
+  if (/implement|build|create|add|refactor|write|fix|migrat|deploy|install/.test(lower))
+    return "build"
+  return "baseline"
+}
+
+function contextForMode(mode: TaskMode): Directive | null {
+  switch (mode) {
+    case "debugging":
+      return {
+        id: "vertex:investigation",
+        text: `[vertex:investigation] Debugging signal detected. Follow the investigation protocol:
+reproduce the failure first → form 3+ competing hypotheses → gather evidence for each → trace the full causal chain → verify the fix resolves it → report which hypotheses you rejected.`,
+      }
+    case "render":
+      return {
+        id: "vertex:grounding",
+        text: `[vertex:grounding] Render/executable artifact detected. Follow the grounding loop:
+run it in the real renderer → observe the actual output → fix what the observation reveals → re-run. A static check (lint, type-check) is not observation. Use browser tools if available.`,
+      }
+    default:
+      return null
+  }
+}
+
+// ===========================================================================
+// FORMATTING + CONSTANTS
+// ===========================================================================
+
+const VERTEX_CONTRACT = `[vertex:contract] Verification reminder: before reporting a task as done,
 - observe the actual output of the change (run the test, render the artifact, hit the endpoint);
 - ground any "done" claim in a tool result from this turn, not in intent;
 - if a step failed and you cannot fix it, surface that explicitly.
 What counts as verification: a Bash tool call (not echo/true/cat) that exited 0 with non-empty stdout. A Write/Edit success message is authoring, not verifying.
-A passing test is not evidence until you have confirmed the test can fail. If you did not break the test to verify it detects failure, state that as a caveat.
-Automated tests often do not surface real issues. Before claiming something works, control it yourself — run it manually, observe the actual behavior, and if browser tools are available, use them to see the rendered output. Tests are a safety net, not a substitute for looking.
+A passing test is not evidence until you have confirmed the test can fail.
+Automated tests often do not surface real issues. Before claiming something works, control it yourself — run it manually, observe the actual behavior, and if browser tools are available, use them to see the rendered output.
 Communicate in a calm, factual tone. Lead with the outcome. Avoid enthusiasm, apology, or performative framing.`
 
+const NON_VERIFICATION_RE = /^(echo|true|:|printf|cat|ls|pwd|cd|head|tail|wc|grep|rg|find|fd)\b/
+
 function defaultDirectives(): readonly Directive[] {
-  return [
-    {
-      id: "vertex:contract",
-      text: DEFAULT_BLOCK,
-    },
-  ]
+  return [{ id: "vertex:contract", text: VERTEX_CONTRACT }]
 }
 
-/** Format a list of directives as a single block for the system prompt. */
 export function formatDirectives(directives: readonly Directive[]): string | null {
   if (directives.length === 0) return null
   const stamp = new Date().toISOString()
@@ -199,64 +267,53 @@ export function formatDirectives(directives: readonly Directive[]): string | nul
   return `<vertex-directives ts="${stamp}">\n${body}\n</vertex-directives>`
 }
 
-// ---------------------------------------------------------------------------
-// Plugin entrypoint
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// PLUGIN ENTRYPOINT
+// ===========================================================================
 
-/**
- * Opencode plugin entrypoint. Wire it in `opencode.json`:
- *
- *   { "plugin": ["elicify-vertex"] }
- *
- * The plugin is always loaded but only injects directives for sessions
- * where the active agent is `elicify-vertex-agent` or the `/elicify-vertex`
- * skill was invoked. Other sessions get zero overhead.
- */
 export const ElicifyVertexPlugin = async (
-  _input: PluginInput,
+  input: PluginInput,
   options?: PluginOptions,
 ): Promise<Hooks & { enqueue: (sessionID: string, directive: Directive) => void }> => {
+  const client = (input as any).client
   const opts: Required<ElicifyVertexOptions> = {
     maxPerSession: 16,
     wireMessagesTransform: true,
     systemDirectives: defaultDirectives,
     activeAgent: "elicify-vertex-agent",
     activeSkillTrigger: "/elicify-vertex",
+    maxStopBlocks: 3,
     ...(options as ElicifyVertexOptions | undefined),
   }
 
   const queue = new DirectiveQueue(opts.maxPerSession)
   const gate = new SessionGate()
+  const ledger = new EvidenceLedger()
 
-  // Debug logging — set VERTEX_DEBUG=1 in the environment to enable.
-  // Writes to ~/.config/opencode/.vertex-debug.log
+  // Last-seen task classification per session (for signal routing).
+  const taskModeBySession = new Map<string, TaskMode>()
+
+  // Debug logging
   const DEBUG = process.env.VERTEX_DEBUG === "1"
-  const debugLog = DEBUG
-    ? `${process.env.HOME}/.config/opencode/.vertex-debug.log`
-    : ""
+  const debugLog = DEBUG ? `${process.env.HOME}/.config/opencode/.vertex-debug.log` : ""
   const debug = (msg: string) => {
     if (!DEBUG) return
-    const ts = new Date().toISOString()
-    const line = `[${ts}] ${msg}\n`
     try {
-      require("fs").appendFileSync(debugLog, line)
+      appendFileSync(debugLog, `[${new Date().toISOString()}] ${msg}\n`)
     } catch {}
   }
   debug("plugin loaded — debug mode enabled")
+
   const alwaysOn = () => opts.systemDirectives().map((d) => ({ ...d }))
 
   return {
-    /**
-     * Register the /elicify-vertex slash command so the user can activate
-     * the plugin from any agent. The command prompt includes the star
-     * consent check on first use.
-     */
-    async config(input: any) {
+    // ── CONFIG: register /elicify-vertex command ──────────────────────────
+    async config(cfgInput: any) {
       debug("config hook fired")
-      input.command = input.command ?? {}
-      if (!input.command["elicify-vertex"]) {
+      cfgInput.command = cfgInput.command ?? {}
+      if (!cfgInput.command["elicify-vertex"]) {
         debug("config: registering /elicify-vertex command")
-        input.command["elicify-vertex"] = {
+        cfgInput.command["elicify-vertex"] = {
           description: "Activate elicify-vertex verification harness for this session.",
           template: `Activate the elicify-vertex verification harness.
 
@@ -276,93 +333,145 @@ verify before claiming done, control things manually, communicate calmly.`,
       }
     },
 
-    /**
-     * Session gate: check the active agent and message text on every user
-     * message. If the agent is the Elicify-Vertex-Agent or the message contains
-     * the skill trigger as a standalone token, activate the session. If the
-     * agent changed to something else, deactivate.
-     */
-    async "chat.message"(input, output) {
+    // ── CHAT.MESSAGE: session gate + ledger reset + task classification ────
+    async "chat.message"(msgInput, output) {
       try {
-        const agent = input.agent
+        const agent = msgInput.agent
         const text = (output.parts || [])
           .filter((p) => p && p.type === "text" && typeof (p as any).text === "string")
           .map((p) => (p as any).text)
           .join("\n")
 
-        // Slash-command semantics: the trigger must be the first non-whitespace
-        // token at the start of a line. A bare `text.includes(trigger)` would
-        // activate on sentences like "is the /elicify-vertex plugin working?",
-        // and a word-boundary match is still too permissive (the trigger can
-        // be preceded by a space mid-sentence). Multiline `^` is the line
-        // start; `\s*` allows leading indentation; `\b` keeps the match tight.
         const triggerRe = new RegExp(
-          `^\\s*${opts.activeSkillTrigger.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}\\b`,
+          `^\\s*${opts.activeSkillTrigger.replace(/[.*+?^${}()|[\]\\\\]/g, "\\\\$&")}\\b`,
           "m",
         )
 
         if (agent === opts.activeAgent || triggerRe.test(text)) {
-          gate.activate(input.sessionID)
-          debug(`chat.message: ACTIVATED session ${input.sessionID} (agent=${agent || "unknown"}, trigger=${triggerRe.test(text)})`)
+          gate.activate(msgInput.sessionID)
+          ledger.reset(msgInput.sessionID)
+          const mode = classifyTask(text)
+          taskModeBySession.set(msgInput.sessionID, mode)
+          debug(`chat.message: ACTIVATED session ${msgInput.sessionID} (agent=${agent || "?"}, mode=${mode})`)
         } else if (agent !== undefined && agent !== opts.activeAgent) {
-          // User switched to a different known agent — deactivate.
-          // (Skip when agent is undefined; the SDK can omit it and we don't
-          // want a missing field to silently keep the gate active forever.)
-          gate.deactivate(input.sessionID)
-          debug(`chat.message: DEACTIVATED session ${input.sessionID} (agent=${agent})`)
-        } else {
-          debug(`chat.message: no-op session ${input.sessionID} (agent=${agent || "undefined"})`)
+          gate.deactivate(msgInput.sessionID)
+          debug(`chat.message: DEACTIVATED session ${msgInput.sessionID} (agent=${agent})`)
         }
       } catch {}
     },
 
-    /**
-     * Optional companion API: enqueue a directive for a session. The
-     * directive will only be injected if the session is active (the
-     * Elicify-Vertex-Agent is selected or /elicify-vertex was invoked).
-     */
+    // ── ENQUEUE: public API for other hooks/plugins ────────────────────────
     enqueue(sessionID: string, directive: Directive): void {
       queue.enqueue(sessionID, directive)
     },
 
-    /**
-     * Append queued + always-on directives to the system prompt for the
-     * next LLM call — but ONLY if the session is vertex-active.
-     * This is the **SDK-native, correct** place to inject post-tool
-     * evidence, stop-block reminders, and per-session instructions.
-     */
-    async "experimental.chat.system.transform"(input, output) {
-      const sessionID = input.sessionID
-      if (!gate.isActive(sessionID)) {
-        debug(`system.transform: SKIPPED session ${sessionID || "undefined"} (gate inactive)`)
-        return
+    // ── TOOL.EXECUTE.AFTER: the READ PATH ─────────────────────────────────
+    async "tool.execute.after"(toolInput, toolOutput) {
+      const sid = toolInput.sessionID
+      if (!gate.isActive(sid)) return
+
+      const tool = toolInput.tool
+      const args = toolInput.args ?? {}
+      const out = toolOutput.output ?? ""
+      const meta = toolOutput.metadata ?? {}
+      const exitCode = typeof meta.exit === "number"
+        ? meta.exit
+        : typeof meta.exitCode === "number"
+          ? meta.exitCode
+          : undefined
+
+      try {
+        // ── Edit/Write: record file changes ──────────────────────────────
+        if (tool === "edit" || tool === "write") {
+          ledger.recordChangedFiles(sid)
+          debug(`tool.after: ${tool} on ${args.filePath ?? "?"} → file changed recorded for ${sid}`)
+        }
+
+        // ── Bash: record verification or failure ─────────────────────────
+        if (tool === "bash") {
+          const command = typeof args.command === "string" ? args.command : ""
+          const isNonVerification = NON_VERIFICATION_RE.test(command.trim())
+
+          if (!isNonVerification && exitCode !== undefined) {
+            const success = exitCode === 0 && out.trim().length > 0
+            ledger.recordVerification(sid, command, exitCode, success)
+            debug(`tool.after: bash "${command.slice(0, 60)}" → exit=${exitCode}, verified=${success}`)
+          }
+
+          // Failure detection
+          if (exitCode !== undefined && exitCode !== 0) {
+            const firstErrLine = out.split("\n").find((l) => l.trim()) ?? "unknown error"
+            const signature = `${exitCode}:${firstErrLine.slice(0, 80)}`
+            ledger.recordFailure(sid, signature)
+
+            // Repeat-failure detection
+            const repeat = ledger.getRepeatFailure(sid)
+            if (repeat) {
+              queue.enqueue(sid, {
+                id: "vertex:repeat-failure",
+                text: `[vertex:repeat-failure] The same class of failure has repeated ${repeat.count} times. Stop retrying silently — report what failed, what you already tried, and your next hypothesis.`,
+              })
+              debug(`tool.after: REPEAT FAILURE detected (${repeat.count}x) for ${sid}`)
+            } else {
+              queue.enqueue(sid, {
+                id: "vertex:tool-failure",
+                text: `[vertex:tool-failure] A tool call failed (exit ${exitCode}). Do not report completion until it is fixed, isolated as a known baseline, or explicitly documented.`,
+              })
+              debug(`tool.after: failure recorded for ${sid}`)
+            }
+          }
+        }
+      } catch (e) {
+        debug(`tool.after: error — ${(e as Error).message}`)
       }
-      const queued = sessionID ? queue.drain(sessionID) : []
-      const combined: Directive[] = [...alwaysOn(), ...queued]
-      const block = formatDirectives(combined)
-      if (!block) return
-      output.system = [...output.system, block]
-      debug(`system.transform: INJECTED ${combined.length} directive(s) into session ${sessionID} (system prompt now ${output.system.length} blocks)`)
     },
 
-    /**
-     * Optional fallback: rewrite the messages array so any undrained
-     * directives from ACTIVE sessions still reach the LLM. Directives
-     * from inactive sessions are silently dropped.
-     *
-     * The SDK does not currently expose `sessionID` to this hook, so we
-     * drain globally and filter by the gate. This is intentionally
-     * lossy — prefer system.transform.
-     */
+    // ── SYSTEM.TRANSFORM: the INJECT PATH (signal-routed + evidence-aware)
+    async "experimental.chat.system.transform"(sysInput, sysOutput) {
+      const sid = sysInput.sessionID
+      if (!sid || !gate.isActive(sid)) {
+        debug(`system.transform: SKIPPED ${sid || "?"} (gate inactive)`)
+        return
+      }
+
+      const combined: Directive[] = [...alwaysOn()]
+
+      // Signal-routed procedure
+      const mode = taskModeBySession.get(sid)
+      if (mode) {
+        const routed = contextForMode(mode)
+        if (routed) combined.push(routed)
+      }
+
+      // Evidence summary (let the model see its own track record)
+      const summary = ledger.summary(sid)
+      if (summary) {
+        combined.push({
+          id: "vertex:ledger",
+          text: `[vertex:ledger] This turn's evidence: ${summary}`,
+        })
+      }
+
+      // Queued directives (from tool.after failures, stop gate, etc.)
+      const queued = queue.drain(sid)
+      combined.push(...queued)
+
+      const block = formatDirectives(combined)
+      if (!block) return
+      sysOutput.system = [...sysOutput.system, block]
+      debug(`system.transform: INJECTED ${combined.length} directive(s) into ${sid} (mode=${mode || "none"}, queued=${queued.length})`)
+    },
+
+    // ── MESSAGES.TRANSFORM: fallback ──────────────────────────────────────
     ...(opts.wireMessagesTransform
       ? {
-          async "experimental.chat.messages.transform"(_input, output) {
+          async "experimental.chat.messages.transform"(_msgInput, msgOutput) {
             const undrained = queue.drainAll()
             const active = undrained.filter((d) => gate.isActive(d.sessionID))
             if (active.length === 0) return
             const block = formatDirectives(active)
             if (!block) return
-            const last = output.messages[output.messages.length - 1]
+            const last = msgOutput.messages[msgOutput.messages.length - 1]
             if (!last) return
             const part: TextPart = {
               id: `prt_${randomUUID().replace(/-/g, "")}`,
@@ -376,6 +485,52 @@ verify before claiming done, control things manually, communicate calmly.`,
           },
         }
       : {}),
+
+    // ── EVENT: the STOP GATE ──────────────────────────────────────────────
+    async event({ event }) {
+      try {
+        if (event.type !== "session.idle") return
+        const sid = event.properties?.sessionID
+        if (typeof sid !== "string") return
+        if (!gate.isActive(sid)) return
+
+        debug(`event: session.idle for ${sid}`)
+
+        // Check if the model's work is unverified
+        if (!ledger.shouldBlockStop(sid)) {
+          debug(`event: ${sid} — no block needed (verified or no changes)`)
+          return
+        }
+
+        const blocks = ledger.getStopBlocks(sid)
+        if (blocks >= opts.maxStopBlocks) {
+          debug(`event: ${sid} — max stop blocks reached (${blocks}), allowing with warning`)
+          queue.enqueue(sid, {
+            id: "vertex:stop-warning",
+            text: `[vertex:stop-warning] You have claimed done ${blocks} times without observed verification. Proceeding, but this task is recorded as unverified.`,
+          })
+          return
+        }
+
+        const count = ledger.incrementStopBlocks(sid)
+        const reason = `[vertex:stop-block] You appear to be stopping, but files were changed this turn without an observed verification command (a Bash call that exited 0 with output). Run a verification command now and cite its output, or explicitly state what remains unverified. (Block ${count}/${opts.maxStopBlocks})`
+
+        queue.enqueue(sid, { id: "vertex:stop-block", text: reason })
+        debug(`event: ${sid} — STOP BLOCK ${count}/${opts.maxStopBlocks} (changed files, no verification)`)
+
+        // Re-prompt the model to continue
+        if (client?.session?.prompt) {
+          await client.session.prompt({
+            path: { id: sid },
+            body: {
+              parts: [{ type: "text", text: reason }],
+            },
+          })
+        }
+      } catch (e) {
+        debug(`event: error — ${(e as Error).message}`)
+      }
+    },
   }
 }
 
