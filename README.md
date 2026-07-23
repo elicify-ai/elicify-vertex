@@ -32,7 +32,7 @@ The plugin sits between you and the model. On every turn where the plugin is act
 - **Stop retrying the same failing approach** — if something fails twice the same way, form a different hypothesis.
 - **Communicate calmly** — lead with the result, avoid enthusiasm and apology, end when the useful information has been delivered.
 
-The plugin only activates when you want it to — when you're using the **Helmsman** agent or the **`/vertex`** skill. Other sessions are left untouched.
+The plugin only activates when you want it to — when you're using the **Elicify-Vertex-Agent** agent or the **`/vertex`** skill. Other sessions are left untouched.
 
 ## Installation
 
@@ -44,9 +44,9 @@ Then restart opencode. That's it — the plugin and the `/vertex` skill are full
 
 ## How to use
 
-### Option 1: The Helmsman agent
+### Option 1: Elicify-Vertex-Agent agent
 
-Select the **Helmsman** agent in opencode. The plugin activates automatically for that session. The Helmsman is a principal orchestrator — it decomposes work, delegates to subagents in parallel, and integrates verified results. Think of it as a senior engineer who owns the full arc of a task.
+Select the **Elicify-Vertex-Agent** agent in opencode. The plugin activates automatically for that session. Elicify-Vertex-Agent is a principal orchestrator — it decomposes work, delegates to subagents in parallel, and integrates verified results. Think of it as a senior engineer who owns the full arc of a task.
 
 ### Option 2: The `/vertex` skill
 
@@ -54,7 +54,7 @@ Type `/vertex` in any opencode session. The plugin activates for that session. U
 
 ### Option 3: Both
 
-Use the Helmsman agent AND invoke `/vertex` when you need an extra nudge. They work together — the agent provides the strategy, the skill provides the discipline.
+Use the Elicify-Vertex-Agent agent AND invoke `/vertex` when you need an extra nudge. They work together — the agent provides the strategy, the skill provides the discipline.
 
 ## What you'll notice
 
@@ -72,7 +72,7 @@ The plugin works out of the box. If you want to customize:
 
 | Option | Default | What it controls |
 |---|---|---|
-| `activeAgent` | `elicify-vertex-helmsman` | Which agent name activates the plugin |
+| `activeAgent` | `elicify-vertex-agent` | Which agent name activates the plugin |
 | `activeSkillTrigger` | `/vertex` | Which slash command activates the plugin |
 | `maxPerSession` | `16` | Max directives queued per session |
 | `systemDirectives` | built-in verification block | The always-on instructions injected every turn |
@@ -80,7 +80,7 @@ The plugin works out of the box. If you want to customize:
 ## Technical details
 
 - **Self-contained** — no symlinks, no external scripts, no system dependencies beyond opencode itself.
-- **Gated** — the plugin is always loaded but only injects when the Helmsman agent or `/vertex` skill is active. Other sessions get zero overhead.
+- **Gated** — the plugin is always loaded but only injects when the Elicify-Vertex-Agent agent or `/vertex` skill is active. Other sessions get zero overhead.
 - **Fails open** — if the plugin encounters an error, it stays silent. A broken harness must never break your work.
 
 ## License
@@ -90,7 +90,7 @@ MIT — see [LICENSE](./LICENSE).
 ## Companion artifacts
 
 - **Skill:** `/vertex` — the slash command that activates the plugin for a session.
-- **Agent:** **The Helmsman** (`elicify-vertex-helmsman`) — the principal orchestrator agent that pairs with this plugin. Decomposes work, delegates in parallel, integrates verified results.
+- **Agent:** **Elicify-Vertex-Agent** (`elicify-vertex-agent`) — the principal orchestrator agent that pairs with this plugin. Decomposes work, delegates in parallel, integrates verified results.
 
 ## Acknowledgments
 

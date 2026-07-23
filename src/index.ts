@@ -12,7 +12,7 @@
  * Gating
  * ------
  * The plugin is always *loaded* but only *active* for sessions where:
- *   - the active agent is `elicify-vertex-helmsman`, OR
+ *   - the active agent is `elicify-vertex-agent`, OR
  *   - the user invoked the `/vertex` skill.
  * Other agents (build, plan, etc.) get zero injection and zero overhead.
  *
@@ -87,7 +87,7 @@ export interface ElicifyVertexOptions {
   /**
    * Agent name that activates the plugin for a session. When the active
    * agent matches this name, the plugin injects directives. Default:
-   * "elicify-vertex-helmsman".
+   * "elicify-vertex-agent".
    */
   readonly activeAgent?: string
 
@@ -209,7 +209,7 @@ export function formatDirectives(directives: readonly Directive[]): string | nul
  *   { "plugin": ["elicify-vertex"] }
  *
  * The plugin is always loaded but only injects directives for sessions
- * where the active agent is `elicify-vertex-helmsman` or the `/vertex`
+ * where the active agent is `elicify-vertex-agent` or the `/vertex`
  * skill was invoked. Other sessions get zero overhead.
  */
 export const ElicifyVertexPlugin: Plugin = async (ctx) => {
@@ -217,7 +217,7 @@ export const ElicifyVertexPlugin: Plugin = async (ctx) => {
     maxPerSession: 16,
     wireMessagesTransform: true,
     systemDirectives: defaultDirectives,
-    activeAgent: "elicify-vertex-helmsman",
+    activeAgent: "elicify-vertex-agent",
     activeSkillTrigger: "/vertex",
     ...(ctx as unknown as ElicifyVertexOptions),
   }
@@ -229,7 +229,7 @@ export const ElicifyVertexPlugin: Plugin = async (ctx) => {
   return {
     /**
      * Session gate: check the active agent and message text on every user
-     * message. If the agent is the Helmsman or the message contains the
+     * message. If the agent is the Elicify-Vertex-Agent or the message contains the
      * skill trigger, activate the session. If the agent changed to something
      * else, deactivate.
      */
@@ -253,7 +253,7 @@ export const ElicifyVertexPlugin: Plugin = async (ctx) => {
     /**
      * Optional companion API: enqueue a directive for a session. The
      * directive will only be injected if the session is active (the
-     * Helmsman agent is selected or /vertex was invoked).
+     * Elicify-Vertex-Agent is selected or /vertex was invoked).
      */
     enqueue(sessionID: string, directive: Directive): void {
       queue.enqueue(sessionID, directive)
