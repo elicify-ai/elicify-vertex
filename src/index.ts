@@ -116,6 +116,10 @@ class SessionGate {
 
 interface SessionLedger {
   changedFilesSeen: boolean
+  /** Distinct kinds of files changed (e.g. "docs", "code", "config") — mirrors fablize ledger.py:145-158 */
+  changedFileKinds: Set<string>
+  /** Set per-prompt to the classified mode (quick/normal/deep) — mirrors fablize gate_prompt.py:24-33 */
+  taskMode: "quick" | "normal" | "deep"
   verificationCommands: string[]
   verificationResults: Array<{ command: string; exitCode: number; success: boolean }>
   failures: Array<{ signature: string; timestamp: string }>
@@ -126,9 +130,11 @@ export class EvidenceLedger {
   private readonly ledgers = new Map<string, SessionLedger>()
 
   /** Reset per-turn state (called on each new user message). */
-  reset(sessionID: string): void {
+  reset(sessionID: string, mode: "quick" | "normal" | "deep" = "normal"): void {
     this.ledgers.set(sessionID, {
       changedFilesSeen: false,
+      changedFileKinds: new Set(),
+      taskMode: mode,
       verificationCommands: [],
       verificationResults: [],
       failures: [],
@@ -136,9 +142,16 @@ export class EvidenceLedger {
     })
   }
 
-  recordChangedFiles(sessionID: string): void {
+  setMode(sessionID: string, mode: "quick" | "normal" | "deep"): void {
     const l = this.ledgers.get(sessionID)
-    if (l) l.changedFilesSeen = true
+    if (l) l.taskMode = mode
+  }
+
+  recordChangedFiles(sessionID: string, filePath: string): void {
+    const l = this.ledgers.get(sessionID)
+    if (!l) return
+    l.changedFilesSeen = true
+    l.changedFileKinds.add(classifyFileKind(filePath))
   }
 
   recordVerification(sessionID: string, command: string, exitCode: number, success: boolean): void {
@@ -182,6 +195,8 @@ export class EvidenceLedger {
     if (!l) {
       l = {
         changedFilesSeen: false,
+        changedFileKinds: new Set(),
+        taskMode: "normal",
         verificationCommands: [],
         verificationResults: [],
         failures: [],
@@ -211,12 +226,55 @@ export class EvidenceLedger {
     return parts.join(" · ")
   }
 
-  /** Should the stop gate block? Files changed but no verification observed. */
+  /** Should the stop gate block? Files changed but no verification observed.
+   * Mirrors fablize verify_state.should_block_stop:18-49 — deep-only with
+   * docs-only exemption, plus our stricter quick-mode bypass.
+   */
   shouldBlockStop(sessionID: string): boolean {
     const l = this.ledgers.get(sessionID)
     if (!l) return false
+    // quick → never block, regardless of changes (mirrors fablize line 24)
+    if (l.taskMode === "quick") return false
+    // docs-only → never block (mirrors fablize line 30)
+    if (l.changedFileKinds.size > 0 && [...l.changedFileKinds].every((k) => k === "docs")) return false
+    // deep AND changed AND not verified → block (mirrors fablize line 42)
     return l.changedFilesSeen && !l.verificationResults.some((v) => v.success)
   }
+}
+
+// ===========================================================================
+// FILE-KIND CLASSIFIER — used for docs-only exemption in the stop gate
+// ===========================================================================
+// Mirrors fablize ledger.classify_path_kind. We classify into 4 kinds:
+//   - docs    : .md, .txt, README, comments-only changes
+//   - code    : .ts, .js, .py, .go, .rs, .java, .c, .cpp, .h, etc.
+//   - config  : .json, .yaml, .yml, .toml, .ini, .env, package.json
+//   - other   : anything else
+// ----------------------------------------------------------------------------
+
+const DOC_EXTENSIONS = new Set([".md", ".mdx", ".txt", ".rst"])
+const DOC_BASENAMES = new Set(["readme", "license", "changelog", "contributing", "code_of_conduct"])
+const CODE_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".pyi", ".go", ".rs", ".java", ".kt", ".scala", ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hxx", ".cs", ".rb", ".php", ".sh", ".bash", ".zsh"])
+const CONFIG_EXTENSIONS = new Set([".json", ".yaml", ".yml", ".toml", ".ini", ".env"])
+
+export function classifyFileKind(filePath: string): "docs" | "code" | "config" | "other" {
+  if (!filePath) return "other"
+  const lower = filePath.toLowerCase()
+  // Extract the basename (last path segment) to handle both "README.md" and
+  // "README" (no extension) correctly.
+  const slash = lower.lastIndexOf("/")
+  const basename = slash === -1 ? lower : lower.slice(slash + 1)
+  const dot = basename.lastIndexOf(".")
+  if (dot === -1) {
+    // no extension — check doc basenames
+    if (DOC_BASENAMES.has(basename)) return "docs"
+    return "other"
+  }
+  const ext = basename.slice(dot)
+  if (DOC_EXTENSIONS.has(ext)) return "docs"
+  if (CODE_EXTENSIONS.has(ext)) return "code"
+  if (CONFIG_EXTENSIONS.has(ext)) return "config"
+  return "other"
 }
 
 // ===========================================================================
@@ -338,6 +396,57 @@ export function classifyTask(text: string): TaskMode {
   if (/implement|build|create|add|refactor|write|fix|migrat|deploy|install/.test(lower))
     return "build"
   return "baseline"
+}
+
+// ===========================================================================
+// STOP-MODE CLASSIFIER — used by the stop gate to decide enforcement strictness
+// ===========================================================================
+// Mirrors fablize scripts/gate/classify_task.py:14-26,29-48.
+// Three modes drive the stop gate:
+//   - quick  : no block, ever (fablize line 24)
+//   - normal : advisory only — we nudge via system.transform but don't block
+//   - deep   : hard block if changed + unverified (fablize line 42)
+// We are STRICTLY BETTER: we also do risk-flag detection (production,
+// database, secret, remote-write) and inject advisories per risk.
+// ----------------------------------------------------------------------------
+
+export type StopMode = "quick" | "normal" | "deep"
+
+const QUICK_RE =
+  /\b(quick|brief|briefly|simple|simply|just explain|explain only|review only|direction|check only|no edits|do not edit)\b/i
+const DEEP_RE =
+  /\b(deep|thorough|thoroughly|exhaustive|end-to-end|production[- ]ready|deploy|deployment|migration|database|auth|security|refactor|large|complex|implement the plan)\b/i
+const NORMAL_RE =
+  /\b(implement|fix|debug|change|edit|create|build|test|lint|review|update)\b/i
+
+export type RiskFlag = "production" | "database" | "secret-or-auth" | "remote-write"
+
+export interface StopModeResult {
+  mode: StopMode
+  risks: RiskFlag[]
+}
+
+export function classifyStopMode(text: string): StopModeResult {
+  const t = text || ""
+  const lower = t.toLowerCase()
+  const risks: RiskFlag[] = []
+  if (lower.includes("production") || /\bdeploy\b/i.test(t)) risks.push("production")
+  if (/\b(db|database|migration|migrate|schema)\b/i.test(t)) risks.push("database")
+  if (/\b(auth|secret|token|api[_-]?key|password)\b/i.test(t)) risks.push("secret-or-auth")
+  if (/\bgit\s+push|release|publish\b/i.test(t)) risks.push("remote-write")
+
+  // deep wins: any deep keyword OR any high-risk flag → deep
+  if (DEEP_RE.test(t) || risks.includes("production") || risks.includes("database") || risks.includes("remote-write")) {
+    return { mode: "deep", risks }
+  }
+  // quick only when no risk flags (a "quick deploy" is still deep)
+  if (QUICK_RE.test(t) && risks.length === 0) {
+    return { mode: "quick", risks }
+  }
+  if (NORMAL_RE.test(t)) {
+    return { mode: "normal", risks }
+  }
+  return { mode: "quick", risks }
 }
 
 export function contextForMode(mode: TaskMode): Directive | null {
@@ -493,10 +602,11 @@ verify before claiming done, control things manually, communicate calmly.`,
 
         if (agent === opts.activeAgent || triggerRe.test(text)) {
           gate.activate(msgInput.sessionID)
-          ledger.reset(msgInput.sessionID)
+          const sigMode = classifyStopMode(text)
+          ledger.reset(msgInput.sessionID, sigMode.mode)
           const mode = classifyTask(text)
           taskModeBySession.set(msgInput.sessionID, mode)
-          debug(`chat.message: ACTIVATED session ${msgInput.sessionID} (agent=${agent || "?"}, mode=${mode})`)
+          debug(`chat.message: ACTIVATED session ${msgInput.sessionID} (agent=${agent || "?"}, mode=${mode}, stopMode=${sigMode.mode}, risks=${sigMode.risks.join(",") || "none"})`)
           logClassify(msgInput.sessionID, {
             mode,
             agent: agent || undefined,
@@ -532,8 +642,9 @@ verify before claiming done, control things manually, communicate calmly.`,
       try {
         // ── Edit/Write: record file changes ──────────────────────────────
         if (tool === "edit" || tool === "write") {
-          ledger.recordChangedFiles(sid)
-          debug(`tool.after: ${tool} on ${args.filePath ?? "?"} → file changed recorded for ${sid}`)
+          const fp = typeof args.filePath === "string" ? args.filePath : ""
+          ledger.recordChangedFiles(sid, fp)
+          debug(`tool.after: ${tool} on ${fp || "?"} → file changed recorded for ${sid}`)
         }
 
         // ── Bash: record verification or failure ─────────────────────────
