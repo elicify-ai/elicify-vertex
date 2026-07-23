@@ -220,6 +220,110 @@ export class EvidenceLedger {
 }
 
 // ===========================================================================
+// PROMISE-NO-ACT DETECTOR — strictly better than fablize finish-the-work.sh
+// ===========================================================================
+// fablize detects only future-intent phrases like "I'll do X next":
+//   /tmp/fablize-deep/hooks/finish-the-work.sh:48-53
+// We additionally catch:
+//   - explicit deferral markers: TODO, FIXME, XXX, deferred, tracked
+//   - issue-filing intent: "file an issue", "track this"
+//   - follow-up language: "follow up", "in a follow", "for tracking"
+//   - the word "later" (common trailing-future marker)
+// All case-insensitive. Triggers on the closing 600 chars of the last
+// assistant message (fablize uses last 400; we use 600 for more headroom).
+// ----------------------------------------------------------------------------
+
+const PROMISE_NO_ACT_KEYWORDS: readonly { needle: string; label: string }[] = [
+  { needle: "deferred", label: "explicit-deferral" },
+  { needle: "tracked", label: "tracked-instead-of-fixed" },
+  { needle: "tracking", label: "tracked-instead-of-fixed" },
+  { needle: "file an issue", label: "issue-filing" },
+  { needle: "i'll file", label: "issue-filing" },
+  { needle: "follow up", label: "follow-up" },
+  { needle: "follow-up", label: "follow-up" },
+  { needle: "todo", label: "todo-marker" },
+  { needle: "fixme", label: "fixme-marker" },
+  { needle: "xxx", label: "xxx-marker" },
+  { needle: "later", label: "later-marker" },
+  { needle: "next iteration", label: "next-iteration" },
+  { needle: "in a follow", label: "follow-up" },
+  { needle: "for tracking purposes", label: "tracking" },
+  { needle: "we should", label: "we-should-X-later" },
+  { needle: "let me", label: "let-me-do-X-next" },
+]
+
+// Future-intent patterns (mirroring fablize's regex shape but with a broader verb set)
+const PROMISE_INTENT_RE = /\b(I'?ll|I will|let me|next,?\s*I|now\s*I'?ll)\b[^.!?\n]{0,80}\b(now|next|then|implement|create|write|add|run|fix|save|build|start|proceed|address|handle|investigate|review)\b/i
+
+export interface PromiseHit {
+  label: string
+  matched: string
+  start: number
+  end: number
+}
+
+/**
+ * Scan assistant text for promise-no-act signals. Returns ALL hits (not just
+ * the first) so callers can log them out-of-band for measurement.
+ *
+ * Strictly better than fablize finish-the-work.sh:54 because:
+ *   - We match explicit deferral markers (TODO/FIXME/XXX/deferred/tracked)
+ *     that fablize's regex cannot match.
+ *   - We match issue-filing intent ("file an issue") that fablize ignores.
+ *   - We match the standalone word "later" — the most common trailing marker.
+ *   - We still keep fablize's verb-followed pattern for parity.
+ *   - Returns structured hits, not a boolean — enables measurement.
+ */
+export function detectPromiseNoAct(text: string): PromiseHit[] {
+  if (!text) return []
+  // Mirror fablize: only inspect the tail. We use 600 chars (vs 400) for more
+  // headroom on multi-sentence conclusions.
+  const tail = text.slice(-600)
+  const lower = tail.toLowerCase()
+  const hits: PromiseHit[] = []
+
+  for (const { needle, label } of PROMISE_NO_ACT_KEYWORDS) {
+    let pos = 0
+    while ((pos = lower.indexOf(needle, pos)) !== -1) {
+      // Boundary check: the previous and next characters must NOT be part of a
+      // larger token. We treat alphanumeric AND "-" AND "_" as in-word
+      // (compound identifiers like "issue-tracker", "time_tracking" do NOT
+      // match — they are compound words, not standalone deferral markers).
+      // Punctuation like ".", ",", "!", "?", ";", ":" counts as a boundary,
+      // so "Will do this later." still matches.
+      const before = pos > 0 ? lower[pos - 1] : ""
+      const after = pos + needle.length < lower.length ? lower[pos + needle.length] : ""
+      const inWord = (c: string) => /[a-z0-9\-_]/.test(c)
+      const boundaryOk = !inWord(before) && !inWord(after)
+      if (boundaryOk) {
+        hits.push({
+          label,
+          matched: tail.slice(pos, pos + needle.length),
+          start: pos,
+          end: pos + needle.length,
+        })
+      }
+      pos += needle.length
+    }
+  }
+
+  // Future-intent pattern (fablize parity, expanded verb set)
+  const m = tail.match(PROMISE_INTENT_RE)
+  if (m && m.index !== undefined) {
+    hits.push({ label: "future-intent", matched: m[0], start: m.index, end: m.index + m[0].length })
+  }
+
+  return hits
+}
+
+/**
+ * The user's instruction explicitly listed these as "indications". They are
+ * already covered above; this export exists so callers and tests can see
+ * the full set in one place.
+ */
+export const PROMISE_NO_ACT_LABELS = PROMISE_NO_ACT_KEYWORDS.map((k) => k.label)
+
+// ===========================================================================
 // TASK CLASSIFIER — signal-routed injection
 // ===========================================================================
 
@@ -328,6 +432,10 @@ export const ElicifyVertexPlugin = async (
 
   // Last-seen task classification per session (for signal routing).
   const taskModeBySession = new Map<string, TaskMode>()
+
+  // Last assistant text per session (for the promise-no-act guard).
+  // Populated by experimental.chat.messages.transform; read by event(session.idle).
+  const lastAssistantText = new Map<string, string>()
 
   // Debug logging
   const DEBUG = process.env.VERTEX_DEBUG === "1"
@@ -504,10 +612,26 @@ verify before claiming done, control things manually, communicate calmly.`,
       debug(`system.transform: INJECTED ${combined.length} directive(s) into ${sid} (mode=${mode || "none"}, queued=${queued.length})`)
     },
 
-    // ── MESSAGES.TRANSFORM: fallback ──────────────────────────────────────
+    // ── MESSAGES.TRANSFORM: fallback + capture last assistant text ────────
     ...(opts.wireMessagesTransform
       ? {
           async "experimental.chat.messages.transform"(_msgInput, msgOutput) {
+            // Capture last assistant text per session for the promise-no-act
+            // guard. Mirrors fablize finish-the-work.sh:15-30 which reads the
+            // transcript to find the last assistant message text.
+            try {
+              for (const m of msgOutput.messages || []) {
+                const info = (m as any).info
+                if (info?.role === "assistant") {
+                  const text = ((m as any).parts || [])
+                    .filter((p: any) => p && p.type === "text" && typeof p.text === "string")
+                    .map((p: any) => p.text)
+                    .join("\n")
+                  if (text) lastAssistantText.set(info.sessionID, text)
+                }
+              }
+            } catch {}
+
             const undrained = queue.drainAll()
             const active = undrained.filter((d) => gate.isActive(d.sessionID))
             if (active.length === 0) return
@@ -537,6 +661,70 @@ verify before claiming done, control things manually, communicate calmly.`,
         if (!gate.isActive(sid)) return
 
         debug(`event: session.idle for ${sid}`)
+
+        // ── PROMISE-NO-ACT GUARD — strictly better than fablize ──────────
+        // Catch deferred/tracked/TODO/FIXME/issue-filing language in the final
+        // assistant message. Only blocks when files were changed this turn
+        // (so a pure "let me explain" message is allowed to end).
+        const lastText = lastAssistantText.get(sid)
+        if (lastText) {
+          const hits = detectPromiseNoAct(lastText)
+          if (hits.length > 0 && ledger.hasChangedFiles(sid)) {
+            const labels = hits.map((h) => h.label).join(", ")
+            const reason = `[vertex:promise-no-act] Your last message contains deferral/intent language (${labels}) but files were changed this turn. Either complete the work now or explicitly state what remains unverified. Promise without act is not allowed when files are changed.`
+            debug(`event: ${sid} — PROMISE-NO-ACT (${labels})`)
+
+            // M3 holdout skip (same as the unverified block path)
+            if (holdoutSuppresses(sid)) {
+              logHoldoutSuppress(sid, "promise-no-act skipped (holdout arm=off)")
+              logGateFire(sid, {
+                decision: "allow",
+                changed: true,
+                verified: ledger.hasVerification(sid),
+                stop_blocks: ledger.getStopBlocks(sid),
+                max_stop_blocks: opts.maxStopBlocks,
+                would_block: true,
+              })
+              debug(`event: ${sid} — HOLDOUT, promise-no-act suppressed`)
+            } else {
+              const count = ledger.incrementStopBlocks(sid)
+              const cap = opts.maxStopBlocks
+              if (count > cap) {
+                // Past cap — log and let it through with a warning
+                logGateFire(sid, {
+                  decision: "warn",
+                  changed: true,
+                  verified: ledger.hasVerification(sid),
+                  stop_blocks: count,
+                  max_stop_blocks: cap,
+                  would_block: true,
+                })
+                queue.enqueue(sid, {
+                  id: "vertex:promise-no-act-warn",
+                  text: `[vertex:promise-no-act-warn] Cap reached (${count - 1} blocks). The following deferral signals were detected: ${labels}. Proceeding.`,
+                })
+                return
+              }
+              queue.enqueue(sid, { id: "vertex:promise-no-act", text: reason })
+              logGateFire(sid, {
+                decision: "block",
+                changed: true,
+                verified: ledger.hasVerification(sid),
+                stop_blocks: count,
+                max_stop_blocks: cap,
+                would_block: true,
+              })
+              debug(`event: ${sid} — PROMISE-NO-ACT BLOCK ${count}/${cap}`)
+              if (client?.session?.prompt) {
+                await client.session.prompt({
+                  path: { id: sid },
+                  body: { parts: [{ type: "text", text: reason }] },
+                })
+              }
+              return
+            }
+          }
+        }
 
         // Check if the model's work is unverified
         if (!ledger.shouldBlockStop(sid)) {
