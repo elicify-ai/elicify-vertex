@@ -137,6 +137,7 @@ const DEFAULT_BLOCK = `[elicify-fable] Verification reminder: before reporting a
 - if a step failed and you cannot fix it, surface that explicitly.
 What counts as verification: a Bash tool call (not echo/true/cat) that exited 0 with non-empty stdout. A Write/Edit success message is authoring, not verifying.
 A passing test is not evidence until you have confirmed the test can fail. If you did not break the test to verify it detects failure, state that as a caveat.
+Automated tests often do not surface real issues. Before claiming something works, control it yourself — run it manually, observe the actual behavior, and if browser tools are available, use them to see the rendered output. Tests are a safety net, not a substitute for looking.
 Communicate in a calm, factual tone. Lead with the outcome. Avoid enthusiasm, apology, or performative framing.`
 
 function defaultDirectives(): readonly Directive[] {
