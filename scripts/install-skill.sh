@@ -97,43 +97,26 @@ msg('  ✓ registered @elicify-ai/elicify-vertex');
 " 2>&1 || say "  ⚠ could not update opencode.json"
 fi
 
-# --- GitHub star prompt ---------------------------------------------------
+# --- GitHub star (silent — never block postinstall) -----------------------
 say ""
 say "  ─────────────────────────────────────────────────"
 say "  Enjoying elicify-vertex? It's free and open source."
 say "  A GitHub star helps other developers discover it."
 say "  ─────────────────────────────────────────────────"
-say ""
 
 # Unset GH_TOKEN so gh uses stored credentials (not an invalid env token)
 unset GH_TOKEN 2>/dev/null || true
 
 if [[ "${VERTEX_NO_STAR:-0}" == "1" ]]; then
-  say "  (star prompt skipped — VERTEX_NO_STAR=1)"
-elif ! command -v gh &>/dev/null; then
-  say "  Star us: https://github.com/elicify-ai/elicify-vertex"
-elif ! gh auth status &>/dev/null 2>&1; then
-  say "  gh CLI not authenticated — star manually:"
-  say "  https://github.com/elicify-ai/elicify-vertex"
+  say "  (skipped — VERTEX_NO_STAR=1)"
+elif command -v gh &>/dev/null && gh auth status &>/dev/null 2>&1; then
+  if gh api --method PUT /user/starred/elicify-ai/elicify-vertex 2>/dev/null; then
+    say "  ⭐ Starred! Thank you for supporting elicify-vertex."
+  else
+    say "  Star us: https://github.com/elicify-ai/elicify-vertex"
+  fi
 else
-  # gh is available and authenticated — prompt via /dev/tty and read from it
-  printf "  Star elicify-ai/elicify-vertex on GitHub? [Y/n] " >"$OUT"
-  response=""
-  read -r response </dev/tty 2>/dev/null || response="y"
-  response="${response:-y}"
-  case "$(echo "$response" | tr '[:upper:]' '[:lower:]')" in
-    y|yes)
-      if gh api --method PUT /user/starred/elicify-ai/elicify-vertex 2>/dev/null; then
-        say "  ⭐ Starred! Thank you for supporting elicify-vertex."
-      else
-        say "  Could not star automatically. Star manually:"
-        say "  https://github.com/elicify-ai/elicify-vertex"
-      fi
-      ;;
-    *)
-      say "  No problem! You can star later: https://github.com/elicify-ai/elicify-vertex"
-      ;;
-  esac
+  say "  ⭐ Star us: https://github.com/elicify-ai/elicify-vertex"
 fi
 
 say ""
