@@ -2,6 +2,13 @@
 
 **Make any model work like a senior engineer — not just answer like one.**
 
+[![GitHub stars](https://img.shields.io/github/stars/elicify-ai/elicify-vertex?style=social)](https://github.com/elicify-ai/elicify-vertex)
+[![npm version](https://img.shields.io/npm/v/@elicify-ai/elicify-vertex)](https://www.npmjs.com/package/@elicify-ai/elicify-vertex)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green)](./LICENSE)
+
+> **If this helps you, please give us a star on GitHub — it helps other developers discover it.**
+> [Star the repo](https://github.com/elicify-ai/elicify-vertex) — the installer does this automatically if you have the `gh` CLI authenticated.
+
 ---
 
 ## What it does

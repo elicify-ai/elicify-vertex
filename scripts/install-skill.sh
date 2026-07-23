@@ -1,20 +1,14 @@
 #!/usr/bin/env bash
-# elicify-vertex — full installer (skill + agent + plugin registration).
+# elicify-vertex — full installer (skill + agent + plugin registration + star).
 #
 # Copies the shipped SKILL.md and agent file into the user's opencode
-# config, and registers the plugin in opencode.json. No symlinks.
-#
-# Behaviour:
-#   - Creates target directories as real directories (no symlinks).
-#   - Copies files. Idempotent. Honours SKILL_FORCE=1 to overwrite.
-#   - Registers "@elicify-ai/elicify-vertex" in opencode.json plugin[]
-#     if not already present (using node for safe JSON editing).
-#   - Exits 0 even on non-fatal issues so npm install is not blocked.
+# config, registers the plugin in opencode.json, and stars the GitHub
+# repo if gh CLI is available. No symlinks.
 #
 # Usage:
-#   bash scripts/install-skill.sh           # install everything
-#   SKILL_FORCE=1 bash scripts/install-skill.sh   # overwrite existing
-#   SKILL_TARGET_DIR=/custom/path bash scripts/install-skill.sh
+#   bash scripts/install-skill.sh                    # install everything
+#   SKILL_FORCE=1 bash scripts/install-skill.sh      # overwrite existing
+#   VERTEX_NO_STAR=1 bash scripts/install-skill.sh   # skip GitHub star
 set -euo pipefail
 
 # --- resolve source files -------------------------------------------------
@@ -26,8 +20,6 @@ SOURCE_AGENT="$PACKAGE_ROOT/agents/elicify-vertex-agent.md"
 # --- resolve config root --------------------------------------------------
 CONFIG_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
 SKILL_DIR="${SKILL_TARGET_DIR:-$CONFIG_ROOT/skills/vertex}"
-AGENT_DIR="$CONFIG_ROOT/agents"
-AGENT_FILE="$AGENT_DIR/elicify-vertex-agent.md"
 OPENCODE_JSON="$CONFIG_ROOT/opencode.json"
 FORCE="${SKILL_FORCE:-0}"
 
@@ -35,53 +27,84 @@ FORCE="${SKILL_FORCE:-0}"
 copy_file() {
   local src="$1" dest="$2"
   if [[ -f "$dest" ]] && [[ "$FORCE" != "1" ]]; then
-    echo "install: $dest already exists (pass SKILL_FORCE=1 to overwrite)"
+    echo "  $dest (already exists)"
     return 0
   fi
   mkdir -p "$(dirname "$dest")"
   cp "$src" "$dest"
-  echo "install: copied -> $dest"
+  echo "  $dest"
 }
 
+echo ""
+echo "  elicify-vertex installer"
+echo "  ─────────────────────────"
+
 # --- install skill --------------------------------------------------------
-if [[ ! -f "$SOURCE_SKILL" ]]; then
-  echo "install: source SKILL.md not found at $SOURCE_SKILL" >&2
-else
+if [[ -f "$SOURCE_SKILL" ]]; then
+  echo ""
+  echo "  Installing skill (/vertex)..."
   copy_file "$SOURCE_SKILL" "$SKILL_DIR/SKILL.md"
+else
+  echo "  WARNING: SKILL.md not found at $SOURCE_SKILL" >&2
 fi
 
-# --- install agent --------------------------------------------------------
-if [[ ! -f "$SOURCE_AGENT" ]]; then
-  echo "install: source agent not found at $SOURCE_AGENT" >&2
+# --- install agent (copy to both agent/ and agents/ for compatibility) ----
+if [[ -f "$SOURCE_AGENT" ]]; then
+  echo ""
+  echo "  Installing agent (Elicify-Vertex-Agent)..."
+  copy_file "$SOURCE_AGENT" "$CONFIG_ROOT/agent/elicify-vertex-agent.md"
+  copy_file "$SOURCE_AGENT" "$CONFIG_ROOT/agents/elicify-vertex-agent.md"
 else
-  copy_file "$SOURCE_AGENT" "$AGENT_FILE"
+  echo "  WARNING: agent file not found at $SOURCE_AGENT" >&2
 fi
 
 # --- register plugin in opencode.json -------------------------------------
+echo ""
+echo "  Registering plugin in opencode.json..."
 if [[ ! -f "$OPENCODE_JSON" ]]; then
-  echo "install: opencode.json not found at $OPENCODE_JSON — skipping plugin registration"
-  echo "  Add this to your opencode.json manually:"
-  echo '  { "plugin": ["@elicify-ai/elicify-vertex"] }'
-  exit 0
-fi
-
-node -e "
+  echo "  opencode.json not found — add this manually:"
+  echo '    { "plugin": ["@elicify-ai/elicify-vertex"] }'
+else
+  node -e "
 const fs = require('fs');
 const path = '$OPENCODE_JSON';
 const pkg = '@elicify-ai/elicify-vertex';
 let cfg;
 try { cfg = JSON.parse(fs.readFileSync(path, 'utf8')); } catch (e) {
-  console.error('install: could not parse opencode.json — skipping plugin registration');
+  console.log('  could not parse opencode.json — skipping');
   process.exit(0);
 }
 if (!Array.isArray(cfg.plugin)) cfg.plugin = [];
 if (cfg.plugin.includes(pkg)) {
-  console.log('install: plugin already registered in opencode.json');
+  console.log('  already registered');
   process.exit(0);
 }
 cfg.plugin.push(pkg);
 fs.writeFileSync(path, JSON.stringify(cfg, null, 2) + '\n');
-console.log('install: registered ' + pkg + ' in opencode.json');
-" 2>&1 || echo "install: could not update opencode.json — add \"@elicify-ai/elicify-vertex\" to plugin[] manually"
+console.log('  registered @elicify-ai/elicify-vertex');
+" 2>&1 || echo "  could not update opencode.json — add \"@elicify-ai/elicify-vertex\" to plugin[] manually"
+fi
 
-echo "install: done. Restart opencode to activate."
+# --- GitHub star (automatic, opt-out via VERTEX_NO_STAR=1) ----------------
+echo ""
+if [[ "${VERTEX_NO_STAR:-0}" == "1" ]]; then
+  echo "  GitHub star skipped (VERTEX_NO_STAR=1)"
+elif command -v gh &>/dev/null; then
+  if gh auth status &>/dev/null 2>&1; then
+    if gh api --method PUT /user/starred/elicify-ai/elicify-vertex 2>/dev/null; then
+      echo "  Starred elicify-ai/elicify-vertex on GitHub"
+    else
+      echo "  Could not star (gh returned error) — star manually:"
+      echo "  https://github.com/elicify-ai/elicify-vertex"
+    fi
+  else
+    echo "  gh CLI not authenticated — star manually:"
+    echo "  https://github.com/elicify-ai/elicify-vertex"
+  fi
+else
+  echo "  Star us on GitHub: https://github.com/elicify-ai/elicify-vertex"
+fi
+
+echo ""
+echo "  Done! Restart opencode to activate."
+echo ""
