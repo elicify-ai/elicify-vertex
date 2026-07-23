@@ -9,6 +9,13 @@
  * Makes the model prove its work before claiming done. Enforces verification,
  * evidence, and communication discipline as procedure — not as luck.
  *
+ * Gating
+ * ------
+ * The plugin is always *loaded* but only *active* for sessions where:
+ *   - the active agent is `elicify-vertex-helmsman`, OR
+ *   - the user invoked the `/vertex` skill.
+ * Other agents (build, plan, etc.) get zero injection and zero overhead.
+ *
  * How it works
  * ------------
  * opencode's SDK exposes two transform hooks:
@@ -76,6 +83,20 @@ export interface ElicifyVertexOptions {
    * to disable. Default: a minimal verification-reminder.
    */
   readonly systemDirectives?: () => readonly Directive[]
+
+  /**
+   * Agent name that activates the plugin for a session. When the active
+   * agent matches this name, the plugin injects directives. Default:
+   * "elicify-vertex-helmsman".
+   */
+  readonly activeAgent?: string
+
+  /**
+   * Skill trigger text that activates the plugin for a session. When the
+   * user's message contains this string, the plugin activates. Default:
+   * "/vertex".
+   */
+  readonly activeSkillTrigger?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +144,30 @@ class DirectiveQueue {
 }
 
 // ---------------------------------------------------------------------------
+// Session activation gate
+// ---------------------------------------------------------------------------
+
+/**
+ * Tracks which sessions have the vertex agent or skill active.
+ * The `chat.message` hook sets/clears flags; the transform hooks read them.
+ */
+class SessionGate {
+  private readonly active = new Set<string>()
+
+  activate(sessionID: string): void {
+    if (sessionID) this.active.add(sessionID)
+  }
+
+  deactivate(sessionID: string): void {
+    this.active.delete(sessionID)
+  }
+
+  isActive(sessionID: string | undefined): boolean {
+    return !!sessionID && this.active.has(sessionID)
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Formatting
 // ---------------------------------------------------------------------------
 
@@ -163,39 +208,52 @@ export function formatDirectives(directives: readonly Directive[]): string | nul
  *
  *   { "plugin": ["elicify-vertex"] }
  *
- * Exposes:
- *   - `enqueue(sessionID, directive)` — call from any other plugin (or from
- *     your own Stop / PostToolUse hooks) to inject a directive on the
- *     next LLM turn.
- *   - `experimental.chat.system.transform` — appends queued + always-on
- *     directives to the system prompt. **This is the correct hook.**
- *   - `experimental.chat.messages.transform` — optional global drain of
- *     all queued directives, written into the last assistant turn. Use
- *     only if `system.transform` is unavailable.
+ * The plugin is always loaded but only injects directives for sessions
+ * where the active agent is `elicify-vertex-helmsman` or the `/vertex`
+ * skill was invoked. Other sessions get zero overhead.
  */
 export const ElicifyVertexPlugin: Plugin = async (ctx) => {
   const opts: Required<ElicifyVertexOptions> = {
     maxPerSession: 16,
     wireMessagesTransform: true,
     systemDirectives: defaultDirectives,
+    activeAgent: "elicify-vertex-helmsman",
+    activeSkillTrigger: "/vertex",
     ...(ctx as unknown as ElicifyVertexOptions),
   }
 
   const queue = new DirectiveQueue(opts.maxPerSession)
+  const gate = new SessionGate()
   const alwaysOn = () => opts.systemDirectives().map((d) => ({ ...d }))
 
   return {
     /**
-     * Optional companion API exposed on the plugin return value so other
-     * plugins (or your own custom hooks) can enqueue directives:
-     *
-     *   const t = await ElicifyVertexPlugin(ctx)
-     *   t.enqueue(sessionID, { id: "stop:block", text: "..." })
-     *
-     * Opencode's plugin API doesn't surface a "shared registry" object
-     * between plugins, so in practice each plugin holds its own queue.
-     * If you need cross-plugin injection, lift the queue into a separate
-     * module and import it from both plugins.
+     * Session gate: check the active agent and message text on every user
+     * message. If the agent is the Helmsman or the message contains the
+     * skill trigger, activate the session. If the agent changed to something
+     * else, deactivate.
+     */
+    async "chat.message"(input, output) {
+      try {
+        const agent = input.agent
+        const text = (output.parts || [])
+          .filter((p) => p && p.type === "text" && typeof (p as any).text === "string")
+          .map((p) => (p as any).text)
+          .join("\n")
+
+        if (agent === opts.activeAgent || text.includes(opts.activeSkillTrigger)) {
+          gate.activate(input.sessionID)
+        } else if (agent && agent !== opts.activeAgent) {
+          // User switched to a different agent — deactivate
+          gate.deactivate(input.sessionID)
+        }
+      } catch {}
+    },
+
+    /**
+     * Optional companion API: enqueue a directive for a session. The
+     * directive will only be injected if the session is active (the
+     * Helmsman agent is selected or /vertex was invoked).
      */
     enqueue(sessionID: string, directive: Directive): void {
       queue.enqueue(sessionID, directive)
@@ -203,35 +261,36 @@ export const ElicifyVertexPlugin: Plugin = async (ctx) => {
 
     /**
      * Append queued + always-on directives to the system prompt for the
-     * next LLM call. This is the **SDK-native, correct** place to inject
-     * post-tool evidence, stop-block reminders, and per-session
-     * instructions.
+     * next LLM call — but ONLY if the session is vertex-active.
+     * This is the **SDK-native, correct** place to inject post-tool
+     * evidence, stop-block reminders, and per-session instructions.
      */
     async "experimental.chat.system.transform"(input, output) {
       const sessionID = input.sessionID
+      if (!gate.isActive(sessionID)) return
       const queued = sessionID ? queue.drain(sessionID) : []
       const combined: Directive[] = [...alwaysOn(), ...queued]
       const block = formatDirectives(combined)
       if (!block) return
-      // Append (do not replace) so other plugins' system transforms are
-      // preserved.
       output.system = [...output.system, block]
     },
 
     /**
      * Optional fallback: rewrite the messages array so any undrained
-     * directives from sessions whose system.transform did not fire still
-     * reach the LLM. Tagged into the last message as a synthetic note.
+     * directives from ACTIVE sessions still reach the LLM. Directives
+     * from inactive sessions are silently dropped.
      *
      * The SDK does not currently expose `sessionID` to this hook, so we
-     * drain globally. This is intentionally lossy — prefer system.transform.
+     * drain globally and filter by the gate. This is intentionally
+     * lossy — prefer system.transform.
      */
     ...(opts.wireMessagesTransform
       ? {
           async "experimental.chat.messages.transform"(_input, output) {
             const undrained = queue.drainAll()
-            if (undrained.length === 0) return
-            const block = formatDirectives(undrained)
+            const active = undrained.filter((d) => gate.isActive(d.sessionID))
+            if (active.length === 0) return
+            const block = formatDirectives(active)
             if (!block) return
             const last = output.messages[output.messages.length - 1]
             if (!last) return

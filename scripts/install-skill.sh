@@ -21,7 +21,7 @@ set -euo pipefail
 # --- resolve source file (this script's own package) -----------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PACKAGE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-SOURCE_SKILL="$PACKAGE_ROOT/skills/elicify-vertex/SKILL.md"
+SOURCE_SKILL="$PACKAGE_ROOT/skills/vertex/SKILL.md"
 
 if [[ ! -f "$SOURCE_SKILL" ]]; then
   echo "install-skill: source SKILL.md not found at $SOURCE_SKILL" >&2
