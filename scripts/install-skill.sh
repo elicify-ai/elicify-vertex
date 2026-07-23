@@ -10,9 +10,9 @@
 #   VERTEX_NO_STAR=1 bash scripts/install-skill.sh   # skip star prompt
 set -euo pipefail
 
-# --- output helper: write to /dev/tty, fall back to stderr -----------------
-if [[ -w /dev/tty ]]; then
-  OUT="/dev/tty"
+# --- output helper: try /dev/tty (bypasses npm capture), fall back to stderr
+if { exec 3>/dev/tty; } 2>/dev/null; then
+  OUT="/dev/fd/3"
 else
   OUT="/dev/stderr"
 fi
