@@ -36,8 +36,6 @@ The plugin only activates when you want it to — when you're using the **Helmsm
 
 ## Installation
 
-### For users
-
 Add the plugin to your `opencode.json`:
 
 ```json
@@ -47,23 +45,6 @@ Add the plugin to your `opencode.json`:
 ```
 
 That's it. opencode installs the package automatically on startup. The skill (`/vertex`) is installed for you — no manual steps, no symlinks, no configuration files to edit.
-
-### For developers
-
-```bash
-git clone https://github.com/elicify-ai/elicify-vertex
-cd elicify-vertex
-npm install
-npm run build
-```
-
-Then point opencode at your local copy:
-
-```json
-{
-  "plugin": ["./elicify-vertex/dist/index.js"]
-}
-```
 
 ## How to use
 
@@ -100,39 +81,11 @@ The plugin works out of the box. If you want to customize:
 | `maxPerSession` | `16` | Max directives queued per session |
 | `systemDirectives` | built-in verification block | The always-on instructions injected every turn |
 
-## For plugin developers
-
-If you're building your own opencode plugin and want to enqueue directives:
-
-```ts
-import { ElicifyVertexPlugin } from "@elicify-ai/elicify-vertex"
-
-const vertex = await ElicifyVertexPlugin(ctx)
-
-// Schedule a directive for the next LLM turn
-vertex.enqueue(sessionID, {
-  id: "stop:block",
-  text: "Verification missing — run a tool and show the output before reporting done.",
-})
-```
-
-The directive will be injected into the system prompt on the next LLM call (if the session is active).
-
 ## Technical details
 
 - **Self-contained** — no symlinks, no external scripts, no system dependencies beyond opencode itself.
 - **Gated** — the plugin is always loaded but only injects when the Helmsman agent or `/vertex` skill is active. Other sessions get zero overhead.
 - **Fails open** — if the plugin encounters an error, it stays silent. A broken harness must never break your work.
-- **ESM + strict TypeScript** — built to the opencode plugin SDK's exact specifications.
-
-## Verify
-
-```bash
-npm install
-npm run typecheck
-npm test
-npm run build
-```
 
 ## License
 
