@@ -233,12 +233,17 @@ export class EvidenceLedger {
   shouldBlockStop(sessionID: string): boolean {
     const l = this.ledgers.get(sessionID)
     if (!l) return false
-    // quick → never block, regardless of changes (mirrors fablize line 24)
-    if (l.taskMode === "quick") return false
+    // quick and normal never hard-block. Fablize made normal advisory-only after
+    // measuring excessive noise (verify_state.py:38-49).
+    if (l.taskMode !== "deep") return false
     // docs-only → never block (mirrors fablize line 30)
     if (l.changedFileKinds.size > 0 && [...l.changedFileKinds].every((k) => k === "docs")) return false
     // deep AND changed AND not verified → block (mirrors fablize line 42)
     return l.changedFilesSeen && !l.verificationResults.some((v) => v.success)
+  }
+
+  getMode(sessionID: string): "quick" | "normal" | "deep" | null {
+    return this.ledgers.get(sessionID)?.taskMode ?? null
   }
 }
 
@@ -291,30 +296,58 @@ export function classifyFileKind(filePath: string): "docs" | "code" | "config" |
 // assistant message (fablize uses last 400; we use 600 for more headroom).
 // ----------------------------------------------------------------------------
 
-const PROMISE_NO_ACT_KEYWORDS: readonly { needle: string; label: string }[] = [
-  { needle: "deferred", label: "explicit-deferral" },
-  { needle: "tracked", label: "tracked-instead-of-fixed" },
-  { needle: "tracking", label: "tracked-instead-of-fixed" },
-  { needle: "file an issue", label: "issue-filing" },
-  { needle: "i'll file", label: "issue-filing" },
-  { needle: "follow up", label: "follow-up" },
-  { needle: "follow-up", label: "follow-up" },
-  { needle: "todo", label: "todo-marker" },
-  { needle: "fixme", label: "fixme-marker" },
-  { needle: "xxx", label: "xxx-marker" },
-  { needle: "later", label: "later-marker" },
-  { needle: "next iteration", label: "next-iteration" },
-  { needle: "in a follow", label: "follow-up" },
-  { needle: "for tracking purposes", label: "tracking" },
-  { needle: "we should", label: "we-should-X-later" },
-  { needle: "let me", label: "let-me-do-X-next" },
+export type PromiseLocale = "en" | "ko"
+
+const PROMISE_NO_ACT_KEYWORDS: readonly { needle: string; label: string; locale: PromiseLocale }[] = [
+  { needle: "deferred", label: "explicit-deferral", locale: "en" },
+  { needle: "tracked", label: "tracked-instead-of-fixed", locale: "en" },
+  { needle: "tracking", label: "tracked-instead-of-fixed", locale: "en" },
+  { needle: "file an issue", label: "issue-filing", locale: "en" },
+  { needle: "i'll file", label: "issue-filing", locale: "en" },
+  { needle: "follow up", label: "follow-up", locale: "en" },
+  { needle: "follow-up", label: "follow-up", locale: "en" },
+  { needle: "todo", label: "todo-marker", locale: "en" },
+  { needle: "fixme", label: "fixme-marker", locale: "en" },
+  { needle: "xxx", label: "xxx-marker", locale: "en" },
+  { needle: "later", label: "later-marker", locale: "en" },
+  { needle: "next iteration", label: "next-iteration", locale: "en" },
+  { needle: "in a follow", label: "follow-up", locale: "en" },
+  { needle: "for tracking purposes", label: "tracking", locale: "en" },
+  // Fablize's promise detector documents English + Korean but only implements
+  // English (finish-the-work.sh:59-62). These explicit Korean annotations make
+  // the behavior genuinely multilingual rather than merely case-insensitive.
+  { needle: "나중에", label: "later-marker", locale: "ko" },
+  { needle: "다음 반복에서", label: "next-iteration", locale: "ko" },
+  { needle: "후속 작업", label: "follow-up", locale: "ko" },
+  { needle: "이슈를 등록", label: "issue-filing", locale: "ko" },
+  { needle: "작업을 연기", label: "explicit-deferral", locale: "ko" },
+  { needle: "추적하겠습니다", label: "tracked-instead-of-fixed", locale: "ko" },
 ]
 
-// Future-intent patterns (mirroring fablize's regex shape but with a broader verb set)
-const PROMISE_INTENT_RE = /\b(I'?ll|I will|let me|next,?\s*I|now\s*I'?ll)\b[^.!?\n]{0,80}\b(now|next|then|implement|create|write|add|run|fix|save|build|start|proceed|address|handle|investigate|review)\b/i
+// Future-intent patterns preserve fablize's verb-followed form and add the
+// explicit forms requested by the parity goal without matching harmless
+// phrases such as "let me know" or "we should be done".
+const PROMISE_INTENT_PATTERNS: readonly { pattern: RegExp; label: string; locale: PromiseLocale }[] = [
+  {
+    pattern: /\b(I'?ll|I will|let me|next,?\s*I|now\s*I'?ll)\b[^.!?\n]{0,80}\b(now|next|then|implement|create|write|add|run|fix|save|build|start|proceed|address|handle|investigate|review)\b/i,
+    label: "future-intent",
+    locale: "en",
+  },
+  {
+    pattern: /\bwe should\b[^.!?\n]{1,100}\blater\b/i,
+    label: "we-should-X-later",
+    locale: "en",
+  },
+  {
+    pattern: /(?:다음에|나중에)[^.!?\n]{0,80}(?:하겠습니다|진행하겠습니다|처리하겠습니다)/u,
+    label: "future-intent",
+    locale: "ko",
+  },
+]
 
 export interface PromiseHit {
   label: string
+  locale: PromiseLocale
   matched: string
   start: number
   end: number
@@ -340,7 +373,7 @@ export function detectPromiseNoAct(text: string): PromiseHit[] {
   const lower = tail.toLowerCase()
   const hits: PromiseHit[] = []
 
-  for (const { needle, label } of PROMISE_NO_ACT_KEYWORDS) {
+  for (const { needle, label, locale } of PROMISE_NO_ACT_KEYWORDS) {
     let pos = 0
     while ((pos = lower.indexOf(needle, pos)) !== -1) {
       // Boundary check: the previous and next characters must NOT be part of a
@@ -351,11 +384,12 @@ export function detectPromiseNoAct(text: string): PromiseHit[] {
       // so "Will do this later." still matches.
       const before = pos > 0 ? lower[pos - 1] : ""
       const after = pos + needle.length < lower.length ? lower[pos + needle.length] : ""
-      const inWord = (c: string) => /[a-z0-9\-_]/.test(c)
+      const inWord = (c: string) => /[\p{L}\p{N}_-]/u.test(c)
       const boundaryOk = !inWord(before) && !inWord(after)
       if (boundaryOk) {
         hits.push({
           label,
+          locale,
           matched: tail.slice(pos, pos + needle.length),
           start: pos,
           end: pos + needle.length,
@@ -365,10 +399,17 @@ export function detectPromiseNoAct(text: string): PromiseHit[] {
     }
   }
 
-  // Future-intent pattern (fablize parity, expanded verb set)
-  const m = tail.match(PROMISE_INTENT_RE)
-  if (m && m.index !== undefined) {
-    hits.push({ label: "future-intent", matched: m[0], start: m.index, end: m.index + m[0].length })
+  for (const { pattern, label, locale } of PROMISE_INTENT_PATTERNS) {
+    const match = tail.match(pattern)
+    if (match && match.index !== undefined) {
+      hits.push({
+        label,
+        locale,
+        matched: match[0],
+        start: match.index,
+        end: match.index + match[0].length,
+      })
+    }
   }
 
   return hits
@@ -380,6 +421,12 @@ export function detectPromiseNoAct(text: string): PromiseHit[] {
  * the full set in one place.
  */
 export const PROMISE_NO_ACT_LABELS = PROMISE_NO_ACT_KEYWORDS.map((k) => k.label)
+
+/** Promise-no-act blocks only unfinished work: changed files, no successful
+ * verification, and a deferral signal in the final assistant message. */
+export function shouldBlockPromiseNoAct(text: string, changed: boolean, verified: boolean): boolean {
+  return changed && !verified && detectPromiseNoAct(text).length > 0
+}
 
 // ===========================================================================
 // TASK CLASSIFIER — signal-routed injection
@@ -413,11 +460,11 @@ export function classifyTask(text: string): TaskMode {
 export type StopMode = "quick" | "normal" | "deep"
 
 const QUICK_RE =
-  /\b(quick|brief|briefly|simple|simply|just explain|explain only|review only|direction|check only|no edits|do not edit)\b/i
+  /\b(quick|brief|briefly|simple|simply|just explain|explain only|review only|direction|check only|no edits|do not edit)\b|간단히|빠르게|설명만|검토만|방향|확인만/i
 const DEEP_RE =
-  /\b(deep|thorough|thoroughly|exhaustive|end-to-end|production[- ]ready|deploy|deployment|migration|database|auth|security|refactor|large|complex|implement the plan)\b/i
+  /\b(deep|thorough|thoroughly|exhaustive|end-to-end|production[- ]ready|deploy|deployment|migration|database|auth|security|refactor|large|complex|implement the plan)\b|끝까지|철저|전부|전체|배포|마이그레이션|인증|보안|리팩터/i
 const NORMAL_RE =
-  /\b(implement|fix|debug|change|edit|create|build|test|lint|review|update)\b/i
+  /\b(implement|fix|debug|change|edit|create|build|test|lint|review|update)\b|구현|수정|고쳐|디버그|작성|생성|테스트|검증/i
 
 export type RiskFlag = "production" | "database" | "secret-or-auth" | "remote-write"
 
@@ -447,6 +494,26 @@ export function classifyStopMode(text: string): StopModeResult {
     return { mode: "normal", risks }
   }
   return { mode: "quick", risks }
+}
+
+/** Mode guidance is injected independently from signal routing. Normal mode is
+ * advisory-only; deep mode defines exit proof before the stop gate can fire.
+ * Mirrors classify_task.py:51-67 and verify_state.py:42-49. */
+export function contextForStopMode(result: StopModeResult): Directive | null {
+  const risks = result.risks.length > 0 ? ` Risk flags: ${result.risks.join(", ")}.` : ""
+  if (result.mode === "normal") {
+    return {
+      id: "vertex:verification-advisory",
+      text: `[vertex:verification-advisory] Normal task mode.${risks} If files change, run one relevant verification command or state why none applies. This is advisory; normal mode does not hard-block completion. Never claim verification that was not observed in a tool result.`,
+    }
+  }
+  if (result.mode === "deep") {
+    return {
+      id: "vertex:verification-required",
+      text: `[vertex:verification-required] Deep task mode.${risks} Define the exit proof before completion and verify changed behavior before the final response. A deep turn that changes no files needs no verification note; changed non-documentation files require observed successful verification.`,
+    }
+  }
+  return null
 }
 
 export function contextForMode(mode: TaskMode): Directive | null {
@@ -541,6 +608,7 @@ export const ElicifyVertexPlugin = async (
 
   // Last-seen task classification per session (for signal routing).
   const taskModeBySession = new Map<string, TaskMode>()
+  const stopModeBySession = new Map<string, StopModeResult>()
 
   // Last assistant text per session (for the promise-no-act guard).
   // Populated by experimental.chat.messages.transform; read by event(session.idle).
@@ -604,6 +672,7 @@ verify before claiming done, control things manually, communicate calmly.`,
           gate.activate(msgInput.sessionID)
           const sigMode = classifyStopMode(text)
           ledger.reset(msgInput.sessionID, sigMode.mode)
+          stopModeBySession.set(msgInput.sessionID, sigMode)
           const mode = classifyTask(text)
           taskModeBySession.set(msgInput.sessionID, mode)
           debug(`chat.message: ACTIVATED session ${msgInput.sessionID} (agent=${agent || "?"}, mode=${mode}, stopMode=${sigMode.mode}, risks=${sigMode.risks.join(",") || "none"})`)
@@ -704,6 +773,12 @@ verify before claiming done, control things manually, communicate calmly.`,
         if (routed) combined.push(routed)
       }
 
+      const stopMode = stopModeBySession.get(sid)
+      if (stopMode) {
+        const guidance = contextForStopMode(stopMode)
+        if (guidance) combined.push(guidance)
+      }
+
       // Evidence summary (let the model see its own track record)
       const summary = ledger.summary(sid)
       if (summary) {
@@ -780,7 +855,7 @@ verify before claiming done, control things manually, communicate calmly.`,
         const lastText = lastAssistantText.get(sid)
         if (lastText) {
           const hits = detectPromiseNoAct(lastText)
-          if (hits.length > 0 && ledger.hasChangedFiles(sid)) {
+          if (shouldBlockPromiseNoAct(lastText, ledger.hasChangedFiles(sid), ledger.hasVerification(sid))) {
             const labels = hits.map((h) => h.label).join(", ")
             const reason = `[vertex:promise-no-act] Your last message contains deferral/intent language (${labels}) but files were changed this turn. Either complete the work now or explicitly state what remains unverified. Promise without act is not allowed when files are changed.`
             debug(`event: ${sid} — PROMISE-NO-ACT (${labels})`)

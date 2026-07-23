@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest"
 import {
   classifyFileKind,
   classifyStopMode,
+  contextForStopMode,
 } from "../src/index.js"
 
 // ---------------------------------------------------------------------------
@@ -78,6 +79,12 @@ describe("classifyStopMode — mirrors fablize classify_task.py", () => {
     expect(classifyStopMode("large complex rewrite").mode).toBe("deep")
   })
 
+  it("matches fablize's Korean quick/normal/deep annotations", () => {
+    expect(classifyStopMode("설명만 해주세요").mode).toBe("quick")
+    expect(classifyStopMode("이 버그를 수정해주세요").mode).toBe("normal")
+    expect(classifyStopMode("끝까지 철저하게 검증해주세요").mode).toBe("deep")
+  })
+
   it("risk flags override to deep", () => {
     // 'explain this for production' has no implementation keyword but
     // 'production' risk flag forces it to deep
@@ -136,11 +143,12 @@ describe("EvidenceLedger.shouldBlockStop — mode-aware", () => {
     expect(l.shouldBlockStop("s1")).toBe(false)
   })
 
-  it("mode=normal + changed code + unverified → blocks", () => {
+  it("mode=normal + changed code + unverified → advisory only, no hard block", () => {
     const l = new EvidenceLedger()
     l.reset("s1", "normal")
     l.recordChangedFiles("s1", "src/whatever.ts")
-    expect(l.shouldBlockStop("s1")).toBe(true)
+    expect(l.shouldBlockStop("s1")).toBe(false)
+    expect(l.getMode("s1")).toBe("normal")
   })
 
   it("mode=deep + changed code + unverified → blocks", () => {
@@ -181,5 +189,25 @@ describe("EvidenceLedger.shouldBlockStop — mode-aware", () => {
     const l = new EvidenceLedger()
     l.reset("s1", "deep")
     expect(l.shouldBlockStop("s1")).toBe(false)
+  })
+})
+
+describe("contextForStopMode — mode-aware guidance", () => {
+  it("injects advisory guidance for normal mode", () => {
+    const directive = contextForStopMode({ mode: "normal", risks: [] })
+    expect(directive?.id).toBe("vertex:verification-advisory")
+    expect(directive?.text).toMatch(/advisory/i)
+    expect(directive?.text).toMatch(/does not hard-block/i)
+  })
+
+  it("injects required exit-proof guidance for deep mode and includes risks", () => {
+    const directive = contextForStopMode({ mode: "deep", risks: ["database"] })
+    expect(directive?.id).toBe("vertex:verification-required")
+    expect(directive?.text).toMatch(/exit proof/i)
+    expect(directive?.text).toContain("database")
+  })
+
+  it("does not inject verification guidance for quick mode", () => {
+    expect(contextForStopMode({ mode: "quick", risks: [] })).toBeNull()
   })
 })

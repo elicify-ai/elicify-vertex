@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest"
 import {
   detectPromiseNoAct,
   PROMISE_NO_ACT_LABELS,
+  shouldBlockPromiseNoAct,
 } from "../src/index.js"
 
 // ---------------------------------------------------------------------------
@@ -126,7 +127,7 @@ describe("detectPromiseNoAct — future-intent pattern (fablize parity)", () => 
     const hits = detectPromiseNoAct(
       "Code is in. Let me run the benchmarks next.",
     )
-    expect(hits.some((h) => h.label === "let-me-do-X-next")).toBe(true)
+    expect(hits.some((h) => h.label === "future-intent")).toBe(true)
   })
 
   it("detects 'we should X later' pattern", () => {
@@ -195,6 +196,36 @@ describe("detectPromiseNoAct — false-positive guards", () => {
       "All tests pass. The feature is complete and verified.",
     )
     expect(hits).toEqual([])
+  })
+
+  it("does NOT match harmless 'let me know' or 'we should be done' phrasing", () => {
+    expect(detectPromiseNoAct("Let me know if you want more detail.")).toEqual([])
+    expect(detectPromiseNoAct("The implementation is complete; we should be done.")).toEqual([])
+  })
+})
+
+describe("detectPromiseNoAct — multilingual annotations", () => {
+  it("detects Korean future intent and identifies its locale", () => {
+    const hits = detectPromiseNoAct("테스트는 아직 실행하지 않았습니다. 나중에 진행하겠습니다.")
+    expect(hits.some((hit) => hit.locale === "ko" && hit.label === "later-marker")).toBe(true)
+    expect(hits.some((hit) => hit.locale === "ko" && hit.label === "future-intent")).toBe(true)
+  })
+
+  it("detects Korean tracking language", () => {
+    const hits = detectPromiseNoAct("이 문제는 추적하겠습니다.")
+    expect(hits).toContainEqual(expect.objectContaining({
+      locale: "ko",
+      label: "tracked-instead-of-fixed",
+    }))
+  })
+})
+
+describe("shouldBlockPromiseNoAct — completion state", () => {
+  it("blocks only when files changed and successful verification is absent", () => {
+    const text = "TODO: add the missing test later."
+    expect(shouldBlockPromiseNoAct(text, true, false)).toBe(true)
+    expect(shouldBlockPromiseNoAct(text, true, true)).toBe(false)
+    expect(shouldBlockPromiseNoAct(text, false, false)).toBe(false)
   })
 })
 
