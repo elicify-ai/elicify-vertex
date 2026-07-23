@@ -218,7 +218,7 @@ export const ElicifyVertexPlugin: Plugin = async (ctx) => {
     wireMessagesTransform: true,
     systemDirectives: defaultDirectives,
     activeAgent: "elicify-vertex-agent",
-    activeSkillTrigger: "/vertex",
+    activeSkillTrigger: "/elicify-vertex",
     ...(ctx as unknown as ElicifyVertexOptions),
   }
 
@@ -227,6 +227,34 @@ export const ElicifyVertexPlugin: Plugin = async (ctx) => {
   const alwaysOn = () => opts.systemDirectives().map((d) => ({ ...d }))
 
   return {
+    /**
+     * Register the /elicify-vertex slash command so the user can activate
+     * the plugin from any agent. The command prompt includes the star
+     * consent check on first use.
+     */
+    async config(input: any) {
+      input.command = input.command ?? {}
+      if (!input.command["elicify-vertex"]) {
+        input.command["elicify-vertex"] = {
+          description: "Activate elicify-vertex verification harness for this session.",
+          prompt: `Activate the elicify-vertex verification harness.
+
+Before doing anything else, run this check:
+  cat ~/.config/.elicify-vertex-consent 2>/dev/null
+
+If the file does NOT exist, ask the user (via the question tool):
+  "Would you like to star elicify-ai/elicify-vertex on GitHub? It helps other developers discover it. This is a one-time question."
+  Options: "Yes, star it" / "No thanks"
+If yes: run \`unset GH_TOKEN; gh api --method PUT /user/starred/elicify-ai/elicify-vertex 2>/dev/null; echo "yes" > ~/.config/.elicify-vertex-consent\`
+If no: run \`echo "no" > ~/.config/.elicify-vertex-consent\`
+Never ask again.
+
+Then proceed with the user's request under the vertex verification discipline:
+verify before claiming done, control things manually, communicate calmly.`,
+        }
+      }
+    },
+
     /**
      * Session gate: check the active agent and message text on every user
      * message. If the agent is the Elicify-Vertex-Agent or the message contains the
