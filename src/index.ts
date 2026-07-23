@@ -109,9 +109,9 @@ class SessionGate {
 
 interface SessionLedger {
   changedFilesSeen: boolean
-  /** Distinct kinds of files changed (e.g. "docs", "code", "config") — mirrors fablize ledger.py:145-158 */
+  /** Distinct kinds of files changed (e.g. "docs", "code", "config") — path-kind classifier */
   changedFileKinds: Set<string>
-  /** Set per-prompt to the classified mode (quick/normal/deep) — mirrors fablize gate_prompt.py:24-33 */
+  /** Set per-prompt to the classified mode (quick/normal/deep) — stop-mode classifier */
   taskMode: "quick" | "normal" | "deep"
   riskFlags: Set<RiskFlag>
   verificationResults: Array<{ command: string; exitCode: number; success: boolean }>
@@ -236,8 +236,7 @@ export class EvidenceLedger {
   }
 
   /** Should the stop gate block? Deep mode, non-docs changes, no successful
-   * verification after the latest mutation. Policy mirrors fablize
-   * verify_state.should_block_stop (verify_state.py:30-49): quick/normal never
+   * verification after the latest mutation. Stop-gate policy: quick/normal never
    * hard-block; docs-only exempt; deep+changed+unverified blocks.
    */
   shouldBlockStop(sessionID: string): boolean {
@@ -263,7 +262,7 @@ export class EvidenceLedger {
 // ===========================================================================
 // FILE-KIND CLASSIFIER — used for docs-only exemption in the stop gate
 // ===========================================================================
-// Mirrors fablize ledger.classify_path_kind. We classify into 4 kinds:
+// Path-kind classifier. We classify into 4 kinds:
 //   - docs    : .md/.mdx/.txt/.rst/.adoc, README/LICENSE basenames, config under docs/
 //   - code    : source extensions (wins over a docs/ path segment)
 //   - config  : .json/.yaml/.yml/.toml/.ini/.env
@@ -306,18 +305,39 @@ export function classifyFileKind(filePath: string): "docs" | "code" | "config" |
 // Core filesystem / SCM mutators. Redirect-to-file is handled separately so
 // stderr/stdout fd duplication (`2>&1`, `>&2`) is never treated as a write.
 const MUTATING_BASH_RE = /\b(?:apply_patch|chmod|mkdir|mv|cp|rm|touch|install|ln|truncate|tee)\b|\b(?:sed\s+-i|perl\s+-pi)\b|\bgit\s+(?:add|commit|checkout|restore|reset|clean|apply|am|merge|rebase|cherry-pick)\b|\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?build\b|(?:^|\s)--(?:write|fix)\b/i
-/** `echo/printf/cat … > file` or `>> file` — not `2>&1` / `>&2` / `n>&m`. */
-const SHELL_FILE_REDIRECT_RE = /(?:^|[\s;|&])(?:\d*)>>(?!&)\s*\S+|(?:^|[\s;|&])(?:\d*)>(?!>|&)\s*\S+/
+// Non-mutating sinks: discarding or re-pointing stdio does not change the workspace.
+// Without this, `cat file 2>/dev/null` (common first-run / probe pattern) is a
+// false-positive bash-mutation and poisons the docs-only stop exemption.
+const DEV_NULL_SINK_RE = /^\/dev\/(?:null|stdout|stderr)$/
+/**
+ * `echo/printf/cat … > file` or `>> file` — not `2>&1` / `>&2` / `n>&m`,
+ * and not redirects whose target is a non-mutating device sink.
+ */
+const SHELL_FILE_REDIRECT_RE = /(?:^|[\s;|&])(?:\d*)(>>(?!&)|>(?!>|&))\s*(\S+)/g
 /** python/python3 -c with open(...).write / writelines or write-mode open. */
 const PYTHON_INLINE_WRITE_RE = /\bpython(?:3(?:\.\d+)?)?\s+-c\s+[\s\S]*(?:\bopen\s*\([^)]*\)\s*\.\s*(?:write|writelines)\b|\bopen\s*\([^)]*['"](?:w|a|x|r\+)[^'"]*['"][^)]*\))/i
 /** node -e / node -p with writeFile(Sync)/appendFile(Sync)/createWriteStream. */
 const NODE_INLINE_WRITE_RE = /\bnode\s+-[ep]\s+[\s\S]*\b(?:writeFileSync|writeFile|appendFileSync|appendFile|createWriteStream)\b/i
 
+/** True when a shell redirect target is a real workspace path (not a device sink). */
+function shellRedirectTargetsWorkspace(command: string): boolean {
+  SHELL_FILE_REDIRECT_RE.lastIndex = 0
+  let match: RegExpExecArray | null
+  while ((match = SHELL_FILE_REDIRECT_RE.exec(command)) !== null) {
+    const target = match[2] ?? ""
+    // Strip surrounding quotes if present (`>"out.txt"` / `>'out.txt'`).
+    const unquoted = target.replace(/^['"]|['"]$/g, "")
+    if (!unquoted || DEV_NULL_SINK_RE.test(unquoted)) continue
+    return true
+  }
+  return false
+}
+
 /** True when a bash command is likely to mutate the workspace. */
 export function isMutatingBashCommand(command: string): boolean {
   if (!command) return false
   return MUTATING_BASH_RE.test(command)
-    || SHELL_FILE_REDIRECT_RE.test(command)
+    || shellRedirectTargetsWorkspace(command)
     || PYTHON_INLINE_WRITE_RE.test(command)
     || NODE_INLINE_WRITE_RE.test(command)
 }
@@ -350,12 +370,10 @@ export function changedPathsFromTool(toolName: string, args: Record<string, unkn
 }
 
 // ===========================================================================
-// PROMISE-NO-ACT DETECTOR (extends fablize finish-the-work.sh)
+// PROMISE-NO-ACT DETECTOR (finish-the-work policy)
 // ===========================================================================
-// fablize detects future-intent phrases like "I'll do X next":
-//   finish-the-work.sh:59-62
-// and exempts ask-the-user tails (finish-the-work.sh:64-69).
-// We additionally catch:
+// Detects future-intent phrases like "I'll do X next" and exempts ask-the-user
+// tails. Also catches:
 //   - explicit deferral markers: TODO, FIXME, XXX, deferred
 //   - issue-filing intent: "file an issue", "I'll file"
 //   - follow-up language: "follow up", "in a follow", "next iteration"
@@ -380,9 +398,8 @@ const PROMISE_NO_ACT_KEYWORDS: readonly { needle: string; label: string; locale:
   { needle: "next iteration", label: "next-iteration", locale: "en" },
   { needle: "in a follow", label: "follow-up", locale: "en" },
   { needle: "for tracking purposes", label: "tracking", locale: "en" },
-  // Fablize's promise detector documents English + Korean but only implements
-  // English (finish-the-work.sh:59-62). These explicit Korean annotations make
-  // the behavior genuinely multilingual rather than merely case-insensitive.
+  // Explicit Korean annotations make the detector genuinely multilingual
+  // rather than merely case-insensitive.
   { needle: "나중에", label: "later-marker", locale: "ko" },
   { needle: "다음 반복에서", label: "next-iteration", locale: "ko" },
   { needle: "후속 작업", label: "follow-up", locale: "ko" },
@@ -391,7 +408,7 @@ const PROMISE_NO_ACT_KEYWORDS: readonly { needle: string; label: string; locale:
   { needle: "추적하겠습니다", label: "tracked-instead-of-fixed", locale: "ko" },
 ]
 
-// Constrained patterns — not bare keywords — plus fablize verb-followed form.
+// Constrained patterns — not bare keywords — plus verb-followed future-intent form.
 // Avoids FPs on "tracked down", "later section", "see you later", "tracking ticket".
 const PROMISE_INTENT_PATTERNS: readonly { pattern: RegExp; label: string; locale: PromiseLocale }[] = [
   {
@@ -454,7 +471,7 @@ export interface PromiseHit {
  * Scan assistant text for promise-no-act signals. Returns ALL hits (not just
  * the first) so callers can log them out-of-band for measurement.
  *
- * Extends fablize finish-the-work.sh:59-62 with:
+ * Promise-no-act detector (finish-the-work policy) covers:
  *   - Explicit deferral markers (TODO/FIXME/XXX/deferred)
  *   - Issue-filing intent ("file an issue")
  *   - Constrained later/tracked/tracking patterns (no bare-keyword FPs)
@@ -462,8 +479,8 @@ export interface PromiseHit {
  */
 export function detectPromiseNoAct(text: string): PromiseHit[] {
   if (!text) return []
-  // Mirror fablize: only inspect the tail. We use 600 chars (vs 400) for more
-  // headroom on multi-sentence conclusions.
+  // Only inspect the tail (last 600 chars) for more headroom on multi-sentence
+  // conclusions without scanning the full turn.
   const tail = text.slice(-600)
   const lower = tail.toLowerCase()
   const hits: PromiseHit[] = []
@@ -510,8 +527,8 @@ export function detectPromiseNoAct(text: string): PromiseHit[] {
 }
 
 /**
- * fablize finish-the-work.sh:64-69 — do not block when the tail is asking the
- * user a question or offering a choice rather than promising unfinished work.
+ * Finish-the-work policy: do not block when the tail is asking the user a
+ * question or offering a choice rather than promising unfinished work.
  */
 function asksUser(text: string): boolean {
   // Phrase-based only. Bare "?" (e.g. "TODO remaining. OK?") must not disable the gate.
@@ -568,11 +585,10 @@ export function classifyTask(text: string): TaskMode {
 // ===========================================================================
 // STOP-MODE CLASSIFIER — used by the stop gate to decide enforcement strictness
 // ===========================================================================
-// Mode classification mirrors fablize classify_task.py:14-48.
-// Stop hard-block policy lives in EvidenceLedger.shouldBlockStop /
-// verify_state.py:30-49 (not in these line numbers).
-// Risk flags also exist in fablize; Vertex promotes any risk (including
-// secret-or-auth) to deep and injects mode advisories via system.transform.
+// Mode classification: quick / normal / deep keyword buckets.
+// Stop hard-block policy lives in EvidenceLedger.shouldBlockStop.
+// Any risk flag (including secret-or-auth) promotes to deep and injects
+// mode advisories via system.transform.
 // ----------------------------------------------------------------------------
 
 export type StopMode = "quick" | "normal" | "deep"
@@ -592,8 +608,7 @@ export interface StopModeResult {
 }
 
 /** Detect only stable enum flags; raw prompt fragments are never persisted.
- * This extends fablize's English/Korean patterns
- * (/tmp/fablize-deep/scripts/gate/classify_task.py:29-40). */
+ * English and Korean risk annotations are both recognized. */
 export function detectRiskFlags(text: string): RiskFlag[] {
   const value = text || ""
   const risks: RiskFlag[] = []
@@ -689,9 +704,8 @@ Stop when you have actually looked, not after a fixed number of checks. One clea
   }
 }
 
-// Fablize includes high-recall review wording only in its manually loaded skill
-// (/tmp/fablize-deep/skills/fablize/SKILL.md:52-54). Vertex routes it as an
-// independent signal so review+render and review+debug tasks retain both modes.
+// High-recall review wording is routed as an independent signal so
+// review+render and review+debug tasks retain both modes.
 export function isReviewTask(text: string): boolean {
   return /\b(?:review|audit|critique|inspect|assess|assessment|evaluate|code[- ]review|red[- ]team|look\s+over|find\s+(?:security\s+)?(?:bugs?|defects?|issues?|flaws?|vulnerabilities?)|check\s+for\s+(?:security\s+)?(?:bugs?|defects?|issues?|flaws?|vulnerabilities?)|analy[sz]e\b[^.!?\n]{0,60}\bfor\s+(?:bugs?|defects?|issues?|flaws?|vulnerabilities?))\b|검토|리뷰|감사|점검/i.test(text || "")
 }
@@ -720,12 +734,11 @@ Automated tests often do not surface real issues. Before claiming something work
 Communicate in a calm, factual tone. Lead with the outcome. Avoid enthusiasm, apology, or performative framing.`
 
 // ===========================================================================
-// PRECISE VERIFICATION PARSING — tighter than fablize parse_tool_result.py
+// PRECISE VERIFICATION PARSING
 // ===========================================================================
-// Fablize searches for a verifier name anywhere in the command, so text-only
-// commands such as `echo pytest` can be misclassified (parse_tool_result.py:16-23,
-// 88-89). This parser uses a positive allowlist at executable positions, checks
-// contradictory failure output even when exit=0, and rejects masked exit codes.
+// Uses a positive allowlist at executable positions (not an unanchored name
+// search that would accept `echo pytest`), checks contradictory failure output
+// even when exit=0, and rejects masked exit codes.
 // ----------------------------------------------------------------------------
 
 const DIRECT_VERIFIER_RE = /^(?:pytest|unittest|vitest|jest|tsc|eslint|ruff|mypy|playwright|cypress|rspec|curl|build|check|validate|verify)(?:\s|$)/i
@@ -1348,7 +1361,7 @@ verify before claiming done, control things manually, communicate calmly.`,
 
         debug(`event: session.idle for ${sid}`)
 
-        // ── PROMISE-NO-ACT GUARD (extends fablize finish-the-work.sh) ────
+        // ── PROMISE-NO-ACT GUARD (finish-the-work policy) ────────────────
         // Catch strong deferral/TODO/FIXME/issue-filing (and weak later/
         // tracked when unverified) in the final assistant message. Only
         // blocks when files were changed (pure Q&A / ask-user ends freely).

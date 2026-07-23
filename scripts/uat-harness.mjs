@@ -495,6 +495,294 @@ console.log("\nI. Cap warn + holdout")
   )
   assert("I2-holdout-would-block", allows.length >= 1, JSON.stringify(allows.slice(-1)))
   assert("I2-holdout-suppress-event", eventsOf("holdout_suppress", off).length >= 1)
+
+  // Cap path must also enqueue stop-warning for the next system.transform
+  clearLogs()
+  prompts = 0
+  const hooksCap = await entryI(
+    {
+      client: { session: { prompt: async () => { prompts++; return {} } } },
+      directory: worktree,
+      worktree,
+      project: {},
+    },
+    { maxStopBlocks: 1 },
+  )
+  const sidCap = "uat-cap-warn-inject"
+  await activate(hooksCap, sidCap, "deep implement the plan")
+  await edit(hooksCap, sidCap)
+  await complete(hooksCap, sidCap, "Done.")
+  await idle(hooksCap, sidCap)
+  await complete(hooksCap, sidCap, "Still done.")
+  await idle(hooksCap, sidCap)
+  const injWarn = await systemInject(hooksCap, sidCap)
+  assert("I3-stop-warning-inject", injWarn.includes("vertex:stop-warning"), injWarn.slice(0, 200))
+}
+
+// ===== J. Tool-failure + repeat-failure inject =====
+console.log("\nJ. Tool-failure + repeat-failure inject")
+{
+  clearLogs()
+  const { hooks } = await loadPlugin()
+  const sid = "uat-j-fail"
+  await activate(hooks, sid, "fix the failing test")
+  await bash(hooks, sid, "npm test", "Error: expected true\n1 failed", 1)
+  const inj = await systemInject(hooks, sid)
+  assert("J1-tool-failure-inject", inj.includes("vertex:tool-failure"), inj.slice(0, 240))
+  assert("J1-debug-failure", debugText().includes("failure recorded"), "debug mentions failure")
+
+  clearLogs()
+  const sid2 = "uat-j-repeat"
+  await activate(hooks, sid2, "fix the flaky test")
+  // Same exit + first error line → same signature → repeat on 2nd
+  await bash(hooks, sid2, "npm test", "Error: boom\nFAIL", 1)
+  await bash(hooks, sid2, "npm test", "Error: boom\nFAIL again", 1)
+  const inj2 = await systemInject(hooks, sid2)
+  assert("J2-repeat-failure-inject", inj2.includes("vertex:repeat-failure"), inj2.slice(0, 240))
+  assert(
+    "J2-recovery-repeat-event",
+    eventsOf("recovery_repeat", sid2).length >= 1,
+    JSON.stringify(eventsOf("recovery_repeat", sid2).slice(-1)),
+  )
+  assert("J2-debug-repeat", debugText().includes("REPEAT FAILURE"), "debug mentions repeat")
+
+  // Non-zero non-verifier still queues tool-failure (any bash exit != 0)
+  clearLogs()
+  const sid3 = "uat-j-any-bash"
+  await activate(hooks, sid3, "run a command")
+  await bash(hooks, sid3, "false", "failed", 1)
+  const inj3 = await systemInject(hooks, sid3)
+  assert("J3-any-bash-nonzero-failure", inj3.includes("vertex:tool-failure"), inj3.slice(0, 200))
+}
+
+// ===== K. Signal-routed injects (investigation / grounding / ledger / normal) =====
+console.log("\nK. Signal-routed procedure + ledger inject")
+{
+  clearLogs()
+  const { hooks } = await loadPlugin()
+
+  const sidDbg = "uat-k-debug"
+  await activate(hooks, sidDbg, "debug why the authentication test is failing")
+  const injDbg = await systemInject(hooks, sidDbg)
+  assert("K1-investigation-inject", injDbg.includes("vertex:investigation"), "investigation present")
+  assert(
+    "K1-classify-debugging",
+    eventsOf("classify", sidDbg).some((e) => e.payload?.mode === "debugging"),
+    JSON.stringify(eventsOf("classify", sidDbg).slice(-1)),
+  )
+  assert("K1-debug-mode", debugText().includes("mode=debugging"), "debug log mode=debugging")
+
+  clearLogs()
+  const sidRen = "uat-k-render"
+  await activate(hooks, sidRen, "build an HTML dashboard and render the chart")
+  const injRen = await systemInject(hooks, sidRen)
+  assert("K2-grounding-inject", injRen.includes("vertex:grounding"), "grounding present")
+  assert(
+    "K2-classify-render",
+    eventsOf("classify", sidRen).some((e) => e.payload?.mode === "render"),
+    JSON.stringify(eventsOf("classify", sidRen).slice(-1)),
+  )
+
+  clearLogs()
+  const sidLed = "uat-k-ledger"
+  await activate(hooks, sidLed, "deep implement the plan")
+  await edit(hooks, sidLed)
+  await bash(hooks, sidLed, "npm test", "3 failed", 1)
+  const injLed = await systemInject(hooks, sidLed)
+  assert("K3-ledger-inject", injLed.includes("vertex:ledger"), "ledger summary injected")
+  assert("K3-ledger-files", /files changed:\s*yes/i.test(injLed), injLed.slice(0, 300))
+
+  clearLogs()
+  const sidNorm = "uat-k-normal"
+  await activate(hooks, sidNorm, "fix the parser bug")
+  const injNorm = await systemInject(hooks, sidNorm)
+  assert(
+    "K4-normal-advisory",
+    injNorm.includes("vertex:verification-advisory"),
+    "normal mode advisory",
+  )
+  assert("K4-no-required", !injNorm.includes("vertex:verification-required"), "not deep required")
+}
+
+// ===== L. Queue lifecycle (H5) =====
+console.log("\nL. Queue lifecycle (messages.transform / compaction / isolation)")
+{
+  clearLogs()
+  const { hooks } = await loadPlugin()
+  await activate(hooks, "uat-l-s1", "fix one")
+  await activate(hooks, "uat-l-s2", "fix two")
+  hooks.enqueue("uat-l-s1", { id: "only-s1", text: "private to s1" })
+  hooks.enqueue("uat-l-s2", { id: "only-s2", text: "private to s2" })
+  const i1 = await systemInject(hooks, "uat-l-s1")
+  const i2 = await systemInject(hooks, "uat-l-s2")
+  assert("L1-session-isolation-s1", i1.includes("only-s1") && !i1.includes("only-s2"), "s1 only")
+  assert("L1-session-isolation-s2", i2.includes("only-s2") && !i2.includes("only-s1"), "s2 only")
+
+  // messages.transform must not drain
+  hooks.enqueue("uat-l-msg", { id: "keep-me", text: "must survive messages.transform" })
+  await activate(hooks, "uat-l-msg", "fix msg")
+  if (typeof hooks["experimental.chat.messages.transform"] === "function") {
+    await hooks["experimental.chat.messages.transform"](
+      {},
+      { messages: [{ info: { id: "m", sessionID: "uat-l-msg", role: "user" }, parts: [] }] },
+    )
+  }
+  const afterMsg = await systemInject(hooks, "uat-l-msg")
+  assert("L2-messages-no-drain", afterMsg.includes("keep-me"), afterMsg.slice(0, 200))
+
+  // compaction holds queue until session.compacted
+  await activate(hooks, "uat-l-cmp", "fix compact")
+  hooks.enqueue("uat-l-cmp", { id: "after-compaction", text: "deliver after compaction" })
+  await hooks["experimental.session.compacting"]({ sessionID: "uat-l-cmp" }, { context: [] })
+  const during = await systemInject(hooks, "uat-l-cmp")
+  assert("L3-compaction-holds", !during.includes("after-compaction"), "held during compact")
+  await hooks.event({ event: { type: "session.compacted", properties: { sessionID: "uat-l-cmp" } } })
+  const afterCmp = await systemInject(hooks, "uat-l-cmp")
+  assert("L3-compaction-releases", afterCmp.includes("after-compaction"), "released after compacted")
+
+  // failed compaction: next chat.message releases
+  await activate(hooks, "uat-l-cmp2", "fix compact2")
+  hooks.enqueue("uat-l-cmp2", { id: "after-failed-compaction", text: "still deliver this" })
+  await hooks["experimental.session.compacting"]({ sessionID: "uat-l-cmp2" }, { context: [] })
+  const during2 = await systemInject(hooks, "uat-l-cmp2")
+  assert("L4-failed-cmp-holds", !during2.includes("after-failed-compaction"), "held")
+  await activate(hooks, "uat-l-cmp2", "continue after failed compaction")
+  const resumed = await systemInject(hooks, "uat-l-cmp2")
+  assert("L4-failed-cmp-releases", resumed.includes("after-failed-compaction"), "released on next message")
+}
+
+// ===== M. file.edited host event =====
+console.log("\nM. file.edited host mutation")
+{
+  clearLogs()
+  let prompts = 0
+  const { hooks } = await loadPlugin(async () => {
+    prompts++
+    return {}
+  })
+  const sid = "uat-m-file"
+  await activate(hooks, sid, "deep implement the plan")
+  await hooks.event({
+    event: { type: "file.edited", properties: { file: join(worktree, "scratch.ts") } },
+  })
+  await complete(hooks, sid, "Done via host edit.")
+  await idle(hooks, sid)
+  assert("M1-file-edited-blocks", prompts >= 1, `prompts=${prompts}`)
+  assert("M1-debug-changed", debugText().includes("file changed") || prompts >= 1, "mutation observed")
+
+  // multi-active: no attribution to innocent session
+  clearLogs()
+  prompts = 0
+  await activate(hooks, "uat-m-editor", "deep implement the plan")
+  await activate(hooks, "uat-m-innocent", "deep review the plan")
+  await hooks.event({
+    event: { type: "file.edited", properties: { file: join(worktree, "other.ts") } },
+  })
+  await complete(hooks, "uat-m-innocent", "Review complete.")
+  await idle(hooks, "uat-m-innocent")
+  assert("M2-multi-active-no-attr", prompts === 0, `prompts=${prompts}`)
+}
+
+// ===== N. Promise-no-act cap warn =====
+console.log("\nN. Promise-no-act cap → warn inject")
+{
+  clearLogs()
+  let prompts = 0
+  const mod = await import(pathToFileURL(DIST).href + `?t=${Date.now()}-n`)
+  const entryN = mod.default?.server || mod.server || mod.default
+  const hooks = await entryN(
+    {
+      client: { session: { prompt: async () => { prompts++; return {} } } },
+      directory: worktree,
+      worktree,
+      project: {},
+    },
+    { maxStopBlocks: 1 },
+  )
+  const sid = "uat-n-promise-cap"
+  // normal mode: stop won't hard-block; promise will
+  await activate(hooks, sid, "fix the parser")
+  await edit(hooks, sid)
+  await complete(hooks, sid, "TODO: I will finish the remaining tests later.")
+  await idle(hooks, sid)
+  assert("N1-promise-first-block", prompts === 1, `prompts=${prompts}`)
+  await complete(hooks, sid, "TODO: still deferred for later.")
+  await idle(hooks, sid)
+  assert("N1-promise-cap-no-reprompt", prompts === 1, `prompts=${prompts}`)
+  const warns = eventsOf("gate_fire", sid).filter((e) => e.payload?.decision === "warn")
+  assert("N1-promise-warn-event", warns.length >= 1, JSON.stringify(warns.slice(-1)))
+  const inj = await systemInject(hooks, sid)
+  assert("N1-promise-warn-inject", inj.includes("vertex:promise-no-act-warn"), inj.slice(0, 240))
+}
+
+// ===== O. session.prompt throw fail-open =====
+console.log("\nO. session.prompt throw fail-open")
+{
+  clearLogs()
+  const mod = await import(pathToFileURL(DIST).href + `?t=${Date.now()}-o`)
+  const entryO = mod.default?.server || mod.server || mod.default
+  const hooks = await entryO(
+    {
+      client: {
+        session: {
+          prompt: async () => {
+            throw new Error("prompt boom")
+          },
+        },
+      },
+      directory: worktree,
+      worktree,
+      project: {},
+    },
+    { maxStopBlocks: 3 },
+  )
+  const sid = "uat-o-throw"
+  await activate(hooks, sid, "deep implement the plan")
+  await edit(hooks, sid)
+  await complete(hooks, sid, "Done.")
+  await idle(hooks, sid)
+  const fires = eventsOf("gate_fire", sid)
+  const last = fires[fires.length - 1]
+  assert(
+    "O1-throw-allow-would-block",
+    last?.payload?.decision === "allow" && last?.payload?.would_block === true,
+    JSON.stringify(last?.payload),
+  )
+  assert(
+    "O1-throw-reason",
+    last?.payload?.reason === "session.prompt failed" || /prompt/i.test(String(last?.payload?.reason || "")),
+    JSON.stringify(last?.payload),
+  )
+  assert("O1-not-fake-block", !fires.some((e) => e.payload?.decision === "block"), "no block claim")
+  const inj = await systemInject(hooks, sid)
+  assert("O1-queue-survives", inj.includes("vertex:stop-block"), "queue kept for transform")
+}
+
+// ===== P. /dev/null probe does not poison docs-only =====
+console.log("\nP. /dev/null non-mutation + docs-only")
+{
+  clearLogs()
+  let prompts = 0
+  const { hooks, mod } = await loadPlugin(async () => {
+    prompts++
+    return {}
+  })
+  assert(
+    "P1-devnull-not-mutating",
+    mod.isMutatingBashCommand("cat ~/.config/.elicify-vertex-consent 2>/dev/null") === false,
+  )
+  assert("P1-real-redirect-mutating", mod.isMutatingBashCommand("echo x > out.txt") === true)
+
+  const sid = "uat-p-docs"
+  await activate(hooks, sid, "deep thorough documentation pass")
+  await bash(hooks, sid, "cat ~/.config/.elicify-vertex-consent 2>/dev/null", "yes\n", 0)
+  await hooks["tool.execute.after"](
+    { tool: "edit", sessionID: sid, callID: "d", args: { filePath: join(worktree, "NOTES.md") } },
+    { title: "e", output: "ok", metadata: {} },
+  )
+  await complete(hooks, sid, "Docs only.")
+  await idle(hooks, sid)
+  assert("P2-docs-after-devnull-no-stop", prompts === 0, `prompts=${prompts}`)
 }
 
 // ===== Summary =====
@@ -505,6 +793,29 @@ console.log(`UAT RESULT: ${passed}/${total} passed, ${failed} failed`)
 console.log(`Artifacts: ${uatRoot}`)
 console.log(`Events:    ${join(dataRoot, ".vertex-events.jsonl")}`)
 console.log(`Debug:     ${join(uatRoot, ".config/opencode/.vertex-debug.log")}`)
+
+// Coverage checklist of inject IDs exercised this run
+const injectIds = [
+  "vertex:contract",
+  "vertex:verification-required",
+  "vertex:verification-advisory",
+  "vertex:investigation",
+  "vertex:grounding",
+  "vertex:review-recall",
+  "vertex:ledger",
+  "vertex:tool-failure",
+  "vertex:repeat-failure",
+  "vertex:stop-block",
+  "vertex:stop-warning",
+  "vertex:promise-no-act",
+  "vertex:promise-no-act-warn",
+]
+const eventTypes = ["classify", "gate_fire", "holdout_suppress", "recovery_repeat"]
+console.log("\nInject ID coverage (harness scenarios):")
+for (const id of injectIds) console.log(`  - ${id}`)
+console.log("Event types covered:")
+for (const t of eventTypes) console.log(`  - ${t}`)
+console.log("Note: measurement 'outcome' is a builder only (not emitted by plugin hot path).")
 
 if (failed > 0) {
   console.log("\nFailures:")

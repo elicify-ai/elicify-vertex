@@ -117,6 +117,13 @@ describe("mutation matrix", () => {
     ["cat README.md", false],
     ["cmd 2>&1", false],
     ["npm test >&2", false],
+    // Device sinks are not workspace mutations (live F1 false positive).
+    ["cat ~/.config/.elicify-vertex-consent 2>/dev/null", false],
+    ["echo x >/dev/null", false],
+    ["echo x 2>/dev/null", false],
+    ["cmd >/dev/null 2>&1", false],
+    ["printf hi 1>/dev/stdout", false],
+    ["printf hi 2>/dev/stderr", false],
     ["python -c \"print(open('f').read())\"", false],
     ["node -e \"console.log(require('fs').readFileSync('f','utf8'))\"", false],
   ] as const)("isMutatingBashCommand(%j) → %s", (command, expected) => {
@@ -126,6 +133,7 @@ describe("mutation matrix", () => {
   it("changedPathsFromTool maps bash mutations to bash-mutation", () => {
     expect(changedPathsFromTool("bash", { command: "echo x > f" })).toEqual(["bash-mutation"])
     expect(changedPathsFromTool("bash", { command: "echo x" })).toEqual([])
+    expect(changedPathsFromTool("bash", { command: "cat f 2>/dev/null" })).toEqual([])
     expect(changedPathsFromTool("edit", { filePath: "a.ts" })).toEqual(["a.ts"])
   })
 })
@@ -152,6 +160,30 @@ describe("mutation observation", () => {
     expect(prompt).toHaveBeenCalledTimes(1)
     const request = (prompt.mock.calls as unknown as Array<[any]>)[0]?.[0]
     expect(request.body.parts[0].text).toContain("vertex:stop-block")
+  })
+
+  it("does not treat 2>/dev/null probes as mutations that poison docs-only stop", async () => {
+    // Live F1: agent first-run `cat … 2>/dev/null` was classified bash-mutation
+    // (kind=other), so a later NOTES.md-only edit still hard-blocked.
+    const prompt = vi.fn(async () => ({}))
+    const hooks = await ElicifyVertexPlugin(pluginInput(prompt), undefined)
+    const sessionID = "docs-only-after-devnull"
+    await activate(hooks, sessionID, "deep implement thorough docs update")
+    await hooks["tool.execute.after"]!({
+      tool: "bash",
+      sessionID,
+      callID: "probe",
+      args: { command: "cat ~/.config/.elicify-vertex-consent 2>/dev/null" },
+    }, { title: "probe", output: "yes\n", metadata: { exit: 0 } })
+    await hooks["tool.execute.after"]!({
+      tool: "edit",
+      sessionID,
+      callID: "docs",
+      args: { filePath: "NOTES.md" },
+    }, { title: "edit", output: "updated", metadata: {} })
+    await completeText(hooks, sessionID, "Updated NOTES.md only.")
+    await hooks.event!({ event: { type: "session.idle", properties: { sessionID } } as any })
+    expect(prompt).not.toHaveBeenCalled()
   })
 
   it("observes host file.edited events", async () => {
