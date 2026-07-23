@@ -1,170 +1,129 @@
 # elicify-vertex
 
-An [opencode](https://opencode.ai) plugin that injects harness directives into the
-**LLM input** — the way Claude's plugin runtime does via
-`hookSpecificOutput.additionalContext` — using opencode's official
-`chat.system.transform` and `chat.messages.transform` hooks.
+**Make any model work like a senior engineer — not just answer like one.**
 
-> **Why this exists.** opencode's SDK does not (yet) expose a post-tool
-> `additionalContext` equivalent whose output becomes a *new* message in the
-> model's next turn. The naive workaround — stamping `output.output` in
-> `tool.execute.after` — reaches the LLM, but as part of the **tool's
-> reply**, not as a directive. Steering power is weak. This plugin wires
-> the *correct* hooks: a per-session directive queue drained into the
-> system prompt for the next LLM call.
+---
 
 ## What it does
 
-1. **Per-session directive queue.** Any code in your plugin (a Stop hook, a
-   PostToolUse hook, a custom event handler) can call
-   `t.enqueue(sessionID, { id, text })` to schedule a directive.
-2. **`experimental.chat.system.transform`** — the SDK-native, **correct**
-   hook. Appends queued + always-on directives to the system prompt for
-   the next LLM call. Has `sessionID` in its input.
-3. **`experimental.chat.messages.transform`** — optional fallback. Rewrites
-   the messages array so any undrained directives still reach the LLM,
-   tagged as a synthetic note on the last message. The SDK does not
-   currently pass `sessionID` to this hook, so it is intentionally lossy.
+elicify-vertex is a plugin for [opencode](https://opencode.ai) that makes AI coding assistants more reliable. It ensures the model **proves its work before claiming it's done** — running tests, checking output, and being honest about what's verified and what isn't.
 
-## Install
+You know how an AI assistant will sometimes say "I've fixed the bug" without actually testing the fix? Or claim "all tests pass" without running them? elicify-vertex stops that. It's a harness that holds the model to the same standard a senior engineer would hold a junior: *show me, don't tell me.*
 
-The plugin is **self-contained** — no symlinks required.
+The plugin is inspired by the working habits of Anthropic's Claude Fable 5 — a model widely praised for its thoroughness, autonomy, and honest reporting. But it doesn't try to imitate Fable. It encodes the **procedures** that make good work reliable: verify before claiming done, investigate before guessing, escalate when stuck, and communicate plainly.
 
-### From npm
+## Why you need it
 
-```bash
-npm install elicify-vertex
-```
+| Without elicify-vertex | With elicify-vertex |
+|---|---|
+| "I've implemented the feature." (untested) | "I've implemented the feature. Tests pass — here's the output." |
+| "All green!" (ran `echo "ok"`) | Actually runs the test suite and shows you the result |
+| Silently retries the same failing fix 5 times | Stops, forms a new hypothesis, or surfaces the blocker |
+| Ends with "I'll run the tests next" | Actually runs the tests before stopping |
+| Verbose, enthusiastic, performative reports | Calm, factual, outcome-first communication |
 
-The `postinstall` hook runs `scripts/install-skill.sh`, which copies the
-shipped `SKILL.md` into `${XDG_CONFIG_HOME:-$HOME/.config}/opencode/skills/elicify-vertex/SKILL.md`
-as a **real file** (no symlink). The `/elicify-vertex` slash
-command is then available in opencode.
+## How it works
 
-Add the plugin to `opencode.json`:
+The plugin sits between you and the model. On every turn where the plugin is active, it quietly adds a set of instructions to the model's system prompt — the part the model reads before generating its response. These instructions remind the model to:
+
+- **Verify before claiming done** — run the test, render the artifact, hit the endpoint. A `Write` success message is authoring, not verifying.
+- **Not trust superficial test passes** — a test that has never been observed to fail proves nothing.
+- **Control things manually** — automated tests often miss real issues. If browser tools are available, use them to see the actual rendered output.
+- **Stop retrying the same failing approach** — if something fails twice the same way, form a different hypothesis.
+- **Communicate calmly** — lead with the result, avoid enthusiasm and apology, end when the useful information has been delivered.
+
+The plugin only activates when you want it to — when you're using the **Helmsman** agent or the **`/vertex`** skill. Other sessions are left untouched.
+
+## Installation
+
+### For users
+
+Add the plugin to your `opencode.json`:
 
 ```json
 {
-  "plugin": ["elicify-vertex"]
+  "plugin": ["@elicify-ai/elicify-vertex"]
 }
 ```
 
-### From source (local dev)
+That's it. opencode installs the package automatically on startup. The skill (`/vertex`) is installed for you — no manual steps, no symlinks, no configuration files to edit.
+
+### For developers
 
 ```bash
 git clone https://github.com/elicify-ai/elicify-vertex
 cd elicify-vertex
 npm install
-npm run setup        # copies SKILL.md to ~/.config/opencode/skills/...
 npm run build
 ```
 
-Then point opencode at the working copy:
+Then point opencode at your local copy:
 
 ```json
 {
-  "plugin": ["./elicify-vertex/src/index.ts"]
+  "plugin": ["./elicify-vertex/dist/index.js"]
 }
 ```
 
-### Custom install location
+## How to use
 
-```bash
-SKILL_TARGET_DIR=/path/to/skills/elicify-vertex bash scripts/install-skill.sh
-```
+### Option 1: The Helmsman agent
 
-To overwrite an existing `SKILL.md`:
+Select the **Helmsman** agent in opencode. The plugin activates automatically for that session. The Helmsman is a principal orchestrator — it decomposes work, delegates to subagents in parallel, and integrates verified results. Think of it as a senior engineer who owns the full arc of a task.
 
-```bash
-SKILL_FORCE=1 bash scripts/install-skill.sh
-```
+### Option 2: The `/vertex` skill
 
-### What is NOT a symlink
+Type `/vertex` in any opencode session. The plugin activates for that session. Use this when you want the verification discipline without switching agents.
 
-- The skill file is copied as a regular file.
-- The plugin source lives in `node_modules/` (or your local path) as real files.
-- No symlinks to `~/.claude/skills`, `~/.config/opencode/vertex`, or any other
-  system path are created by this package.
+### Option 3: Both
 
-If your `~/.config/opencode/skills` happens to be a symlink to
-`~/.claude/skills` (a pre-existing system condition on elicify-devpods), the
-plugin will follow it and write a real file there. That is the user's
-symlink, not this plugin's.
+Use the Helmsman agent AND invoke `/vertex` when you need an extra nudge. They work together — the agent provides the strategy, the skill provides the discipline.
 
-## Usage from another plugin
+## What you'll notice
+
+After installing elicify-vertex, your AI assistant will:
+
+1. **Stop claiming "done" without evidence.** If it says "done," it will show you the tool output that proves it.
+2. **Actually run tests** — not just say it ran them. You'll see the command and the output.
+3. **Be honest about failures.** If something didn't work, it will tell you — not paper over it.
+4. **Communicate more clearly.** Shorter, calmer, more direct. No enthusiasm theater.
+5. **Not loop on the same error.** If a fix doesn't work twice, it will try a different approach.
+
+## Configuration
+
+The plugin works out of the box. If you want to customize:
+
+| Option | Default | What it controls |
+|---|---|---|
+| `activeAgent` | `elicify-vertex-helmsman` | Which agent name activates the plugin |
+| `activeSkillTrigger` | `/vertex` | Which slash command activates the plugin |
+| `maxPerSession` | `16` | Max directives queued per session |
+| `systemDirectives` | built-in verification block | The always-on instructions injected every turn |
+
+## For plugin developers
+
+If you're building your own opencode plugin and want to enqueue directives:
 
 ```ts
-import type { Plugin } from "@opencode-ai/plugin"
-import ElicifyVertexPlugin from "elicify-vertex"
+import { ElicifyVertexPlugin } from "@elicify-ai/elicify-vertex"
 
-export const MyPlugin: Plugin = async (ctx) => {
-  // 1) Ensure the transform plugin is also loaded (opencode loads it
-  //    from opencode.json — no need to require() it here).
-  // 2) In a Stop or PostToolUse hook, write a directive into the
-  //    transform plugin's queue via a shared module:
-  const t = await ElicifyVertexPlugin(ctx)
+const vertex = await ElicifyVertexPlugin(ctx)
 
-  return {
-    async event({ event }) {
-      if (event.type === "session.idle") {
-        t.enqueue(event.properties.sessionID, {
-          id: "stop:block",
-          text: "Verification missing — observe a tool result before reporting done.",
-        })
-      }
-    },
-  }
-}
+// Schedule a directive for the next LLM turn
+vertex.enqueue(sessionID, {
+  id: "stop:block",
+  text: "Verification missing — run a tool and show the output before reporting done.",
+})
 ```
 
-> **Cross-plugin note.** Opencode's plugin runtime does not give plugins
-> a shared registry. The cleanest way to enqueue directives from another
-> plugin is to import the `DirectiveQueue` class directly from a small
-> module (e.g. `./queue.js`) rather than going through the plugin return
-> value. See `src/index.ts` for the in-memory queue implementation.
+The directive will be injected into the system prompt on the next LLM call (if the session is active).
 
-## API
+## Technical details
 
-### `Directive`
-
-```ts
-interface Directive {
-  readonly id: string       // e.g. "post-tool:evidence"
-  readonly text: string     // shown to the LLM
-  readonly at?: string      // optional ISO timestamp; set on enqueue if missing
-}
-```
-
-### `ElicifyVertexOptions`
-
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `maxPerSession` | `number` | `16` | Cap on queued directives per session. Oldest is dropped. |
-| `wireMessagesTransform` | `boolean` | `true` | Also wire the messages-array rewrite as a fallback. |
-| `systemDirectives` | `() => Directive[]` | elicify-vertex reminder | Always-on directives injected every turn. |
-
-### `formatDirectives(directives)`
-
-Pure formatter exposed for tests and downstream plugins. Returns
-`null` for an empty list, otherwise a tagged block suitable for appending
-to a system prompt.
-
-## Design choices (best practices)
-
-- **ESM only**, `"type": "module"`. Matches the opencode plugin runtime.
-- **Strict TypeScript** with `noUnused*`, `noImplicitReturns`. The SDK
-  surface is small; treat its types as the contract.
-- **No side effects at import time.** The plugin factory is `async` and
-  returns hooks; the queue lives in the closure.
-- **Append, never replace.** `system.transform` and `messages.transform`
-  both add to the existing output so other plugins' transforms are
-  preserved.
-- **Tagged synthetic content.** Directives are wrapped in
-  `<elicify-vertex-directives ts="...">...</elicify-vertex-directives>` so they are
-  easy to grep for in logs and easy for the model to recognise as
-  harness-injected (not user-typed).
-- **Fails open.** No throw paths in the hooks — a broken transform must
-  never break the LLM call.
+- **Self-contained** — no symlinks, no external scripts, no system dependencies beyond opencode itself.
+- **Gated** — the plugin is always loaded but only injects when the Helmsman agent or `/vertex` skill is active. Other sessions get zero overhead.
+- **Fails open** — if the plugin encounters an error, it stays silent. A broken harness must never break your work.
+- **ESM + strict TypeScript** — built to the opencode plugin SDK's exact specifications.
 
 ## Verify
 
@@ -181,5 +140,9 @@ MIT — see [LICENSE](./LICENSE).
 
 ## Companion artifacts
 
-- **Skill:** `SKILL.md` (and `skills/elicify-vertex/SKILL.md`) — installable into `~/.config/opencode/skills/elicify-vertex/` for the `/elicify-vertex` slash command.
-- **Architect agent:** **Elicify-Fable-Architect** — the principal orchestrator that uses this transform plugin to inject verification reminders. Lives in `~/.config/opencode/agents/elicify-vertex-architect.md`.
+- **Skill:** `/vertex` — the slash command that activates the plugin for a session.
+- **Agent:** **The Helmsman** (`elicify-vertex-helmsman`) — the principal orchestrator agent that pairs with this plugin. Decomposes work, delegates in parallel, integrates verified results.
+
+## Acknowledgments
+
+The behavioral patterns encoded in this plugin are inspired by the working habits of Anthropic's Claude Fable 5 — a model praised for reducing human supervision, verifying before claiming done, and communicating with calm maturity. The plugin does not imitate Fable; it encodes the **procedures** that make good work reliable, regardless of which model you use.
