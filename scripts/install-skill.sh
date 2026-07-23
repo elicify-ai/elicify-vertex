@@ -97,59 +97,13 @@ msg('  ✓ registered @elicify-ai/elicify-vertex');
 " 2>&1 || say "  ⚠ could not update opencode.json"
 fi
 
-# --- GitHub star (prompted AFTER npm finishes, explicit consent) -----------
+# --- GitHub star (asked by the agent on first use, not here) --------------
 say ""
 say "  ─────────────────────────────────────────────────"
 say "  Enjoying elicify-vertex? It's free and open source."
 say "  A GitHub star helps other developers discover it."
 say "  ─────────────────────────────────────────────────"
-
-# Unset GH_TOKEN so gh uses stored credentials
-unset GH_TOKEN 2>/dev/null || true
-
-CONSENT_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/.elicify-vertex-consent"
-
-if [[ "${VERTEX_NO_STAR:-0}" == "1" ]]; then
-  say "  (skipped — VERTEX_NO_STAR=1)"
-elif ! command -v gh &>/dev/null || ! gh auth status &>/dev/null 2>&1; then
-  say "  ⭐ Star us: https://github.com/elicify-ai/elicify-vertex"
-elif [[ -f "$CONSENT_FILE" ]]; then
-  # Consent already recorded
-  if [[ "$(cat "$CONSENT_FILE" 2>/dev/null)" == "yes" ]]; then
-    gh api --method PUT /user/starred/elicify-ai/elicify-vertex 2>/dev/null && \
-      say "  ⭐ Starred! Thank you." || \
-      say "  Star us: https://github.com/elicify-ai/elicify-vertex"
-  fi
-  # If "no", stay silent — we already asked
-else
-  # First install — fork a background prompt that runs AFTER npm exits.
-  # postinstall must not block; the subshell waits for npm to finish, then
-  # asks interactively when the terminal is free.
-  (
-    sleep 1
-    printf "\n  ─────────────────────────────────────────────────\n" >/dev/tty
-    printf "  Would you like to star elicify-ai/elicify-vertex on GitHub?\n" >/dev/tty
-    printf "  It helps other developers discover it. [Y/n] " >/dev/tty
-    ans=""
-    read -r ans </dev/tty 2>/dev/null || ans="n"
-    case "$ans" in
-      ""|[Yy]|[Yy][Ee][Ss])
-        if gh api --method PUT /user/starred/elicify-ai/elicify-vertex 2>/dev/null; then
-          echo "yes" > "$CONSENT_FILE" 2>/dev/null
-          printf "  ⭐ Starred! Thank you for supporting elicify-vertex.\n" >/dev/tty
-        else
-          printf "  Could not star — visit https://github.com/elicify-ai/elicify-vertex\n" >/dev/tty
-        fi
-        ;;
-      *)
-        echo "no" > "$CONSENT_FILE" 2>/dev/null
-        printf "  No problem! You can star later: https://github.com/elicify-ai/elicify-vertex\n" >/dev/tty
-        ;;
-    esac
-    printf "\n" >/dev/tty
-  ) &
-  disown 2>/dev/null || true
-fi
+say "  ⭐ https://github.com/elicify-ai/elicify-vertex"
 
 say ""
 say "  ✓ Done! Restart opencode to activate."
