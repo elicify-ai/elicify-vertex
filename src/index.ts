@@ -906,6 +906,41 @@ export function formatDirectives(directives: readonly Directive[]): string | nul
   return `<vertex-directives ts="${stamp}">\n${body}\n</vertex-directives>`
 }
 
+/**
+ * One-line user-visible cue when the harness first activates for a session.
+ * Kept short on purpose (REQUIREMENTS-INJECTION-VISIBILITY.md).
+ */
+export function formatActivateCue(input: {
+  stopMode: "quick" | "normal" | "deep"
+  taskMode?: TaskMode
+  agent?: string
+}): string {
+  const agent = input.agent?.trim() || "session"
+  const task = input.taskMode && input.taskMode !== "baseline" ? ` · task=${input.taskMode}` : ""
+  return redactSecrets(`[vertex] harness on · stopMode=${input.stopMode}${task} · ${agent}`)
+}
+
+/**
+ * User-visible gate continuation body. Full reason is allowed on gate block;
+ * lead with a short status line, then the model-facing detail.
+ */
+export function formatGateContinuationText(reason: string): string {
+  const clean = redactSecrets(reason.trim())
+  const kind = /promise-no-act/i.test(clean)
+    ? "promise"
+    : /stop-block/i.test(clean)
+      ? "stop"
+      : "gate"
+  const headline =
+    kind === "promise"
+      ? "[vertex] completion paused · unfinished work signaled after file changes"
+      : kind === "stop"
+        ? "[vertex] completion paused · verification required"
+        : "[vertex] completion paused"
+  if (clean.startsWith("[vertex]")) return `${headline}\n\n${clean}`
+  return `${headline}\n\n${clean}`
+}
+
 // ===========================================================================
 // PLUGIN ENTRYPOINT
 // ===========================================================================
@@ -957,6 +992,8 @@ export const ElicifyVertexPlugin = async (
   const commandActivatedSessions = new Set<string>()
   const gateContinuationSessions = new Set<string>()
   const compactingSessions = new Set<string>()
+  /** Sessions that already received the one-shot user-visible activate cue. */
+  const activateCueShown = new Set<string>()
 
   // Last assistant text per session (for the promise-no-act guard).
   // Populated by experimental.text.complete; read by event(session.idle).
@@ -1017,7 +1054,7 @@ export const ElicifyVertexPlugin = async (
     try {
       await client.session.prompt({
         path: { id: sid },
-        body: { parts: [{ type: "text", text: reason }] },
+        body: { parts: [{ type: "text", text: formatGateContinuationText(reason) }] },
       })
       fire("block")
     } catch (err) {
@@ -1213,8 +1250,21 @@ $ARGUMENTS`,
             risks: sigMode.risks,
             review,
           })
+          // One minimal user-visible line the first time this session becomes
+          // harness-active (covers agent select and /elicify-vertex). Not every turn.
+          if (!activateCueShown.has(msgInput.sessionID)) {
+            activateCueShown.add(msgInput.sessionID)
+            const cue = formatActivateCue({
+              stopMode: sigMode.mode,
+              taskMode: mode,
+              agent: agent || undefined,
+            })
+            output.parts.push({ type: "text", text: `\n${cue}` } as any)
+            debug(`chat.message: ACTIVATE CUE for ${msgInput.sessionID}: ${cue}`)
+          }
         } else if (agent !== undefined && agent !== opts.activeAgent) {
           gate.deactivate(msgInput.sessionID)
+          activateCueShown.delete(msgInput.sessionID)
           debug(`chat.message: DEACTIVATED session ${msgInput.sessionID} (agent=${agent})`)
         }
       } catch (err) {

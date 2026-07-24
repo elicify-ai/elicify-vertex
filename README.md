@@ -77,7 +77,7 @@ Details: [docs/USAGE.md](./docs/USAGE.md) · [docs/ARCHITECTURE.md](./docs/ARCHI
 npm install @elicify-ai/elicify-vertex
 ```
 
-Requires Node **≥ 20**. Current package: **`@elicify-ai/elicify-vertex@0.9.1`**.
+Requires Node **≥ 20**. Current package: **`@elicify-ai/elicify-vertex@0.9.2`**.
 
 `postinstall` runs `scripts/install-skill.sh` (skill + agent into `~/.config/opencode/…`). Restart OpenCode after install.
 

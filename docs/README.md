@@ -26,3 +26,4 @@ This directory holds developer and power-user detail, grounded in the package so
 | [SUPPORT.md](../SUPPORT.md) | Where to get help |
 | [TRADEMARKS.md](../TRADEMARKS.md) | Brand / name policy |
 
+| [REQUIREMENTS-INJECTION-VISIBILITY.md](./REQUIREMENTS-INJECTION-VISIBILITY.md) | Operator-agreed visibility of harness inject/steering |

@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest"
-import { ElicifyVertexPlugin } from "../src/index.js"
+import {
+  ElicifyVertexPlugin,
+  formatActivateCue,
+  formatGateContinuationText,
+} from "../src/index.js"
 
 describe("ElicifyVertexPlugin.config", () => {
   it("registers the /elicify-vertex slash command with description + template (opencode 1.18.4 schema)", async () => {
@@ -173,19 +177,127 @@ describe("ElicifyVertexPlugin.chat.message activation gate", () => {
     // Activate via the vertex agent.
     await hooks["chat.message"]!(
       { sessionID, agent: "elicify-vertex-agent" } as any,
-      { message: {} as any, parts: [] },
+      {
+        message: {} as any,
+        parts: [{ type: "text", text: "start" } as any],
+      },
     )
-    // Switch to build.
+    expect(await gateActiveFor(sessionID, "elicify-vertex-agent", "still")).toBe(true)
+
+    // Switch to another primary agent → deactivate.
     await hooks["chat.message"]!(
       { sessionID, agent: "build" } as any,
-      { message: {} as any, parts: [] },
+      {
+        message: {} as any,
+        parts: [{ type: "text", text: "now on build" } as any],
+      },
     )
-
-    const fakeOutput: { system: string[] } = { system: [] }
+    const output = { system: [] as string[] }
     await hooks["experimental.chat.system.transform"]!(
       { sessionID, model: {} as any },
-      fakeOutput,
+      output,
     )
-    expect(fakeOutput.system).toEqual([])
+    expect(output.system.some((s) => s.includes("vertex-directives"))).toBe(false)
+  })
+})
+
+describe("user-visible harness cues", () => {
+  it("formatActivateCue is a single redacted status line", () => {
+    const line = formatActivateCue({
+      stopMode: "deep",
+      taskMode: "debugging",
+      agent: "elicify-vertex-agent",
+    })
+    expect(line).toMatch(/^\[vertex\] harness on · stopMode=deep · task=debugging · elicify-vertex-agent$/)
+    expect(line.includes("\n")).toBe(false)
+  })
+
+  it("formatGateContinuationText leads with a short headline then full reason", () => {
+    const text = formatGateContinuationText(
+      "[vertex:stop-block] You appear to be stopping without verification. (Block 1/3)",
+    )
+    expect(text.startsWith("[vertex] completion paused · verification required")).toBe(true)
+    expect(text).toContain("[vertex:stop-block]")
+    expect(text).toContain("Block 1/3")
+  })
+
+  it("appends activate cue once on first harness activation, not on later turns", async () => {
+    const hooks = await ElicifyVertexPlugin({} as any, undefined)
+    const sessionID = "cue-once"
+    const parts1 = [{ type: "text", text: "hello" } as any]
+    await hooks["chat.message"]!(
+      { sessionID, agent: "elicify-vertex-agent" } as any,
+      { message: {} as any, parts: parts1 },
+    )
+    const joined1 = parts1.map((p: any) => p.text).join("")
+    expect(joined1).toContain("[vertex] harness on")
+    expect(joined1).toContain("stopMode=")
+
+    const parts2 = [{ type: "text", text: "second message" } as any]
+    await hooks["chat.message"]!(
+      { sessionID, agent: "elicify-vertex-agent" } as any,
+      { message: {} as any, parts: parts2 },
+    )
+    const joined2 = parts2.map((p: any) => p.text).join("")
+    expect(joined2).not.toContain("[vertex] harness on")
+  })
+
+  it("re-shows activate cue after deactivate then reactivate", async () => {
+    const hooks = await ElicifyVertexPlugin({} as any, undefined)
+    const sessionID = "cue-reactivate"
+    const p1 = [{ type: "text", text: "a" } as any]
+    await hooks["chat.message"]!(
+      { sessionID, agent: "elicify-vertex-agent" } as any,
+      { message: {} as any, parts: p1 },
+    )
+    expect(p1.map((p: any) => p.text).join("")).toContain("[vertex] harness on")
+
+    await hooks["chat.message"]!(
+      { sessionID, agent: "build" } as any,
+      { message: {} as any, parts: [{ type: "text", text: "leave" } as any] },
+    )
+
+    const p2 = [{ type: "text", text: "back" } as any]
+    await hooks["chat.message"]!(
+      { sessionID, agent: "elicify-vertex-agent" } as any,
+      { message: {} as any, parts: p2 },
+    )
+    expect(p2.map((p: any) => p.text).join("")).toContain("[vertex] harness on")
+  })
+
+  it("gate continuation prompt uses user-visible gate formatting", async () => {
+    const prompts: string[] = []
+    const hooks = await ElicifyVertexPlugin(
+      {
+        client: {
+          session: {
+            prompt: async (req: any) => {
+              prompts.push(String(req?.body?.parts?.[0]?.text ?? ""))
+              return {}
+            },
+          },
+        },
+        directory: "/work",
+        worktree: "/work",
+      } as any,
+      undefined,
+    )
+    const sessionID = "gate-visible"
+    await hooks["chat.message"]!(
+      { sessionID, agent: "elicify-vertex-agent" } as any,
+      { message: {} as any, parts: [{ type: "text", text: "deep implement the plan" } as any] },
+    )
+    await hooks["tool.execute.after"]!(
+      { tool: "edit", sessionID, callID: "e", args: { filePath: "src/a.ts" } },
+      { title: "e", output: "ok", metadata: {} },
+    )
+    await hooks["experimental.text.complete"]!(
+      { sessionID, messageID: "m", partID: "p" },
+      { text: "All done." },
+    )
+    await hooks.event!({ event: { type: "session.idle", properties: { sessionID } } as any })
+    expect(prompts.length).toBe(1)
+    expect(prompts[0]).toContain("[vertex] completion paused · verification required")
+    expect(prompts[0]).toContain("[vertex:stop-block]")
   })
 })

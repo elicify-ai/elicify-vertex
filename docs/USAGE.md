@@ -120,6 +120,18 @@ Slash: `/elicify-vertex-goal-create`, `-next`, `-checkpoint`, `-status`. If crea
 
 State files (mode `0600`, dir `0700`): `goals.json`, `goals.ledger.jsonl`, lockfile; secrets redacted on disk (`redactForDisk`).
 
+## What you see in chat vs what the model sees
+
+| Path | Visible in chat UI? |
+|------|---------------------|
+| System inject (`<vertex-directives>` each turn) | **No** — model-only by design |
+| **Activate cue** (first harness-on message) | **Yes** — one line, e.g. `[vertex] harness on · stopMode=deep · …` |
+| **Gate block** (stop / promise-no-act) | **Yes** — continuation with headline + full reason |
+| Verification receipt on tool output | **Yes** — `[vertex:verification-receipt] vrf_…` |
+| Operator proof | `VERTEX_DEBUG=1` → `~/.config/opencode/.vertex-debug.log` (`ACTIVATED`, `INJECTED`, `ACTIVATE CUE`, `STOP BLOCK`) |
+
+Full requirements: [REQUIREMENTS-INJECTION-VISIBILITY.md](./REQUIREMENTS-INJECTION-VISIBILITY.md).
+
 ## Env vars
 
 | Variable | Effect |
