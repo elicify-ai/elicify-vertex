@@ -37,20 +37,27 @@ for file in \
   fi
 done
 
-# --- unregister plugin from opencode.json ---------------------------------
+# --- unregister plugin + commands from opencode.json -----------------------
 if [[ -f "$OPENCODE_JSON" ]]; then
   node -e "
 const fs = require('fs');
 const path = '$OPENCODE_JSON';
 const pkg = '@elicify-ai/elicify-vertex';
+const commandNames = ['elicify-vertex', 'elicify-vertex-goal-create', 'elicify-vertex-goal-next', 'elicify-vertex-goal-checkpoint', 'elicify-vertex-goal-status'];
 let cfg;
 try { cfg = JSON.parse(fs.readFileSync(path, 'utf8')); } catch (e) { process.exit(0); }
-if (!Array.isArray(cfg.plugin)) process.exit(0);
-const before = cfg.plugin.length;
-cfg.plugin = cfg.plugin.filter(p => p !== pkg);
-if (cfg.plugin.length === before) process.exit(0);
-fs.writeFileSync(path, JSON.stringify(cfg, null, 2) + '\n');
-console.log('  ✓ removed ' + pkg + ' from opencode.json');
+let changed = false;
+if (Array.isArray(cfg.plugin)) {
+  const before = cfg.plugin.length;
+  cfg.plugin = cfg.plugin.filter(p => p !== pkg);
+  if (cfg.plugin.length !== before) { changed = true; console.log('  ✓ removed ' + pkg + ' from opencode.json'); }
+}
+if (cfg.command) {
+  const commandCount = Object.keys(cfg.command).length;
+  for (const name of commandNames) { delete cfg.command[name]; }
+  if (Object.keys(cfg.command).length !== commandCount) { changed = true; console.log('  ✓ removed elicify-vertex commands from opencode.json'); }
+}
+if (changed) fs.writeFileSync(path, JSON.stringify(cfg, null, 2) + '\n');
 " 2>&1 || true
 fi
 

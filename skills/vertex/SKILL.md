@@ -30,7 +30,7 @@ The plugin loads with opencode but only **gates / dynamic-injects** when a sessi
 | Path | How |
 |------|-----|
 | **Agent (recommended)** | **Elicify-Vertex-Agent** (`elicify-vertex-agent`) — default `activeAgent` |
-| **Slash** | `/elicify-vertex` only (default `activeSkillTrigger`; registered via config hook) |
+| **Slash** | `/elicify-vertex` only (default `activeSkillTrigger`; registered via config hook + `opencode.json` `command` section) |
 
 Other agents/sessions stay untouched (gate deactivates when another named agent is selected).
 
@@ -56,7 +56,7 @@ Other agents/sessions stay untouched (gate deactivates when another named agent 
 npm install @elicify-ai/elicify-vertex
 ```
 
-Postinstall copies the skill + agent and registers the package in `~/.config/opencode/opencode.json`:
+Postinstall copies the skill + agent, registers the package in `~/.config/opencode/opencode.json`, and persists the 5 slash commands (`/elicify-vertex`, `/elicify-vertex-goal-{create,next,checkpoint,status}`) in the `command` section of the config file so they are always visible in the command palette:
 
 ```json
 {
@@ -117,7 +117,7 @@ Env (optional): `VERTEX_DEBUG=1` (debug log under `~/.config/opencode/.vertex-de
 
 ## Multi-story goals (optional)
 
-Tools: `elicify_vertex_goal_create` / `_next` / `_checkpoint` / `_status` (slash: `/elicify-vertex-goal-*`).
+Tools: `elicify_vertex_goal_create` / `_next` / `_checkpoint` / `_status` (slash: `/elicify-vertex-goal-{create,next,checkpoint,status}` — persisted in `opencode.json` `command` section for palette visibility).
 State: `<writable-project>/.elicify-vertex/`. Not required for harness stop/promise gates.
 Requires a writable project directory (never `/`). Final story needs a session verification receipt.
 

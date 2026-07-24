@@ -88,6 +88,12 @@ fs.writeFileSync(path, JSON.stringify(cfg, null, 2) + '\n');
   say "  ✓ done"
 fi
 
+# --- register slash commands in opencode.json (fallback for palette visibility) ---
+say ""
+say "  Registering slash commands in opencode.json..."
+node "$SCRIPT_DIR/register-commands.mjs" 2>/dev/null || true
+say "  ✓ done"
+
 # --- GitHub star link -----------------------------------------------------
 say ""
 say "  ─────────────────────────────────────────────────"
