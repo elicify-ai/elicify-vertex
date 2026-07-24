@@ -552,8 +552,12 @@ export function changedPathsFromTool(toolName: string, args: Record<string, unkn
 //   - "later" only with future intent (will/I'll/going to … later; we should)
 // Bare "later"/"tracked"/"tracking" alone are NOT needles (FP risk on
 // "see you later", "tracked down", "later section", "tracking is closed").
-// Tail window: last 600 chars. Blocking policy: see shouldBlockPromiseNoAct.
+// Tail window: last PROMISE_TAIL_WINDOW chars. Blocking policy: see shouldBlockPromiseNoAct.
 // ----------------------------------------------------------------------------
+
+/** Only the tail of the assistant text is scanned for promise-no-act and
+ * ask-user signals, leaving headroom on multi-sentence conclusions. */
+const PROMISE_TAIL_WINDOW = 600
 
 export type PromiseLocale = "en" | "ko"
 
@@ -654,9 +658,9 @@ export interface PromiseHit {
  */
 export function detectPromiseNoAct(text: string): PromiseHit[] {
   if (!text) return []
-  // Only inspect the tail (last 600 chars) for more headroom on multi-sentence
-  // conclusions without scanning the full turn.
-  const tail = text.slice(-600)
+  // Only inspect the tail (last PROMISE_TAIL_WINDOW chars) for more headroom
+  // on multi-sentence conclusions without scanning the full turn.
+  const tail = text.slice(-PROMISE_TAIL_WINDOW)
   const lower = tail.toLowerCase()
   const hits: PromiseHit[] = []
 
@@ -707,7 +711,7 @@ export function detectPromiseNoAct(text: string): PromiseHit[] {
  */
 function asksUser(text: string): boolean {
   // Phrase-based only. Bare "?" (e.g. "TODO remaining. OK?") must not disable the gate.
-  const tail = text.slice(-600).toLowerCase()
+  const tail = text.slice(-PROMISE_TAIL_WINDOW).toLowerCase()
   return /\b(?:shall i|should i|would you like|do you want|let me know|which option)\b/i.test(tail)
 }
 

@@ -137,6 +137,9 @@ export interface GoalStoryInput {
 const STORY_STATUSES = new Set<StoryStatus>(["pending", "in_progress", "complete", "failed", "blocked"])
 const PLAN_STATUSES = new Set<PlanStatus>(["active", "complete", "failed", "blocked"])
 
+/** A goals.lock older than this is treated as stale and reclaimed. */
+const STALE_LOCK_MS = 30_000
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value)
 }
@@ -469,7 +472,7 @@ export class MultiStoryGoalEngine {
         ownsLock = true
       } catch (error) {
         const code = (error as NodeJS.ErrnoException).code
-        if (code !== "EEXIST" || Date.now() - statSync(this.lockPath).mtimeMs < 30_000) {
+        if (code !== "EEXIST" || Date.now() - statSync(this.lockPath).mtimeMs < STALE_LOCK_MS) {
           throw new Error("goal plan is being modified by another process")
         }
         unlinkSync(this.lockPath)
