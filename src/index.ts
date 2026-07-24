@@ -49,6 +49,13 @@ export interface ElicifyVertexOptions {
   readonly systemDirectives?: () => readonly Directive[]
   readonly activeAgent?: string
   readonly activeSkillTrigger?: string
+  /**
+   * Maximum number of stop-gate blocks before the plugin stops blocking.
+   * Must be a positive integer — `0`, negative, NaN, Infinity, or
+   * non-integer values throw `RangeError("maxStopBlocks must be a
+   * positive integer")` at plugin init, because a non-positive cap would
+   * silently disable the stop gate. Defaults to 3.
+   */
   readonly maxStopBlocks?: number
 }
 
@@ -109,6 +116,8 @@ class SessionGate {
 // EVIDENCE LEDGER — the READ PATH's memory
 // ===========================================================================
 
+const REPEAT_FAILURE_THRESHOLD = 2
+
 interface SessionLedger {
   changedFilesSeen: boolean
   /** Distinct kinds of files changed — path-kind classifier. */
@@ -125,13 +134,11 @@ interface SessionLedger {
 export class EvidenceLedger {
   private readonly ledgers = new Map<string, SessionLedger>()
 
-  /** Reset per-turn state (called on each new user message). */
-  reset(
-    sessionID: string,
-    mode: "quick" | "normal" | "deep" = "normal",
-    risks: readonly RiskFlag[] = [],
-  ): void {
-    this.ledgers.set(sessionID, {
+  private freshLedger(
+    mode: SessionLedger["taskMode"],
+    risks: readonly RiskFlag[],
+  ): SessionLedger {
+    return {
       changedFilesSeen: false,
       changedFileKinds: new Set(),
       taskMode: mode,
@@ -140,7 +147,16 @@ export class EvidenceLedger {
       failures: [],
       stopBlocks: 0,
       promiseBlocks: 0,
-    })
+    }
+  }
+
+  /** Reset per-turn state (called on each new user message). */
+  reset(
+    sessionID: string,
+    mode: "quick" | "normal" | "deep" = "normal",
+    risks: readonly RiskFlag[] = [],
+  ): void {
+    this.ledgers.set(sessionID, this.freshLedger(mode, risks))
   }
 
   recordChangedFiles(sessionID: string, filePath: string): void {
@@ -185,13 +201,13 @@ export class EvidenceLedger {
   /** Check if the same failure signature appeared >=2 times this turn. */
   getRepeatFailure(sessionID: string): { signature: string; count: number } | null {
     const l = this.ledgers.get(sessionID)
-    if (!l || l.failures.length < 2) return null
+    if (!l || l.failures.length < REPEAT_FAILURE_THRESHOLD) return null
     const counts = new Map<string, number>()
     for (const f of l.failures) {
       counts.set(f.signature, (counts.get(f.signature) ?? 0) + 1)
     }
     for (const [signature, count] of counts) {
-      if (count >= 2) return { signature, count }
+      if (count >= REPEAT_FAILURE_THRESHOLD) return { signature, count }
     }
     return null
   }
@@ -199,16 +215,7 @@ export class EvidenceLedger {
   incrementStopBlocks(sessionID: string): number {
     let l = this.ledgers.get(sessionID)
     if (!l) {
-      l = {
-        changedFilesSeen: false,
-        changedFileKinds: new Set(),
-        taskMode: "normal",
-        riskFlags: new Set(),
-        verificationResults: [],
-        failures: [],
-        stopBlocks: 0,
-        promiseBlocks: 0,
-      }
+      l = this.freshLedger("normal", [])
       this.ledgers.set(sessionID, l)
     }
     l.stopBlocks++
@@ -322,9 +329,21 @@ export function classifyFileKind(filePath: string): FileKind {
 // they are gated by MUTATING_BASH_RE / PYTHON_INLINE_WRITE_RE /
 // NODE_INLINE_WRITE_RE separately.
 const READER_HEAD_RE = /^(?:grep|rg|man|ls|pwd|which|whereis|help|info|file|strings|less|head|tail|awk|cat|echo|printf)\b/i
-// Mutators anchored to start-of-segment. `tee` is NOT here — handled by
-// teeIsMutation below so device-sink discards don't false-positive.
-const MUTATING_BASH_RE = /^(?:apply_patch\b|chmod|mkdir|mv\b|cp\b|rm\b|touch\b|install\b|ln\b|truncate\b)|\b(?:sed\s+-i|perl\s+-pi)\b|\bgit\s+(?:add|commit|checkout|switch|restore|reset|clean|apply|am|merge|rebase|cherry-pick)\b|\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?build\b|(?:^|\s)--(?:write|fix)\b|\bcurl\s+(?:-o\b|-O\b|--output\b|--output-document\b)\b|\bwget\s+(?:-O\b|--output\b|--output-document\b)\b/i
+// Mutators anchored to start-of-segment. EVERY alternative is anchored with
+// `^` so a mutator keyword embedded inside a quoted argument
+// (`python script.py "git add x"`) does not false-positive. In-segment
+// mutation flags like `--write`/`--fix` (e.g. `npm version --write`) are
+// checked separately by MUTATING_BASH_FLAG_RE below. `tee` is NOT here —
+// handled by teeIsMutation so device-sink discards don't false-positive.
+const MUTATING_BASH_RE = /^(?:apply_patch\b|chmod\b|mkdir\b|mv\b|cp\b|rm\b|touch\b|install\b|ln\b|truncate\b|sed\s+-i|perl\s+-pi|git\s+(?:add|commit|checkout|switch|restore|reset|clean|apply|am|merge|rebase|cherry-pick)|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?build\b)/i
+/** In-segment mutation flags (checked anywhere in the segment). Separate
+ * from MUTATING_BASH_RE so segment-start anchoring does not hide
+ * `--write`/`--fix` flags that mutate later in the segment. */
+const MUTATING_BASH_FLAG_RE = /(?:^|[\s;|&])(?:--write|--fix)\b/i
+// Output options can occur after other downloader flags (for example,
+// `curl -s -L -o file URL`). Keep this anchored to the segment head so text
+// printed by a reader command is not mistaken for a download.
+const DOWNLOAD_OUTPUT_OPTION_RE = /(?:^|\s)(?:-O|-o|--output(?:-document)?)(?:=|\s|$)/i
 // Sinks that are not real workspace writes (so they don't poison docs-only).
 const DEV_NULL_SINK_RE = /^\/dev\/(?:null|stdout|stderr)$/
 /**
@@ -334,6 +353,11 @@ const DEV_NULL_SINK_RE = /^\/dev\/(?:null|stdout|stderr)$/
 const SHELL_FILE_REDIRECT_RE = /(?:^|[\s;|&])(?:\d*)(>>(?!&)|>(?!>|&))\s*(\S+)/g
 /** node -e / node -p with writeFile(Sync)/appendFile(Sync)/createWriteStream. */
 const NODE_INLINE_WRITE_RE = /\bnode\s+-[ep]\s+[\s\S]*\b(?:writeFileSync|writeFile|appendFileSync|appendFile|createWriteStream)\b/i
+/** Detect curl/wget output targets after any preceding options. */
+function downloaderIsMutation(segment: string): boolean {
+  const value = segment.trim()
+  return /^(?:curl|wget)\b/i.test(value) && DOWNLOAD_OUTPUT_OPTION_RE.test(value)
+}
 
 /**
  * Detect python/python3 inline writes: `python -c "open('f','w').write(...)"`
@@ -342,14 +366,25 @@ const NODE_INLINE_WRITE_RE = /\bnode\s+-[ep]\s+[\s\S]*\b(?:writeFileSync|writeFi
  * or write-mode `open('…','w'|…)`.
  */
 const PYTHON_INLINE_C_RE = /\bpython(?:3(?:\.\d+)?)?\s+-c\s+(?:["']\s*)?(?:\bopen\s*\([^)]*\)\s*\.\s*(?:write|writelines)\b|\bopen\s*\([^)]*['"](?:w|a|x|r\+)[^'"]*['"][^)]*\))/i
-const PYTHON_INLINE_HEREDOC_RE_G = /\bpython(?:3(?:\.\d+)?)?\s+-?\s*<<\s*(\S+)\s*\n([\s\S]*?)\n\1\b/gi
+const PYTHON_INLINE_HEREDOC_START_RE_G = /\bpython(?:3(?:\.\d+)?)?\s+(?:-\s*)?<<-?\s*(?:(['"])([^'"\s]+)\1|([^\s]+))[ \t]*(?:\r?\n|$)/gi
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
 function pythonIsMutation(command: string): boolean {
   if (PYTHON_INLINE_C_RE.test(command)) return true
-  // Reset global regex state — global /g flags carry lastIndex across calls.
-  PYTHON_INLINE_HEREDOC_RE_G.lastIndex = 0
-  let m: RegExpExecArray | null
-  while ((m = PYTHON_INLINE_HEREDOC_RE_G.exec(command)) !== null) {
-    const body = m[2] ?? ""
+  // Quoted delimiters (`<<'PY'`, `<<\"PY\"`) and tab-stripping heredocs
+  // (`<<-PY`) are normalized before matching the closing delimiter.
+  // matchAll avoids any global-regex lastIndex state across calls.
+  for (const m of command.matchAll(PYTHON_INLINE_HEREDOC_START_RE_G)) {
+    const delimiter = m[2] ?? m[3]
+    if (!delimiter) continue
+    const remainder = command.slice(m.index + m[0].length)
+    const closing = new RegExp(
+      `^[\\t ]*${escapeRegExp(delimiter)}[\\t ]*(?:\\r?\\n|$)`,
+      "m",
+    ).exec(remainder)
+    if (!closing) continue
+    const body = remainder.slice(0, closing.index)
     if (/\bopen\s*\([^)]*\)\s*\.\s*(?:write|writelines)\b/i.test(body)) return true
     if (/\bopen\s*\([^)]*['"](?:w|a|x|r\+)[^'"]*['"][^)]*\)/i.test(body)) return true
   }
@@ -358,9 +393,8 @@ function pythonIsMutation(command: string): boolean {
 
 /** True when a shell redirect target is a real workspace path (not a device sink). */
 function shellRedirectTargetsWorkspace(command: string): boolean {
-  SHELL_FILE_REDIRECT_RE.lastIndex = 0
-  let match: RegExpExecArray | null
-  while ((match = SHELL_FILE_REDIRECT_RE.exec(command)) !== null) {
+  // matchAll avoids manual lastIndex bookkeeping and is robust under reuse.
+  for (const match of command.matchAll(SHELL_FILE_REDIRECT_RE)) {
     const target = match[2] ?? ""
     // Strip surrounding quotes if present (`>"out.txt"` / `>'out.txt'`).
     const unquoted = target.replace(/^['"]|['"]$/g, "")
@@ -369,31 +403,87 @@ function shellRedirectTargetsWorkspace(command: string): boolean {
   }
   return false
 }
-/** Segment command by shell composition (no quotes/parens awareness — best
- * effort, mirrors how the verification parser already works). */
+/**
+ * Segment command by shell composition. Quote-aware: a `"…"` or `'…'` pair
+ * suppresses `;`, `|`, `&&`, `||`, and `\n` separators inside it so
+ * `python -c "x; rm f"` is one segment, not two. Backslash escape is honored
+ * inside `"…"` and outside quotes; inside `'…'` the backslash is literal
+ * (POSIX). Separators split at their outer boundaries only.
+ */
 function bashSegments(command: string): string[] {
-  return command
-    .split(/&&|\|\||[;\n]|(?<!\|)\|(?!\|)/)
-    .map((s) => s.trim())
-    .filter(Boolean)
+  const segments: string[] = []
+  let current = ""
+  let quote: '"' | "'" | null = null
+  let escaped = false
+  const flush = (): void => {
+    const trimmed = current.trim()
+    if (trimmed) segments.push(trimmed)
+    current = ""
+  }
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]
+    if (escaped) {
+      current += ch
+      escaped = false
+      continue
+    }
+    if (ch === "\\" && quote !== "'") {
+      current += ch
+      escaped = true
+      continue
+    }
+    if (quote) {
+      current += ch
+      if (ch === quote) quote = null
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      current += ch
+      quote = ch
+      continue
+    }
+    if (ch === "&" && command[i + 1] === "&") {
+      flush()
+      i++ // skip second `&`
+      continue
+    }
+    if (ch === "|" && command[i + 1] === "|") {
+      flush()
+      i++ // skip second `|`
+      continue
+    }
+    if (ch === "|" && command[i - 1] !== "|" && command[i + 1] !== "|") {
+      flush()
+      continue
+    }
+    if (ch === ";" || ch === "\n") {
+      flush()
+      continue
+    }
+    current += ch
+  }
+  flush()
+  return segments
 }
 
-/** Detect a `tee` write in `command`, honoring `tee -a /dev/null` etc. as a
- * discard. `tee` may appear at start of segment, after `|`, after `>&`, or
- * after space. The next non-flag token tells us if it's a real target. */
+/** Detect a `tee` write, including valid options and multiple targets. Device
+ * sinks are ignored unless another target in the same invocation is writable. */
 function teeIsMutation(command: string): boolean {
-  // Each `tee` occurrence: capture everything between it and the next `;`, `&`,
-  // `|`, or end. Look at the first non-flag token.
-  const re = /(^|[|\s;])tee\b((?:\s+-[a-zA-Z]+)*)(?:\s+(\S+))?/g
-  let m: RegExpExecArray | null
-  while ((m = re.exec(command)) !== null) {
-    const flags = (m[2] || "").trim()
-    // `-a` does not change discard-vs-write. Other flags unknown — be conservative.
-    if (!/^(?:-a)?$/.test(flags)) continue
-    const target = (m[3] || "").replace(/^['"]|['"]$/g, "")
-    if (!target) continue
-    if (DEV_NULL_SINK_RE.test(target)) continue
-    return true
+  for (const segment of bashSegments(command)) {
+    const match = segment.match(/^tee\b([\s\S]*)/i)
+    if (!match) continue
+    const tokens = match[1].match(/"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|\S+/g) ?? []
+    let options = true
+    for (const token of tokens) {
+      const value = token.replace(/^['"]|['"]$/g, "")
+      if (options && value === "--") {
+        options = false
+        continue
+      }
+      if (options && value.startsWith("-")) continue
+      options = false
+      if (!DEV_NULL_SINK_RE.test(value)) return true
+    }
   }
   return false
 }
@@ -410,8 +500,12 @@ export function isMutatingBashCommand(command: string): boolean {
   if (segments.length > 0 && segments.every((seg) => READER_HEAD_RE.test(seg))) {
     if (!shellRedirectTargetsWorkspace(command) && !teeIsMutation(command)) return false
   }
-  // Check every segment against MUTATING_BASH_RE (anchored to segment head).
-  const anyMutator = segments.some((seg) => MUTATING_BASH_RE.test(seg))
+  // Check every segment against MUTATING_BASH_RE (anchored to segment head)
+  // and MUTATING_BASH_FLAG_RE (in-segment flags like `--write`/`--fix`).
+  const anyMutator = segments.some(
+    (seg) => MUTATING_BASH_RE.test(seg) || MUTATING_BASH_FLAG_RE.test(seg),
+  )
+    || segments.some((seg) => downloaderIsMutation(seg))
     || shellRedirectTargetsWorkspace(command)
     || teeIsMutation(command)
     || pythonIsMutation(command)
@@ -1034,21 +1128,23 @@ export function parseVerification(command: string, output: string, exitCode?: nu
   // Watch-mode runners (vitest --watch, npm run dev, nodemon, …) must never
   // be treated as verification: they never exit on their own and the exit=0
   // we sometimes see is from a wrapper, not real proof.
-  // Anchor `dev`/`start` to end of token (followed by space/end/quote/`-`)
-  // so `npm run dev-docs` doesn't over-trigger.
-  const WATCH_RE = /(?:^|\s|--)watch(?:=|\b)|\brun\s+\S+[:.](?:watch|watch-mode)\b|\bnodemon\b|\b(?:npm|pnpm|yarn|bun)\s+run\s+(?:dev|start)(?=\s|$|"|'|--)/i
+  // Anchor `dev` and the `start:*` family so `npm run dev-docs` remains a
+  // normal non-verification script rather than an accidental watch match.
+  const WATCH_RE = /(?:^|\s|--|[-_.:])watch(?:=|\b)|\brun\s+\S+[:.](?:watch|watch-mode)\b|\bnodemon\b|\b(?:npm|pnpm|yarn|bun)\s+run\s+(?:dev|start(?:[-_.:][\w-]+)?)(?=\s|$|"|'|--)/i
+  // A nonzero verifier exit or contradictory failure output is a failure even
+  // when the command also looks like a long-running watcher.
+  if (isVerificationCommand && exitCode !== undefined && exitCode !== 0) {
+    return { outcome: "failed", isVerificationCommand, matchedPattern, failureDetected: true, successDetected, exitCodeReliable }
+  }
+  if (isVerificationCommand && failureDetected) {
+    return { outcome: "failed", isVerificationCommand, matchedPattern, failureDetected, successDetected, exitCodeReliable }
+  }
   if (WATCH_RE.test(parsedCommand)) {
     return { outcome: "ambiguous", isVerificationCommand: true, matchedPattern, failureDetected, successDetected, exitCodeReliable: false }
   }
 
   if (!isVerificationCommand) {
     return { outcome: "not-verification", isVerificationCommand, matchedPattern, failureDetected, successDetected, exitCodeReliable }
-  }
-  if (exitCode !== undefined && exitCode !== 0) {
-    return { outcome: "failed", isVerificationCommand, matchedPattern, failureDetected: true, successDetected, exitCodeReliable }
-  }
-  if (failureDetected) {
-    return { outcome: "failed", isVerificationCommand, matchedPattern, failureDetected, successDetected, exitCodeReliable }
   }
   if (exitCode === 0 && exitCodeReliable) {
     return { outcome: "verified", isVerificationCommand, matchedPattern, failureDetected, successDetected, exitCodeReliable }
@@ -1112,6 +1208,19 @@ export const ElicifyVertexPlugin = async (
   options?: PluginOptions,
 ): Promise<Hooks & { enqueue: (sessionID: string, directive: Directive) => void }> => {
   const client = (input as any).client
+  const userOpts = options as ElicifyVertexOptions | undefined
+  // Reject non-positive or non-integer maxStopBlocks at init: a 0 or negative
+  // cap silently disables the stop gate (because every block count exceeds it
+  // immediately) and a non-integer bypasses the loop counter entirely.
+  if (userOpts?.maxStopBlocks !== undefined) {
+    if (
+      !Number.isInteger(userOpts.maxStopBlocks)
+      || !Number.isFinite(userOpts.maxStopBlocks)
+      || userOpts.maxStopBlocks <= 0
+    ) {
+      throw new RangeError("maxStopBlocks must be a positive integer")
+    }
+  }
   const opts: Required<ElicifyVertexOptions> = {
     maxPerSession: 16,
     wireMessagesTransform: true,
@@ -1119,7 +1228,7 @@ export const ElicifyVertexPlugin = async (
     activeAgent: "elicify-vertex-agent",
     activeSkillTrigger: "/elicify-vertex",
     maxStopBlocks: 3,
-    ...(options as ElicifyVertexOptions | undefined),
+    ...userOpts,
   }
 
   const queue = new DirectiveQueue(opts.maxPerSession)
@@ -1185,7 +1294,16 @@ export const ElicifyVertexPlugin = async (
    * actually runs. Missing/failed prompt → allow+would_block; queue already holds
    * the reason for system.transform. Continuation flag remains until chat.message
    * consumes it on success; cleared on prompt failure so next user turn resets.
+   *
+   * The prompt call is wrapped in Promise.race with a CONTINUATION_TIMEOUT_MS
+   * timer so a hung session.prompt cannot leave gateContinuationSessions set
+   * indefinitely (which would silently disable the gate for the rest of the
+   * session). On timeout: clear the flag, log gate_fire with reason
+   * "continuation timeout", and leave the directive queue intact for the
+   * next system.transform.
    */
+  const CONTINUATION_TIMEOUT_MS = 30_000
+  const CONTINUATION_TIMEOUT_ERROR = "continuation timeout"
   const attemptGateContinuation = async (
     sid: string,
     reason: string,
@@ -1213,16 +1331,34 @@ export const ElicifyVertexPlugin = async (
       return
     }
     gateContinuationSessions.add(sid)
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined
     try {
-      await client.session.prompt({
-        path: { id: sid },
-        body: { parts: [{ type: "text", text: formatGateContinuationText(reason) }] },
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutHandle = setTimeout(
+          () => reject(new Error(CONTINUATION_TIMEOUT_ERROR)),
+          CONTINUATION_TIMEOUT_MS,
+        )
       })
+      await Promise.race([
+        client.session.prompt({
+          path: { id: sid },
+          body: { parts: [{ type: "text", text: formatGateContinuationText(reason) }] },
+        }),
+        timeoutPromise,
+      ])
       fire("block")
     } catch (err) {
       console.error("[vertex] session.prompt", err)
+      // Always clear the in-flight flag on failure — the gate must not be
+      // silently disabled for the rest of the session.
       gateContinuationSessions.delete(sid)
-      fire("allow", { reason: "session.prompt failed" })
+      const isTimeout = err instanceof Error && err.message === CONTINUATION_TIMEOUT_ERROR
+      fire("allow", { reason: isTimeout ? CONTINUATION_TIMEOUT_ERROR : "session.prompt failed" })
+      // Queue is preserved in both cases: the stop-block / promise-no-act
+      // directive was enqueued BEFORE attemptGateContinuation was called, so
+      // system.transform on the next turn still delivers it.
+    } finally {
+      if (timeoutHandle) clearTimeout(timeoutHandle)
     }
   }
 
