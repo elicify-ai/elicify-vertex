@@ -410,7 +410,7 @@ function shellRedirectTargetsWorkspace(command: string): boolean {
  * inside `"…"` and outside quotes; inside `'…'` the backslash is literal
  * (POSIX). Separators split at their outer boundaries only.
  */
-function bashSegments(command: string): string[] {
+function shellSegments(command: string): string[] {
   const segments: string[] = []
   let current = ""
   let quote: '"' | "'" | null = null
@@ -469,7 +469,7 @@ function bashSegments(command: string): string[] {
 /** Detect a `tee` write, including valid options and multiple targets. Device
  * sinks are ignored unless another target in the same invocation is writable. */
 function teeIsMutation(command: string): boolean {
-  for (const segment of bashSegments(command)) {
+  for (const segment of shellSegments(command)) {
     const match = segment.match(/^tee\b([\s\S]*)/i)
     if (!match) continue
     const tokens = match[1].match(/"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|\S+/g) ?? []
@@ -496,7 +496,7 @@ export function isMutatingBashCommand(command: string): boolean {
   // If every segment starts with a reader AND there is no redirect-write
   // AND no `tee` to a real workspace target, this is a read-only command.
   // `echo > file` is a write (redirect) even though echo is a reader head.
-  const segments = bashSegments(command)
+  const segments = shellSegments(command)
   if (segments.length > 0 && segments.every((seg) => READER_HEAD_RE.test(seg))) {
     if (!shellRedirectTargetsWorkspace(command) && !teeIsMutation(command)) return false
   }
@@ -1020,8 +1020,8 @@ function stripCommandPrefix(segment: string): string {
   return value
 }
 
-function unwrapShellCommand(segment: string): string {
-  const value = stripCommandPrefix(segment)
+function unwrapShellWrapper(input: string): string {
+  const value = stripCommandPrefix(input)
   const wrapped = value.match(/^(?:bash|sh|zsh)\s+-(?:lc|c)\s+(["'])([\s\S]*)\1$/i)
   return wrapped ? wrapped[2].trim() : value
 }
@@ -1045,7 +1045,7 @@ function afterExecWrapper(value: string): string | null {
 }
 
 function matchVerificationSegment(segment: string): string | null {
-  const value = unwrapShellCommand(segment)
+  const value = unwrapShellWrapper(segment)
   const unwrapped = afterExecWrapper(value)
   const candidate = unwrapped ?? value
   const packageRun = candidate.match(/^(?:npm|pnpm|yarn|bun)\s+run\s+([^\s;&|]+)/i)
@@ -1065,19 +1065,6 @@ function matchVerificationSegment(segment: string): string | null {
     return executable
   }
   return null
-}
-
-function commandSegments(command: string): string[] {
-  return command
-    .split(/&&|\|\||[;\n]|(?<!\|)\|(?!\|)/)
-    .map((segment) => segment.trim())
-    .filter(Boolean)
-}
-
-function unwrapTopLevelShellCommand(command: string): string {
-  const value = stripCommandPrefix(command)
-  const wrapped = value.match(/^(?:bash|sh|zsh)\s+-(?:lc|c)\s+(["'])([\s\S]*)\1$/i)
-  return wrapped ? wrapped[2] : command
 }
 
 /** Strip shell redirections so operators inside them are not mistaken for
@@ -1107,8 +1094,8 @@ function hasReliableAggregateExit(command: string, segments: string[], verifierI
 /** Parse one observed shell result into evidence. Exit zero is sufficient for
  * silent tools such as `tsc --noEmit`, unless output contradicts it. */
 export function parseVerification(command: string, output: string, exitCode?: number): VerificationResult {
-  const parsedCommand = unwrapTopLevelShellCommand(command || "")
-  const segments = commandSegments(parsedCommand)
+  const parsedCommand = unwrapShellWrapper(command || "")
+  const segments = shellSegments(parsedCommand)
   const matches = segments.map(matchVerificationSegment)
   const verifierIndexes = matches
     .map((match, index) => match ? index : -1)

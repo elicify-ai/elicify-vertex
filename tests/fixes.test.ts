@@ -297,7 +297,7 @@ describe("Fix 5: python heredoc opener variants", () => {
 })
 
 // ---------------------------------------------------------------------------
-// Fix 6: quote-aware bashSegments
+// Fix 6: quote-aware shellSegments
 //
 // Pre-fix symptom: the splitter does a regex split on `;`, `|`, `&&`, `||`
 // without quote awareness, so `python -c "pytest; echo done"` is split into
@@ -305,7 +305,7 @@ describe("Fix 5: python heredoc opener variants", () => {
 // suppress separators inside them.
 // ---------------------------------------------------------------------------
 
-describe("Fix 6: quote-aware bashSegments", () => {
+describe("Fix 6: quote-aware shellSegments", () => {
   it("does not treat a quoted `;` as a real separator (false positive on `rm f` inside python -c)", () => {
     // Pre-fix: regex split on `;` turns the trailing `rm f"` into a second
     // segment whose head matches `^rm\b` → flagged as a mutation. The `rm`
