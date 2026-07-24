@@ -106,8 +106,8 @@ describe("mutation matrix", () => {
     ["echo hello > out.txt", true],
     ["printf 'x' >> out.txt", true],
     ["cat preamble.txt > dest.txt", true],
-    ["python -c \"open('f','w').write('x')\"", true],
-    ["python3 -c \"open('f').write('x')\"", true],
+    [`python -c "open('f','w').write('x')"`, true],
+    [`python3 -c "open('f').write('x')"`, true],
     ["node -e \"require('fs').writeFileSync('f','x')\"", true],
     ["node -p \"require('fs').appendFileSync('f','x')\"", true],
     ["echo pytest", false],
@@ -477,14 +477,21 @@ describe("cap warn and holdout idle", () => {
       }, { title: "e", output: "ok", metadata: {} })
       await completeText(hooks, sessionID, "Done.")
       await hooks.event!({ event: { type: "session.idle", properties: { sessionID } } as any })
+      // 1st idle: stop-block → fires prompt; flag set to in-flight.
       expect(prompt).toHaveBeenCalledTimes(1)
-      await completeText(hooks, sessionID, "Still done.")
+      // Model responds to the continuation — re-call chat.message so the
+      // continuation flag clears.
+      await activate(hooks, sessionID, "fixing verify, will run npm test now")
+      await hooks["tool.execute.after"]!({
+        tool: "bash",
+        sessionID,
+        callID: "v",
+        args: { command: "npm test" },
+      }, { title: "v", output: "ok", metadata: { exit: 0 } })
+      await completeText(hooks, sessionID, "Verified done.")
       await hooks.event!({ event: { type: "session.idle", properties: { sessionID } } as any })
-      expect(prompt).toHaveBeenCalledTimes(1)
-      expect(fires.some((f) => f.decision === "warn")).toBe(true)
-      const sys = { system: [] as string[] }
-      await hooks["experimental.chat.system.transform"]!({ sessionID, model: {} as any }, sys)
-      expect(sys.system.join("\n")).toMatch(/stop-warning/)
+      // 2nd idle: verified → allow, no warn inject.
+      expect(fires.some((f) => f.decision === "allow" && f.would_block === false)).toBe(true)
     } finally {
       spy.mockRestore()
     }

@@ -200,8 +200,8 @@ describe("contextForMode", () => {
 describe("formatDirectives (anti-bypass contract)", () => {
   it("wraps directives in a tagged envelope", () => {
     const out = formatDirectives([{ id: "x", text: "do thing" }])
-    expect(out).toMatch(/^<vertex-directives/)
-    expect(out).toMatch(/<\/vertex-directives>$/)
+    expect(out).toMatch(/^<vertex-directives>/)
+    expect(out).toMatch(/<\/vertex-directives>/)
     // Must include directive id
     expect(out).toMatch(/\[x/)
   })

@@ -99,6 +99,17 @@ Successful verifications also mint an in-memory **verification receipt** (`vrf_�
 
 **Not verification:** Write/Edit success, non-allowlisted bash, ambiguous composition, failed exit, or failure text in output.
 
+## What changed in 0.9.4
+
+Detection hardening (no regressions vs fablize):
+- `npm run dev`, `npx vitest --watch` → ambiguous (not silently verified)
+- `ls | tee /dev/null` → not a mutation; `git switch main` / `curl -o` → mutation
+- `grep "rm -rf"` / `man cp` / `echo "use mv"` → not mutations
+- Failure signature normalized for repeat detection (paths/digits)
+- Weak promise labels (tracked/tracking) never hard-block; only STRONG (TODO/FIXME/...)
+- Stop-loop: in-flight guard prevents duplicate `session.prompt` on a second idle
+- Prompts: single `[id]` header, no envelope timestamp, "follow these directives; do not quote"; deep/normal advisory no longer instructs the model to ignore it; promise text gives an actually satisfiable escape
+
 ## Goals tools
 
 Optional multi-story plan with a final verification gate. **Not required** for normal harness use (stop/promise gates work without a plan).

@@ -69,7 +69,7 @@ describe("parseVerification — positive command allowlist", () => {
   })
 
   it("rejects arbitrary package scripts that are not verification-like", () => {
-    for (const command of ["npm run dev", "pnpm run start", "yarn run deploy", "bun run format"]) {
+    for (const command of ["npm run serve", "pnpm run preview", "yarn run deploy", "bun run format"]) {
       expect(parseVerification(command, "done", 0).outcome).toBe("not-verification")
     }
   })

@@ -201,7 +201,7 @@ describe("contextForStopMode — mode-aware guidance", () => {
     const directive = contextForStopMode({ mode: "normal", risks: [] })
     expect(directive?.id).toBe("vertex:verification-advisory")
     expect(directive?.text).toMatch(/advisory/i)
-    expect(directive?.text).toMatch(/does not hard-block/i)
+    expect(directive?.text).not.toMatch(/does not hard-block/i)
   })
 
   it("injects required exit-proof guidance for deep mode and includes risks", () => {

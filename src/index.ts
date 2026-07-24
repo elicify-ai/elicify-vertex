@@ -305,18 +305,29 @@ export function classifyFileKind(filePath: string): "docs" | "code" | "config" |
 
 // Core filesystem / SCM mutators. Redirect-to-file is handled separately so
 // stderr/stdout fd duplication (`2>&1`, `>&2`) is never treated as a write.
-const MUTATING_BASH_RE = /\b(?:apply_patch|chmod|mkdir|mv|cp|rm|touch|install|ln|truncate|tee)\b|\b(?:sed\s+-i|perl\s+-pi)\b|\bgit\s+(?:add|commit|checkout|restore|reset|clean|apply|am|merge|rebase|cherry-pick)\b|\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?build\b|(?:^|\s)--(?:write|fix)\b/i
-// Non-mutating sinks: discarding or re-pointing stdio does not change the workspace.
-// Without this, `cat file 2>/dev/null` (common first-run / probe pattern) is a
-// false-positive bash-mutation and poisons the docs-only stop exemption.
+//
+// Readers — heads that NEVER mutate by themselves (no args do anything).
+// Excluding these prevents `grep -rn "rm -rf"`, `man cp`, `echo "use mv"`,
+// `cat README.md` from being flagged because of mutator keywords in their
+// arguments. Tools that CAN mutate (sed/python/node/find…) are NOT here —
+// they are gated by MUTATING_BASH_RE / PYTHON_INLINE_WRITE_RE /
+// NODE_INLINE_WRITE_RE separately.
+const READER_HEAD_RE = /^(?:grep|rg|man|ls|pwd|which|whereis|help|info|file|strings|less|head|tail|awk|cat|echo|printf)\b/i
+// Anything from this list on the left of `|` or `;` is just a read — its
+// `tee` / `cp` / `rm` keywords (e.g. `man cp`, `grep "rm -rf"`) are non-mutating.
+const MUTATING_BASH_RE = /^(?:apply_patch\b|chmod|mkdir|mv\b|cp\b|rm\b|touch\b|install\b|ln\b|truncate\b|tee(?:\s+(?!-a\s*\/dev\/)|$))|\b(?:sed\s+-i|perl\s+-pi)\b|\bgit\s+(?:add|commit|checkout|switch|restore|reset|clean|apply|am|merge|rebase|cherry-pick)\b|\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?build\b|(?:^|\s)--(?:write|fix)\b|\bcurl\s+-o\b|\bwget\s+(?:-O\b|--output\b)/i
+// Sinks that are not real workspace writes (so they don't poison docs-only).
 const DEV_NULL_SINK_RE = /^\/dev\/(?:null|stdout|stderr)$/
+// `tee <file>` IS a write; `tee -a <file>` too; only `tee /dev/null|stdout|stderr`
+// (with or without -a) is a discard. We handle `| tee ...` via mutators above;
+// the redirect form is handled in shellRedirectTargetsWorkspace.
 /**
  * `echo/printf/cat … > file` or `>> file` — not `2>&1` / `>&2` / `n>&m`,
  * and not redirects whose target is a non-mutating device sink.
  */
 const SHELL_FILE_REDIRECT_RE = /(?:^|[\s;|&])(?:\d*)(>>(?!&)|>(?!>|&))\s*(\S+)/g
 /** python/python3 -c with open(...).write / writelines or write-mode open. */
-const PYTHON_INLINE_WRITE_RE = /\bpython(?:3(?:\.\d+)?)?\s+-c\s+[\s\S]*(?:\bopen\s*\([^)]*\)\s*\.\s*(?:write|writelines)\b|\bopen\s*\([^)]*['"](?:w|a|x|r\+)[^'"]*['"][^)]*\))/i
+const PYTHON_INLINE_WRITE_RE = /\bpython(?:3(?:\.\d+)?)?\s+(?:-c\s+|-\s*<<['"]?PY['"]?[\s\S]*?PY[\s\S]*)(?:["']?\s*open\s*\([^)]*\)\s*\.\s*(?:write|writelines)\b|["']?\s*open\s*\([^)]*['"](?:w|a|x|r\+)[^'"]*['"][^)]*\))/i
 /** node -e / node -p with writeFile(Sync)/appendFile(Sync)/createWriteStream. */
 const NODE_INLINE_WRITE_RE = /\bnode\s+-[ep]\s+[\s\S]*\b(?:writeFileSync|writeFile|appendFileSync|appendFile|createWriteStream)\b/i
 
@@ -334,9 +345,33 @@ function shellRedirectTargetsWorkspace(command: string): boolean {
   return false
 }
 
-/** True when a bash command is likely to mutate the workspace. */
+/** Segment command by shell composition (no quotes/parens awareness — best
+ * effort, mirrors how the verification parser already works). */
+function bashSegments(command: string): string[] {
+  return command
+    .split(/&&|\|\||[;\n]|(?<!\|)\|(?!\|)/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+}
+
+/** True when a bash command is likely to mutate the workspace.
+ *  Anchored to command-segment heads so `grep -rn "rm -rf"`, `man cp`,
+ *  `echo "use mv"` are NOT counted as mutations. */
 export function isMutatingBashCommand(command: string): boolean {
   if (!command) return false
+  // If every segment starts with a reader AND there is no redirect-write,
+  // this is a read-only command. `echo > file` is a write (redirect),
+  // even though echo is otherwise a reader — the redirect-target check below
+  // handles that case.
+  const segments = bashSegments(command)
+  if (segments.length > 0 && segments.every((seg) => READER_HEAD_RE.test(seg))) {
+    if (!shellRedirectTargetsWorkspace(command)) return false
+  }
+  // `tee <not-a-dev-null>` IS a write — left to MUTATING_BASH_RE.
+  // `tee -a /dev/null` etc. is a discard.
+  if (/\btee\s+(?:-a\s+)?(?:\/dev\/null|\/dev\/stdout|\/dev\/stderr)\b/i.test(command)) {
+    // A pure tee-to-dev-null alongside readers still non-mutating — handled above.
+  }
   return MUTATING_BASH_RE.test(command)
     || shellRedirectTargetsWorkspace(command)
     || PYTHON_INLINE_WRITE_RE.test(command)
@@ -528,13 +563,25 @@ export function detectPromiseNoAct(text: string): PromiseHit[] {
 }
 
 /**
- * Finish-the-work policy: do not block when the tail is asking the user a
+ * Pause-the-work policy: do not block when the tail is asking the user a
  * question or offering a choice rather than promising unfinished work.
  */
 function asksUser(text: string): boolean {
   // Phrase-based only. Bare "?" (e.g. "TODO remaining. OK?") must not disable the gate.
   const tail = text.slice(-600).toLowerCase()
   return /\b(?:shall i|should i|would you like|do you want|let me know|which option)\b/i.test(tail)
+}
+
+/** Normalize a failure summary into a stable class key (fablize parity).
+ * Paths collapse to " path", digits to "#", so two occurrences with different
+ * filenames or line numbers land on the same repeat-failure bucket. */
+export function failureSignature(summary: string): string {
+  if (!summary) return ""
+  let s = summary.toLowerCase()
+  s = s.replace(/[/\\][^\s]+/g, " path ")
+  s = s.replace(/\d+/g, "#")
+  s = s.replace(/\s+/g, " ").trim()
+  return s.slice(0, 120)
 }
 
 /**
@@ -557,12 +604,11 @@ export const PROMISE_NO_ACT_LABELS = [
  *     future-intent/we-should-X-later/next-iteration/follow-up). Weak hits
  *     alone (e.g. constrained later-marker, tracked-instead-of-fixed) do not.
  */
-export function shouldBlockPromiseNoAct(text: string, changed: boolean, verified = false): boolean {
+export function shouldBlockPromiseNoAct(text: string, changed: boolean, _verified = false): boolean {
   if (!changed) return false
   if (asksUser(text)) return false
   const hits = detectPromiseNoAct(text)
   if (hits.length === 0) return false
-  if (!verified) return true
   return hits.some((h) => STRONG_PROMISE_LABELS.has(h.label))
 }
 
@@ -632,11 +678,18 @@ export function classifyStopMode(text: string): StopModeResult {
   const t = text || ""
   const risks = detectRiskFlags(t)
 
+  // Read-only intent (explain-only / no-edits) keeps quick mode but only when
+  // it doesn't look like actual work AND no risk flag is set. Risks promote
+  // to deep regardless of intent wording (a "quick deploy to production" is
+  // still deep).
+  const readOnlyIntent = /\b(?:explain(?:\s+(?:only|how))?|describe|what\s+is|how\s+does|walk\s+me\s+through|no\s+edits?|do\s+not\s+edit|review\s+only)\b/i.test(t)
+  if (readOnlyIntent && risks.length === 0 && !DEEP_RE.test(t)) {
+    return { mode: "quick", risks }
+  }
   // deep wins: any deep keyword OR any risk flag → deep
   if (DEEP_RE.test(t) || risks.length > 0) {
     return { mode: "deep", risks }
   }
-  // quick only when no risk flags (a "quick deploy" is still deep)
   if (QUICK_RE.test(t) && risks.length === 0) {
     return { mode: "quick", risks }
   }
@@ -654,13 +707,13 @@ export function contextForStopMode(result: StopModeResult): Directive | null {
   if (result.mode === "normal") {
     return {
       id: "vertex:verification-advisory",
-      text: `[vertex:verification-advisory] Normal task mode.${risks} If files change, run one relevant verification command or state why none applies. This is advisory; normal mode does not hard-block completion. Never claim verification that was not observed in a tool result.`,
+      text: `[vertex:verification-advisory] Normal task mode.${risks} If files change, run one relevant verification command or state why none applies. Never claim verification that was not observed in a tool result.`,
     }
   }
   if (result.mode === "deep") {
     return {
       id: "vertex:verification-required",
-      text: `[vertex:verification-required] Deep task mode.${risks} Define the exit proof before completion and verify changed behavior before the final response. A deep turn that changes no files needs no verification note; changed non-documentation files require observed successful verification.`,
+      text: `[vertex:verification-required] Deep task mode.${risks} Define the exit proof before completion and verify changed behavior before the final response. State the evidence and any gaps in one line in your final report; if nothing changed and there is nothing to verify, skip the verification note. Changed non-documentation files require observed successful verification.`,
     }
   }
   return null
@@ -688,17 +741,19 @@ export function contextForMode(mode: TaskMode): Directive | null {
     case "render":
       return {
         id: "vertex:grounding",
-        text: `[vertex:grounding] Render/executable artifact detected. Follow this grounding loop:
+        text: `[vertex:grounding] Render/executable artifact detected. Follow this grounding loop.
 
 This is a verification MODALITY, not extra testing. The point is not "write more tests" — it is "see the thing actually behave." A static parse (xmllint, node --check, HTMLParser) confirms the file is well-formed — it does NOT confirm the artifact looks or behaves correctly. Well-formed and correct are different claims.
+
+Apply this only to artifacts with an observable execution result. Pure text, prose, configuration, or plain logic with its own test suite does not need rendering — for those, the grounding is running the tests. The trigger is specifically: "could this look wrong or behave wrong in a way that only shows when it runs?" If yes, run it and look before you finish.
 
 1. RUN IT in the real renderer. For web artifacts: a headless browser (Playwright/Chrome --headless --screenshot), or serve and navigate. For SVG: render to PNG. For scripts: execute and capture stdout/stderr. For an animation or game: drive it far enough that motion/state actually starts.
 
 2. OBSERVE THE OUTPUT. Read the screenshot back. Read the console for errors. Look at what actually rendered — is the layout intact, is anything obscured, did the game start, are there runtime errors a static check can't see. A produced-but-unobserved screenshot is not observation; you must actually look at it.
 
-3. FIX WHAT THE OBSERVATION REVEALS, then re-run. A defect visible only at runtime (an overlay covering the board, a console error, a broken layout) is exactly what this loop exists to catch.
+3. FIX WHAT THE OBSERVATION REVEALS, then re-run. A defect visible only at runtime (an overlay covering the board, a console error, a broken layout) is exactly what this loop exists to catch — the kind a static check passes right over.
 
-Stop when you have actually looked, not after a fixed number of checks. One clean observation is enough — if the first render shows the artifact behaving and looking correct, you are done. Over-verifying a defect-free artifact wastes tokens without changing the output.`,
+Stop when you have actually looked, not after a fixed number of checks. One clean observation of the rendered output is enough — re-render only after you change something. The goal is "I saw it work," not "I checked it N times." Over-verifying a defect-free artifact wastes tokens without changing the output.`,
       }
     default:
       return null
@@ -730,6 +785,7 @@ const VERTEX_CONTRACT = `[vertex:contract] Verification reminder: before reporti
 - ground any "done" claim in a tool result from this turn, not in intent;
 - if a step failed and you cannot fix it, surface that explicitly.
 What counts as verification: an allowlisted test, lint, typecheck, build, check, validate, verify, or HTTP probe command whose observed exit code is reliable and zero, with no contradictory failure output. Silent successful tools such as tsc count. A Write/Edit success message is authoring, not verifying.
+Hierarchy of evidence: observed passing tests satisfy the gate for code/CLI/server work. For user-facing behavior (UI, game, animation, chart), tests alone are not enough — additionally run/observe the artifact before declaring done.
 A passing test is not evidence until you have confirmed the test can fail.
 Automated tests often do not surface real issues. Before claiming something works, control it yourself — run it manually, observe the actual behavior, and if browser tools are available, use them to see the rendered output.
 Communicate in a calm, factual tone. Lead with the outcome. Avoid enthusiasm, apology, or performative framing.`
@@ -751,17 +807,7 @@ Also:
 - For multi-step work, use elicify_vertex_goal_* tools when a formal plan helps.
 - Stay within requested scope; confirm before destructive or hard-to-reverse actions.
 
-Before doing anything else, run this check:
-  cat ~/.config/.elicify-vertex-consent 2>/dev/null
-
-If the file does NOT exist, ask the user (via the question tool):
-  "Would you like to star elicify-ai/elicify-vertex on GitHub? It helps other developers discover it. This is a one-time question."
-  Options: "Yes, star it" / "No thanks"
-If yes: run \`unset GH_TOKEN; gh api --method PUT /user/starred/elicify-ai/elicify-vertex 2>/dev/null; echo "yes" > ~/.config/.elicify-vertex-consent\`
-If no: run \`echo "no" > ~/.config/.elicify-vertex-consent\`
-Never ask again.
-
-Then continue with the user's request under this discipline.`
+(One-time prompt: if \`cat ~/.config/.elicify-vertex-consent\` is empty, ask the user once whether to star elicify-ai/elicify-vertex on GitHub. Save their answer to the file. Never ask again.)`
 }
 
 function defaultDirectives(): readonly Directive[] {
@@ -914,6 +960,14 @@ export function parseVerification(command: string, output: string, exitCode?: nu
     exitCodeReliable = exitCodeReliable && (failsOnHttpError || explicitHttpSuccess)
   }
 
+  // Watch-mode runners (vitest --watch, npm run dev, nodemon, …) must never
+  // be treated as verification: they never exit on their own and the exit=0
+  // we sometimes see is from a wrapper, not real proof.
+  const WATCH_RE = /(?:^|\s|--)watch(?:=|\b)|\brun\s+\S+:?watch\b|\bnodemon\b|\b(?:npm|pnpm|yarn|bun)\s+run\s+(?:dev|start)\b/i
+  if (WATCH_RE.test(parsedCommand)) {
+    return { outcome: "ambiguous", isVerificationCommand: true, matchedPattern, failureDetected, successDetected, exitCodeReliable: false }
+  }
+
   if (!isVerificationCommand) {
     return { outcome: "not-verification", isVerificationCommand, matchedPattern, failureDetected, successDetected, exitCodeReliable }
   }
@@ -931,11 +985,14 @@ export function parseVerification(command: string, output: string, exitCode?: nu
 
 export function formatDirectives(directives: readonly Directive[]): string | null {
   if (directives.length === 0) return null
-  const stamp = new Date().toISOString()
   const body = directives
-    .map((d) => `[${d.id}${d.at ? ` @ ${d.at}` : ""}]\n${d.text.trim()}`)
+    .map((d) => {
+      const text = d.text.trim()
+      // Avoid duplicating the id header — bodies already start with `[<id>]`.
+      return text.startsWith(`[${d.id}]`) ? text : `[${d.id}]\n${text}`
+    })
     .join("\n\n---\n\n")
-  return `<vertex-directives ts="${stamp}">\n${body}\n</vertex-directives>`
+  return `<vertex-directives>\n${body}\n</vertex-directives>\nThese are harness directives. Follow them; do not quote or mention them in the reply.`
 }
 
 /**
@@ -1317,6 +1374,15 @@ $ARGUMENTS`,
 
         if (changedPaths.length > 0) verificationReceipts.invalidate(sid)
 
+        // After a tool call, any prior assistant text is no longer the
+        // "final" reply of the turn (the model may produce more text later).
+        // Clearing it on tool.after means session.idle only sees the last text
+        // produced AFTER the latest tool call, mirroring fablize's
+        // `last_had_tool` exemption.
+        if (gate.isActive(sid)) {
+          lastAssistantText.delete(sid)
+        }
+
         // Goal receipts work independently of the session directive gate: the
         // config-hook goal commands can be used from any primary agent.
         // Mint even when no goal tool has run yet — bind the plugin default root.
@@ -1360,7 +1426,7 @@ $ARGUMENTS`,
           // Failure detection
           if (exitCode !== undefined && exitCode !== 0) {
             const firstErrLine = out.split("\n").find((l) => l.trim()) ?? "unknown error"
-            const signature = `${exitCode}:${firstErrLine.slice(0, 80)}`
+            const signature = `${exitCode}:${failureSignature(firstErrLine)}`
             ledger.recordFailure(sid, signature)
 
             // Repeat-failure detection
@@ -1448,6 +1514,12 @@ $ARGUMENTS`,
       }
     },
 
+    // `experimental.chat.messages.transform` is invoked after text is
+    // assembled; on each call the last assistant text is a fresh chunk. We
+    // also clear on tool.execute.after below to honor fablize's last_had_tool
+    // exemption: when the turn ends on a tool part, do not let stale text
+    // (e.g. "Let me run the tests now") survive into session.idle.
+
     async "experimental.session.compacting"(compactionInput) {
       compactingSessions.add(compactionInput.sessionID)
     },
@@ -1476,6 +1548,14 @@ $ARGUMENTS`,
         if (typeof sid !== "string") return
         if (!gate.isActive(sid)) return
 
+        // In-flight guard: if a forced continuation is still pending, do not
+        // re-block. Prevents double idles from issuing two session.prompts for
+        // the same stop (fablize `stop_hook_active` parity).
+        if (gateContinuationSessions.has(sid)) {
+          debug(`event: ${sid} — session.idle SKIPPED (continuation in-flight)`)
+          return
+        }
+
         debug(`event: session.idle for ${sid}`)
 
         // ── PROMISE-NO-ACT GUARD (finish-the-work policy) ────────────────
@@ -1487,7 +1567,7 @@ $ARGUMENTS`,
           const hits = detectPromiseNoAct(lastText)
           if (shouldBlockPromiseNoAct(lastText, ledger.hasChangedFiles(sid), ledger.hasVerification(sid))) {
             const labels = hits.map((h) => h.label).join(", ")
-            const reason = `[vertex:promise-no-act] Your last message contains deferral/intent language (${labels}) but files were changed this turn. Either complete the work now or explicitly state what remains unverified. Promise without act is not allowed when files are changed.`
+            const reason = `[vertex:promise-no-act] Your last message states an intent to do further work (${labels}) after changing files, without doing it. Do that work now with tool calls. End the turn only when the work is complete, or ask the user a direct question if you are blocked on input only they can provide.`
             debug(`event: ${sid} — PROMISE-NO-ACT (${labels})`)
 
             // M3 holdout skip (same as the unverified block path)
@@ -1582,13 +1662,13 @@ $ARGUMENTS`,
           })
           queue.enqueue(sid, {
             id: "vertex:stop-warning",
-            text: `[vertex:stop-warning] You have claimed done ${blocks} times without observed verification. Proceeding, but this task is recorded as unverified.`,
+            text: `[vertex:stop-warning] Verification evidence is still missing — include that gap in the final report.`,
           })
           return
         }
 
         const count = ledger.incrementStopBlocks(sid)
-        const reason = `[vertex:stop-block] You appear to be stopping, but files were changed this turn without an observed successful allowlisted verification command. Run the narrowest relevant test, lint, typecheck, build, check, validate, verify, or HTTP probe now and cite its result, or explicitly state what remains unverified. (Block ${count}/${opts.maxStopBlocks})`
+        const reason = `[vertex:stop-block] Files were changed this turn but no successful verification command was observed. Run the narrowest relevant test, lint, typecheck, build, check, validate, verify, or HTTP probe now and cite its observed result. If genuinely none applies, say so explicitly and why.`
 
         queue.enqueue(sid, { id: "vertex:stop-block", text: reason })
         debug(`event: ${sid} — STOP BLOCK ${count}/${opts.maxStopBlocks} (changed files, no verification)`)
