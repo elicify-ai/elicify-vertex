@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>elicify-vertex — Events, actions & injected prompts</title>
+  <style>
+    :root {
+      --bg: #0a0a0b;
+      --panel: #121214;
+      --panel2: #1a1a1e;
+      --border: #2a2a32;
+      --text: #e8e8ed;
+      --muted: #9a9aa8;
+      --accent: #d4af37;
+      --oc: #5b9fd4;
+      --claude: #d97706;
+      --fab: #c4b5fd;
+      --vx: #34d399;
+      --prompt: #fbbf24;
+      --unused: #52525b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Inter", ui-sans-serif, system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.45;
+      padding: 1.75rem 1rem 3.5rem;
+    }
+    .wrap { max-width: 1280px; margin: 0 auto; }
+    h1 {
+      font-weight: 600;
+      font-size: 1.55rem;
+      letter-spacing: -0.02em;
+      margin: 0 0 0.35rem;
+    }
+    .sub { color: var(--muted); margin: 0 0 1.25rem; font-size: 0.92rem; max-width: 52rem; }
+    .legend {
+      display: flex; flex-wrap: wrap; gap: 0.65rem 1.1rem;
+      margin-bottom: 1.25rem; font-size: 0.82rem; color: var(--muted);
+    }
+    .legend i {
+      display: inline-block; width: 0.55rem; height: 0.55rem;
+      border-radius: 999px; margin-right: 0.35rem; vertical-align: middle;
+    }
+    .i-oc { background: var(--oc); }
+    .i-cl { background: var(--claude); }
+    .i-fb { background: var(--fab); }
+    .i-vx { background: var(--vx); }
+    .i-pr { background: var(--prompt); }
+    h2 {
+      font-size: 0.75rem;
+      font-weight: 600;
+      color: var(--accent);
+      margin: 1.75rem 0 0.65rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+    .scroll {
+      overflow-x: auto;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--panel);
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.8rem;
+      min-width: 960px;
+    }
+    th, td {
+      text-align: left;
+      vertical-align: top;
+      padding: 0.65rem 0.7rem;
+      border-bottom: 1px solid var(--border);
+    }
+    th {
+      background: var(--panel2);
+      color: var(--muted);
+      font-weight: 600;
+      font-size: 0.68rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: rgba(255,255,255,0.015); }
+    code {
+      font-family: ui-monospace, "JetBrains Mono", Menlo, monospace;
+      font-size: 0.74rem;
+      background: #0c0c10;
+      padding: 0.08rem 0.3rem;
+      border-radius: 3px;
+      color: #c8c8d4;
+      word-break: break-word;
+    }
+    .ev {
+      font-family: ui-monospace, "JetBrains Mono", monospace;
+      font-size: 0.76rem;
+      color: var(--oc);
+      font-weight: 500;
+    }
+    .cl {
+      font-family: ui-monospace, "JetBrains Mono", monospace;
+      font-size: 0.76rem;
+      color: var(--claude);
+    }
+    .plain { color: var(--text); }
+    .muted { color: var(--muted); }
+    .none { color: var(--unused); font-style: italic; }
+    .prompt-box {
+      margin-top: 0.35rem;
+      padding: 0.45rem 0.55rem;
+      background: #0c0c10;
+      border: 1px solid #2a2518;
+      border-left: 3px solid var(--prompt);
+      border-radius: 4px;
+      font-family: ui-monospace, "JetBrains Mono", monospace;
+      font-size: 0.7rem;
+      color: #e7d5a3;
+      white-space: pre-wrap;
+      line-height: 1.4;
+    }
+    .prompt-box .lbl {
+      display: block;
+      color: #a38b4a;
+      font-size: 0.62rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      margin-bottom: 0.25rem;
+      font-family: inherit;
+    }
+    .chip {
+      display: inline-block;
+      font-size: 0.62rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+      padding: 0.1rem 0.35rem;
+      border-radius: 3px;
+      margin-bottom: 0.25rem;
+    }
+    .chip.sys { background: rgba(91,159,212,0.15); color: var(--oc); }
+    .chip.chat { background: rgba(52,211,153,0.12); color: var(--vx); }
+    .chip.none { background: rgba(82,82,91,0.3); color: var(--unused); }
+    .chip.file { background: rgba(167,139,250,0.15); color: var(--fab); }
+    .flow {
+      padding: 0.9rem 1rem;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      font-family: ui-monospace, monospace;
+      font-size: 0.78rem;
+      color: var(--muted);
+      line-height: 1.55;
+    }
+    .flow b { color: var(--vx); }
+    .note {
+      margin-top: 1.25rem;
+      padding: 0.85rem 1rem;
+      border-left: 3px solid var(--accent);
+      background: var(--panel);
+      color: var(--muted);
+      font-size: 0.85rem;
+    }
+    .note strong { color: var(--text); }
+    footer {
+      margin-top: 2rem;
+      color: var(--unused);
+      font-size: 0.72rem;
+    }
+    a { color: var(--oc); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Events, what happens, and what gets injected</h1>
+    <p class="sub">
+      Side-by-side map of <strong>OpenCode</strong> hooks, the closest <strong>Claude Code</strong> hook,
+      what <strong>Fablize</strong> does, and what <strong>elicify-vertex</strong> does — in plain English —
+      plus the <strong>exact style of text</strong> each side injects (if any).
+    </p>
+
+    <div class="legend">
+      <span><i class="i-oc"></i>OpenCode event</span>
+      <span><i class="i-cl"></i>Claude Code event</span>
+      <span><i class="i-fb"></i>Fablize</span>
+      <span><i class="i-vx"></i>Vertex</span>
+      <span><i class="i-pr"></i>Injected prompt text</span>
+    </div>
+
+    <h2>Vertex flow (simple)</h2>
+    <div class="flow"><b>You send a message</b> → turn harness on/off, reset scorecard, maybe show “harness on”
+<b>A tool finishes</b> → note file changes / tests; maybe queue a failure reminder
+<b>Model is about to answer</b> → put rules in the <em>system</em> prompt (you usually don’t see them)
+<b>Model goes idle (“done”)</b> → if proof is missing, block and send a visible nudge
+<b>File edited / compact</b> → extra change signal / don’t lose queued reminders</div>
+
+    <h2>Main mapping table</h2>
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr>
+            <th style="width:14%">When (OpenCode)</th>
+            <th style="width:12%">Claude Code ≈</th>
+            <th style="width:24%">Fablize does…</th>
+            <th style="width:25%">Vertex does…</th>
+            <th style="width:25%">What text is injected?</th>
+          </tr>
+        </thead>
+        <tbody>
+
+          <tr>
+            <td><div class="ev">config</div><div class="muted">Plugin loads</div></td>
+            <td><div class="cl">Install / setup</div></td>
+            <td class="plain">Installs hooks and writes a short always-on block into CLAUDE.md.</td>
+            <td class="plain">Registers slash commands (<code>/elicify-vertex</code>, goal helpers).</td>
+            <td>
+              <span class="chip file">Fablize → CLAUDE.md file</span>
+              <div class="prompt-box"><span class="lbl">Fablize always-on (short)</span>Lead with the outcome · stay in scope · ground “done” in tool results · confirm before destructive actions.
+[2+ stories] run goals.py …
+[debug] follow investigation-protocol.txt …
+[render] follow grounding pack …</div>
+              <span class="chip none" style="margin-top:0.4rem">Vertex: no prompt here</span>
+            </td>
+          </tr>
+
+          <tr>
+            <td><div class="ev">command.execute.before</div><div class="muted">Slash command runs</div></td>
+            <td><div class="cl">Slash / skill run</div></td>
+            <td class="plain none">Not the main path (uses skills/commands differently).</td>
+            <td class="plain">Turns the harness <strong>on</strong> for this chat when you run <code>/elicify-vertex</code>.</td>
+            <td>
+              <span class="chip none">No model inject yet</span>
+              <div class="muted" style="margin-top:0.35rem;font-size:0.75rem">Slash only expands a user template; real inject starts on the next message / LLM call.</div>
+            </td>
+          </tr>
+
+          <tr>
+            <td><div class="ev">chat.message</div><div class="muted">You send a message</div></td>
+            <td><div class="cl">UserPromptSubmit</div></td>
+            <td class="plain">
+              Resets this turn’s scorecard.
+              Picks quick / normal / deep.
+              May add a short debug/render tip.
+            </td>
+            <td class="plain">
+              Turns harness on or off (agent or slash).
+              Resets the scorecard.
+              Classifies how strict to be.
+              Once per session: adds a short “harness on” line you can see.
+            </td>
+            <td>
+              <span class="chip sys">Fablize → additionalContext (short)</span>
+              <div class="prompt-box"><span class="lbl">Fablize mode nudge (exact style)</span>fablize gate — task mode: deep.
+Define the exit proof before completion and verify changed behavior before final. …
+Never claim verification that was not actually observed in a tool result.</div>
+              <div class="prompt-box" style="margin-top:0.4rem"><span class="lbl">Fablize router (if debug/render words match)</span>[fablize:investigation] … follow packs/investigation-protocol.txt …
+[fablize:grounding] … follow packs/verification-grounding-pack.txt …</div>
+              <span class="chip chat" style="margin-top:0.45rem">Vertex → chat (once)</span>
+              <div class="prompt-box"><span class="lbl">Vertex activate cue (user-visible, once)</span>[vertex] harness on · stopMode=deep · task=debugging · elicify-vertex-agent</div>
+              <div class="muted" style="margin-top:0.35rem;font-size:0.75rem">Vertex does <strong>not</strong> put the full contract on this event — that happens on <code>system.transform</code>.</div>
+            </td>
+          </tr>
+
+          <tr>
+            <td><div class="ev">tool.execute.after</div><div class="muted">A tool just finished</div></td>
+            <td><div class="cl">PostToolUse</div></td>
+            <td class="plain">
+              Notes “files changed” and whether a test looked green or red.
+              If something failed (or failed twice), tells the model not to pretend it’s done.
+            </td>
+            <td class="plain">
+              Same idea: update the scorecard.
+              Queue a failure reminder if needed.
+              If a real verifier passed, save a receipt id on the tool output.
+            </td>
+            <td>
+              <span class="chip sys">Only if failure (both)</span>
+              <div class="prompt-box"><span class="lbl">Fablize / Vertex failure (same idea)</span>fablize gate observed a tool failure. Do not report completion until it is fixed…
+— or —
+[vertex:tool-failure] A tool call failed (exit N). Do not report completion until it is fixed…
+
+[vertex:repeat-failure] The same class of failure has repeated N times. Stop retrying silently…</div>
+              <span class="chip chat" style="margin-top:0.4rem">Vertex receipt (tool output)</span>
+              <div class="prompt-box"><span class="lbl">Appended to tool result when verify succeeds</span>[vertex:verification-receipt] vrf_…</div>
+              <div class="muted" style="margin-top:0.35rem;font-size:0.75rem">Failure text is queued, then delivered on the <strong>next</strong> system inject (Vertex) or as PostToolUse context (Fablize).</div>
+            </td>
+          </tr>
+
+          <tr>
+            <td><div class="ev">experimental.chat.system.transform</div><div class="muted">Right before the model thinks</div></td>
+            <td><div class="cl">System prompt / additionalContext merge</div></td>
+            <td class="plain">
+              Fablize does <strong>not</strong> re-paste a long contract here every time.
+              Baseline lives in CLAUDE.md; UPS already added a short mode line.
+            </td>
+            <td class="plain">
+              If harness is on: always attach the verify-before-done rules to the <strong>system</strong> side.
+              Add mode tips if needed.
+              Dump any queued failure/stop reminders.
+              You usually <strong>don’t see</strong> this in the chat UI.
+            </td>
+            <td>
+              <span class="chip sys">Vertex every active turn (system — invisible in chat)</span>
+              <div class="prompt-box"><span class="lbl">Envelope</span><vertex-directives ts="…">
+[vertex:contract]
+…full contract…
+---
+[vertex:verification-required]   ← if deep
+… or verification-advisory if normal …
+---
+[vertex:investigation]           ← if debugging task
+… or grounding / review-recall …
+---
+[vertex:ledger] This turn's evidence: …   ← if any
+---
+[queued: tool-failure | stop-block | …]  ← if any
+</vertex-directives></div>
+              <div class="prompt-box" style="margin-top:0.4rem"><span class="lbl">vertex:contract (exact body)</span>[vertex:contract] Verification reminder: before reporting a task as done,
+- observe the actual output of the change (run the test, render the artifact, hit the endpoint);
+- ground any "done" claim in a tool result from this turn, not in intent;
+- if a step failed and you cannot fix it, surface that explicitly.
+What counts as verification: an allowlisted test, lint, typecheck, build, check, validate, verify, or HTTP probe… Silent successful tools such as tsc count. A Write/Edit success message is authoring, not verifying.
+A passing test is not evidence until you have confirmed the test can fail.
+…control it yourself… Communicate in a calm, factual tone…</div>
+              <div class="prompt-box" style="margin-top:0.4rem"><span class="lbl">Deep mode add-on (exact)</span>[vertex:verification-required] Deep task mode. Define the exit proof before completion and verify changed behavior before the final response. A deep turn that changes no files needs no verification note; changed non-documentation files require observed successful verification.</div>
+            </td>
+          </tr>
+
+          <tr>
+            <td><div class="ev">experimental.text.complete</div><div class="muted">Model finished its reply text</div></td>
+            <td><div class="cl">End of assistant message</div></td>
+            <td class="plain">Doesn’t inject here. Later, on Stop, reads the last words from the transcript.</td>
+            <td class="plain">Remembers the last reply so it can catch “I’ll do it later…” endings.</td>
+            <td><span class="chip none">No inject on this event</span></td>
+          </tr>
+
+          <tr>
+            <td><div class="ev">event → session.idle</div><div class="muted">Model stopped / turn idle</div></td>
+            <td><div class="cl">Stop</div></td>
+            <td class="plain">
+              If deep work changed files but no real test was seen → block “done” and force another turn.
+              If the last message only promised work → block and say “do it now.”
+            </td>
+            <td class="plain">
+              Same idea: check the scorecard.
+              If fake “done” or empty promise after edits → send a visible pause message and make the model continue.
+            </td>
+            <td>
+              <span class="chip chat">User-visible continuation (both)</span>
+              <div class="prompt-box"><span class="lbl">Fablize stop (style)</span>decision: block
+reason: …changed files without observed verification…</div>
+              <div class="prompt-box" style="margin-top:0.4rem"><span class="lbl">Fablize promise-no-act (exact idea)</span>Your previous response ended by stating an intent to do work without actually doing it. Do that work now with tool calls…</div>
+              <div class="prompt-box" style="margin-top:0.4rem"><span class="lbl">Vertex gate (user-visible, 0.9.2+)</span>[vertex] completion paused · verification required
+
+[vertex:stop-block] You appear to be stopping, but files were changed this turn without an observed successful allowlisted verification command. Run the narrowest relevant test… (Block 1/3)</div>
+              <div class="prompt-box" style="margin-top:0.4rem"><span class="lbl">Vertex promise (user-visible)</span>[vertex] completion paused · unfinished work signaled after file changes
+
+[vertex:promise-no-act] Your last message contains deferral/intent language (…) but files were changed…</div>
+            </td>
+          </tr>
+
+          <tr>
+            <td><div class="ev">event → file.edited</div><div class="muted">Host says a file changed</div></td>
+            <td><div class="cl muted">—</div></td>
+            <td class="plain none">Not used.</td>
+            <td class="plain">Counts as a file change (if only one active session) and forgets old “tests passed” proof.</td>
+            <td><span class="chip none">No prompt — scorecard only</span></td>
+          </tr>
+
+          <tr>
+            <td><div class="ev">experimental.session.compacting</div><div class="muted">Chat is being summarized</div></td>
+            <td><div class="cl">≈ PreCompact</div></td>
+            <td class="plain none">Not used.</td>
+            <td class="plain">Holds queued reminders so they aren’t lost mid-summary.</td>
+            <td><span class="chip none">No prompt</span></td>
+          </tr>
+
+          <tr>
+            <td><div class="ev">event → session.compacted</div><div class="muted">Summary finished</div></td>
+            <td><div class="cl muted">—</div></td>
+            <td class="plain none">Not used.</td>
+            <td class="plain">Allows queued reminders again.</td>
+            <td><span class="chip none">No prompt</span></td>
+          </tr>
+
+          <tr>
+            <td><div class="ev">tool.execute.before</div><div class="muted">Before a tool runs</div></td>
+            <td><div class="cl">PreToolUse</div></td>
+            <td class="plain none">Not used by Fablize (host may block dangerous commands).</td>
+            <td class="plain none">Not used by Vertex.</td>
+            <td><span class="chip none">—</span></td>
+          </tr>
+
+        </tbody>
+      </table>
+    </div>
+
+    <h2>Optional mode prompts Vertex may add every turn (system)</h2>
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>When classified</th>
+            <th>Inject id</th>
+            <th>What it tells the model (summary)</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Always (active)</td>
+            <td><code>vertex:contract</code></td>
+            <td>Verify before “done”; calm tone; Write ≠ verify</td>
+          </tr>
+          <tr>
+            <td>stopMode = normal</td>
+            <td><code>vertex:verification-advisory</code></td>
+            <td>If files change, run one check or say why not (does not hard-block)</td>
+          </tr>
+          <tr>
+            <td>stopMode = deep</td>
+            <td><code>vertex:verification-required</code></td>
+            <td>Must define exit proof; non-docs changes need observed verify</td>
+          </tr>
+          <tr>
+            <td>task = debugging</td>
+            <td><code>vertex:investigation</code></td>
+            <td>Full 6-step investigate discipline (reproduce → 3+ hypotheses → …)</td>
+          </tr>
+          <tr>
+            <td>task = render/UI</td>
+            <td><code>vertex:grounding</code></td>
+            <td>Full run → observe → fix → re-run loop</td>
+          </tr>
+          <tr>
+            <td>task = review</td>
+            <td><code>vertex:review-recall</code></td>
+            <td>Collect all findings first, filter in a second pass</td>
+          </tr>
+          <tr>
+            <td>Evidence this turn</td>
+            <td><code>vertex:ledger</code></td>
+            <td>One line: files changed / verified counts / risks</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="note">
+      <strong>Biggest difference:</strong>
+      Fablize keeps the always-on text <em>short in CLAUDE.md</em> and injects <em>short</em> mode lines on UserPromptSubmit.
+      Vertex puts a <em>full contract (and often full procedures)</em> into the system prompt on <em>every model turn</em> while active.
+      Both use tool results + stop/idle for the “you’re not done” gates.
+    </div>
+
+    <footer>
+      docs/event-mapping.html · elicify-vertex · sources: OpenCode plugin hooks, fablize hooks.json / gate_*.py / fablize-block.md, src/index.ts
+    </footer>
+  </div>
+</body>
+</html>

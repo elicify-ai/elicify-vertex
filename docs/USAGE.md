@@ -124,11 +124,12 @@ State files (mode `0600`, dir `0700`): `goals.json`, `goals.ledger.jsonl`, lockf
 
 | Path | Visible in chat UI? |
 |------|---------------------|
-| System inject (`<vertex-directives>` each turn) | **No** — model-only by design |
-| **Activate cue** (first harness-on message) | **Yes** — one line, e.g. `[vertex] harness on · stopMode=deep · …` |
+| **Static contract** | In **Elicify-Vertex-Agent** prompt always; also in **`/elicify-vertex` slash template** (injected when you run the slash — not only a silent switch) |
+| System inject each turn | **Dynamic only** (mode / ledger / queued failures) — **not** the full static contract |
+| **Activate cue** (first harness-on message) | **Yes** — one line, e.g. `[vertex] harness on · stopMode=…` |
 | **Gate block** (stop / promise-no-act) | **Yes** — continuation with headline + full reason |
 | Verification receipt on tool output | **Yes** — `[vertex:verification-receipt] vrf_…` |
-| Operator proof | `VERTEX_DEBUG=1` → `~/.config/opencode/.vertex-debug.log` (`ACTIVATED`, `INJECTED`, `ACTIVATE CUE`, `STOP BLOCK`) |
+| Operator proof | `VERTEX_DEBUG=1` → `~/.config/opencode/.vertex-debug.log` |
 
 Full requirements: [REQUIREMENTS-INJECTION-VISIBILITY.md](./REQUIREMENTS-INJECTION-VISIBILITY.md).
 

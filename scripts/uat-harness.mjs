@@ -160,10 +160,11 @@ console.log("A. Activation")
   )
   await hooks["chat.message"](
     { sessionID: sid2, agent: "build" },
-    { message: {}, parts: [{ type: "text", text: "Activate the elicify-vertex verification harness." }] },
+    { message: {}, parts: [{ type: "text", text: "implement the parser under the elicify-vertex harness." }] },
   )
   const inj2 = await systemInject(hooks, sid2)
-  assert("A2-slash-elicify-vertex-activates", inj2.includes("vertex-directives") && inj2.includes("vertex:contract"), "slash activates")
+  assert("A2-slash-elicify-vertex-activates", inj2.includes("verification-advisory") || inj2.includes("verification-required"), "slash activates dynamic inject")
+  assert("A2-no-static-contract-every-turn", !inj2.includes("A passing test is not evidence until you have confirmed the test can fail"), "static contract not in every-turn system inject")
   assert("A2-classify-event", eventsOf("classify", sid2).length >= 1, `classify count=${eventsOf("classify", sid2).length}`)
   assert("A2-debug-activated", debugText().includes("ACTIVATED"), "debug shows ACTIVATED")
 
@@ -171,8 +172,9 @@ console.log("A. Activation")
   const sid3 = "uat-a3"
   await activate(hooks, sid3, "deep implement something")
   const inj3 = await systemInject(hooks, sid3)
-  assert("A3-agent-activates", inj3.includes("vertex:contract"), "agent activates")
-  assert("A3-deep-guidance", inj3.includes("verification-required") || inj3.includes("deep"), "deep guidance present")
+  assert("A3-agent-activates", inj3.includes("verification-required"), "agent activates with deep guidance")
+  assert("A3-deep-guidance", inj3.includes("verification-required") || debugText().includes("stopMode=deep"), "deep guidance present")
+  assert("A3-no-static-contract-every-turn", !inj3.includes("A passing test is not evidence until you have confirmed the test can fail"), "static contract not re-injected every turn")
 
   clearLogs()
   const sid4 = "uat-a4"
@@ -796,7 +798,7 @@ console.log(`Debug:     ${join(uatRoot, ".config/opencode/.vertex-debug.log")}`)
 
 // Coverage checklist of inject IDs exercised this run
 const injectIds = [
-  "vertex:contract",
+  "vertex:contract (agent prompt + /elicify-vertex slash — not every-turn system)",
   "vertex:verification-required",
   "vertex:verification-advisory",
   "vertex:investigation",

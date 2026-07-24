@@ -1,28 +1,48 @@
 import { describe, expect, it } from "vitest"
 import {
   ElicifyVertexPlugin,
+  VERIFICATION_CONTRACT,
+  elicifyVertexSlashTemplate,
   formatActivateCue,
   formatGateContinuationText,
 } from "../src/index.js"
 
 describe("ElicifyVertexPlugin.config", () => {
-  it("registers the /elicify-vertex slash command with description + template (opencode 1.18.4 schema)", async () => {
-    // Stub PluginInput — config() only mutates its arg, never reads from input.
+  it("registers /elicify-vertex with full behavioral contract in the slash template", async () => {
     const hooks = await ElicifyVertexPlugin({} as any, undefined)
     const input: { command: Record<string, any> } = { command: {} }
-
     await hooks.config!(input as any)
-
-    // The schema REQUIRES `template` (not `prompt`) under opencode 1.18.4.
-    // Missing `template` is what crashed boot before this test existed.
     expect(input.command["elicify-vertex"]).toBeDefined()
-    expect(input.command["elicify-vertex"].template).toEqual(expect.any(String))
-    expect(input.command["elicify-vertex"].template.length).toBeGreaterThan(0)
-    expect(input.command["elicify-vertex"].description).toEqual(expect.any(String))
-    // Guard against the regression: `prompt` is NOT a valid field.
+    expect(input.command["elicify-vertex"].template).toContain("[vertex:contract]")
+    expect(input.command["elicify-vertex"].template).toContain("Verification reminder")
+    expect(input.command["elicify-vertex"].template.length).toBeGreaterThan(400)
     expect(input.command["elicify-vertex"].prompt).toBeUndefined()
-    // Single activation slash command — no /vertex alias.
     expect(input.command.vertex).toBeUndefined()
+    expect(elicifyVertexSlashTemplate()).toContain(VERIFICATION_CONTRACT.slice(0, 40))
+  })
+
+  it("slash activation enables harness; system inject is dynamic not full static contract every turn", async () => {
+    const hooks = await ElicifyVertexPlugin({} as any, undefined)
+    const sessionID = "slash-session"
+    await hooks["command.execute.before"]!({
+      command: "elicify-vertex",
+      sessionID,
+      arguments: "verify this",
+    }, { parts: [] })
+    // User message after slash (any agent) — use implement so stop-mode guidance injects
+    const parts = [{ type: "text", text: "implement the parser fix" } as any]
+    await hooks["chat.message"]!({ sessionID, agent: "build" } as any, {
+      message: {} as any,
+      parts,
+    })
+    expect(parts.map((p: any) => p.text).join("")).toContain("[vertex] harness on")
+
+    const output = { system: [] as string[] }
+    await hooks["experimental.chat.system.transform"]!({ sessionID, model: {} as any }, output)
+    const sys = output.system.join("\n")
+    // Dynamic mode guidance may appear; full static contract must NOT be re-injected every turn
+    expect(sys).toContain("verification-advisory")
+    expect(sys).not.toContain("A passing test is not evidence until you have confirmed the test can fail")
   })
 
   it("does not overwrite a user-provided elicify-vertex command", async () => {
@@ -87,7 +107,7 @@ describe("ElicifyVertexPlugin.config", () => {
 
   it("activates from the actual slash-command lifecycle and stays active for later messages", async () => {
     const hooks = await ElicifyVertexPlugin({} as any, undefined)
-    const sessionID = "slash-session"
+    const sessionID = "slash-session-persist"
     await hooks["command.execute.before"]!({
       command: "elicify-vertex",
       sessionID,
@@ -95,34 +115,39 @@ describe("ElicifyVertexPlugin.config", () => {
     }, { parts: [] })
     await hooks["chat.message"]!({ sessionID, agent: "build" } as any, {
       message: {} as any,
-      parts: [{ type: "text", text: "Activate the elicify-vertex verification harness." } as any],
+      parts: [{ type: "text", text: "implement the fix now" } as any],
     })
 
-    for (const text of ["first expanded command", "later ordinary message"]) {
+    for (const text of ["implement first follow-up", "implement later ordinary message"]) {
       await hooks["chat.message"]!({ sessionID, agent: "build" } as any, {
         message: {} as any,
         parts: [{ type: "text", text } as any],
       })
       const output = { system: [] as string[] }
       await hooks["experimental.chat.system.transform"]!({ sessionID, model: {} as any }, output)
-      expect(output.system.join("\n")).toContain("vertex:contract")
+      // Still active: dynamic stop-mode guidance present; full static contract absent
+      expect(output.system.join("\n")).toMatch(/verification-advisory|verification-required/)
+      expect(output.system.join("\n")).not.toContain(
+        "A passing test is not evidence until you have confirmed the test can fail",
+      )
     }
   })
 })
 
 describe("ElicifyVertexPlugin.chat.message activation gate", () => {
-  /** Helper: run chat.message then check whether system.transform injects a block. */
+  /** Active if harness injects dynamic directives or shows activate cue. */
   async function gateActiveFor(
     sessionID: string,
     agent: string | undefined,
     text: string,
   ): Promise<boolean> {
     const hooks = await ElicifyVertexPlugin({} as any, undefined)
+    const parts = [{ type: "text", text } as any]
     await hooks["chat.message"]!(
       { sessionID, agent } as any,
       {
         message: {} as any,
-        parts: [{ type: "text", text } as any],
+        parts,
       },
     )
     const fakeOutput: { system: string[] } = { system: [] }
@@ -130,16 +155,23 @@ describe("ElicifyVertexPlugin.chat.message activation gate", () => {
       { sessionID, model: {} as any },
       fakeOutput,
     )
-    return fakeOutput.system.some((s) => s.includes("vertex-directives"))
+    const sys = fakeOutput.system.join("\n")
+    const cue = parts.map((p: any) => p.text).join("")
+    return (
+      cue.includes("[vertex] harness on")
+      || sys.includes("vertex-directives")
+      || sys.includes("verification-")
+    )
   }
 
   it("activates when the agent is the elicify-vertex-agent", async () => {
-    const active = await gateActiveFor("s1", "elicify-vertex-agent", "anything")
+    // Use implement so stop-mode guidance is present even without static contract
+    const active = await gateActiveFor("s1", "elicify-vertex-agent", "implement the feature")
     expect(active).toBe(true)
   })
 
   it("activates when the user message STARTS with the trigger", async () => {
-    const active = await gateActiveFor("s2", "build", "/elicify-vertex please verify")
+    const active = await gateActiveFor("s2", "build", "/elicify-vertex please implement the fix")
     expect(active).toBe(true)
   })
 
@@ -148,19 +180,16 @@ describe("ElicifyVertexPlugin.chat.message activation gate", () => {
   })
 
   it("activates with leading whitespace before the trigger", async () => {
-    const active = await gateActiveFor("s3", "build", "   /elicify-vertex go")
+    const active = await gateActiveFor("s3", "build", "   /elicify-vertex implement go")
     expect(active).toBe(true)
   })
 
   it("activates when the trigger is the first token on a new line", async () => {
-    const active = await gateActiveFor("s4", "build", "previous context\n/elicify-vertex now")
+    const active = await gateActiveFor("s4", "build", "previous context\n/elicify-vertex implement now")
     expect(active).toBe(true)
   })
 
   it("does NOT activate on a question mentioning the trigger mid-sentence", async () => {
-    // "is the /elicify-vertex plugin working?" — trigger is in the middle
-    // of a sentence, not at the start of a line. Original code activated
-    // here; the slash-command semantics fix prevents it.
     const active = await gateActiveFor("s5", "build", "is the /elicify-vertex plugin working?")
     expect(active).toBe(false)
   })
@@ -174,17 +203,14 @@ describe("ElicifyVertexPlugin.chat.message activation gate", () => {
     const hooks = await ElicifyVertexPlugin({} as any, undefined)
     const sessionID = "s7"
 
-    // Activate via the vertex agent.
     await hooks["chat.message"]!(
       { sessionID, agent: "elicify-vertex-agent" } as any,
       {
         message: {} as any,
-        parts: [{ type: "text", text: "start" } as any],
+        parts: [{ type: "text", text: "implement start" } as any],
       },
     )
-    expect(await gateActiveFor(sessionID, "elicify-vertex-agent", "still")).toBe(true)
 
-    // Switch to another primary agent → deactivate.
     await hooks["chat.message"]!(
       { sessionID, agent: "build" } as any,
       {

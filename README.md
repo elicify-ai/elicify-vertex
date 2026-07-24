@@ -77,7 +77,7 @@ Details: [docs/USAGE.md](./docs/USAGE.md) · [docs/ARCHITECTURE.md](./docs/ARCHI
 npm install @elicify-ai/elicify-vertex
 ```
 
-Requires Node **≥ 20**. Current package: **`@elicify-ai/elicify-vertex@0.9.2`**.
+Requires Node **≥ 20**. Current package: **`@elicify-ai/elicify-vertex@0.9.3`**.
 
 `postinstall` runs `scripts/install-skill.sh` (skill + agent into `~/.config/opencode/…`). Restart OpenCode after install.
 
@@ -140,7 +140,7 @@ In any other agent/session, run:
 /elicify-vertex
 ```
 
-That is the **only** activation slash command. It turns on the same verification harness for the current session without switching primary agents.
+That **injects the verification discipline into the conversation** (full contract in the slash expansion) **and** turns on the harness for this session (tool evidence + stop/promise gates). It is not a silent flag-only switch.
 
 Optional goal helpers (after the harness is active): `/elicify-vertex-goal-create`, `/elicify-vertex-goal-next`, `/elicify-vertex-goal-checkpoint`, `/elicify-vertex-goal-status`.
 

@@ -23,7 +23,9 @@ An opencode plugin that closes the verification loop: inject → observe → rec
 
 ## Activation
 
-The plugin loads with opencode but only **injects / gates** when a session is activated:
+The **static verification contract** lives in the **Elicify-Vertex-Agent** prompt and in the **`/elicify-vertex` slash template** (slash injects behavior, not only a silent flag). Per-turn `system.transform` carries **dynamic** notes only (mode, ledger, queued failures/stops).
+
+The plugin loads with opencode but only **gates / dynamic-injects** when a session is activated:
 
 | Path | How |
 |------|-----|
