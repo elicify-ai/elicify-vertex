@@ -1195,7 +1195,6 @@ export function formatGateContinuationText(reason: string): string {
       : kind === "stop"
         ? "[vertex] completion paused · verification required"
         : "[vertex] completion paused"
-  if (clean.startsWith("[vertex]")) return `${headline}\n\n${clean}`
   return `${headline}\n\n${clean}`
 }
 
