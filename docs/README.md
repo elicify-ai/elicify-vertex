@@ -27,3 +27,4 @@ This directory holds developer and power-user detail, grounded in the package so
 | [TRADEMARKS.md](../TRADEMARKS.md) | Brand / name policy |
 
 | [REQUIREMENTS-INJECTION-VISIBILITY.md](./REQUIREMENTS-INJECTION-VISIBILITY.md) | Operator-agreed visibility of harness inject/steering |
+| [keyword-inject.html](./keyword-inject.html) | Keyword detection → when inject fires |

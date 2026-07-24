@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Keyword detection & when inject fires — Fablize vs Vertex</title>
+  <style>
+    :root {
+      --bg: #0a0a0b; --panel: #121214; --panel2: #1a1a1e; --border: #2a2a32;
+      --text: #e8e8ed; --muted: #9a9aa8; --accent: #d4af37;
+      --fab: #c4b5fd; --vx: #34d399; --warn: #fbbf24; --dim: #52525b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font-family: Inter, system-ui, sans-serif;
+      background: var(--bg); color: var(--text); line-height: 1.5;
+      padding: 1.75rem 1rem 3rem;
+    }
+    .wrap { max-width: 920px; margin: 0 auto; }
+    h1 { font-size: 1.45rem; margin: 0 0 0.4rem; font-weight: 600; }
+    .sub { color: var(--muted); margin: 0 0 1.25rem; font-size: 0.95rem; }
+    h2 {
+      font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em;
+      color: var(--accent); margin: 1.75rem 0 0.65rem; font-weight: 600;
+    }
+    .callout {
+      background: var(--panel); border: 1px solid var(--border);
+      border-left: 3px solid var(--warn); border-radius: 8px;
+      padding: 0.9rem 1rem; margin: 1rem 0; font-size: 0.9rem; color: var(--muted);
+    }
+    .callout strong { color: var(--text); }
+    .yes { color: var(--vx); font-weight: 600; }
+    .partial { color: var(--warn); font-weight: 600; }
+    .grid2 {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem;
+    }
+    @media (max-width: 720px) { .grid2 { grid-template-columns: 1fr; } }
+    .card {
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 10px; padding: 0.9rem 1rem; font-size: 0.85rem;
+    }
+    .card h3 { margin: 0 0 0.5rem; font-size: 0.9rem; }
+    .card.fab h3 { color: var(--fab); }
+    .card.vx h3 { color: var(--vx); }
+    .card ul { margin: 0; padding-left: 1.1rem; color: var(--muted); }
+    .card li { margin: 0.3rem 0; }
+    .flow {
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 10px; padding: 1rem 1.1rem;
+      font-family: ui-monospace, monospace; font-size: 0.78rem;
+      color: var(--muted); line-height: 1.55; overflow-x: auto;
+    }
+    .flow .t { color: var(--text); }
+    .flow .kw { color: var(--warn); }
+    .flow .inj { color: var(--vx); }
+    .flow .dim { color: var(--dim); }
+    table {
+      width: 100%; border-collapse: collapse; font-size: 0.8rem;
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 10px; overflow: hidden;
+    }
+    th, td {
+      text-align: left; vertical-align: top;
+      padding: 0.55rem 0.65rem; border-bottom: 1px solid var(--border);
+    }
+    th {
+      background: var(--panel2); color: var(--muted); font-size: 0.68rem;
+      text-transform: uppercase; letter-spacing: 0.04em;
+    }
+    tr:last-child td { border-bottom: none; }
+    code {
+      font-family: ui-monospace, monospace; font-size: 0.75rem;
+      background: #0c0c10; padding: 0.08rem 0.3rem; border-radius: 3px; color: #c8c8d0;
+    }
+    .kw-list {
+      font-family: ui-monospace, monospace; font-size: 0.72rem;
+      color: #e7d5a3; background: #0c0c10; border-radius: 6px;
+      padding: 0.5rem 0.65rem; margin: 0.35rem 0; border-left: 3px solid var(--warn);
+    }
+    .ex {
+      margin: 0.75rem 0; padding: 0.75rem 0.9rem;
+      background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+      font-size: 0.85rem;
+    }
+    .ex .u { color: var(--oc, #5b9fd4); font-family: monospace; font-size: 0.8rem; }
+    .ex .arrow { color: var(--dim); margin: 0.35rem 0; font-size: 0.75rem; }
+    .ex .out { color: var(--vx); font-family: monospace; font-size: 0.75rem; white-space: pre-wrap; }
+    footer { margin-top: 2rem; color: var(--dim); font-size: 0.72rem; }
+    a { color: #5b9fd4; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Keyword detection → when inject fires</h1>
+    <p class="sub">
+      Your reading of Fablize is right. Here’s how Vertex compares, and exactly
+      how <em>our</em> keyword detection works and when text is injected.
+    </p>
+
+    <div class="callout">
+      <strong>Your understanding:</strong> Fablize’s important part is
+      <em>UserPromptSubmit</em> — short <strong>mode nudge</strong> every user prompt,
+      plus <strong>router</strong> one-liners when keywords match (investigation / grounding),
+      pointing at pack files.<br /><br />
+      <span class="yes">We do have keyword detection</span> and we do inject mode + investigation/grounding/review
+      from it — <span class="partial">but the timing and shape differ</span>:
+      we classify on <code>chat.message</code>, then re-attach those directives on
+      <strong>every following LLM call</strong> via <code>system.transform</code> until the next user message
+      reclassifies. We do <strong>not</strong> use short “follow pack file” pointers; we inline full procedure text.
+      Static contract is separate (agent / slash), not the UPS-style short block.
+    </div>
+
+    <h2>1. Fablize vs Vertex — the “UPS / router” piece</h2>
+    <div class="grid2">
+      <div class="card fab">
+        <h3>Fablize (Claude UserPromptSubmit)</h3>
+        <ul>
+          <li><strong>When:</strong> every user prompt submit</li>
+          <li><strong>Mode nudge:</strong> a few lines (“task mode: deep…”)</li>
+          <li><strong>Router:</strong> if prompt contains debug/html/… → one line + path to pack file</li>
+          <li><strong>Pack body:</strong> stays on disk; model is told to follow the file</li>
+          <li><strong>Not</strong> re-run on every intermediate LLM step the same way</li>
+        </ul>
+      </div>
+      <div class="card vx">
+        <h3>Vertex (OpenCode)</h3>
+        <ul>
+          <li><strong>When classify:</strong> each <code>chat.message</code> (user message), if harness on</li>
+          <li><strong>Mode nudge:</strong> short-ish <code>verification-required</code> / <code>advisory</code></li>
+          <li><strong>Router-like:</strong> same message → <code>debugging</code> / <code>render</code> / <code>review</code> flags</li>
+          <li><strong>Pack body:</strong> full investigation/grounding/review text <em>inlined</em></li>
+          <li><strong>When inject:</strong> every <code>system.transform</code> (each model call) until next user message</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2>2. Vertex timeline (one user message)</h2>
+    <div class="flow">
+<span class="t">1. You send a message</span>  →  <span class="kw">chat.message</span>
+   · Is harness on? (agent = elicify-vertex-agent OR /elicify-vertex was used)
+   · If no → stop. No classify, no inject.
+   · If yes → <span class="kw">run keyword detectors on the message text</span>
+        classifyStopMode(text)  → quick | normal | deep + risks
+        classifyTask(text)      → baseline | build | debugging | render
+        isReviewTask(text)      → true | false
+   · Store results on the session
+   · Maybe show once: <span class="inj">[vertex] harness on · stopMode=…</span>
+
+<span class="t">2. Model is about to answer</span>  →  <span class="kw">system.transform</span>  (may run several times per turn)
+   · Read stored classification
+   · <span class="inj">Inject dynamic directives into system prompt</span> (invisible in chat UI):
+        if stopMode normal/deep → verification-advisory | verification-required
+        if task debugging      → full investigation procedure
+        if task render         → full grounding procedure
+        if review              → review-recall procedure
+        if ledger has evidence → ledger one-liner
+        if queue has items     → tool-failure / stop-block / …
+   · <span class="dim">Does NOT re-inject full static [vertex:contract] (that’s agent/slash)</span>
+
+<span class="t">3. Tools run</span>  →  <span class="kw">tool.execute.after</span>
+   · Update scorecard; maybe <span class="inj">queue</span> failure text (delivered on next system.transform)
+
+<span class="t">4. Model goes idle</span>  →  <span class="kw">session.idle</span>
+   · Maybe <span class="inj">visible</span> stop / promise continuation (not keyword-based)
+    </div>
+
+    <h2>3. What keywords we look for</h2>
+    <p class="sub" style="margin-bottom:0.5rem">All on the <strong>user message text</strong> at <code>chat.message</code>. English + some Korean.</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Detector</th>
+          <th>Looks for (examples)</th>
+          <th>Result</th>
+          <th>Injected later on system.transform</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>classifyStopMode</code></td>
+          <td>
+            <div class="kw-list">deep, thorough, end-to-end, deploy, migration, security, refactor, large, complex, implement the plan, …</div>
+            Risks: production, database, auth/secret/token, git push/release
+          </td>
+          <td><code>deep</code> (+ risks)</td>
+          <td><code>vertex:verification-required</code> (+ risk flags line)</td>
+        </tr>
+        <tr>
+          <td></td>
+          <td>
+            <div class="kw-list">implement, fix, debug, change, edit, create, build, test, lint, review, update, …</div>
+            (and not deep/quick-only)
+          </td>
+          <td><code>normal</code></td>
+          <td><code>vertex:verification-advisory</code></td>
+        </tr>
+        <tr>
+          <td></td>
+          <td>
+            <div class="kw-list">quick, brief, just explain, review only, no edits, …</div>
+            (and no risk flags)
+          </td>
+          <td><code>quick</code></td>
+          <td><em>no stop-mode inject</em></td>
+        </tr>
+        <tr>
+          <td><code>classifyTask</code></td>
+          <td>
+            <div class="kw-list">debug, bug, error, traceback, crash, failing, not working, …</div>
+          </td>
+          <td><code>debugging</code></td>
+          <td><strong>Full</strong> <code>vertex:investigation</code> (6 steps inlined — not a pack path)</td>
+        </tr>
+        <tr>
+          <td></td>
+          <td>
+            <div class="kw-list">html, svg, game, canvas, chart, render, website, webpage, ui, dashboard, …</div>
+          </td>
+          <td><code>render</code></td>
+          <td><strong>Full</strong> <code>vertex:grounding</code> (run/observe/fix loop inlined)</td>
+        </tr>
+        <tr>
+          <td></td>
+          <td>implement/build/create-style without debug/render</td>
+          <td><code>build</code></td>
+          <td><em>no task procedure</em> (only stop-mode if any)</td>
+        </tr>
+        <tr>
+          <td><code>isReviewTask</code></td>
+          <td>
+            <div class="kw-list">review, audit, critique, code-review, red-team, find bugs/security flaws, …</div>
+          </td>
+          <td><code>review=true</code></td>
+          <td><code>vertex:review-recall</code> (two-pass collect/filter)</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>4. Worked examples</h2>
+
+    <div class="ex">
+      <div class="u">User: "hi"</div>
+      <div class="arrow">→ stopMode=quick, task=baseline, review=false</div>
+      <div class="out">system.transform: often empty (or almost)
+static contract: only if agent md or earlier /elicify-vertex slash
+activate cue: once if first activation</div>
+    </div>
+
+    <div class="ex">
+      <div class="u">User: "deep implement auth for production"</div>
+      <div class="arrow">→ stopMode=<strong>deep</strong> (deep + auth + production risks), task=<strong>build</strong>, review=false</div>
+      <div class="out">system.transform injects:
+  [vertex:verification-required] Deep task mode. Risk flags: production, secret-or-auth. …</div>
+    </div>
+
+    <div class="ex">
+      <div class="u">User: "debug why the test is failing"</div>
+      <div class="arrow">→ stopMode=<strong>normal</strong> (fix/debug keywords), task=<strong>debugging</strong></div>
+      <div class="out">system.transform injects:
+  [vertex:verification-advisory] …
+  [vertex:investigation] full 6-step procedure (inlined)</div>
+    </div>
+
+    <div class="ex">
+      <div class="u">User: "build an HTML dashboard chart"</div>
+      <div class="arrow">→ stopMode=normal/deep (build), task=<strong>render</strong></div>
+      <div class="out">system.transform injects:
+  [vertex:verification-…] …
+  [vertex:grounding] full run/observe/fix loop (inlined)</div>
+    </div>
+
+    <div class="ex">
+      <div class="u">User: "review this PR for security flaws"</div>
+      <div class="arrow">→ review=<strong>true</strong> (+ maybe deep if security)</div>
+      <div class="out">system.transform injects:
+  [vertex:review-recall] collect then filter
+  (+ verification-required if deep)</div>
+    </div>
+
+    <h2>5. What is <em>not</em> keyword-driven</h2>
+    <table>
+      <thead>
+        <tr><th>Inject / action</th><th>Trigger</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Static <code>[vertex:contract]</code></td>
+          <td>Agent prompt always, or <code>/elicify-vertex</code> slash expansion — <strong>not</strong> keyword router</td>
+        </tr>
+        <tr>
+          <td><code>tool-failure</code> / <code>repeat-failure</code></td>
+          <td>Tool exit ≠ 0 (and repeat signature)</td>
+        </tr>
+        <tr>
+          <td><code>stop-block</code></td>
+          <td><code>session.idle</code> + deep + files changed + no verify</td>
+        </tr>
+        <tr>
+          <td><code>promise-no-act</code></td>
+          <td><code>session.idle</code> + last assistant text matches promise patterns</td>
+        </tr>
+        <tr>
+          <td><code>ledger</code></td>
+          <td>Scorecard non-empty this turn</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="callout" style="border-left-color: var(--vx); margin-top: 1.25rem;">
+      <strong>Bottom line:</strong> Yes — we <em>do</em> keyword-detect on the user message (like Fablize UPS + router).
+      Difference: Fablize injects a <em>short</em> tip at prompt submit and points at pack files;
+      we store the classification and inject <em>full procedures</em> on every system transform until the next user message.
+      The “most important” Fablize-style short UPS block is closest to our
+      <code>verification-required/advisory</code> + investigation/grounding — not to the old every-turn full contract (removed in 0.9.3).
+    </div>
+
+    <p class="sub" style="margin-top:1.25rem">
+      Related: <a href="./event-mapping.html">full event mapping</a>
+    </p>
+    <footer>docs/keyword-inject.html · elicify-vertex · classifyStopMode / classifyTask / isReviewTask · chat.message → system.transform</footer>
+  </div>
+</body>
+</html>
