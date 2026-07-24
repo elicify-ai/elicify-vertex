@@ -99,7 +99,7 @@ Successful verifications also mint an in-memory **verification receipt** (`vrf_â
 
 **Not verification:** Write/Edit success, non-allowlisted bash, ambiguous composition, failed exit, or failure text in output.
 
-## What changed in 0.9.4
+## What changed in 0.9.5
 
 Detection hardening (no regressions vs fablize):
 - `npm run dev`, `npx vitest --watch` â†’ ambiguous (not silently verified)

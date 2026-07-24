@@ -105,7 +105,7 @@ import {
 interface ElicifyVertexOptions {
   maxPerSession?: number              // default 16
   wireMessagesTransform?: boolean     // default true
-  systemDirectives?: () => readonly Directive[]  // default: vertex:contract
+  systemDirectives?: () => readonly Directive[]  // default: [] (static contract ships via the agent prompt and /elicify-vertex slash template, not every turn)
   activeAgent?: string                // default "elicify-vertex-agent"
   activeSkillTrigger?: string         // default "/elicify-vertex" 
   maxStopBlocks?: number              // default 3

@@ -255,6 +255,48 @@ describe("Fix 3: in-flight guard has a 30s TTL", () => {
 })
 
 // ---------------------------------------------------------------------------
+// Fix 5: python heredoc opener variants
+//
+// Pre-fix symptom: PYTHON_INLINE_HEREDOC_RE_G captured the raw delimiter
+// token (`'PY'`, `"PY"`) including its quotes and did not allow the
+// tab-stripping `<<-` form, so `python3 <<'PY'` / `<<"PY"` / `<<-PY`
+// heredocs were never matched — a write-mode `open(...,'w')` inside them
+// was a false negative. The opener must accept single/double quotes around
+// the tag and a leading `-` (indented closing delimiter).
+// ---------------------------------------------------------------------------
+
+describe("Fix 5: python heredoc opener variants", () => {
+  it("detects a mutating heredoc with a single-quoted delimiter (<<'PY')", () => {
+    // Pre-fix: delimiter captured as `'PY'` (with quotes) → closing `PY`
+    // never matches → returns false (FN).
+    expect(isMutatingBashCommand(`python3 <<'PY'\nopen('f','w').write('x')\nPY`)).toBe(true)
+  })
+
+  it("detects a mutating heredoc with a double-quoted delimiter (<<\"PY\")", () => {
+    expect(isMutatingBashCommand(`python3 <<\"PY\"\nopen('f','w').write('x')\nPY`)).toBe(true)
+  })
+
+  it("detects a mutating tab-stripping heredoc (<<-PY) with indented body and closer", () => {
+    expect(isMutatingBashCommand(`python3 <<-PY\n\topen('f','w').write('x')\n\tPY`)).toBe(true)
+  })
+
+  it("detects a mutating tab-stripping heredoc with a quoted delimiter (<<-'PY')", () => {
+    expect(isMutatingBashCommand(`python3 <<-'PY'\n\topen('f','w').write('x')\n\tPY`)).toBe(true)
+  })
+
+  it("does not flag a read-only heredoc behind a quoted delimiter", () => {
+    // Detection must key on the body, not merely the opener shape.
+    expect(isMutatingBashCommand(`python3 <<'PY'\nprint('x')\nPY`)).toBe(false)
+    expect(isMutatingBashCommand(`python3 <<-PY\n\tprint('x')\n\tPY`)).toBe(false)
+  })
+
+  it("still detects the unquoted forms (no regression)", () => {
+    expect(isMutatingBashCommand(`python3 <<PY\nopen('f','w').write('x')\nPY`)).toBe(true)
+    expect(isMutatingBashCommand(`python3 - <<EOF\nopen('f','w').write('x')\nEOF`)).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Fix 6: quote-aware bashSegments
 //
 // Pre-fix symptom: the splitter does a regex split on `;`, `|`, `&&`, `||`

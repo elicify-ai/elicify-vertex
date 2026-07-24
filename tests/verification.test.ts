@@ -68,6 +68,13 @@ describe("parseVerification — positive command allowlist", () => {
     }
   })
 
+  it("does not treat arbitrary package scripts as verification", () => {
+    for (const command of ["npm run serve", "pnpm run preview", "yarn run deploy", "bun run format"]) {
+      expect(parseVerification(command, "done", 0).outcome).toBe("not-verification")
+    }
+  })
+
+
 describe("parseVerification — watch-mode runners are never verified", () => {
   it.each([
     ["npx vitest --watch", 0, "2 passed", "ambiguous"],
@@ -76,12 +83,20 @@ describe("parseVerification — watch-mode runners are never verified", () => {
     ["yarn run dev", 0, "ok", "ambiguous"],
     ["nodemon app.js", 0, "ready", "ambiguous"],
     ["npx tsc --watch", 0, "compiled", "ambiguous"],
+    ["npm run test-watch", 0, "watching", "ambiguous"],
+    ["npm run test:watch", 0, "watching", "ambiguous"],
+    ["npm run test.watch", 0, "watching", "ambiguous"],
+    ["npm run start:prod", 0, "listening", "ambiguous"],
     ["npm run dev-docs", 0, "ok", "not-verification"], // over-trigger guard
     ["echo --watch", 0, "", "ambiguous"], // contains --watch token; ambiguous is safer than verified
-    // exit=1 still failed (not ambiguous) when clearly failed
-    ["npx vitest --watch", 1, "exit code 1", "ambiguous"],
+    // exit=1 fails before watch-mode ambiguity is considered
+    ["npx vitest --watch", 1, "exit code 1", "failed"],
   ])("%j exit=%d text=%j → %s", (cmd, exit, text, want) => {
     expect(parseVerification(cmd, text, exit).outcome).toBe(want)
+  })
+
+  it("prioritizes failure output over watch-mode ambiguity", () => {
+    expect(parseVerification("npm run test:watch", "1 failed", 0).outcome).toBe("failed")
   })
 })
 
@@ -120,6 +135,8 @@ describe("classifyStopMode — read-only intent stays quick (with risks kept adv
     ["describe how to fix the parser", "normal"],  // describe alone → not read-only
     ["describe the deploy pipeline", "deep"],      // 'deploy' is a DEEP keyword
     ["no edits, just explain", "quick"],
+    ["do not code; explain the fix", "quick"],
+    ["do not code and explain", "quick"],
   ])("%j → %s", (text, want) => {
     expect(classifyStopMode(text).mode).toBe(want)
   })
