@@ -117,16 +117,22 @@ class SessionGate {
 // ===========================================================================
 
 const REPEAT_FAILURE_THRESHOLD = 2
+/** Distinct changed paths kept per turn for the evidence-rich stop-block. */
+const MAX_TRACKED_CHANGED_PATHS = 10
 
 interface SessionLedger {
   changedFilesSeen: boolean
   /** Distinct kinds of files changed — path-kind classifier. */
   changedFileKinds: Set<FileKind>
+  /** Distinct changed paths this turn (capped) — surfaced in stop-block reasons. */
+  changedFilePaths: string[]
   /** Set per-prompt to the classified mode (quick/normal/deep) — stop-mode classifier */
   taskMode: "quick" | "normal" | "deep"
   riskFlags: Set<RiskFlag>
   verificationResults: Array<{ command: string; exitCode: number; success: boolean }>
   failures: Array<{ signature: string; timestamp: string }>
+  /** Signatures whose repeat-failure directive already fired this turn (cooldown). */
+  repeatSignaturesFired: Set<string>
   stopBlocks: number
   promiseBlocks: number
 }
@@ -141,10 +147,12 @@ export class EvidenceLedger {
     return {
       changedFilesSeen: false,
       changedFileKinds: new Set(),
+      changedFilePaths: [],
       taskMode: mode,
       riskFlags: new Set(risks),
       verificationResults: [],
       failures: [],
+      repeatSignaturesFired: new Set(),
       stopBlocks: 0,
       promiseBlocks: 0,
     }
@@ -163,7 +171,17 @@ export class EvidenceLedger {
     const l = this.ledgers.get(sessionID)
     if (!l) return
     l.changedFilesSeen = true
-    l.changedFileKinds.add(classifyFileKind(filePath))
+    const kind = classifyFileKind(filePath)
+    l.changedFileKinds.add(kind)
+    if (filePath && !l.changedFilePaths.includes(filePath) && l.changedFilePaths.length < MAX_TRACKED_CHANGED_PATHS) {
+      l.changedFilePaths.push(filePath)
+    }
+    // Evidence-driven mode promotion: the prompt text said "quick", but the
+    // model mutated non-docs files — what it DID outranks what was asked.
+    // Promote quick → normal (advisory) only; never auto-escalate to deep.
+    if (kind !== "docs" && l.taskMode === "quick") {
+      l.taskMode = "normal"
+    }
     // Post-mutation evidence is stale: a prior green verifier does not cover
     // edits that land after it. Mirror receipt invalidation for the stop gate.
     l.verificationResults = l.verificationResults.filter((v) => !v.success)
@@ -212,6 +230,20 @@ export class EvidenceLedger {
     return null
   }
 
+  /**
+   * Per-signature cooldown for the repeat-failure directive. Returns true the
+   * FIRST time a signature is marked this turn (caller should fire), false on
+   * later calls (caller stays silent). Without this, the guard whose purpose
+   * is "stop repeating yourself" repeats itself on every subsequent failure.
+   */
+  markRepeatFired(sessionID: string, signature: string): boolean {
+    const l = this.ledgers.get(sessionID)
+    if (!l) return false
+    if (l.repeatSignaturesFired.has(signature)) return false
+    l.repeatSignaturesFired.add(signature)
+    return true
+  }
+
   incrementStopBlocks(sessionID: string): number {
     let l = this.ledgers.get(sessionID)
     if (!l) {
@@ -250,6 +282,25 @@ export class EvidenceLedger {
     if (verified > 0) parts.push(`verified: ${verified}`)
     if (failed > 0) parts.push(`failed: ${failed}`)
     return parts.join(" · ")
+  }
+
+  /**
+   * Decision-relevant ledger summary for injection. Returns the summary only
+   * when it can change the model's next action: unverified changes pending, or
+   * risk flags present. "files changed: yes" right after the model changed a
+   * file is telling it what it just did — that is noise, not signal.
+   */
+  actionableSummary(sessionID: string): string | null {
+    const l = this.ledgers.get(sessionID)
+    if (!l) return null
+    const unverifiedChanges = l.changedFilesSeen && !l.verificationResults.some((v) => v.success)
+    if (!unverifiedChanges && l.riskFlags.size === 0) return null
+    return this.summary(sessionID)
+  }
+
+  /** Distinct changed paths recorded this turn (capped), for stop-block evidence. */
+  getChangedPaths(sessionID: string): string[] {
+    return [...(this.ledgers.get(sessionID)?.changedFilePaths ?? [])]
   }
 
   /** Should the stop gate block? Deep mode, non-docs changes, no successful
@@ -1190,6 +1241,23 @@ export function formatGateContinuationText(reason: string): string {
   return `${headline}\n\n${clean}`
 }
 
+/**
+ * Human-readable changed-path list for the stop-block reason. Pseudo markers
+ * from changedPathsFromTool become readable labels; long lists are truncated.
+ */
+export function formatChangedPathsForReason(paths: readonly string[], maxShown = 5): string {
+  const PSEUDO_LABELS: Record<string, string> = {
+    "edit-mutation": "(file edit)",
+    "patch-mutation": "(patch)",
+    "bash-mutation": "(shell mutation)",
+  }
+  const labeled = paths.map((p) => PSEUDO_LABELS[p] ?? p)
+  if (labeled.length === 0) return "files changed"
+  const shown = labeled.slice(0, maxShown).join(", ")
+  const rest = labeled.length - maxShown
+  return rest > 0 ? `${shown} (+${rest} more)` : shown
+}
+
 // ===========================================================================
 // PLUGIN ENTRYPOINT
 // ===========================================================================
@@ -1630,15 +1698,21 @@ $ARGUMENTS`,
             const signature = `${exitCode}:${failureSignature(firstErrLine)}`
             ledger.recordFailure(sid, signature)
 
-            // Repeat-failure detection
+            // Repeat-failure detection with per-signature cooldown: surface
+            // the repeat ONCE per turn, then stay silent — re-injecting the
+            // same warning on every subsequent failure is itself a loop.
             const repeat = ledger.getRepeatFailure(sid)
             if (repeat) {
-              queue.enqueue(sid, {
-                id: "vertex:repeat-failure",
-                text: `[vertex:repeat-failure] The same class of failure has repeated ${repeat.count} times. Stop retrying silently — report what failed, what you already tried, and your next hypothesis.`,
-              })
-              logRecoveryRepeat(sid, { signature: repeat.signature, count: repeat.count })
-              debug(`tool.after: REPEAT FAILURE detected (${repeat.count}x) for ${sid}`)
+              if (ledger.markRepeatFired(sid, repeat.signature)) {
+                queue.enqueue(sid, {
+                  id: "vertex:repeat-failure",
+                  text: `[vertex:repeat-failure] The same class of failure has repeated ${repeat.count} times. Stop retrying silently — report what failed, what you already tried, and your next hypothesis.`,
+                })
+                logRecoveryRepeat(sid, { signature: repeat.signature, count: repeat.count })
+                debug(`tool.after: REPEAT FAILURE detected (${repeat.count}x) for ${sid}`)
+              } else {
+                debug(`tool.after: repeat failure cooldown (already surfaced) for ${sid}`)
+              }
             } else {
               queue.enqueue(sid, {
                 id: "vertex:tool-failure",
@@ -1678,8 +1752,9 @@ $ARGUMENTS`,
         if (guidance) combined.push(guidance)
       }
 
-      // Evidence summary (let the model see its own track record)
-      const summary = ledger.summary(sid)
+      // Evidence summary — injected only when decision-relevant (unverified
+      // changes pending or risk flags present), not as a running narration.
+      const summary = ledger.actionableSummary(sid)
       if (summary) {
         combined.push({
           id: "vertex:ledger",
@@ -1862,7 +1937,10 @@ $ARGUMENTS`,
         }
 
         const count = ledger.incrementStopBlocks(sid)
-        const reason = `[vertex:stop-block] Files were changed this turn but no successful verification command was observed. Run the narrowest relevant test, lint, typecheck, build, check, validate, verify, or HTTP probe now and cite its observed result. If genuinely none applies, say so explicitly and why.`
+        // Evidence-rich block: name the changed paths so the model can pick
+        // the narrowest verifier instead of being scolded in the abstract.
+        const changedList = formatChangedPathsForReason(ledger.getChangedPaths(sid))
+        const reason = `[vertex:stop-block] Changed this turn: ${changedList} — no successful verification observed since the latest change. Run the narrowest relevant test, lint, typecheck, build, check, validate, verify, or HTTP probe covering those paths now and cite its observed result. If genuinely none applies, say so explicitly and why.`
 
         queue.enqueue(sid, { id: "vertex:stop-block", text: reason })
         debug(`event: ${sid} — STOP BLOCK ${count}/${opts.maxStopBlocks} (changed files, no verification)`)
