@@ -11,6 +11,15 @@
 # Requires: opencode on PATH, jq, rg; agent elicify-vertex-agent installed.
 set -euo pipefail
 
+# F-07 / TDD Plan test 35 (live_scripted_session, docs/vertex2-spec.md): this
+# script drives a REAL `opencode run` against a real model provider — it is
+# maintainer-run locally only and MUST be skipped in headless CI (which has no
+# provider keys) unless the operator explicitly opts in.
+if [[ "${OPENCODE_LIVE_TEST:-0}" != "1" ]]; then
+  echo "uat-opencode-live.sh: skipped (headless/CI default). Set OPENCODE_LIVE_TEST=1 to run this live opencode CLI UAT locally."
+  exit 0
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 WORK="${UAT_WORK:-/tmp/oc-uat}"

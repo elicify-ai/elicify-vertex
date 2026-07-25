@@ -79,16 +79,10 @@
   "engines": {
     "node": ">=20"
   },
-  "peerDependencies": {
-    "@opencode-ai/plugin": "^1.0.0"
-  },
-  "peerDependenciesMeta": {
-    "@opencode-ai/plugin": {
-      "optional": true
-    }
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.16.0"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "^1.16.0",
     "@types/node": "^22.10.0",
     "typescript": "^5.6.0",
     "vitest": "^2.1.0"

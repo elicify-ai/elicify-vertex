@@ -30,8 +30,8 @@
  */
 
 import { createHash } from "node:crypto"
-import { appendFileSync, chmodSync, mkdirSync } from "node:fs"
-import { dirname, resolve } from "node:path"
+import { appendFileSync, chmodSync, mkdirSync, readdirSync, renameSync, statSync, unlinkSync } from "node:fs"
+import { basename, dirname, extname, join, resolve } from "node:path"
 import { homedir } from "node:os"
 import { redactForDisk } from "./redaction.js"
 
@@ -54,6 +54,43 @@ export type EventType =
   | "holdout_suppress"
   | "recovery_repeat"
 
+/**
+ * Vertex 2 event types (FR-033). Additive to `EventType` — the v1 union above
+ * is untouched; `MeasurementEvent.event_type` below accepts either.
+ */
+export type V2EventType =
+  | "directive_rendered"
+  | "directive_complied"
+  | "calibration"
+  | "phase_transition"
+  | "resolution:none"
+  | "dosing:unknown-model"
+  | "gate:multi-session-advisory"
+  | "pins:disk-fallback-memory"
+  | "pins:disk-recovered"
+  | "pins:disk-unavailable"
+  | "intake:classify-skipped"
+  | "intake:classify-fallback"
+  | "intake:classify-capped"
+  | "intake:classify-unsupported"
+  | "subturn:cleanup-failed"
+  | "judge:unavailable"
+  | "judge:malformed"
+  | "judge:unsupported"
+  | "judge:field-dropped"
+  | "criteria:re-pinned"
+  | "criteria:truncated"
+  | "expect:absent"
+
+/**
+ * FR-028/FR-029 dosing profile, mirrored locally rather than imported from
+ * `src/v2/dosing.ts`/`src/v2/types.ts`. Structurally identical to that
+ * module's `Profile` — kept as a local alias so this file has no compile-time
+ * dependency on another wave's module (consistent with the `ResolveVerifierFn`
+ * alias below; see that comment for the fuller rationale).
+ */
+export type DosingProfile = "standard" | "frontier"
+
 /** Payload schema is intentionally loose — measurement is observational. */
 export type EventPayload = Record<string, unknown>
 
@@ -62,8 +99,24 @@ export interface MeasurementEvent {
   ts: string
   session_id: string
   holdout_arm: HoldoutArm
-  event_type: EventType
+  event_type: EventType | V2EventType
   payload: EventPayload
+  /**
+   * FR-033: every event carries `model` (a `providerID/modelID` string) or
+   * the literal `"unknown"`. Stamped by `makeEvent`/`makeV2Event` — never
+   * left unset — so this is optional only at the type level (for maximal
+   * backward compatibility with any pre-existing construction path), not at
+   * runtime.
+   */
+  model?: string
+  /**
+   * FR-033: every event carries the resolved dosing profile. v1-sourced
+   * events (built via `makeEvent`, which no v1 call site can override) are
+   * always stamped `"standard"`, matching "defaulting to 'standard' when
+   * v1's engine path is active and no v2 dosing ran" from the module
+   * contracts doc.
+   */
+  profile?: DosingProfile
 }
 
 // ---------- paths (override via VERTEX_DATA) ---------------------------------
@@ -84,13 +137,22 @@ export function eventsPath(): string {
 // ---------- holdout ------------------------------------------
 
 /**
- * Deterministic per-session holdout arm. Same session_id always returns same
- * arm. Not exposed to the model — purely an out-of-band function.
+ * Deterministic per-session (optionally per-directive-family, FR-035) holdout
+ * arm. Same session_id (+ family, when given) always returns the same arm.
+ * Not exposed to the model — purely an out-of-band function.
+ *
+ * FR-035: extends the original session-only hash with an optional `family`
+ * component so a session can be independently in the 'off' arm PER DIRECTIVE
+ * FAMILY (e.g. session X off for 'elevate' but on for 'verify-gap'). Omitting
+ * `family` (or passing an empty string) reproduces exactly today's
+ * session-only hash input — backward compatible with every existing caller
+ * and with the v1 regression suite's distribution/determinism assertions.
  */
-export function holdoutArm(sessionId: string | undefined | null): HoldoutArm {
+export function holdoutArm(sessionId: string | undefined | null, family?: string): HoldoutArm {
   if (!sessionId) return "on"
+  const hashInput = family ? `holdout|${sessionId}|${family}` : "holdout|" + sessionId
   const h = createHash("sha256")
-    .update("holdout|" + sessionId, "utf8")
+    .update(hashInput, "utf8")
     .digest("hex")
   const bucket = parseInt(h.slice(0, 8), 16) / 0xffffffff
   return bucket < HOLDOUT_OFF_FRACTION ? "off" : "on"
@@ -98,12 +160,13 @@ export function holdoutArm(sessionId: string | undefined | null): HoldoutArm {
 
 /**
  * env-gated (default OFF) holdout suppression: returns true only when the
- * env flag is set AND the session is in the 'off' arm. Default behaviour is
- * always 'do not suppress', so the gate is unchanged when the flag is unset.
+ * env flag is set AND the session (optionally scoped to `family`, FR-035) is
+ * in the 'off' arm. Default behaviour is always 'do not suppress', so the
+ * gate is unchanged when the flag is unset.
  */
-export function holdoutSuppresses(sessionId: string | undefined | null): boolean {
+export function holdoutSuppresses(sessionId: string | undefined | null, family?: string): boolean {
   if (process.env.VERTEX_HOLDOUT !== "1") return false
-  return holdoutArm(sessionId) === "off"
+  return holdoutArm(sessionId, family) === "off"
 }
 
 // ---------- event logging ---------------------------------------------------
@@ -112,7 +175,16 @@ function utcNow(): string {
   return new Date().toISOString().replace(/\.\d{3}Z$/, "Z")
 }
 
-/** Build an event object. Does NOT write to disk. */
+/**
+ * Build an event object. Does NOT write to disk.
+ *
+ * FR-033: `model`/`profile` are always stamped, even though no v1 call site
+ * (this function's signature is unchanged, frozen by `src/index.ts`) can
+ * supply them — v1 never resolved a model id or a dosing profile, so every
+ * v1-sourced event is correctly, deterministically `model: "unknown"`,
+ * `profile: "standard"`. v2 events are built via `makeV2Event` below, which
+ * DOES accept a resolved model/profile.
+ */
 export function makeEvent(
   sessionId: string | undefined | null,
   eventType: EventType,
@@ -124,17 +196,124 @@ export function makeEvent(
     holdout_arm: holdoutArm(sessionId),
     event_type: eventType,
     payload,
+    model: "unknown",
+    profile: "standard",
   }
+}
+
+/** FR-033a: rotate the live sink at this many bytes. */
+export const ROTATE_MAX_BYTES = 32 * 1024 * 1024
+
+/** FR-033a: delete rotated siblings older than this many days. */
+export const ROTATE_RETENTION_DAYS = 30
+
+export interface RotationOptions {
+  /** Override for tests — avoid writing 32MB to exercise the size trigger. */
+  maxBytes?: number
+  /** Override for tests — avoid waiting 30 real days to exercise pruning. */
+  maxAgeDays?: number
+  /** Override "now" for deterministic age-pruning assertions in tests. */
+  now?: Date
+}
+
+export interface RotationResult {
+  rotated: boolean
+  rotatedTo: string | null
+  pruned: string[]
+}
+
+/**
+ * FR-033a: size/age rotation for the JSONL sink, run as a check-before-write
+ * so `appendEvent`'s signature never has to change (module contracts doc:
+ * "wrap it" rather than alter the existing append path's shape).
+ *
+ * 1. If the live file at `path` exceeds `maxBytes`, it is renamed (never
+ *    copied — a single atomic `renameSync`) to `<stem>.<ISO-timestamp><ext>`
+ *    in the same directory, e.g. `.vertex-events.jsonl` (32MB+) becomes
+ *    `.vertex-events.2026-07-25T12-00-00-000Z.jsonl`. (The spec's prose
+ *    example writes this as `events.<timestamp>.jsonl`; the real sink's
+ *    basename is `.vertex-events.jsonl`, not `events.jsonl` — this function
+ *    preserves the live file's actual stem rather than hardcoding the
+ *    literal word "events", so the rotated name stays visibly related to its
+ *    source file and the scheme still works under `VERTEX_DATA`/`path`
+ *    overrides that use a different basename, e.g. in tests.)
+ * 2. Independently of whether rotation just happened, every sibling file in
+ *    the same directory matching `<stem>.*<ext>` (excluding the live file
+ *    itself) whose mtime is older than `maxAgeDays` is deleted.
+ *
+ * Exported standalone (not only invoked from inside `appendEvent`) so tests
+ * can drive both behaviours with small thresholds and a fixed `now` instead
+ * of writing real 32MB / waiting real days.
+ */
+export function rotateEventsSinkIfNeeded(path?: string, opts: RotationOptions = {}): RotationResult {
+  const p = path ?? eventsPath()
+  const maxBytes = opts.maxBytes ?? ROTATE_MAX_BYTES
+  const maxAgeDays = opts.maxAgeDays ?? ROTATE_RETENTION_DAYS
+  const now = opts.now ?? new Date()
+  const result: RotationResult = { rotated: false, rotatedTo: null, pruned: [] }
+
+  const dir = dirname(p)
+  const ext = extname(p) || ".jsonl"
+  const stem = basename(p, ext)
+  const liveBase = basename(p)
+
+  try {
+    const stat = statSync(p)
+    if (stat.isFile() && stat.size > maxBytes) {
+      const stamp = now.toISOString().replace(/[:.]/g, "-")
+      const rotatedPath = join(dir, `${stem}.${stamp}${ext}`)
+      renameSync(p, rotatedPath)
+      result.rotated = true
+      result.rotatedTo = rotatedPath
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.error("[vertex] measurement rotate", p, err)
+    }
+  }
+
+  try {
+    const maxAgeMs = maxAgeDays * 24 * 60 * 60 * 1000
+    const entries = readdirSync(dir)
+    for (const entry of entries) {
+      if (entry === liveBase) continue
+      if (!entry.startsWith(stem + ".") || !entry.endsWith(ext)) continue
+      const full = join(dir, entry)
+      try {
+        const st = statSync(full)
+        if (!st.isFile()) continue
+        if (now.getTime() - st.mtime.getTime() > maxAgeMs) {
+          unlinkSync(full)
+          result.pruned.push(full)
+        }
+      } catch {
+        // best-effort — another process may have already removed it; not fatal.
+      }
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.error("[vertex] measurement prune", p, err)
+    }
+  }
+
+  return result
 }
 
 /**
  * Append one event to the events JSONL (append-only, never rewrites). Failures
  * are fail-open for the plugin hot path but logged to stderr for operators.
+ *
+ * FR-033a: performs a rotate-if-oversized + prune-if-stale check immediately
+ * before the write, via `rotateEventsSinkIfNeeded` (default thresholds). This
+ * function's own signature is unchanged so every existing caller (v1's
+ * `logEvent`/`logClassify`/etc., all of `src/index.ts`) keeps working
+ * unmodified.
  */
 export function appendEvent(event: MeasurementEvent, path?: string): string {
   const p = path ?? eventsPath()
   try {
     mkdirSync(dirname(p), { recursive: true, mode: 0o700 })
+    rotateEventsSinkIfNeeded(p)
     const safeEvent = redactForDisk(event)
     appendFileSync(p, JSON.stringify(safeEvent) + "\n", { encoding: "utf8", mode: 0o600 })
     chmodSync(p, 0o600)
@@ -214,12 +393,34 @@ export function logRecoveryRepeat(
   logEvent(sessionId, "recovery_repeat", payload, path)
 }
 
+/**
+ * FR-035: `holdout_suppress` MUST be logged "with family" when the
+ * suppression decision was family-scoped (BDD "Directive-family holdout
+ * suppresses rendering"). `extra` is a new optional parameter inserted
+ * *before* the pre-existing `path` parameter — every current call site (both
+ * in `src/index.ts` and `tests/measurement.test.ts`) invokes this with
+ * exactly 2 positional args (`sessionId, reason`), never a 3rd `path`
+ * argument, so this insertion does not change behaviour for any existing
+ * caller: `extra` stays `undefined`, the family-aware branch below never
+ * runs, and the emitted event is byte-identical to before this change
+ * (`model: "unknown"`, `profile: "standard"`, session-only `holdout_arm`,
+ * exactly as `makeEvent` has always produced).
+ */
 export function logHoldoutSuppress(
   sessionId: string | undefined | null,
   reason: string,
+  extra?: { family?: string; model?: string | null; profile?: DosingProfile | null },
   path?: string,
 ): void {
-  logEvent(sessionId, "holdout_suppress", { reason }, path)
+  const family = extra?.family
+  const payload: EventPayload = family ? { reason, family } : { reason }
+  const ev = makeEvent(sessionId, "holdout_suppress", payload)
+  if (extra) {
+    ev.model = extra.model && extra.model.trim().length > 0 ? extra.model : "unknown"
+    ev.profile = extra.profile ?? "standard"
+    ev.holdout_arm = holdoutArm(sessionId, family)
+  }
+  appendEvent(ev, path)
 }
 
 export function logOutcome(
@@ -244,3 +445,404 @@ export function logOutcome(
 //     events: MeasurementEvent[],
 //     source: { commits?: Commit[]; userMessages?: string[] },
 //   ): Promise<number>  // returns count of outcome events written
+
+// =============================================================================
+// Vertex 2 extension — FR-033, FR-033a, FR-034, FR-035
+// =============================================================================
+//
+// Additive only: every export above this line is untouched in name/signature
+// (only `MeasurementEvent`'s shape widened with optional fields, `holdoutArm`/
+// `holdoutSuppresses` gained a trailing optional `family` param, and
+// `makeEvent`/`appendEvent` gained internal — not signature — behaviour).
+// v2 modules never import this file directly (module contracts doc's
+// "Logging convention": they take an injected `EventLogger`); the wave-3
+// wiring agent is the only caller of the writers below.
+
+/**
+ * Shared input shape every v2 writer accepts: `{ sessionID, model, profile,
+ * ...payload }` (module contracts doc, "measurement.ts extension"). `model`
+ * defaults to `"unknown"` when omitted/blank; `profile` defaults to
+ * `"standard"` when omitted. `family`, when present, scopes both the
+ * FR-035 per-family holdout-arm hash AND is carried into the payload (the
+ * BDD scenario "Directive-family holdout suppresses rendering" expects
+ * `holdout_suppress` logged "with family: elevate" — i.e. visible in the
+ * record, not just used internally for the arm hash).
+ */
+export interface V2EventInput {
+  sessionID: string | undefined | null
+  model?: string | null
+  profile?: DosingProfile | null
+  /** FR-035: directive family, when this event is family-scoped. */
+  family?: string
+  [key: string]: unknown
+}
+
+/**
+ * FR-033: build (without writing) a v2 event record. Every v2 writer routes
+ * through this so `model`/`profile`/`session_id`/`holdout_arm` are stamped
+ * consistently. Exported (parity with `makeEvent`) so callers/tests can
+ * inspect the record before deciding whether to append it (e.g. holdout
+ * suppression is a caller decision — this function does not itself suppress
+ * anything, it only builds the record).
+ */
+export function makeV2Event(eventType: V2EventType, input: V2EventInput): MeasurementEvent {
+  const { sessionID, model, profile, family, ...rest } = input
+  const resolvedModel = model && model.trim().length > 0 ? model : "unknown"
+  const resolvedProfile: DosingProfile = profile ?? "standard"
+  // `family` is consumed above for the FR-035 per-family holdout-arm hash,
+  // but the BDD/FR-033 contract (mirrored by logHoldoutSuppress below) is
+  // that a family-scoped event also carries `family` in its own payload —
+  // re-include it here rather than letting it silently disappear from every
+  // directive_rendered/directive_complied record on disk.
+  const payload: EventPayload = family ? { ...rest, family } : rest
+  return {
+    ts: utcNow(),
+    session_id: sessionID || "no-session",
+    holdout_arm: holdoutArm(sessionID, family),
+    event_type: eventType,
+    payload,
+    model: resolvedModel,
+    profile: resolvedProfile,
+  }
+}
+
+/** Convenience: build + append one v2 event in one call. */
+export function logV2Event(eventType: V2EventType, input: V2EventInput, path?: string): MeasurementEvent {
+  const ev = makeV2Event(eventType, input)
+  appendEvent(ev, path)
+  return ev
+}
+
+// ---------- typed v2 convenience writers --------------------------------------
+//
+// One wrapper per new v2 event type (module contracts doc's exact list of 22).
+// Each is a thin `logV2Event` call with a documentation-only payload shape —
+// `V2EventInput`'s index signature still allows extra fields, so these are
+// guides, not hard schemas. None of these payload shapes carry a raw-text
+// field (e.g. no verbatim user ask/prompt text) — see the `event_invariants_property`
+// test (test 42) for why that matters (FR-033's "no record carries raw user
+// prompt text" invariant).
+
+export interface DirectiveRenderedInput extends V2EventInput {
+  family: string
+  instanceId: string
+  priority: "correction" | "phase-guidance" | "enrichment"
+  /** "full" O-D-P-E grammar vs the FR-006 one-line decay form. */
+  form?: "full" | "decay"
+}
+export function logDirectiveRendered(input: DirectiveRenderedInput, path?: string): MeasurementEvent {
+  return logV2Event("directive_rendered", input, path)
+}
+
+export interface DirectiveCompliedInput extends V2EventInput {
+  family: string
+  instanceId: string
+}
+export function logDirectiveComplied(input: DirectiveCompliedInput, path?: string): MeasurementEvent {
+  return logV2Event("directive_complied", input, path)
+}
+
+export interface CalibrationInput extends V2EventInput {
+  declared: "low" | "med" | "high" | null
+  observed: "pass" | "fail"
+}
+export function logCalibration(input: CalibrationInput, path?: string): MeasurementEvent {
+  return logV2Event("calibration", input, path)
+}
+
+export interface PhaseTransitionInput extends V2EventInput {
+  storyId: string | null
+  from: "intake" | "execute" | "elevate" | "close"
+  to: "intake" | "execute" | "elevate" | "close"
+  /** FR-001 transition table row id, e.g. "T1", "T3", "T7". */
+  trigger: string
+}
+export function logPhaseTransition(input: PhaseTransitionInput, path?: string): MeasurementEvent {
+  return logV2Event("phase_transition", input, path)
+}
+
+export interface ResolutionNoneInput extends V2EventInput {
+  changedPaths?: string[]
+}
+export function logResolutionNone(input: ResolutionNoneInput, path?: string): MeasurementEvent {
+  return logV2Event("resolution:none", input, path)
+}
+
+export interface DosingUnknownModelInput extends V2EventInput {
+  rawModelId: string | null
+}
+export function logDosingUnknownModel(input: DosingUnknownModelInput, path?: string): MeasurementEvent {
+  return logV2Event("dosing:unknown-model", input, path)
+}
+
+export interface GateMultiSessionAdvisoryInput extends V2EventInput {
+  activeSessionCount?: number
+}
+export function logGateMultiSessionAdvisory(input: GateMultiSessionAdvisoryInput, path?: string): MeasurementEvent {
+  return logV2Event("gate:multi-session-advisory", input, path)
+}
+
+export interface PinsDiskFallbackMemoryInput extends V2EventInput {
+  reason?: string
+}
+export function logPinsDiskFallbackMemory(input: PinsDiskFallbackMemoryInput, path?: string): MeasurementEvent {
+  return logV2Event("pins:disk-fallback-memory", input, path)
+}
+
+export type PinsDiskRecoveredInput = V2EventInput
+export function logPinsDiskRecovered(input: PinsDiskRecoveredInput, path?: string): MeasurementEvent {
+  return logV2Event("pins:disk-recovered", input, path)
+}
+
+export interface PinsDiskUnavailableInput extends V2EventInput {
+  consecutiveFailures?: number
+}
+export function logPinsDiskUnavailable(input: PinsDiskUnavailableInput, path?: string): MeasurementEvent {
+  return logV2Event("pins:disk-unavailable", input, path)
+}
+
+export interface IntakeClassifySkippedInput extends V2EventInput {
+  /** Which pre-filter pattern matched (e.g. "TRIVIAL_ASK_RE") — never the raw ask text. */
+  matched?: string
+}
+export function logIntakeClassifySkipped(input: IntakeClassifySkippedInput, path?: string): MeasurementEvent {
+  return logV2Event("intake:classify-skipped", input, path)
+}
+
+export interface IntakeClassifyFallbackInput extends V2EventInput {
+  reason?: string
+}
+export function logIntakeClassifyFallback(input: IntakeClassifyFallbackInput, path?: string): MeasurementEvent {
+  return logV2Event("intake:classify-fallback", input, path)
+}
+
+export interface IntakeClassifyCappedInput extends V2EventInput {
+  cap?: number
+}
+export function logIntakeClassifyCapped(input: IntakeClassifyCappedInput, path?: string): MeasurementEvent {
+  return logV2Event("intake:classify-capped", input, path)
+}
+
+export interface IntakeClassifyUnsupportedInput extends V2EventInput {
+  reason?: string
+}
+export function logIntakeClassifyUnsupported(input: IntakeClassifyUnsupportedInput, path?: string): MeasurementEvent {
+  return logV2Event("intake:classify-unsupported", input, path)
+}
+
+export interface SubturnCleanupFailedInput extends V2EventInput {
+  agent?: string
+  reason?: string
+}
+export function logSubturnCleanupFailed(input: SubturnCleanupFailedInput, path?: string): MeasurementEvent {
+  return logV2Event("subturn:cleanup-failed", input, path)
+}
+
+export interface JudgeUnavailableInput extends V2EventInput {
+  reason?: string
+}
+export function logJudgeUnavailable(input: JudgeUnavailableInput, path?: string): MeasurementEvent {
+  return logV2Event("judge:unavailable", input, path)
+}
+
+export interface JudgeMalformedInput extends V2EventInput {
+  reason?: string
+}
+export function logJudgeMalformed(input: JudgeMalformedInput, path?: string): MeasurementEvent {
+  return logV2Event("judge:malformed", input, path)
+}
+
+export interface JudgeUnsupportedInput extends V2EventInput {
+  reason?: string
+}
+export function logJudgeUnsupported(input: JudgeUnsupportedInput, path?: string): MeasurementEvent {
+  return logV2Event("judge:unsupported", input, path)
+}
+
+export interface JudgeFieldDroppedInput extends V2EventInput {
+  field: "criteria" | "diffSummary" | "verifierSummaries"
+  reason?: string
+}
+export function logJudgeFieldDropped(input: JudgeFieldDroppedInput, path?: string): MeasurementEvent {
+  return logV2Event("judge:field-dropped", input, path)
+}
+
+export interface CriteriaRePinnedInput extends V2EventInput {
+  count?: number
+}
+export function logCriteriaRePinned(input: CriteriaRePinnedInput, path?: string): MeasurementEvent {
+  return logV2Event("criteria:re-pinned", input, path)
+}
+
+export interface CriteriaTruncatedInput extends V2EventInput {
+  droppedCount?: number
+  cap?: number
+}
+export function logCriteriaTruncated(input: CriteriaTruncatedInput, path?: string): MeasurementEvent {
+  return logV2Event("criteria:truncated", input, path)
+}
+
+export type ExpectAbsentInput = V2EventInput
+export function logExpectAbsent(input: ExpectAbsentInput, path?: string): MeasurementEvent {
+  return logV2Event("expect:absent", input, path)
+}
+
+// ---------- FR-034: directive_complied verifier equivalence ------------------
+
+/** FR-034: flags stripped before comparing two verifier commands for equivalence. */
+export const IGNORED_VERIFIER_FLAGS = [
+  "--reporter=*",
+  "--reporters=*",
+  "-v",
+  "--verbose",
+  "--silent",
+  "--no-color",
+  "--color",
+  "--bail",
+  "--run",
+  "--watch=false",
+] as const
+
+const IGNORED_VERIFIER_EXACT_FLAGS: ReadonlySet<string> = new Set([
+  "-v",
+  "--verbose",
+  "--silent",
+  "--no-color",
+  "--color",
+  "--bail",
+  "--run",
+  "--watch=false",
+])
+const IGNORED_VERIFIER_PREFIX_FLAGS: readonly string[] = ["--reporter=", "--reporters="]
+
+function isIgnoredVerifierFlag(token: string): boolean {
+  if (IGNORED_VERIFIER_EXACT_FLAGS.has(token)) return true
+  return IGNORED_VERIFIER_PREFIX_FLAGS.some((prefix) => token.startsWith(prefix))
+}
+
+/** Strip every `IGNORED_VERIFIER_FLAGS` token out of a shell command string. */
+export function stripIgnoredVerifierFlags(command: string): string {
+  return command
+    .split(/\s+/)
+    .filter(Boolean)
+    .filter((tok) => !isIgnoredVerifierFlag(tok))
+    .join(" ")
+}
+
+/**
+ * Local structural mirror of `src/v2/resolve.ts`'s `ResolveContext` /
+ * `ResolveDeps` / `ResolutionResult` / `resolveVerifier` (module contracts
+ * doc §4). Defined locally rather than imported: this file was authored in
+ * the same wave as `resolve.ts` and the task brief calls for avoiding a hard
+ * dependency on that file's existence timing. **Wave-3 wiring should replace
+ * this alias with a real `import type { resolveVerifier } from "../v2/resolve.js"`
+ * and pass the real function into `verifiersEquivalent` once wiring is
+ * assembled** — the shapes below were cross-checked against the actual
+ * `src/v2/resolve.ts` that landed during this session and match it exactly
+ * (`ResolutionResult.rationale`'s 4-way union, `matchedPaths: string[]`,
+ * `ResolveContext.storyVerifiers: readonly string[] | null`), so the swap
+ * should be a pure type-only substitution with no logic change required.
+ */
+export interface ResolveVerifierManifest {
+  scripts: Record<string, string>
+  workspaceRoot?: string
+}
+export interface ResolveVerifierContext {
+  changedPaths: string[]
+  storyVerifiers: readonly string[] | null
+}
+export interface ResolveVerifierDeps {
+  readManifest(): ResolveVerifierManifest | null
+  fallbackProbe?: (globs: string[]) => string[]
+}
+export interface ResolveVerifierResult {
+  command: string | null
+  rationale: "story" | "basename" | "fallback:package-script" | "none"
+  matchedPaths: string[]
+}
+export type ResolveVerifierFn = (ctx: ResolveVerifierContext, deps: ResolveVerifierDeps) => ResolveVerifierResult
+
+const VERIFIER_COMMAND_STOPWORDS: ReadonlySet<string> = new Set([
+  "npx",
+  "npm",
+  "pnpm",
+  "yarn",
+  "run",
+  "test",
+  "tests",
+  "exec",
+  "vitest",
+  "jest",
+  "mocha",
+  "workspace",
+  "&&",
+])
+
+/**
+ * Heuristic extraction of the path-shaped tokens out of a (flag-stripped)
+ * verifier command — e.g. `"npx vitest run tests/lexer.test.ts"` ->
+ * `["tests/lexer.test.ts"]`; `"npm test"` -> `[]` (no path argument). Used
+ * only to build the synthetic `ResolveVerifierContext.changedPaths` below;
+ * see `verifiersEquivalent`'s doc comment for why this bridging is needed.
+ */
+function extractVerifierTargetTokens(strippedCommand: string): string[] {
+  return strippedCommand
+    .split(/\s+/)
+    .filter(Boolean)
+    .filter((tok) => !tok.startsWith("-"))
+    .filter((tok) => !VERIFIER_COMMAND_STOPWORDS.has(tok.toLowerCase()))
+    .filter((tok) => /[./]/.test(tok))
+}
+
+/**
+ * FR-034: two verifier command strings are equivalent when, after stripping
+ * `IGNORED_VERIFIER_FLAGS`, the injected resolver returns the same tier
+ * (`rationale`) and the same target path set (`matchedPaths`, order-
+ * independent) for both.
+ *
+ * Bridging note (judgment call — see final report): `resolveVerifier`'s real
+ * contract resolves *changed paths* to a *command* (paths -> command), not a
+ * command to a tier (command -> tier), so there is no direct call shape for
+ * "classify this raw command string I was handed." This function bridges the
+ * gap by, per side: extracting the path-shaped tokens out of the (flag-
+ * stripped) command via `extractVerifierTargetTokens`, then calling `resolve`
+ * with a synthetic `{ changedPaths: <those tokens>, storyVerifiers: [<that
+ * stripped command>] }` and an empty manifest (`readManifest: () => null`),
+ * and comparing the two `ResolveVerifierResult`s by `rationale` +
+ * `matchedPaths` set equality. A fast path short-circuits to `true` when the
+ * two flag-stripped strings are byte-identical (covers the common case —
+ * Dataset row 10 — without invoking `resolve` at all).
+ *
+ * Verified against the real `src/v2/resolve.ts` tier-1 ("story") and tier-4
+ * ("none", empty `changedPaths`) branches, which is exactly the pair Dataset
+ * rows 10/11 exercise: `"npx vitest run tests/lexer.test.ts"` extracts
+ * `["tests/lexer.test.ts"]` -> tier "story"; `"npm test"` extracts `[]` ->
+ * `resolveVerifier` returns tier "none" immediately (its `paths.length === 0`
+ * guard fires before it even looks at `storyVerifiers`) — so the two are
+ * correctly non-equivalent by `rationale` mismatch, matching Dataset row 11.
+ */
+export function verifiersEquivalent(rendered: string, observed: string, resolve: ResolveVerifierFn): boolean {
+  const strippedRendered = stripIgnoredVerifierFlags(rendered).trim()
+  const strippedObserved = stripIgnoredVerifierFlags(observed).trim()
+  if (strippedRendered.length === 0 || strippedObserved.length === 0) return false
+  if (strippedRendered === strippedObserved) return true
+
+  const deps: ResolveVerifierDeps = { readManifest: () => null }
+  const a = resolve(
+    { changedPaths: extractVerifierTargetTokens(strippedRendered), storyVerifiers: [strippedRendered] },
+    deps,
+  )
+  const b = resolve(
+    { changedPaths: extractVerifierTargetTokens(strippedObserved), storyVerifiers: [strippedObserved] },
+    deps,
+  )
+  if (a.rationale !== b.rationale) return false
+
+  const setA = new Set(a.matchedPaths)
+  const setB = new Set(b.matchedPaths)
+  if (setA.size !== setB.size) return false
+  for (const path of setA) {
+    if (!setB.has(path)) return false
+  }
+  return true
+}

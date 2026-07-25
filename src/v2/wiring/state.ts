@@ -1,0 +1,188 @@
+/**
+ * Wave-3 wiring — per-session runtime state for `src/v2/plugin.ts`.
+ *
+ * None of the v2 modules (phase.ts, pin.ts, story.ts, composer.ts) own this
+ * shape — each of them keys its OWN internal per-session state off the
+ * session id passed to their methods. This is the wiring-only bookkeeping
+ * the spec explicitly assigns to the integration point rather than any
+ * single module: activation, intake-subturn frequency caps (FR-018b), the
+ * turn-scoped EXPECT artifact (FR-023), phase-entry/event "pending finding"
+ * flags the composer needs re-offered every `system.transform` invocation
+ * until rendered (FR-004's per-invocation budget), and the dosing profile
+ * resolved for the session (FR-028).
+ */
+import type { DosingProfile } from "../../measurement.js"
+import type { ExpectArtifact } from "../artifacts.js"
+
+export interface PendingScopeDrift {
+  path: string
+  offer: "fold" | "amend" | "revert"
+  scopeGlobsMatchedZero: boolean
+}
+
+export interface PendingAnomaly {
+  expectText: string
+  observedSummary: string
+  failureClass: string | null
+}
+
+export interface RenderedVerifyGap {
+  instanceId: string
+  command: string
+}
+
+export interface V2SessionState {
+  /** Mirrors v1's `SessionGate` — true once activated this process, until deactivated. */
+  active: boolean
+  /** One-time user-visible activation cue (mirrors v1's `activateCueShown`). */
+  activateCueShown: boolean
+  /** In-flight guard: a `client.session.prompt` idle-gate continuation is pending for this session. */
+  idleContinuationInFlight: boolean
+  /** True between `experimental.session.compacting` and the matching `session.compacted`. */
+  compacting: boolean
+
+  /** Resolved workspace root for `.elicify-vertex/` state (worktree -> directory -> cwd -> $HOME). */
+  workspaceRoot: string
+
+  /** Model id last observed (`providerID/modelID`), preferring `system.transform`'s required field over `chat.message`'s optional one. */
+  modelId: string | null
+  profile: DosingProfile
+
+  // -- Intake classification frequency caps (FR-018b) — session-lifetime state
+  //    `classifyMultiStory` itself does not self-throttle, per its own module
+  //    contract; these two counters are what wiring owns instead.
+  classifiedThisTask: boolean
+  intakeSubturnCount: number
+  /** Set once a subturn (or its heuristic fallback) has flagged this task multi-story; cleared once a plan is created. */
+  multiStoryPending: boolean
+
+  // -- EXPECT artifact (FR-023) — expires at turn end.
+  turnExpect: ExpectArtifact | null
+  expectAbsentLoggedThisTurn: boolean
+
+  // -- Phase-entry / one-shot-per-turn pending findings (re-offered every
+  //    `system.transform` invocation of the turn until the composer actually
+  //    renders them, then cleared; also cleared at the next `chat.message`).
+  precommitmentPending: boolean
+  scopeDriftPending: PendingScopeDrift | null
+  anomalyPending: PendingAnomaly | null
+  elevatePending: boolean
+  /** Set once after `session.compacted`; cleared once actually rendered (FR-014: exactly once). */
+  needsCriteriaReinject: boolean
+
+  // -- FR-034 compliance join: verify-gap prescriptions rendered THIS turn,
+  //    checked against observed verifier commands in `tool.execute.after`.
+  renderedVerifyGaps: RenderedVerifyGap[]
+  /** Families with >=1 recorded compliance ever this session (FR-029 "frontier" nudge-after-compliance dose). */
+  compliedFamiliesEver: Set<string>
+  /** True once a verification has succeeded THIS turn (FR-029 "frontier" verification-prescription relevance-gap approximation). */
+  everVerifiedThisTurn: boolean
+  /** True once a changed path this turn looks like a test file (FR-029 "standard" falsification on-new-tests-only approximation). */
+  turnIntroducedNewTestFile: boolean
+  /** Single-slot pending repeat-failure finding (mirrors v1's per-signature-once-per-turn cooldown via `EvidenceLedger.markRepeatFired`). */
+  repeatFailurePending: { signature: string; count: number } | null
+
+  // -- Criteria idle-gate replay caps (FR-015, "criteria pinned" branch) —
+  //    v2's own counter, independent of v1's `EvidenceLedger` stop/promise
+  //    block counters (which back the zero-criteria fallback instead).
+  criteriaBlocks: number
+
+  /** Last completed assistant text (mirrors v1's `lastAssistantText`, used nowhere safety-critical in v2 wiring today but kept for parity / future use). */
+  lastAssistantText: string | null
+
+  /** Monotonic per-session instance-id counter for `Finding.instanceId`. */
+  instanceCounter: number
+}
+
+export function freshSessionState(workspaceRoot: string): V2SessionState {
+  return {
+    active: false,
+    activateCueShown: false,
+    idleContinuationInFlight: false,
+    compacting: false,
+    workspaceRoot,
+    modelId: null,
+    profile: "standard",
+    classifiedThisTask: false,
+    intakeSubturnCount: 0,
+    multiStoryPending: false,
+    turnExpect: null,
+    expectAbsentLoggedThisTurn: false,
+    precommitmentPending: false,
+    scopeDriftPending: null,
+    anomalyPending: null,
+    elevatePending: false,
+    needsCriteriaReinject: false,
+    renderedVerifyGaps: [],
+    compliedFamiliesEver: new Set(),
+    everVerifiedThisTurn: false,
+    turnIntroducedNewTestFile: false,
+    repeatFailurePending: null,
+    criteriaBlocks: 0,
+    lastAssistantText: null,
+    instanceCounter: 0,
+  }
+}
+
+/** Reset the per-TURN slice of state (called from `chat.message`, mirroring
+ * v1's `EvidenceLedger.reset` / `PhaseEngine.onUserMessage` cadence). Session-
+ * lifetime fields (activation, workspace root, intake caps, dosing profile,
+ * `multiStoryPending`) are intentionally left untouched. */
+export function resetTurnState(state: V2SessionState): void {
+  state.turnExpect = null
+  state.expectAbsentLoggedThisTurn = false
+  state.precommitmentPending = false
+  state.scopeDriftPending = null
+  state.anomalyPending = null
+  state.elevatePending = false
+  state.renderedVerifyGaps = []
+  state.everVerifiedThisTurn = false
+  state.turnIntroducedNewTestFile = false
+  state.repeatFailurePending = null
+  // Per-turn criteria idle-gate replay cap (FR-015 "criteria pinned" branch)
+  // — v1 parity: EvidenceLedger.reset() zeroes stopBlocks on every
+  // chat.message, so its cap is 3 blocks PER TURN, not 3 ever. Without this
+  // reset, criteriaBlocks was session-lifetime: a long session would
+  // permanently stop enforcing unevidenced criteria after only 3 blocks in
+  // its entire history instead of 3 per turn — safety-critical, not cosmetic.
+  state.criteriaBlocks = 0
+  // needsCriteriaReinject deliberately NOT reset here — it must survive
+  // until actually rendered (FR-014), and a compaction's synthetic
+  // auto-continue message is itself a chat.message-shaped event in some
+  // hosts; clearing it here would risk losing the one-shot re-injection.
+}
+
+export function nextInstanceId(state: V2SessionState): string {
+  state.instanceCounter += 1
+  return `D-${state.instanceCounter}`
+}
+
+/**
+ * FR-036 self-created-session guard, built on `subturn.ts`'s
+ * `SelfCreatedSessions`. That class needs a synchronous `resolveParent`
+ * lookup to walk beyond a single hop (module contract: "resolveParent lets
+ * the caller supply a lookup ... without this class owning client access").
+ * Since the OpenCode client's parent-lookup is async and hook dispatch is
+ * not, wiring cannot query the host synchronously for an ARBITRARY session's
+ * parent — but it doesn't need to for the common case: `isSelfCreated`
+ * checks `sessionID` itself against the recorded id set FIRST, before ever
+ * calling `resolveParent` (see `subturn.ts`), so every session this harness
+ * itself created (the only case that actually occurs in this codebase — the
+ * judge/intake subturns never nest a grandchild) is caught with zero calls
+ * to `resolveParent`. `resolveParent` is still wired to a real (synchronous,
+ * in-memory) child->parent map populated at the moment wiring records a
+ * subturn, so the defensive grandchild case in FR-036's text is honoured
+ * for any future host behaviour without requiring an async client call
+ * inside a hook.
+ */
+export class SelfCreatedGuard {
+  private readonly childToParent = new Map<string, string | null>()
+
+  record(sessionID: string, parentID: string | null): void {
+    this.childToParent.set(sessionID, parentID)
+  }
+
+  resolveParent = (sessionID: string): string | null => {
+    return this.childToParent.get(sessionID) ?? null
+  }
+}

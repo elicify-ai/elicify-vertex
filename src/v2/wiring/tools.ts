@@ -1,0 +1,250 @@
+/**
+ * Wave-3 wiring — `elicify_vertex_plan_*` tools and their matching
+ * `/elicify-vertex-plan-*` slash commands (Ambiguity #6's naming
+ * resolution), backed by `StoryEngine` rather than v1's `MultiStoryGoalEngine`.
+ * Structure mirrors v1's `elicify_vertex_goal_*` tools in `src/index.ts`.
+ *
+ * Waiver-provenance enforcement (`story.ts`'s module header, "Dataset row 6
+ * of Checkpoint evidence validation" — flagged as high-severity in the wave
+ * brief alongside FR-036/CRIT-001): `StoryEngine.checkpoint` only checks that
+ * a waiver is STRUCTURALLY well-formed (a non-empty `sourceMessageId`). It
+ * explicitly documents that the caller (this file) must independently prove
+ * the referenced message id names a real `role: "user"` chat message before
+ * ever attaching it as evidence — a waiver id supplied via tool-call
+ * arguments is, by construction, something the MODEL wrote, so it can never
+ * be trusted on its own. `checkpointTool` below resolves every
+ * `waiverSourceMessageId` against `client.session.messages(...)` and REJECTS
+ * (throws, does not silently drop) any waiver whose id does not resolve to a
+ * `role: "user"` message.
+ */
+import { resolve } from "node:path"
+
+import { tool } from "@opencode-ai/plugin"
+import type { VerificationReceiptStore } from "../../goals.js"
+import type { PhaseEngine } from "../phase.js"
+import type { StoryEngine } from "../story.js"
+import type { OpencodeClient } from "../types.js"
+import type { V2SessionState } from "./state.js"
+
+export interface PlanToolsDeps {
+  storyEngine: StoryEngine
+  verificationReceipts: VerificationReceiptStore
+  client: OpencodeClient
+  states: Map<string, V2SessionState>
+  /** T8 (FR-001): rebinds phase to `execute` for the next story when a
+   * non-final story checkpoints complete. Without this call the phase
+   * engine's per-story slot for the newly-active story is never touched
+   * until its first mutation, so `getPhase()` reads a stale/default value
+   * in the window between checkpoint and that mutation. */
+  phaseEngine: PhaseEngine
+  /** Runs when a plan is successfully created, so wiring can clear `multiStoryPending`. */
+  onPlanCreated: (sessionID: string) => void
+}
+
+interface ClientMessage {
+  info?: { id?: string; role?: string }
+  message?: { id?: string; role?: string }
+}
+
+function isFieldsStyle(value: unknown): value is { data?: unknown; error?: unknown } {
+  return typeof value === "object" && value !== null && ("data" in value || "error" in value)
+}
+
+async function isUserMessage(client: OpencodeClient, sessionID: string, messageID: string): Promise<boolean> {
+  try {
+    const raw = await client.session.messages({ path: { id: sessionID } } as never)
+    const list = isFieldsStyle(raw) ? raw.data : raw
+    if (!Array.isArray(list)) return false
+    for (const entry of list as ClientMessage[]) {
+      const info = entry.info ?? entry.message
+      if (info?.id === messageID) return info.role === "user"
+    }
+    return false
+  } catch {
+    return false
+  }
+}
+
+function isValidTimestampString(value: unknown): value is string {
+  return typeof value === "string" && value.trim() !== "" && Number.isFinite(Date.parse(value))
+}
+
+/**
+ * v1 parity (`src/goals.ts`'s `MultiStoryGoalEngine.checkpoint`, ~L300-312):
+ * a `receiptId` evidence pointer is only as good as the receipt it names
+ * still being an OBSERVED, workspace-matching, time-valid verification
+ * (FR-020: "workspace-matching, time-valid receipt") — not merely present
+ * in the store. Existence alone (this function's previous behaviour)
+ * accepts a receipt recorded in a different workspace, one that failed, or
+ * one whose timestamp cannot possibly cover this story's work.
+ *
+ * "Not before story start" is checked defensively: `StoryV2` does not carry
+ * a `startedAt` field as of this fix (a sibling wave-4 agent may add one to
+ * story.ts concurrently, which this file does not — and must not — depend
+ * on). This falls back through a hypothetical `story.createdAt` to
+ * `plan.createdAt`, and skips the time bound entirely if none of those
+ * resolve to a valid timestamp — it never crashes on a field that may or
+ * may not exist, and never skips the workspace/outcome/exitCode checks just
+ * because the time bound can't be computed.
+ */
+function isFreshReceipt(
+  deps: Pick<PlanToolsDeps, "verificationReceipts" | "states" | "storyEngine">,
+  sessionID: string,
+  storyId: string,
+  receiptId: string,
+): boolean {
+  const receipt = deps.verificationReceipts.get(sessionID, receiptId)
+  if (!receipt) return false
+  if (receipt.outcome !== "verified" || receipt.exitCode !== 0) return false
+
+  const state = deps.states.get(sessionID)
+  if (state && resolve(receipt.workspaceRoot) !== resolve(state.workspaceRoot)) return false
+
+  const now = new Date().toISOString()
+  if (receipt.observedAt > now) return false
+
+  const plan = deps.storyEngine.getPlan(sessionID)
+  const story = plan?.stories.find((s) => s.id === storyId)
+  const storyStart =
+    (story as Record<string, unknown> | undefined)?.startedAt ??
+    (story as Record<string, unknown> | undefined)?.createdAt ??
+    plan?.createdAt
+  if (isValidTimestampString(storyStart) && receipt.observedAt < storyStart) return false
+
+  return true
+}
+
+export function buildPlanTools(deps: PlanToolsDeps) {
+  const { storyEngine, verificationReceipts, client, states, phaseEngine } = deps
+
+  const createTool = tool({
+    description:
+      "Create the elicify-vertex v2 story-contract plan under <project>/.elicify-vertex/plan.json. " +
+      "Call only after the user has confirmed a proposed plan. Pass the confirmed stories.",
+    args: {
+      stories: tool.schema
+        .array(
+          tool.schema.object({
+            text: tool.schema.string().min(1),
+            acceptanceItems: tool.schema.array(tool.schema.string().min(1)).min(1),
+            scopeGlobs: tool.schema.array(tool.schema.string()).optional().default([]),
+            verifiers: tool.schema.array(tool.schema.string()).optional().default([]),
+          }),
+        )
+        .min(1),
+    },
+    async execute(args, context) {
+      const plan = storyEngine.createPlan(context.sessionID, args.stories)
+      deps.onPlanCreated(context.sessionID)
+      return JSON.stringify(plan, null, 2)
+    },
+  })
+
+  const nextTool = tool({
+    description: "Return the active story in the elicify-vertex v2 plan. Work only that story until checkpointed.",
+    args: {},
+    async execute(_args, context) {
+      const story = storyEngine.getActiveStory(context.sessionID)
+      return JSON.stringify(story, null, 2)
+    },
+  })
+
+  const checkpointTool = tool({
+    description:
+      "Checkpoint a story in the elicify-vertex v2 plan (complete|failed|blocked). " +
+      "For status=complete, every acceptance item needs evidence: either a verificationReceiptId observed " +
+      "earlier in this session, or a waiverSourceMessageId naming a real user chat message that explicitly waived it.",
+    args: {
+      storyId: tool.schema.string().min(1),
+      status: tool.schema.enum(["complete", "failed", "blocked"]),
+      items: tool.schema
+        .array(
+          tool.schema.object({
+            id: tool.schema.string().min(1),
+            receiptId: tool.schema.string().optional(),
+            waiverSourceMessageId: tool.schema.string().optional(),
+          }),
+        )
+        .optional()
+        .default([]),
+    },
+    async execute(args, context) {
+      for (const item of args.items) {
+        if (item.receiptId) {
+          storyEngine.attachEvidence(context.sessionID, args.storyId, item.id, { receiptId: item.receiptId })
+        } else if (item.waiverSourceMessageId) {
+          const verified = await isUserMessage(client, context.sessionID, item.waiverSourceMessageId)
+          if (!verified) {
+            throw new Error(
+              `waiver for acceptance item ${item.id} references message ${item.waiverSourceMessageId}, which does not resolve to a user-authored chat message — rejected`,
+            )
+          }
+          storyEngine.attachEvidence(context.sessionID, args.storyId, item.id, {
+            waiver: true,
+            sourceMessageId: item.waiverSourceMessageId,
+          })
+        }
+      }
+      storyEngine.checkpoint(context.sessionID, args.storyId, args.status, {
+        isValidReceipt: (receiptId) =>
+          isFreshReceipt({ verificationReceipts, states, storyEngine }, context.sessionID, args.storyId, receiptId),
+      })
+      const plan = storyEngine.getPlan(context.sessionID)
+      // T8 (FR-001): a non-final story completing rebinds phase to `execute`
+      // for the newly-active successor story. `storyEngine.checkpoint` above
+      // already promoted the next "pending" story to "active" internally;
+      // if a different story is now active, that's the T8 arc.
+      if (args.status === "complete") {
+        const nowActive = storyEngine.getActiveStory(context.sessionID)
+        if (nowActive && nowActive.id !== args.storyId) {
+          phaseEngine.onStoryAdvance(context.sessionID, args.storyId, nowActive.id)
+        }
+      }
+      return JSON.stringify(plan, null, 2)
+    },
+  })
+
+  const statusTool = tool({
+    description: "Read the elicify-vertex v2 story-contract plan for the current session (null if none).",
+    args: {},
+    async execute(_args, context) {
+      return JSON.stringify(storyEngine.getPlan(context.sessionID), null, 2)
+    },
+  })
+
+  return {
+    elicify_vertex_plan_create: createTool,
+    elicify_vertex_plan_next: nextTool,
+    elicify_vertex_plan_checkpoint: checkpointTool,
+    elicify_vertex_plan_status: statusTool,
+  }
+}
+
+export function planSlashCommands(): Record<string, { description: string; template: string }> {
+  return {
+    "elicify-vertex-plan-create": {
+      description: "Create the elicify-vertex v2 story-contract plan (project/.elicify-vertex).",
+      template: `Create the elicify-vertex v2 plan with elicify_vertex_plan_create, using the stories the user just confirmed (text, acceptanceItems, scopeGlobs, verifiers per story).
+
+$ARGUMENTS`,
+    },
+    "elicify-vertex-plan-next": {
+      description: "Show the active story in the elicify-vertex v2 plan.",
+      template: `Call elicify_vertex_plan_next and report the active story (id, text, acceptanceItems). If there is no plan, tell the user to confirm a plan proposal first.
+
+$ARGUMENTS`,
+    },
+    "elicify-vertex-plan-checkpoint": {
+      description: "Checkpoint a story in the elicify-vertex v2 plan with evidence.",
+      template: `Call elicify_vertex_plan_checkpoint for the active story: status (complete|failed|blocked) and, for each acceptance item, either a receiptId from an observed verification this session or a waiverSourceMessageId naming the user message that explicitly waived it.
+
+$ARGUMENTS`,
+    },
+    "elicify-vertex-plan-status": {
+      description: "Show the elicify-vertex v2 plan status.",
+      template: `Call elicify_vertex_plan_status and report plan status, active story, and next legal step.
+
+$ARGUMENTS`,
+    },
+  }
+}
