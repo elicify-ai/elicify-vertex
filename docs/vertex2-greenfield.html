@@ -1,0 +1,662 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vertex 2 — From Guardrail to Exoskeleton</title>
+<style>
+  :root {
+    --ink: #1a1d23;
+    --ink-soft: #4a505c;
+    --ink-faint: #8a91a0;
+    --paper: #fbfaf7;
+    --card: #ffffff;
+    --line: #e4e2db;
+    --accent: #b4552d;       /* burnt sienna */
+    --accent-soft: #f6e8e0;
+    --good: #2d6a4f;
+    --good-soft: #e3efe8;
+    --bad: #9b2c2c;
+    --bad-soft: #f6e3e3;
+    --guide: #1d5c8f;
+    --guide-soft: #e2edf5;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+    background: var(--paper);
+    color: var(--ink);
+    line-height: 1.65;
+    font-size: 16px;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 0 32px 120px; }
+
+  /* ---------- header ---------- */
+  header { padding: 88px 0 48px; border-bottom: 1px solid var(--line); }
+  .kicker {
+    font-family: var(--mono); font-size: 12px; letter-spacing: .18em;
+    text-transform: uppercase; color: var(--accent); margin-bottom: 18px;
+  }
+  h1 { font-size: 44px; line-height: 1.12; font-weight: 750; letter-spacing: -0.02em; max-width: 22ch; }
+  h1 em { font-style: normal; color: var(--accent); }
+  .lede {
+    margin-top: 22px; font-size: 19px; color: var(--ink-soft); max-width: 62ch;
+  }
+  .lede strong { color: var(--ink); }
+
+  /* ---------- sections ---------- */
+  section { padding: 64px 0 8px; }
+  .sec-num {
+    font-family: var(--mono); font-size: 12px; color: var(--accent);
+    letter-spacing: .15em; margin-bottom: 8px;
+  }
+  h2 { font-size: 28px; font-weight: 700; letter-spacing: -0.015em; margin-bottom: 6px; }
+  .sec-sub { color: var(--ink-soft); max-width: 68ch; margin-bottom: 28px; }
+  h3 { font-size: 18px; font-weight: 650; margin: 30px 0 10px; }
+  p { max-width: 72ch; margin-bottom: 14px; }
+  .muted { color: var(--ink-faint); }
+
+  /* ---------- thesis cards ---------- */
+  .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin: 26px 0; }
+  .grid2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; margin: 26px 0; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    padding: 20px 22px;
+  }
+  .card h4 { font-size: 15px; font-weight: 650; margin-bottom: 8px; }
+  .card p { font-size: 14px; color: var(--ink-soft); margin: 0; }
+  .card .tag {
+    display: inline-block; font-family: var(--mono); font-size: 11px;
+    padding: 2px 8px; border-radius: 20px; margin-bottom: 10px;
+  }
+  .tag.fail { background: var(--bad-soft); color: var(--bad); }
+  .tag.fix  { background: var(--good-soft); color: var(--good); }
+  .tag.blue { background: var(--guide-soft); color: var(--guide); }
+
+  /* ---------- diagram frame ---------- */
+  .figure {
+    background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+    padding: 28px; margin: 28px 0;
+  }
+  .figure figcaption {
+    font-size: 13px; color: var(--ink-faint); margin-top: 14px; text-align: center;
+  }
+  svg { display: block; margin: 0 auto; max-width: 100%; height: auto; }
+  svg text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  svg .mono { font-family: var(--mono); }
+
+  /* ---------- injection grammar ---------- */
+  .before-after { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 24px 0; }
+  .inj {
+    border-radius: 10px; padding: 18px 20px; font-family: var(--mono);
+    font-size: 12.5px; line-height: 1.7; white-space: pre-wrap; overflow-x: auto;
+  }
+  .inj-label { font-family: var(--mono); font-size: 11px; letter-spacing: .12em;
+    text-transform: uppercase; margin-bottom: 8px; }
+  .inj.bad  { background: var(--bad-soft); border: 1px solid #ecc9c9; color: #6d2020; }
+  .inj.good { background: var(--good-soft); border: 1px solid #c4dccf; color: #1d4a37; }
+  .inj .k { font-weight: 700; }
+
+  /* ---------- pattern library ---------- */
+  table { width: 100%; border-collapse: collapse; margin: 22px 0; background: var(--card);
+    border: 1px solid var(--line); border-radius: 10px; overflow: hidden; font-size: 14px; }
+  th { text-align: left; font-size: 12px; letter-spacing: .08em; text-transform: uppercase;
+    color: var(--ink-faint); padding: 12px 16px; border-bottom: 1px solid var(--line);
+    background: #f6f4ef; font-weight: 600; }
+  td { padding: 12px 16px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  td.pname { font-weight: 650; white-space: nowrap; }
+  td .tpl { font-family: var(--mono); font-size: 12px; color: var(--guide); display: block; margin-top: 4px; }
+  td .targets { font-size: 12px; color: var(--ink-faint); }
+
+  /* ---------- code / schema ---------- */
+  pre.code {
+    background: #22252c; color: #d8dce6; border-radius: 10px; padding: 20px 22px;
+    font-family: var(--mono); font-size: 12.5px; line-height: 1.7; overflow-x: auto; margin: 20px 0;
+  }
+  pre.code .c { color: #7f8798; }
+  pre.code .s { color: #a8c88a; }
+  pre.code .key { color: #8ab4d8; }
+
+  /* ---------- callout ---------- */
+  .callout {
+    border-left: 3px solid var(--accent); background: var(--accent-soft);
+    padding: 16px 20px; border-radius: 0 10px 10px 0; margin: 24px 0; max-width: 76ch;
+  }
+  .callout p { margin: 0; font-size: 15px; }
+
+  footer { margin-top: 80px; padding-top: 24px; border-top: 1px solid var(--line);
+    font-size: 13px; color: var(--ink-faint); }
+
+  @media (max-width: 760px) {
+    .grid3, .grid2, .before-after { grid-template-columns: 1fr; }
+    h1 { font-size: 34px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="kicker">elicify-vertex · greenfield design · v2 proposal</div>
+  <h1>From guardrail to <em>exoskeleton</em></h1>
+  <p class="lede">
+    Vertex 1 is a system of gates: it <strong>stops bad endings</strong>. The behavior users
+    actually love — ownership, one-shot competence, root-cause instinct, taste — is
+    <strong>initiative</strong>, and initiative cannot be gated into existence.
+    Vertex 2 keeps the gates as the last line and rebuilds everything in front of them:
+    a phase-aware process engine, an injection layer that <strong>prescribes instead of
+    complains</strong>, and prompt techniques that motivate <strong>reasoning</strong>, not compliance.
+  </p>
+</header>
+
+<!-- ============================================================ -->
+<section>
+  <div class="sec-num">00</div>
+  <h2>Why v1 plateaus</h2>
+  <p class="sec-sub">Three structural limits — not bugs, design ceilings.</p>
+  <div class="grid3">
+    <div class="card">
+      <span class="tag fail">limit 1</span>
+      <h4>It complains, it doesn't coach</h4>
+      <p>"Files changed, no verification observed — run a test." True, and useless. The harness
+      <em>knows</em> which files changed, which verifier last ran, and what it covered — and throws
+      that away at the exact moment it matters.</p>
+    </div>
+    <div class="card">
+      <span class="tag fail">limit 2</span>
+      <h4>It regulates the end of the turn</h4>
+      <p>The stop gate fires at idle. But quality is decided at the <em>start</em>: whether intent was
+      restated, assumptions surfaced, an approach chosen. v1 has zero presence where one-shot
+      competence is born.</p>
+    </div>
+    <div class="card">
+      <span class="tag fail">limit 3</span>
+      <h4>Process is passive</h4>
+      <p>The goals engine waits to be invoked, stories are free text, checkpoints accept prose as
+      evidence. The plan never talks to the injection layer. It's a notebook, not a backbone.</p>
+    </div>
+  </div>
+  <div class="callout"><p><strong>Thesis.</strong> One loop, seven phases, three injection moments.
+  Every injection follows one grammar: <em>Observation → Diagnosis → Prescription → Example</em>.
+  The goal engine carries the state that makes prescriptions specific. Gates remain — as the
+  <em>last</em> resort, and every block teaches.</p></div>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <div class="sec-num">01</div>
+  <h2>The loop — seven phases, three injection moments</h2>
+  <p class="sec-sub">Work moves through phases. The engine tracks the phase per story and serves
+  phase-matched guidance. The right prompt at the wrong phase is noise.</p>
+
+  <div class="figure">
+    <svg viewBox="0 0 900 470" role="img" aria-label="Seven phase loop diagram">
+      <!-- lane background -->
+      <defs>
+        <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="#8a91a0"/>
+        </marker>
+        <marker id="arrA" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="#b4552d"/>
+        </marker>
+      </defs>
+
+      <!-- Phase boxes row 1 -->
+      <g font-size="14" font-weight="600" text-anchor="middle">
+        <rect x="30"  y="60" width="150" height="64" rx="10" fill="#e2edf5" stroke="#1d5c8f"/>
+        <text x="105" y="87" fill="#1d5c8f">1 · INTAKE</text>
+        <text x="105" y="106" font-size="11" font-weight="400" fill="#4a505c">intent · criteria · assumptions</text>
+
+        <rect x="230" y="60" width="150" height="64" rx="10" fill="#e2edf5" stroke="#1d5c8f"/>
+        <text x="305" y="87" fill="#1d5c8f">2 · FRAME</text>
+        <text x="305" y="106" font-size="11" font-weight="400" fill="#4a505c">approach + tradeoff · decompose</text>
+
+        <rect x="430" y="60" width="150" height="64" rx="10" fill="#e2edf5" stroke="#1d5c8f"/>
+        <text x="505" y="87" fill="#1d5c8f">3 · PLAN</text>
+        <text x="505" y="106" font-size="11" font-weight="400" fill="#4a505c">smallest verifiable steps</text>
+
+        <rect x="630" y="60" width="150" height="64" rx="10" fill="#fff" stroke="#8a91a0"/>
+        <text x="705" y="87" fill="#1a1d23">4 · EXECUTE</text>
+        <text x="705" y="106" font-size="11" font-weight="400" fill="#4a505c">read-before-write · scope watch</text>
+      </g>
+
+      <!-- Phase boxes row 2 (right to left) -->
+      <g font-size="14" font-weight="600" text-anchor="middle">
+        <rect x="630" y="220" width="150" height="64" rx="10" fill="#fff" stroke="#8a91a0"/>
+        <text x="705" y="247" fill="#1a1d23">5 · VERIFY</text>
+        <text x="705" y="266" font-size="11" font-weight="400" fill="#4a505c">relevance · pre-commit · falsify</text>
+
+        <rect x="430" y="220" width="150" height="64" rx="10" fill="#f6e8e0" stroke="#b4552d"/>
+        <text x="505" y="247" fill="#b4552d">6 · ELEVATE</text>
+        <text x="505" y="266" font-size="11" font-weight="400" fill="#4a505c">criteria replay · sweep · taste</text>
+
+        <rect x="230" y="220" width="150" height="64" rx="10" fill="#e3efe8" stroke="#2d6a4f"/>
+        <text x="305" y="247" fill="#2d6a4f">7 · CLOSE</text>
+        <text x="305" y="266" font-size="11" font-weight="400" fill="#4a505c">receipt-bound checkpoint · report</text>
+      </g>
+
+      <!-- arrows row1 -->
+      <g stroke="#8a91a0" stroke-width="2" fill="none">
+        <line x1="180" y1="92" x2="222" y2="92" marker-end="url(#arr)"/>
+        <line x1="380" y1="92" x2="422" y2="92" marker-end="url(#arr)"/>
+        <line x1="580" y1="92" x2="622" y2="92" marker-end="url(#arr)"/>
+        <path d="M 705 124 L 705 212" marker-end="url(#arr)"/>
+        <line x1="630" y1="252" x2="588" y2="252" marker-end="url(#arr)"/>
+        <line x1="430" y1="252" x2="388" y2="252" marker-end="url(#arr)"/>
+      </g>
+      <!-- loop back: verify fails -> execute -->
+      <path d="M 660 220 C 640 180, 660 160, 690 128" stroke="#9b2c2c" stroke-width="1.6" fill="none" stroke-dasharray="5 4" marker-end="url(#arr)"/>
+      <text x="612" y="175" font-size="11" fill="#9b2c2c">fail → re-model, not re-try</text>
+      <!-- next story loop -->
+      <path d="M 230 252 C 120 252, 90 180, 100 128" stroke="#2d6a4f" stroke-width="1.6" fill="none" stroke-dasharray="5 4" marker-end="url(#arr)"/>
+      <text x="88" y="200" font-size="11" fill="#2d6a4f">next story</text>
+
+      <!-- Injection moments strip -->
+      <rect x="30" y="340" width="840" height="100" rx="10" fill="#fbf3ee" stroke="#e8cdbd"/>
+      <text x="50" y="368" font-size="12" letter-spacing="2" fill="#b4552d" font-weight="700">INJECTION MOMENTS</text>
+      <g font-size="13">
+        <circle cx="70" cy="400" r="5" fill="#b4552d"/>
+        <text x="86" y="405" fill="#1a1d23"><tspan font-weight="650">Turn-start scaffold</tspan> <tspan fill="#4a505c">— intake/frame prompts, only until pinned</tspan></text>
+        <circle cx="70" cy="424" r="5" fill="#b4552d"/>
+        <text x="86" y="429" fill="#1a1d23"><tspan font-weight="650">Anomaly interrupt</tspan> <tspan fill="#4a505c">— expected ≠ observed, scope drift, repeat failure</tspan></text>
+        <circle cx="480" cy="400" r="5" fill="#b4552d"/>
+        <text x="496" y="405" fill="#1a1d23"><tspan font-weight="650">Post-green elevate</tspan> <tspan fill="#4a505c">— the moment weak models stop and strong ones keep going</tspan></text>
+        <circle cx="480" cy="424" r="5" fill="#b4552d"/>
+        <text x="496" y="429" fill="#1a1d23"><tspan font-weight="650">Idle gate (last resort)</tspan> <tspan fill="#4a505c">— blocks only when criteria are unmet AND unexplained</tspan></text>
+      </g>
+      <!-- connectors from strip to loop -->
+      <path d="M 105 340 L 105 128" stroke="#b4552d" stroke-width="1.4" fill="none" stroke-dasharray="3 4" marker-end="url(#arrA)"/>
+      <path d="M 505 340 L 505 288" stroke="#b4552d" stroke-width="1.4" fill="none" stroke-dasharray="3 4" marker-end="url(#arrA)"/>
+      <path d="M 705 340 L 705 288" stroke="#b4552d" stroke-width="1.4" fill="none" stroke-dasharray="3 4" marker-end="url(#arrA)"/>
+    </svg>
+    <figcaption>Fig. 1 — The seven-phase loop. Blue = front-loading (where one-shot competence is born),
+    white = the work, sienna = elevation (where "done" becomes "finished well"), green = evidence-bound closure.</figcaption>
+  </div>
+
+  <div class="grid2">
+    <div class="card">
+      <span class="tag blue">phases 1–3 · front-load</span>
+      <h4>Where one-shot competence comes from</h4>
+      <p>Restate the <em>real</em> outcome in one line. Pin acceptance criteria. State 2–3 assumptions
+      and proceed — ask only at irreversible forks. Name the approach <em>and the approach you rejected</em>.
+      For multi-story scope, the engine proposes the decomposition unprompted.</p>
+    </div>
+    <div class="card">
+      <span class="tag fix">phase 6 · elevate</span>
+      <h4>Where "done" becomes senior</h4>
+      <p>Fires once, after the verifier goes green: replay each acceptance criterion against evidence;
+      sweep adjacent findings (surface always, fix if small + same root cause + tested, else propose);
+      one taste pass — read the diff as a reviewer who didn't write it.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <div class="sec-num">02</div>
+  <h2>The injection grammar — prescribe, don't complain</h2>
+  <p class="sec-sub">Every injection is generated from observed state and follows one shape:
+  <strong>Observation → Diagnosis → Prescription → Example.</strong> If the harness cannot fill all
+  four slots, it should question whether it has anything to say.</p>
+
+  <div class="before-after">
+    <div>
+      <div class="inj-label" style="color:var(--bad)">v1 — complaint</div>
+      <div class="inj bad">[vertex:stop-block] Files were changed
+this turn but no successful verification
+command was observed. Run the narrowest
+relevant test, lint, typecheck, build,
+check, validate, verify, or HTTP probe
+now and cite its observed result.</div>
+    </div>
+    <div>
+      <div class="inj-label" style="color:var(--good)">v2 — prescription</div>
+      <div class="inj good"><span class="k">[vertex:verify-gap]</span>
+<span class="k">Observed:</span> src/parser.ts, src/lexer.ts changed.
+Last verifier `tsc --noEmit` (types only)
+predates the lexer edit.
+<span class="k">Diagnosis:</span> behavioral change carrying
+type-only evidence — logic regressions
+are invisible to it.
+<span class="k">Do now:</span> npx vitest run tests/lexer.test.ts
+(narrowest suite covering the changed paths).
+<span class="k">Then:</span> if it passes on the first run, state
+why you trust a test you never saw fail.</div>
+    </div>
+  </div>
+
+  <div class="before-after">
+    <div>
+      <div class="inj-label" style="color:var(--bad)">v1 — complaint</div>
+      <div class="inj bad">[vertex:repeat-failure] The same class of
+failure has repeated 2 times. Stop retrying
+silently — report what failed, what you
+already tried, and your next hypothesis.</div>
+    </div>
+    <div>
+      <div class="inj-label" style="color:var(--good)">v2 — prescription</div>
+      <div class="inj good"><span class="k">[vertex:re-model]</span>
+<span class="k">Observed:</span> `npm test` failed twice with the
+same signature (TS2322 in goals.ts:114);
+your two edits changed the same 4 lines.
+<span class="k">Diagnosis:</span> perturbing one location twice =
+the defect is probably NOT at that location.
+<span class="k">Do now:</span> before a third edit, answer in one
+line: what belief about goals.ts made both
+fixes look right? Read the caller
+(index.ts:1408) before touching the file again.
+<span class="k">Example:</span> "I assumed checkpoint() owns the
+receipt type — it's actually widened upstream."</div>
+    </div>
+  </div>
+
+  <h3>Composition rules</h3>
+  <div class="grid3">
+    <div class="card"><h4>Budget: 2 per turn</h4><p>Attention is the scarce resource. Priority when over budget:
+      correction &gt; phase guidance &gt; enrichment. Everything else waits or is dropped.</p></div>
+    <div class="card"><h4>Cooldowns everywhere</h4><p>No directive repeats within its cooldown window.
+      A guidance system that repeats itself trains the model to ignore it.</p></div>
+    <div class="card"><h4>Decay by compliance</h4><p>If the model followed the prescription last time,
+      the next occurrence shrinks to a one-line reminder. Dosage adapts to observed behavior.</p></div>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <div class="sec-num">03</div>
+  <h2>Prompt technique library — motivate reasoning, not compliance</h2>
+  <p class="sec-sub">Ten patterns, each mapped to the failure mode it targets and the phase where it fires.
+  These are <em>questions that change the reasoning path</em>, not instructions to obey.</p>
+
+  <table>
+    <thead><tr><th style="width:18%">Pattern</th><th style="width:14%">Fires at</th><th>Template</th><th style="width:26%">Targets</th></tr></thead>
+    <tbody>
+      <tr><td class="pname">Pre-commitment</td><td>VERIFY, before any run</td>
+        <td>State the expected output in one line — <em>before</em> running.<span class="tpl">"Expected: 18 tests pass, the new one fails on the boundary case."</span></td>
+        <td class="targets">Confirmation bias. Makes surprise <em>detectable</em> — the anomaly interrupt keys off this.</td></tr>
+      <tr><td class="pname">Falsification</td><td>FRAME / new tests</td>
+        <td>What observation would prove this approach wrong? Get that observation first.<span class="tpl">"Break the guard, watch the test fail, restore."</span></td>
+        <td class="targets">Coherent-but-wrong narratives; tests that can't fail.</td></tr>
+      <tr><td class="pname">Assumption-forward</td><td>INTAKE</td>
+        <td>List 2–3 assumptions you are proceeding on. Ask only if a fork is destructive.<span class="tpl">"Assuming: Node ≥20, the API is internal, breaking the CLI flag is acceptable."</span></td>
+        <td class="targets">Clarification-loop paralysis; invisible assumptions.</td></tr>
+      <tr><td class="pname">Contrastive planning</td><td>FRAME</td>
+        <td>Name the approach you rejected, in one line, with the reason.<span class="tpl">"Rejected event-sourcing: two writers, no replay need."</span></td>
+        <td class="targets">First-idea anchoring. Forces ≥2 options at near-zero token cost.</td></tr>
+      <tr><td class="pname">Surprise interrupt</td><td>anomaly</td>
+        <td>Expected ≠ observed. Revise your model of the system before touching the code. What did you believe that is now false?</td>
+        <td class="targets">Rationalizing anomalies; symptom-chasing.</td></tr>
+      <tr><td class="pname">Root-cause ladder</td><td>after any failure→fix</td>
+        <td>Symptom or defect? What allowed it? Does the defect survive your fix anywhere else?</td>
+        <td class="targets">Bandaid fixes — fires on <em>every</em> fix, not only "debug"-classified tasks.</td></tr>
+      <tr><td class="pname">Confidence declaration</td><td>VERIFY</td>
+        <td>State confidence (low / med / high) before the verifier runs. The harness logs calibration per model.</td>
+        <td class="targets">Overconfident coherence — the only pattern that catches "sincerely wrong."</td></tr>
+      <tr><td class="pname">Criteria replay</td><td>ELEVATE / CLOSE</td>
+        <td>Quote each pinned acceptance criterion. Mark met / unmet, each with an evidence pointer (receipt id).</td>
+        <td class="targets">Answering the literal request instead of the intent; long-horizon drift.</td></tr>
+      <tr><td class="pname">Rubric self-score</td><td>ELEVATE</td>
+        <td>Score the diff: correct · minimal · consistent with the codebase · tested. Any low-confidence item → act on it now.</td>
+        <td class="targets">Unexamined "done"; quality left on the table.</td></tr>
+      <tr><td class="pname">Taste pass</td><td>ELEVATE</td>
+        <td>Read the full diff as a reviewer who didn't write it. Delete anything that doesn't pay rent.</td>
+        <td class="targets">Accumulated cruft; the gap between "works" and "signed by a senior."</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout"><p><strong>Design rule:</strong> imperatives produce compliance theater; questions
+  with a required one-line answer produce reasoning. Every pattern above demands a short <em>written
+  artifact</em> (an expectation, a rejected option, an assumption list) — which the harness can then
+  observe, compare against outcomes, and measure.</p></div>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <div class="sec-num">04</div>
+  <h2>Goal engine v2 — the process becomes the backbone</h2>
+  <p class="sec-sub">You were right that goals are the mechanism — and right that v1 doesn't do it right.
+  v1 stories are prose in a JSON file. v2 stories are <strong>contracts</strong> that the injection layer reads.</p>
+
+  <div class="grid3">
+    <div class="card"><span class="tag fail">v1</span><h4>Passive</h4><p>Waits for the user to invoke
+      <code>/goal-create</code>. Plans are an afterthought.</p></div>
+    <div class="card"><span class="tag fail">v1</span><h4>Prose stories</h4><p>Objective is free text.
+      No criteria, no scope, no bound verifier. Checkpoints accept any string as "evidence".</p></div>
+    <div class="card"><span class="tag fail">v1</span><h4>Disconnected</h4><p>The plan never informs
+      the injection layer. The stop gate doesn't know what "done" means for <em>this</em> story.</p></div>
+  </div>
+
+  <pre class="code"><span class="c">// v2 story — a contract, not a note. Written at FRAME, enforced everywhere.</span>
+{
+  <span class="key">"id"</span>: <span class="s">"S2"</span>,
+  <span class="key">"objective"</span>: <span class="s">"Parser handles nested templates"</span>,
+  <span class="key">"phase"</span>: <span class="s">"execute"</span>,                        <span class="c">// intake|frame|plan|execute|verify|elevate|closed</span>
+  <span class="key">"acceptance"</span>: [
+    { <span class="key">"id"</span>: <span class="s">"A1"</span>, <span class="key">"text"</span>: <span class="s">"nested `${}` parses to AST depth n"</span>, <span class="key">"evidence"</span>: null },
+    { <span class="key">"id"</span>: <span class="s">"A2"</span>, <span class="key">"text"</span>: <span class="s">"error spans point at inner token"</span>,  <span class="key">"evidence"</span>: null }
+  ],
+  <span class="key">"scope"</span>: [<span class="s">"src/parser/**"</span>, <span class="s">"tests/parser/**"</span>],   <span class="c">// feeds the scope watchdog</span>
+  <span class="key">"verifiers"</span>: [<span class="s">"npx vitest run tests/parser"</span>],     <span class="c">// feeds verify-relevance + prescriptions</span>
+  <span class="key">"assumptions"</span>: [<span class="s">"grammar stays LL(1)"</span>],
+  <span class="key">"rejected"</span>: [<span class="s">"regex pre-pass: can't nest"</span>],       <span class="c">// contrastive planning artifact</span>
+  <span class="key">"amendments"</span>: []                                    <span class="c">// re-planning is legal, but logged with reasons</span>
+}</pre>
+
+  <h3>What the contract buys, mechanically</h3>
+  <div class="grid2">
+    <div class="card"><h4>Scope watchdog (guides, doesn't block)</h4>
+      <p>Mutation outside <code>scope</code> → <em>"src/cli.ts is outside S2. Fold it into a proposal,
+      amend the story with a reason, or revert."</em> Proactivity becomes visible and governed —
+      surface always, fix when small + same root cause + tested, propose otherwise.</p></div>
+    <div class="card"><h4>Verifier relevance</h4>
+      <p>Green evidence must come from a verifier bound to the story (or covering its changed paths).
+      <code>tsc</code> after a logic change downgrades to partial evidence — the prescription names
+      the missing suite.</p></div>
+    <div class="card"><h4>Receipt-bound criteria</h4>
+      <p>A checkpoint is legal only when every acceptance item carries an evidence pointer
+      (verification receipt id or explicit user waiver). Prose is not evidence.</p></div>
+    <div class="card"><h4>The plan is the memory</h4>
+      <p>The goal file survives compaction; after every compaction the engine re-injects pinned
+      criteria + active story. Long-horizon persistence stops depending on context luck.</p></div>
+  </div>
+
+  <div class="figure">
+    <svg viewBox="0 0 900 240" role="img" aria-label="Goal engine feeds injection layer">
+      <defs>
+        <marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="#1d5c8f"/>
+        </marker>
+      </defs>
+      <rect x="30" y="70" width="220" height="110" rx="12" fill="#e3efe8" stroke="#2d6a4f"/>
+      <text x="140" y="103" text-anchor="middle" font-size="15" font-weight="700" fill="#2d6a4f">GOAL ENGINE v2</text>
+      <text x="140" y="126" text-anchor="middle" font-size="11.5" fill="#4a505c">stories · criteria · scope</text>
+      <text x="140" y="144" text-anchor="middle" font-size="11.5" fill="#4a505c">verifiers · phase · receipts</text>
+
+      <rect x="360" y="20" width="230" height="54" rx="10" fill="#fff" stroke="#8a91a0"/>
+      <text x="475" y="43" text-anchor="middle" font-size="13" font-weight="650">Scope watchdog</text>
+      <text x="475" y="61" text-anchor="middle" font-size="11" fill="#4a505c">reads story.scope</text>
+
+      <rect x="360" y="94" width="230" height="54" rx="10" fill="#fff" stroke="#8a91a0"/>
+      <text x="475" y="117" text-anchor="middle" font-size="13" font-weight="650">Verify-relevance</text>
+      <text x="475" y="135" text-anchor="middle" font-size="11" fill="#4a505c">reads story.verifiers + changed paths</text>
+
+      <rect x="360" y="168" width="230" height="54" rx="10" fill="#fff" stroke="#8a91a0"/>
+      <text x="475" y="191" text-anchor="middle" font-size="13" font-weight="650">Criteria replay / idle gate</text>
+      <text x="475" y="209" text-anchor="middle" font-size="11" fill="#4a505c">reads story.acceptance + receipts</text>
+
+      <rect x="680" y="94" width="190" height="54" rx="10" fill="#f6e8e0" stroke="#b4552d"/>
+      <text x="775" y="117" text-anchor="middle" font-size="13" font-weight="650" fill="#b4552d">Injection composer</text>
+      <text x="775" y="135" text-anchor="middle" font-size="11" fill="#4a505c">O → D → P → E grammar</text>
+
+      <g stroke="#1d5c8f" stroke-width="1.8" fill="none">
+        <path d="M 250 110 C 300 100, 310 60, 352 47" marker-end="url(#arr2)"/>
+        <line x1="250" y1="121" x2="352" y2="121" marker-end="url(#arr2)"/>
+        <path d="M 250 132 C 300 142, 310 180, 352 195" marker-end="url(#arr2)"/>
+        <line x1="590" y1="47"  x2="672" y2="108" marker-end="url(#arr2)"/>
+        <line x1="590" y1="121" x2="672" y2="121" marker-end="url(#arr2)"/>
+        <line x1="590" y1="195" x2="672" y2="134" marker-end="url(#arr2)"/>
+      </g>
+    </svg>
+    <figcaption>Fig. 2 — The plan stops being a notebook. Story contracts feed every detector,
+    and detectors feed one composer that speaks the O→D→P→E grammar.</figcaption>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <div class="sec-num">05</div>
+  <h2>Model-conditioned dosing</h2>
+  <p class="sec-sub">One failure profile per model class, one dose per profile. Every event logs the model id;
+  the holdout arm learns which directives earn their tokens <em>per model</em>.</p>
+  <table>
+    <thead><tr><th>Directive family</th><th><code>standard</code> profile</th><th><code>frontier</code> profile (Fable-class)</th></tr></thead>
+    <tbody>
+      <tr><td class="pname">Phase procedure (intake, plan)</td><td>Full scaffold, every task</td><td>One-line nudge; suppress after first compliance</td></tr>
+      <tr><td class="pname">Verification prescriptions</td><td>Always, with exact commands</td><td>Only on relevance gaps</td></tr>
+      <tr><td class="pname">Falsification / pre-commitment</td><td>On new tests</td><td><strong>Primary lever</strong> — the adversary of coherence</td></tr>
+      <tr><td class="pname">Anomaly interrupt</td><td>On</td><td>On — highest-value moment for strong models</td></tr>
+      <tr><td class="pname">Proactive-fix license</td><td>Propose only, never silently fix</td><td>Fix when small + related + tested; always report</td></tr>
+      <tr><td class="pname">Elevate phase</td><td>Full checklist</td><td>Rubric + taste pass only</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <div class="sec-num">06</div>
+  <h2>Measure what users feel</h2>
+  <p class="sec-sub">v1 counts blocks. Users don't feel blocks — they feel corrections they didn't have to make.</p>
+  <div class="grid3">
+    <div class="card"><h4>One-shot rate</h4><p>Corrective user turns per task, from first ask to acceptance.
+      The single number closest to "feels like Fable".</p></div>
+    <div class="card"><h4>Block conversion</h4><p>Share of gate blocks followed by a green, <em>relevant</em>
+      verifier within the same turn. Measures whether prescriptions actually teach.</p></div>
+    <div class="card"><h4>Proposal acceptance</h4><p>Share of elevate-phase proposals ("I also found X — take it?")
+      the user accepts. Proxy for judged, non-annoying proactivity.</p></div>
+    <div class="card"><h4>Criteria-met-at-close</h4><p>Acceptance items with hard evidence at checkpoint ÷ total.
+      Detects literal-answer-wrong-intent.</p></div>
+    <div class="card"><h4>Calibration</h4><p>Declared confidence vs verifier outcome, per model.
+      The overconfident-coherence detector.</p></div>
+    <div class="card"><h4>Directive ROI</h4><p>Per directive family × model: compliance rate and downstream
+      outcome delta vs holdout. Prompts that don't move outcomes get deleted.</p></div>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <div class="sec-num">07</div>
+  <h2>Build map — hooks to components</h2>
+  <pre class="code"><span class="c">// opencode plugin surface → v2 components</span>
+<span class="key">chat.message</span>                → intake classifier · phase engine init · criteria pinning
+<span class="key">experimental.chat.system.transform</span>
+                            → injection composer (O→D→P→E, budget 2, cooldown, decay)
+<span class="key">tool.execute.after</span>          → evidence collectors:
+                              mutation+scope watch · verifier relevance ·
+                              anomaly detector (pre-commit expectation vs observed) ·
+                              repeat-failure (per-signature cooldown)
+<span class="key">session.idle</span>                → criteria replay → elevate directive →
+                              gate ONLY if criteria unmet AND unexplained (teachable block)
+<span class="key">event(session.compacted)</span>    → re-inject pinned criteria + active story
+<span class="key">tool: goal_*</span>                → engine v2 (auto-propose at FRAME · contract stories ·
+                              receipt-bound checkpoints · logged amendments)
+<span class="key">events.jsonl</span>                → model id on every event · directive→outcome joins · holdout per family</pre>
+
+  <h3>Migration order (each step ships value alone)</h3>
+  <p><strong>1.</strong> Injection composer + O→D→P→E grammar (rewrites existing directives, no new state) →
+  <strong>2.</strong> Intake/criteria pinning + idle criteria replay →
+  <strong>3.</strong> Story contracts (scope, verifiers, receipt-bound checkpoints) →
+  <strong>4.</strong> Anomaly interrupt via pre-commitment →
+  <strong>5.</strong> Elevate phase →
+  <strong>6.</strong> Model-conditioned dosing + directive ROI measurement.</p>
+
+  <div class="callout"><p><strong>The honest ceiling, stated up front:</strong> this system closes the
+  <em>discipline</em> gap — front-loading, persistence, root-cause, evidence. It narrows but cannot close
+  the <em>judgment</em> gap: taste and true one-shot competence remain properties of the base model.
+  The exoskeleton makes a mid model work like a disciplined senior; it makes a frontier model auditable.
+  Both are worth building.</p></div>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <div class="sec-num">08</div>
+  <h2>Implementing the guide layer — the three-tier composer</h2>
+  <p class="sec-sub">The obvious question: doesn't "diagnose and prescribe" need an LLM judge?
+  Mostly no — and where judgment is genuinely needed, extract it from the <em>working model itself,
+  pinned in time so it cannot be rationalized</em>. A judge model exists only as a thin escalation tier.</p>
+
+  <div class="grid3">
+    <div class="card">
+      <span class="tag fix">tier 1 · always</span>
+      <h4>Deterministic slot-filling</h4>
+      <p>~80% of guide value, zero LLM. Observations come from the ledger. Diagnoses come from a
+      <em>finite failure-mode taxonomy</em> — each taxon a template with slots. Prescriptions come from
+      narrowest-verifier resolution: story <code>verifiers</code> → basename matching
+      (<code>src/lexer.ts → tests/**/lexer.test.ts</code>) → <code>rg</code> in test dirs →
+      <code>package.json</code> scripts → <code>vitest related</code>. Fast, free, debuggable,
+      never hallucinates.</p>
+    </div>
+    <div class="card">
+      <span class="tag blue">tier 2 · the real judge</span>
+      <h4>Temporal self-judgment</h4>
+      <p>"Was this expected?" needs no judge — it needs <strong>pre-commitment</strong>. The harness
+      demands <code>EXPECT: &lt;one line&gt;</code> before the run (captured deterministically from the
+      text stream), then compares expectation vs observation with string/exit logic. The judge is the
+      working model at time T, audited at time T+1 — judgment extracted <em>before the outcome exists</em>
+      cannot be rationalized after. Same mechanism: confidence calibration, criteria replay
+      (every "met" must carry a receipt id), root-cause ladder.</p>
+    </div>
+    <div class="card">
+      <span class="tag">tier 3 · escalation only</span>
+      <h4>LLM judge, on a leash</h4>
+      <p>Needed for three things only: intent-vs-criteria audit at the final gate of deep stories,
+      classifying failures the taxonomy misses, scoring taste passes <em>for measurement</em>.
+      Constraints: runs as an <strong>in-loop subturn</strong> — a child session
+      (<code>session.create({parentID})</code>) prompted with tool-calling disabled, on the
+      <strong>session's own model by default</strong> (always configured; optional
+      <code>judgeModel</code> override), 5&nbsp;s cap, never in the hot path, deterministic
+      fallback, and an <strong>evidence-only diet</strong> — diff + criteria + verifier output,
+      never the chat narrative, or the judge inherits the coherence bias it exists to catch.</p>
+    </div>
+  </div>
+
+  <h3>Which tier implements which guide feature</h3>
+  <table>
+    <thead><tr><th>Guide feature</th><th>Tier</th><th>Mechanics</th></tr></thead>
+    <tbody>
+      <tr><td class="pname">verify-gap prescription</td><td>1</td>
+        <td>ledger paths + verifier classification + narrowest-verifier resolution; tier 3 only if resolution is ambiguous</td></tr>
+      <tr><td class="pname">Scope watchdog</td><td>1</td>
+        <td>glob match: changed paths vs <code>story.scope</code></td></tr>
+      <tr><td class="pname">Anomaly interrupt</td><td>2</td>
+        <td><code>EXPECT:</code> artifact captured pre-run; deterministic compare post-run; mismatch quotes the model's own words back</td></tr>
+      <tr><td class="pname">Re-model on repeat failure</td><td>1 + 2</td>
+        <td>detection: signature + same-location diff tracking (tier 1); the "what belief was false?" answer is the model's artifact (tier 2)</td></tr>
+      <tr><td class="pname">Criteria replay</td><td>2 → 3</td>
+        <td>model marks met/unmet with receipt ids, harness validates receipts (tier 2); judge audits intent-fit once, at the final gate of deep stories (tier 3)</td></tr>
+      <tr><td class="pname">Confidence calibration</td><td>2</td>
+        <td>declared confidence captured pre-run; outcome deterministic; calibration curve per model</td></tr>
+      <tr><td class="pname">Taste pass</td><td>2 → 3</td>
+        <td>fresh-role prompt on the diff (tier 2); judge scores a sample offline for the measurement layer (tier 3)</td></tr>
+      <tr><td class="pname">Directive ROI</td><td>1 + 3</td>
+        <td>compliance is detectable from artifacts (tier 1 string checks); outcome deltas are plain statistics; judge only labels ambiguous outcomes offline</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout"><p><strong>The principle:</strong> the guide layer's intelligence is
+  <em>state you already collect, kept until the moment it matters, poured into templates</em> —
+  plus the working model's own judgment, extracted <em>before</em> outcomes exist so it is checkable
+  <em>after</em>. A second model judges only what the first model cannot be pinned to: intent.
+  Graceful degradation top-down: tier 3 unavailable → tier 2 still guides; tier 2 artifact missing →
+  tier 1 still prescribes.</p></div>
+</section>
+
+<footer>
+  elicify-vertex · Vertex 2 greenfield sketch · drafted by Fable (claude-fable-5) · 2026-07-25 ·
+  companion to docs/ARCHITECTURE.md
+</footer>
+
+</div>
+</body>
+</html>
