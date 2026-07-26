@@ -3,43 +3,61 @@
  * zero-tool subagents (`vertex-judge`, `vertex-intake`), the `/elicify-vertex`
  * activation command, and the `/elicify-vertex-plan-*` slash commands.
  *
- * The `tools` field on both agents is a static, hardcoded deny map
- * (`KNOWN_TOOL_NAMES`, below) — NOT built via `subturn.ts`'s `buildDenyMap`,
- * which calls `client.tool.ids()` (a real HTTP round trip back to the
- * host). `config` fires while the host is still bootstrapping the plugin
- * set — live-host testing showed this round trip deadlocks: the host can't
- * finish bootstrapping until `config` returns, and `config` was waiting on
- * a host call that only resolves after bootstrapping finishes.
+ * Zero-tool enforcement is carried ENTIRELY by `AGENT_PERMISSION` below
+ * (specifically its `"*": "deny"` wildcard), NOT by the `tools` deny map.
+ * Live-host testing (opencode 1.18.4, via `opencode debug agent` against
+ * throwaway probe agents registered four different ways) established the
+ * host's actual behaviour, which contradicts the bundled SDK's `AgentConfig`
+ * type:
  *
- * Post-review correction: an earlier version of this fix used a bare
- * `{"*": false}` wildcard entry instead of real tool names, on the
- * assumption that `"*"` is honoured as "deny every tool not otherwise
- * named". Live-host testing (`opencode debug agent vertex-judge`) disproved
- * this: `"*"` is treated as a literal (nonexistent) tool name, so it denies
- * nothing, and the resolved `tools` map came back with most real tools
- * (`read`, `glob`, `grep`, `task`, `todowrite`, `skill`, this plugin's own
- * `elicify_vertex_plan_*` tools, and any other installed plugin's tools)
- * still `true`. `KNOWN_TOOL_NAMES` replaces the wildcard with an explicit,
- * compile-time-known list: every opencode core built-in tool plus this
- * plugin's own tool names (the only two sets that CAN be known without a
- * live host call).
+ *   - `tools: {name: false}` on a plugin-registered agent is IGNORED. An
+ *     agent registered with ONLY a tools-deny map resolves every tool to
+ *     `true` — including `bash`, `edit`, `write` and `webfetch`. Two earlier
+ *     versions of this file got this wrong in different ways (first a bare
+ *     `{"*": false}`, then an enumerated `KNOWN_TOOL_NAMES` list); neither
+ *     denied anything, because the field itself is not consulted.
+ *   - `permission: {"*": "deny"}` DOES resolve the agent to zero enabled
+ *     tools, and is what actually delivers FR-030b.
  *
- * This is still necessarily incomplete for tools contributed by OTHER
- * installed plugins/MCP servers (their names aren't knowable at compile
- * time) — that gap is intentionally left to the FR-030b capability PROBE
- * (`judge.ts`/`story.ts`'s `classifyMultiStory`, each calling
- * `probeCapability` before every real subturn, long after the host is
- * fully up) to catch: if some other plugin's tool is still enabled, the
- * probe correctly refuses (`judge:unsupported` / `intake:unsupported`)
- * rather than silently running with more capability than "zero tools"
- * implies. That refusal path, not this map, remains the actual control of
- * record (spec Open Question 1) — this map only exists to make the probe
- * PASS as often as possible without reintroducing the config-time deadlock.
+ * The `tools` deny map is still passed (harmless, and correct per the
+ * documented type should a host ever honour it) but must never be relied on
+ * as the control. It is deliberately NOT built via `subturn.ts`'s
+ * `buildDenyMap`, which calls `client.tool.ids()` — a real HTTP round trip
+ * back to the host. `config` fires while the host is still bootstrapping the
+ * plugin set, and live testing showed that round trip deadlocks: the host
+ * can't finish bootstrapping until `config` returns, and `config` was
+ * waiting on a call that only resolves after bootstrapping finishes.
+ *
+ * The FR-030b capability PROBE (`judge.ts` / `story.ts`'s
+ * `classifyMultiStory`, each calling `probeCapability` before every real
+ * subturn, long after the host is fully up) remains the control of record:
+ * it reads the resolution back and refuses (`judge:unsupported` /
+ * `intake:unsupported`) if anything is still enabled — so a host that
+ * honours neither mechanism degrades to "judge disabled", never to "judge
+ * running with unaudited capability".
  */
 import type { OpencodeClient } from "../types.js"
 import { planSlashCommands } from "./tools.js"
 
-const AGENT_PERMISSION = { edit: "deny" as const, bash: "deny" as const, webfetch: "deny" as const }
+/**
+ * FR-030b zero-tool enforcement. The `"*": "deny"` wildcard is the load-bearing
+ * entry and MUST NOT be removed: live-host testing (opencode 1.18.4,
+ * `opencode debug agent`) established that
+ *   - the `tools: {name: false}` map is IGNORED entirely for agent registration —
+ *     an agent registered with only a tools-deny map resolves EVERY tool to
+ *     `true`, including `bash`, `edit`, `write` and `webfetch`;
+ *   - `permission: {"*": "deny"}` DOES resolve the agent to zero enabled tools.
+ * The explicit `edit`/`bash`/`webfetch` entries are kept alongside the wildcard
+ * because `probeCapability` (subturn.ts) requires a rule *naming* each of those
+ * three to prove denial — the wildcard alone satisfies the zero-tool check but
+ * emits no per-permission rule for the probe to read back.
+ */
+const AGENT_PERMISSION = {
+  "*": "deny" as const,
+  edit: "deny" as const,
+  bash: "deny" as const,
+  webfetch: "deny" as const,
+}
 
 /**
  * Every opencode core built-in tool name observed on a live host

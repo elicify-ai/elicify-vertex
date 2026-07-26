@@ -860,7 +860,29 @@ export interface ClassifyResult {
   source: "subturn" | "heuristic" | "skipped"
 }
 
-const INTAKE_SUBTURN_TIMEOUT_MS = 5000
+/**
+ * Raised from the spec's literal 5000ms for the same reason as judge.ts's
+ * `JUDGE_TOTAL_BUDGET_MS` (see that constant's comment): once the FR-030b
+ * capability probe started passing, live runs showed the intake subturn
+ * consuming the whole 5s on the model round-trip and logging
+ * `intake:classify-fallback {reason:"timeout"}` every time — so the
+ * subturn-first design silently degraded to the heuristic classifier on
+ * every real ask. `VERTEX_INTAKE_BUDGET_MS` overrides it (values <= 0 or
+ * unparseable fall back to the default).
+ *
+ * Intake is on the critical path of a user's first turn (unlike the judge,
+ * which runs at idle), so this default is deliberately lower than the
+ * judge's: a wrong-but-fast heuristic classification is a better failure
+ * mode here than a long stall before the assistant responds.
+ */
+const DEFAULT_INTAKE_SUBTURN_TIMEOUT_MS = 15_000
+
+function resolveIntakeTimeoutMs(): number {
+  const raw = Number(process.env.VERTEX_INTAKE_BUDGET_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_INTAKE_SUBTURN_TIMEOUT_MS
+}
+
+export const INTAKE_SUBTURN_TIMEOUT_MS = resolveIntakeTimeoutMs()
 const INTAKE_AGENT_NAME = "vertex-intake"
 
 const INTAKE_SYSTEM_PROMPT =

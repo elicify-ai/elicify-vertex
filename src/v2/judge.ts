@@ -346,9 +346,46 @@ const JUDGE_AGENT_NAME = "vertex-judge"
 
 /** FR-030: total budget shared across the capability probe + deny-map build
  * AND the subturn attempt(s) (override attempt, then its session-model
- * retry) — never a fresh 5s per phase or per attempt (CRITICAL fix: the
- * clock now starts before the probe, not just before the subturn). */
-export const JUDGE_TOTAL_BUDGET_MS = 5000
+ * retry) — never a fresh budget per phase or per attempt (CRITICAL fix: the
+ * clock now starts before the probe, not just before the subturn).
+ *
+ * Raised from the spec's literal 5000ms after live-host measurement: with
+ * the probe passing, a real judge subturn against a hosted model
+ * (openrouter/z-ai/glm-5.2) consumed the ENTIRE 5s budget on the model
+ * round-trip alone and logged `judge:unavailable {reason:"timeout"}` every
+ * time — i.e. the spec's budget made the judge unreachable in practice, not
+ * merely tight. 5s is a plausible bound for a local/cached model and an
+ * impossible one for a remote frontier model.
+ *
+ * `VERTEX_JUDGE_BUDGET_MS` overrides it (values <= 0 or unparseable fall
+ * back to the default) so an operator on a slow provider can raise it
+ * further, or drive it back down to the spec's 5000 to reproduce FR-030's
+ * literal behaviour. The judge remains advisory and non-gating, so the cost
+ * of a longer budget is bounded latency on an already-idle session, never a
+ * blocked turn.
+ *
+ * The 90s default is set from measurement, not taste. Two full successful
+ * judge runs (probe + child session create + model round-trip + delete)
+ * against openrouter/z-ai/glm-5.2 measured **28.8s and 45.6s** — a ~1.6x
+ * spread between back-to-back runs of an identical payload, i.e. provider
+ * latency here is highly variable rather than tightly clustered. Budgets
+ * near the observed cost are therefore actively harmful: they convert that
+ * variance into intermittent `judge:unavailable` timeouts that are
+ * indistinguishable from a broken feature (a 30s budget would have passed
+ * the first run and failed the second). 90s is ~2x the slowest observation.
+ *
+ * Erring generous is the right asymmetry here: the judge runs at idle and
+ * is advisory/non-gating, so an over-long budget costs only latency on an
+ * already-idle session, while an over-short one silently removes the
+ * feature. */
+const DEFAULT_JUDGE_TOTAL_BUDGET_MS = 90_000
+
+function resolveJudgeBudgetMs(): number {
+  const raw = Number(process.env.VERTEX_JUDGE_BUDGET_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_JUDGE_TOTAL_BUDGET_MS
+}
+
+export const JUDGE_TOTAL_BUDGET_MS = resolveJudgeBudgetMs()
 
 const JUDGE_SYSTEM_PROMPT = [
   "You are an automated fit-for-purpose judge for a coding assistant's completed task.",

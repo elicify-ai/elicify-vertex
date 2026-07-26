@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 
 import {
   IMPERATIVE_VERBS,
+  INTAKE_SUBTURN_TIMEOUT_MS,
   SEQUENCING_WORDS,
   StoryEngine,
   TRIVIAL_ASK_RE,
@@ -979,7 +980,7 @@ describe("intake_prefilter_and_heuristics (test 38, Dataset: 14 rows)", () => {
     expect(client.session.prompt).toHaveBeenCalledTimes(2)
   })
 
-  it("row 14: a subturn that never resolves falls back to the heuristic within the 5s total budget, logging intake:classify-fallback", async () => {
+  it("row 14: a subturn that never resolves falls back to the heuristic within the total intake budget, logging intake:classify-fallback", async () => {
     vi.useFakeTimers()
     const client = makeIntakeClient({ promptImpl: () => new Promise(() => {}) })
     const { deps, logger } = classifyDeps()
@@ -989,7 +990,11 @@ describe("intake_prefilter_and_heuristics (test 38, Dataset: 14 rows)", () => {
       sessionModel: SESSION_MODEL,
       askText: "first add the parser, then wire the CLI",
     })
-    await vi.advanceTimersByTimeAsync(5000)
+    // Advance by the module's ACTUAL configured budget rather than a
+    // hardcoded 5000: the default was raised (and made env-overridable) once
+    // live runs showed 5s timing out on every real model round-trip, so a
+    // literal here would silently stop exercising the timeout path.
+    await vi.advanceTimersByTimeAsync(INTAKE_SUBTURN_TIMEOUT_MS)
     const result = await resultPromise
 
     expect(result).toEqual({ multiStory: true, source: "heuristic" })

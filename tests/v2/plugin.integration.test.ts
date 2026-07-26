@@ -361,6 +361,50 @@ describe("verification receipt surfaced to the model (v1 parity fix)", () => {
 })
 
 // ===========================================================================
+// promise-no-act port: stale pre-tool-call text must not survive into
+// session.idle (v1 parity — src/index.ts clears lastAssistantText the same
+// way on every tool.execute.after while its gate is active)
+// ===========================================================================
+
+describe("promise-no-act port: stale text cleared by the next tool call", () => {
+  function promiseTexts(client: StubClient): string[] {
+    return client.session.prompt.mock.calls
+      .map((call: unknown[]) => (call[0] as { body?: { parts?: Array<{ text?: string }> } })?.body?.parts?.[0]?.text ?? "")
+      .filter((text: string) => text.includes("vertex:promise-no-act"))
+  }
+
+  it("does not block on a deferral phrase that predates the latest tool call", async () => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "stale-promise-session"
+
+    await activate(hooks, sid, "refactor the auth database migration end to end")
+    // This text alone WOULD trigger promise-no-act (see the gate.test.ts unit
+    // test) — but a tool call happens afterward, which must clear it.
+    await completeText(hooks, sid, "TODO: handle the edge case next.")
+    await toolAfter(hooks, sid, "edit", { filePath: "src/foo.ts" }, "updated")
+
+    await idle(hooks, sid)
+
+    expect(promiseTexts(client)).toHaveLength(0)
+  })
+
+  it("still blocks when the deferral text is the genuinely last thing produced (no tool call after it)", async () => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "fresh-promise-session"
+
+    await activate(hooks, sid, "refactor the auth database migration end to end")
+    await toolAfter(hooks, sid, "edit", { filePath: "src/foo.ts" }, "updated")
+    await completeText(hooks, sid, "TODO: handle the edge case next.")
+
+    await idle(hooks, sid)
+
+    expect(promiseTexts(client)).toHaveLength(1)
+  })
+})
+
+// ===========================================================================
 // Test 52: kill_switch_restores_v1 (FR-037 / US-11)
 // ===========================================================================
 

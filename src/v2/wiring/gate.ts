@@ -14,9 +14,11 @@
  * scope creep into a mechanism the spec does not ask this wave to carry
  * forward, so it is left out on purpose (documented, not a silent gap).
  */
+import { detectPromiseNoAct, shouldBlockPromiseNoAct } from "../../index.js"
 import type { EvidenceLedger } from "../../index.js"
 import { classifyFileKind, formatChangedPathsForReason, formatGateContinuationText } from "../../index.js"
 import { holdoutSuppresses, logHoldoutSuppress } from "../../measurement.js"
+import type { InjectionComposer } from "../composer.js"
 import type { EventLogger, OpencodeClient } from "../types.js"
 import type { PhaseEngine } from "../phase.js"
 import type { PinStore } from "../pin.js"
@@ -47,6 +49,9 @@ export interface GateContext {
   /** Recent verifier output summaries this session, for the judge payload (best-effort, bounded). */
   recentVerifierSummaries: (sessionID: string) => string[]
   diffSummary: (sessionID: string) => string
+  /** FIX (turn-freeze): `promptContinuation` calls `composer.newTurn(sid)` on
+   * every dispatched continuation — see that function's doc comment for why. */
+  composer: InjectionComposer
 }
 
 const CONTINUATION_TIMEOUT_MS = 30_000
@@ -68,6 +73,26 @@ async function promptContinuation(
   }
   const state = ctx.states.get(sid)
   if (state) state.idleContinuationInFlight = true
+
+  // FIX (turn-freeze, discovered via a real long-running unattended session):
+  // `composer.newTurn()` was only ever called from `chat.message` for a
+  // genuinely new user-authored message. The continuation THIS function
+  // sends re-enters as a `chat.message`, but `idleContinuationInFlight`
+  // makes that reentrant call a no-op (by design — it must not reset
+  // phase/ledger/pins as if new user intent arrived). The unintended side
+  // effect: on an unattended session where the harness itself is the only
+  // thing keeping the conversation going (no new human message ever
+  // arrives), `turnIndex` never advances again after the first real turn.
+  // Every per-turn-capped family (most default caps are 1) spends its
+  // budget once and is then dropped by `per-turn-cap:dropped` for the rest
+  // of the session, however long that runs — a real session showed 435 such
+  // drops over ~1.5 hours with turnIndex stuck at 7. Advancing the turn
+  // here (once per continuation the gate actually dispatches, a natural
+  // "next round" boundary distinct from "new user intent") resets per-turn
+  // spend so a capped family becomes eligible again on the next round,
+  // without touching phase/resetTurnState/pin-gc — those remain genuinely
+  // gated on real user messages only.
+  ctx.composer.newTurn(sid)
   let timeoutHandle: ReturnType<typeof setTimeout> | undefined
   try {
     const timeoutPromise = new Promise<never>((_, reject) => {
@@ -107,6 +132,57 @@ function narrowestPrescription(ctx: GateContext, state: V2SessionState, sid: str
     return "a relevant test, lint, typecheck, build, check, validate, verify, or HTTP probe command covering the changed paths"
   }
   return resolution.command
+}
+
+/**
+ * Promise-no-act port (v1 parity — this was deliberately NOT carried into
+ * v2 at wave-3 time, per this file's original header comment; ported now
+ * because a real long-running session showed the model closing a turn on
+ * "the rest of the criteria are deferred/tracked" language, which nothing
+ * in v2 detected). Reuses v1's `detectPromiseNoAct`/`shouldBlockPromiseNoAct`
+ * verbatim against `state.lastAssistantText` (the last text produced by
+ * `experimental.text.complete`, cleared on the next tool call by
+ * `plugin.ts`'s `tool.execute.after` so stale pre-tool-call text can never
+ * be checked here — mirrors v1's own `lastAssistantText.delete(sid)`).
+ *
+ * Checked FIRST in `handleSessionIdle`, before the criteria/zero-criteria
+ * branches — matching v1's ordering, where a promise-no-act hit takes
+ * precedence over (and short-circuits) the unverified-changes check.
+ *
+ * Reuses `EvidenceLedger.incrementPromiseBlocks`/`getPromiseBlocks` (v1's
+ * own counter, already driven in parallel by this module) rather than
+ * adding a new field to `V2SessionState`, and `ctx.maxCriteriaBlocks` as the
+ * cap — v1 uses one shared `maxStopBlocks` value across both promise-no-act
+ * and criteria blocks; v2 already threads the equivalent single cap value
+ * through `GateContext` for the criteria branch, so reusing it here keeps
+ * one cap knob instead of introducing a second, independently-configured one.
+ *
+ * Returns `true` iff it fired a continuation (caller must skip the rest of
+ * the FR-015 tree for this idle event, matching v1's early return).
+ */
+async function handlePromiseNoAct(ctx: GateContext, sid: string, state: V2SessionState): Promise<boolean> {
+  const lastText = state.lastAssistantText
+  if (!lastText) return false
+
+  const changed = ctx.evidenceLedger.hasChangedFiles(sid)
+  const verified = ctx.evidenceLedger.hasVerification(sid)
+  if (!shouldBlockPromiseNoAct(lastText, changed, verified)) return false
+
+  if (holdoutSuppresses(sid, "promise-no-act")) {
+    logHoldoutSuppress(sid, "v2 promise-no-act block skipped (holdout arm=off)", { family: "promise-no-act" })
+    return false
+  }
+
+  const count = ctx.evidenceLedger.incrementPromiseBlocks(sid)
+  if (count > ctx.maxCriteriaBlocks) {
+    return false // past cap: allow through with no further prompt (v2's established convention — see handleZeroCriteriaFallback)
+  }
+
+  const hits = detectPromiseNoAct(lastText)
+  const labels = hits.map((h) => h.label).join(", ")
+  const reason = `[vertex:promise-no-act] Your last message states an intent to do further work (${labels}) after changing files, without doing it. Do that work now with tool calls. End the turn only when the work is complete, or ask the user a direct question if you are blocked on input only they can provide.`
+  await promptContinuation(ctx, sid, reason)
+  return true
 }
 
 /** FR-015 zero-criteria fallback: v1's `EvidenceLedger.shouldBlockStop`, verbatim semantics, reused not reimplemented. */
@@ -231,6 +307,10 @@ export async function handleSessionIdle(ctx: GateContext, sid: string): Promise<
     state.needsCriteriaReinject = true // best-effort advisory surface on the next transform, never a block
     return
   }
+
+  // v1 ordering: promise-no-act is checked BEFORE the criteria/zero-criteria
+  // branches and short-circuits the rest of the tree when it fires.
+  if (await handlePromiseNoAct(ctx, sid, state)) return
 
   const criteria = ctx.pinStore.get(sid)
   const activeStory = ctx.storyEngine.getActiveStory(sid)

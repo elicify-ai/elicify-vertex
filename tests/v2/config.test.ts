@@ -50,29 +50,35 @@ describe("applyV2Config", () => {
     expect(Object.keys(cfgInput.command!).sort()).toEqual(["elicify-vertex", "elicify-vertex-plan-clear"])
   })
 
-  it("registers vertex-judge/vertex-intake with a deny map naming real built-in tools, not a bare wildcard", async () => {
+  it("registers vertex-judge/vertex-intake with the wildcard permission deny that actually delivers zero tools", async () => {
+    const cfgInput: { command?: Record<string, unknown>; agent?: Record<string, unknown> } = {}
+    await applyV2Config(cfgInput as never, {} as OpencodeClient, "elicify-vertex")
+
+    const judge = cfgInput.agent!["vertex-judge"] as { permission: Record<string, string> }
+    const intake = cfgInput.agent!["vertex-intake"] as { permission: Record<string, string> }
+    for (const permission of [judge.permission, intake.permission]) {
+      // The load-bearing entry: live-host testing showed the `tools` map is
+      // ignored entirely and ONLY `permission: {"*": "deny"}` resolves the
+      // agent to zero enabled tools (see config.ts's module header).
+      expect(permission["*"]).toBe("deny")
+      // Kept alongside the wildcard because probeCapability requires a rule
+      // *naming* each of these three to prove denial on read-back.
+      expect(permission.edit).toBe("deny")
+      expect(permission.bash).toBe("deny")
+      expect(permission.webfetch).toBe("deny")
+    }
+  })
+
+  it("never registers an agent whose tools deny map contains an enabled entry", async () => {
     const cfgInput: { command?: Record<string, unknown>; agent?: Record<string, unknown> } = {}
     await applyV2Config(cfgInput as never, {} as OpencodeClient, "elicify-vertex")
 
     const judge = cfgInput.agent!["vertex-judge"] as { tools: Record<string, boolean> }
     const intake = cfgInput.agent!["vertex-intake"] as { tools: Record<string, boolean> }
+    // The tools map is not the control of record (the host ignores it), but
+    // it must never contradict the permission block if a host DOES honour it.
     for (const toolsMap of [judge.tools, intake.tools]) {
-      // Every entry present must be false (deny) — no accidental true.
       expect(Object.values(toolsMap).every((v) => v === false)).toBe(true)
-      // Real built-in tool names must be explicitly covered, not just "*".
-      for (const name of ["bash", "edit", "write", "read", "glob", "grep", "task", "todowrite", "skill", "webfetch"]) {
-        expect(toolsMap[name]).toBe(false)
-      }
-      // This plugin's own plan tools (including the new clear tool) must be covered too.
-      for (const name of [
-        "elicify_vertex_plan_create",
-        "elicify_vertex_plan_next",
-        "elicify_vertex_plan_checkpoint",
-        "elicify_vertex_plan_status",
-        "elicify_vertex_plan_clear",
-      ]) {
-        expect(toolsMap[name]).toBe(false)
-      }
     }
   })
 })

@@ -299,6 +299,7 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       const stat = computeBoundedDiffStat(cwd, changedPaths)
       return stat || formatChangedPathsSummary(changedPaths)
     },
+    composer,
   }
 
   function formatChangedPathsSummary(paths: readonly string[]): string {
@@ -460,6 +461,15 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       if (isSelf(sid)) return
       const state = states.get(sid)
       if (!state || !state.active) return
+
+      // v1 parity (src/index.ts's tool.execute.after): once a tool runs,
+      // any prior assistant text is no longer the turn's "final" reply — the
+      // model may still produce more text after this tool call. Clearing it
+      // here means gate.ts's promise-no-act check (session.idle) only ever
+      // sees text produced AFTER the latest tool call; without this, stale
+      // pre-tool-call text (e.g. "I'll fix this next" followed by the model
+      // actually fixing it) would still read as an unfulfilled promise.
+      state.lastAssistantText = null
 
       const toolName = toolInput.tool
       const args = (toolInput.args ?? {}) as Record<string, unknown>
