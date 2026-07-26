@@ -3,13 +3,24 @@
  * Register elicify-vertex slash commands in opencode.json.
  * Called by install-skill.sh and postinstall.
  *
- * Reads opencode.json, adds the 5 elicify-vertex commands to the `command`
+ * Reads opencode.json, adds the elicify-vertex commands to the `command`
  * section (if not already present), writes the result.
  *
  * This is a FALLBACK for the plugin's config hook.  The config hook also
  * registers the same commands at runtime, but some OpenCode TUI versions do
  * not surface plugin-registered commands in the command palette.  Persisting
  * them in the config file guarantees they are always visible.
+ *
+ * Only two commands: `/elicify-vertex` (activate) and
+ * `/elicify-vertex-plan-clear` (abandon the current plan/pins). Everything
+ * else — creating, advancing, and checkpointing the plan — happens through
+ * the model calling `elicify_vertex_plan_*` tools directly, driven by the
+ * harness's own directives, not by a human typing a slash command. This
+ * file's templates MUST be kept in sync with `src/v2/wiring/config.ts`'s
+ * `ACTIVATE_TEMPLATE` and `src/v2/wiring/tools.ts`'s `planSlashCommands()` —
+ * because the config hook only ever adds a command with `??=` (never
+ * overwrites one already on disk), whatever this script writes here is what
+ * a user actually sees, even after every later plugin upgrade.
  */
 
 import { readFileSync, writeFileSync } from "node:fs"
@@ -26,78 +37,24 @@ const PKG = "@elicify-ai/elicify-vertex"
 // ── Command templates (mirrors src/index.ts config hook) ───────────────────
 
 const MAIN_COMMAND = {
-  description:
-    "Inject elicify-vertex verification discipline into this session and activate the harness.",
-  template: `Activate the elicify-vertex verification harness for this session and adopt the following discipline for all following work in this chat.
+  description: "Activate the elicify-vertex 2 verification harness for this session.",
+  template: `Activate the elicify-vertex 2 verification harness for this session.
 
-[vertex:contract] Verification reminder: before reporting a task as done,
-- observe the actual output of the change (run the test, render the artifact, hit the endpoint);
-- ground any "done" claim in a tool result from this turn, not in intent;
-- if a step failed and you cannot fix it, surface that explicitly.
-What counts as verification: an allowlisted test, lint, typecheck, build, check, validate, verify, or HTTP probe command whose observed exit code is reliable and zero, with no contradictory failure output. Silent successful tools such as tsc count. A Write/Edit success message is authoring, not verifying.
-Hierarchy of evidence: observed passing tests satisfy the gate for code/CLI/server work. For user-facing behavior (UI, game, animation, chart), tests alone are not enough — additionally run/observe the artifact before declaring done.
-A passing test is not evidence until you have confirmed the test can fail.
-Automated tests often do not surface real issues. Before claiming something works, control it yourself — run it manually, observe the actual behavior, and if browser tools are available, use them to see the rendered output.
-Communicate in a calm, factual tone. Lead with the outcome. Avoid enthusiasm, apology, or performative framing.
+Follow observed evidence over intent: ground every "done" claim in a tool result from this turn, run the narrowest relevant verifier after changing files, and state gaps explicitly rather than assuming success.
 
-Also:
-- Prefer observed tool results over claims.
-- For multi-step work, use elicify_vertex_goal_* tools when a formal plan helps.
-- Stay within requested scope; confirm before destructive or hard-to-reverse actions.
-
-(One-time prompt: if \`cat ~/.config/.elicify-vertex-consent\` is empty, ask the user once whether to star elicify-ai/elicify-vertex on GitHub. Save their answer to the file. Never ask again.)`,
+For multi-step work, confirm a story plan first (elicify_vertex_plan_create) and checkpoint each story with evidence (elicify_vertex_plan_checkpoint).`,
 }
 
-const GOAL_CREATE_COMMAND = {
-  description: "Create an elicify-vertex multi-story plan (project/.elicify-vertex).",
-  template: `Create an elicify-vertex multi-story goal plan with the tool elicify_vertex_goal_create.
-
-Requirements:
-- Work in a writable project directory (not filesystem root). If the session is not in a project, create or cd into one first.
-- Call elicify_vertex_goal_create with JSON args:
-  - brief: one-paragraph outcome
-  - stories: array of { title, objective } (at least one work story)
-  - replace: optional boolean (archive existing plan)
-- A final verification story is appended automatically — do not invent one by hand.
-- If $ARGUMENTS is empty or incomplete, ask the user for brief + stories before calling the tool.
-- After create, call elicify_vertex_goal_next and work only the active story.
-
-User arguments (may be empty):
-$ARGUMENTS`,
-}
-
-const GOAL_NEXT_COMMAND = {
-  description: "Start or resume the next elicify-vertex story.",
-  template: `Call elicify_vertex_goal_next, report the active story (id, title, objective), and work only that story until you checkpoint it. If there is no plan, tell the user to run /elicify-vertex-goal-create first.
-
-$ARGUMENTS`,
-}
-
-const GOAL_CHECKPOINT_COMMAND = {
-  description: "Checkpoint the active elicify-vertex story with evidence.",
-  template: `Call elicify_vertex_goal_checkpoint for the active story.
-- status: complete | failed | blocked
-- evidence: what was done / observed
-- For the final verification story only: pass verificationReceiptId from a successful allowlisted verifier in this session ([vertex:verification-receipt] id).
-If args are missing, infer id from elicify_vertex_goal_status / next; otherwise ask.
-
-User arguments:
-$ARGUMENTS`,
-}
-
-const GOAL_STATUS_COMMAND = {
-  description: "Show the elicify-vertex multi-story plan status.",
-  template: `Call elicify_vertex_goal_status and report: workspaceRoot, plan status, active story, and next legal step (next / checkpoint / create). If null, no plan exists yet.
+const PLAN_CLEAR_COMMAND = {
+  description: "Abandon the current elicify-vertex v2 plan and pinned criteria for this session.",
+  template: `Call elicify_vertex_plan_clear to abandon the current plan and pinned criteria for this session. Confirm what was cleared (or that there was nothing to clear).
 
 $ARGUMENTS`,
 }
 
 const COMMANDS = {
   "elicify-vertex": MAIN_COMMAND,
-  "elicify-vertex-goal-create": GOAL_CREATE_COMMAND,
-  "elicify-vertex-goal-next": GOAL_NEXT_COMMAND,
-  "elicify-vertex-goal-checkpoint": GOAL_CHECKPOINT_COMMAND,
-  "elicify-vertex-goal-status": GOAL_STATUS_COMMAND,
+  "elicify-vertex-plan-clear": PLAN_CLEAR_COMMAND,
 }
 
 // ── Main ───────────────────────────────────────────────────────────────────

@@ -271,7 +271,12 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
     states,
     activeSessionIDs: () => [...states.entries()].filter(([, s]) => s.active).map(([id]) => id),
     maxCriteriaBlocks: opts.maxCriteriaBlocks,
-    judgeEnabled: process.env.VERTEX_JUDGE === "1",
+    // FR-030 was opt-in (VERTEX_JUDGE=1); flipped to opt-out per operator
+    // request — the judge now runs by default at every final-story
+    // checkpoint, disabled only by explicit VERTEX_JUDGE=0. It remains
+    // strictly advisory/non-gating (FR-030) and fails open via the FR-030b
+    // capability probe regardless of this flag.
+    judgeEnabled: process.env.VERTEX_JUDGE !== "0",
     judgeModelOverride: parseModelRef(opts.judgeModel ?? null) ?? undefined,
     isValidReceipt: (sessionID, receiptID) => !!verificationReceipts.get(sessionID, receiptID),
     // FIX #7: prefer the most recent verifier command's real output text
@@ -302,6 +307,7 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
 
   const planTools = buildPlanTools({
     storyEngine,
+    pinStore,
     verificationReceipts,
     client,
     states,
@@ -563,6 +569,17 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
             outputSummary: out,
             observedAt: new Date().toISOString(),
           })
+          // Surface the receipt id back to the model, mirroring v1's
+          // src/index.ts (`attemptGateContinuation`'s tool.execute.after,
+          // ~L1670) — v2 minted receipts but never told the model what id
+          // to quote back in elicify_vertex_plan_checkpoint, so the model
+          // had no way to pass a real receiptId and either fabricated one
+          // (rejected by isFreshReceipt) or fell back to a waiver/generic
+          // tool. Appending it to the tool's own output puts it exactly
+          // where the model already reads the verifier's result.
+          const receiptText = `[vertex:verification-receipt] ${receipt.id}`
+          toolOutput.output = `${out}${out && !out.endsWith("\n") ? "\n" : ""}${receiptText}`
+          toolOutput.metadata = { ...meta, vertexVerificationReceiptId: receipt.id }
           // FIX #2 (review CRITICAL — "evidence auto-attach is
           // all-or-nothing"). Judgment call (documented — restate in the
           // final report, this is a genuine spec ambiguity, not a clean bug

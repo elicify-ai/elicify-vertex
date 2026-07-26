@@ -43,7 +43,10 @@ if [[ -f "$OPENCODE_JSON" ]]; then
 const fs = require('fs');
 const path = '$OPENCODE_JSON';
 const pkg = '@elicify-ai/elicify-vertex';
-const commandNames = ['elicify-vertex', 'elicify-vertex-goal-create', 'elicify-vertex-goal-next', 'elicify-vertex-goal-checkpoint', 'elicify-vertex-goal-status'];
+// Superset of every command name this package has ever registered, across
+// both the v1 goal-* names and the current v2 plan-* names, so uninstall
+// cleans up regardless of which version was installed.
+const commandNames = ['elicify-vertex', 'elicify-vertex-goal-create', 'elicify-vertex-goal-next', 'elicify-vertex-goal-checkpoint', 'elicify-vertex-goal-status', 'elicify-vertex-plan-create', 'elicify-vertex-plan-next', 'elicify-vertex-plan-checkpoint', 'elicify-vertex-plan-status', 'elicify-vertex-plan-clear'];
 let cfg;
 try { cfg = JSON.parse(fs.readFileSync(path, 'utf8')); } catch (e) { process.exit(0); }
 let changed = false;

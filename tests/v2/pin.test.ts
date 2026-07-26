@@ -151,6 +151,42 @@ describe("PinStore — happy path persistence (Dataset: Pins persistence #1)", (
   })
 })
 
+describe("PinStore.clearPins (human-facing escape hatch — /elicify-vertex-plan-clear)", () => {
+  it("is a no-op returning false when the session has no pinned criteria", () => {
+    const stateDir = temporaryRoot()
+    const store = new PinStore({ stateDir, logger: vi.fn() })
+    expect(store.clearPins("s1")).toBe(false)
+  })
+
+  it("drops the session's criteria in memory and on disk, leaving other sessions untouched", () => {
+    const stateDir = temporaryRoot()
+    const store = new PinStore({ stateDir, logger: vi.fn() })
+    store.pin("s1", ["criterion one"])
+    store.pin("s2", ["another session's criterion"])
+
+    const cleared = store.clearPins("s1")
+
+    expect(cleared).toBe(true)
+    expect(store.get("s1")).toEqual([])
+    expect(store.get("s2")).toHaveLength(1)
+
+    const onDisk = readPinsFile(stateDir)
+    expect(onDisk.s1).toBeUndefined()
+    expect(onDisk.s2).toBeDefined()
+  })
+
+  it("survives a fresh PinStore instance — the clear is durable, not just in-memory", () => {
+    const stateDir = temporaryRoot()
+    const store = new PinStore({ stateDir, logger: vi.fn() })
+    store.pin("s1", ["criterion one"])
+    store.clearPins("s1")
+
+    const restarted = new PinStore({ stateDir, logger: vi.fn() })
+    restarted.load("s1")
+    expect(restarted.get("s1")).toEqual([])
+  })
+})
+
 describe("PinStore — gc() lifecycle (Dataset: Pins persistence #6, #7)", () => {
   it("drops an entry whose updatedAt is 8 days old and keeps a fresh, known entry", () => {
     const stateDir = temporaryRoot()

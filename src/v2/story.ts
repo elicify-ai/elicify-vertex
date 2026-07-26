@@ -626,6 +626,49 @@ export class StoryEngine {
     this.persistPlan(sessionID)
   }
 
+  // -- Plan clear (human-facing escape hatch) --------------------------------
+
+  /**
+   * Reversibly archives (never deletes) the session's current plan entry —
+   * the human-facing escape hatch for abandoning/resetting a plan (invoked
+   * via `/elicify-vertex-plan-clear` or a direct natural-language request,
+   * never proactively offered by the composer/findings system). Mirrors
+   * `archiveV1IfPresent`'s never-destroy convention, adapted for a single
+   * entry inside the shared multi-session `plan.json` file rather than a
+   * whole-file migration: the plan is serialized to its own file under
+   * `archive/`, then the session's key is dropped from `plan.json` (leaving
+   * every other session's entry untouched). Returns `false` (no-op) when
+   * the session has no plan to clear.
+   */
+  clearPlan(sessionID: string): boolean {
+    const plan = this.getPlan(sessionID)
+    if (!plan) return false
+
+    const lock = acquireStateLock(this.stateDir)
+    try {
+      fsIO.mkdirSync(this.archiveDir, { recursive: true, mode: 0o700 })
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-")
+      let archivePath = join(this.archiveDir, `plan.${sessionID}.${timestamp}.json`)
+      let suffix = 0
+      while (fsIO.existsSync(archivePath)) {
+        suffix += 1
+        archivePath = join(this.archiveDir, `plan.${sessionID}.${timestamp}-${suffix}.json`)
+      }
+      fsIO.writeFileSync(archivePath, `${JSON.stringify(redactForDisk(plan), null, 2)}\n`, {
+        encoding: "utf8",
+        flag: "wx",
+        mode: 0o600,
+      })
+    } finally {
+      lock.release()
+    }
+
+    this.plans.delete(sessionID)
+    this.persistPlan(sessionID)
+    this.logger("story:plan-cleared", { sessionID })
+    return true
+  }
+
   // -- Persistence -----------------------------------------------------------
 
   private hydrateFromDisk(sessionID: string): void {

@@ -266,6 +266,24 @@ export class PinStore {
   }
 
   /**
+   * Drops the session's pinned criteria (in memory and on disk) — the human-
+   * facing escape hatch companion to `StoryEngine.clearPlan`, invoked via
+   * `/elicify-vertex-plan-clear` or a direct natural-language request, never
+   * proactively offered by the composer/findings system. Unlike `gc()`
+   * (silent, time/liveness-driven pruning) this is an explicit user-facing
+   * action, so it is not archived — pinned criteria are ephemeral session
+   * scratch state (re-derivable from the transcript), not a plan artifact
+   * worth preserving the way `StoryEngine.clearPlan`'s archive is. Returns
+   * `false` (no-op) when the session had no pinned criteria.
+   */
+  clearPins(sessionID: string): boolean {
+    if (!this.entries.has(sessionID)) return false
+    this.entries.delete(sessionID)
+    this.persist(sessionID)
+    return true
+  }
+
+  /**
    * Explicit disk sync point — call after pin()/attachEvidence(). Swallows fs
    * errors internally per FR-013's fallback state machine (memory fallback,
    * pins:disk-fallback-memory / pins:disk-recovered / pins:disk-unavailable

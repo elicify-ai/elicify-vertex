@@ -189,30 +189,96 @@ export async function buildDenyMap(client: OpencodeClient): Promise<Record<strin
   return denyMap
 }
 
-const DENY_REQUIRED_PERMISSIONS = ["edit", "webfetch"] as const
+const DENY_REQUIRED_PERMISSIONS = ["edit", "bash", "webfetch"] as const
+
+/**
+ * Live-host correction (post-review, confirmed via `opencode debug agent
+ * <name>` against a running host): `Agent.permission` does NOT resolve to
+ * the flat `{edit, bash: {[cmd]: ...}, webfetch, ...}` shape documented in
+ * the bundled `@opencode-ai/sdk` `types.gen.d.ts` (`Agent.permission`,
+ * ~L1407). The live host instead resolves it to a flat ARRAY of merged rule
+ * objects — `Array<{ permission: string; action: "allow"|"ask"|"deny";
+ * pattern: string }>` — one entry per (permission-category, pattern) rule
+ * across every config layer (global defaults, project config, this agent's
+ * own `AGENT_PERMISSION` registration), e.g.
+ * `{ permission: "edit", action: "deny", pattern: "*" }`. Indexing this
+ * array with `permission["edit"]` (the old flat-object assumption) reads
+ * `undefined` for every key — the exact "permission.edit is undefined,
+ * expected deny" failure reason observed in real intake/judge probe events.
+ *
+ * This function accepts BOTH shapes defensively (the array shape is what a
+ * live host actually returns today; the flat-object shape stays supported
+ * in case a future/other host version matches the documented SDK type) — it
+ * is intentionally not narrowed to "array only".
+ *
+ * Array-shape evaluation: collect every rule whose `permission` field
+ * equals `key` (generic `permission: "*"` catch-all rules do NOT count —
+ * only rules naming `key` specifically). Denied requires at least one such
+ * rule AND every one of them has `action === "deny"`. This does not attempt
+ * full glob/pattern precedence resolution (e.g. a `pattern`-scoped
+ * exception overriding a `pattern: "*"` rule) — for `edit`/`bash`/
+ * `webfetch` specifically, this repo's own registration
+ * (`wiring/config.ts`'s `AGENT_PERMISSION`) only ever emits a single
+ * `pattern: "*"` rule per key, so "every named-key rule is deny" is exactly
+ * as strict as full precedence resolution would be for the shapes this
+ * function is actually asked to verify; requiring ALL (not "any") is the
+ * fail-closed choice if a host ever surfaces more than one.
+ */
+function permissionDenied(permission: unknown, key: string): { denied: boolean; detail: string } {
+  if (Array.isArray(permission)) {
+    const rules = permission.filter(
+      (rule): rule is { permission: string; action: string; pattern?: string } =>
+        !!rule && typeof rule === "object" && (rule as { permission?: unknown }).permission === key,
+    )
+    if (rules.length === 0) {
+      return { denied: false, detail: `no rule for permission "${key}" is present` }
+    }
+    const notDenied = rules.find((rule) => rule.action !== "deny")
+    if (notDenied) {
+      return { denied: false, detail: `rule ${JSON.stringify(notDenied)} is not "deny"` }
+    }
+    return { denied: true, detail: "" }
+  }
+
+  if (permission && typeof permission === "object") {
+    const value = (permission as Record<string, unknown>)[key]
+    if (value === "deny") return { denied: true, detail: "" }
+    if (value && typeof value === "object") {
+      // bash-shaped: {[command]: "ask"|"allow"|"deny"}
+      const entries = Object.entries(value as Record<string, unknown>)
+      if (entries.length === 0) {
+        return { denied: false, detail: `"${key}" resolved to no entries (cannot confirm deny-all)` }
+      }
+      const notDenied = entries.find(([, v]) => v !== "deny")
+      if (notDenied) {
+        return { denied: false, detail: `"${key}[${notDenied[0]}]" is "${String(notDenied[1])}"` }
+      }
+      return { denied: true, detail: "" }
+    }
+    return { denied: false, detail: `"${key}" is "${String(value)}"` }
+  }
+
+  return { denied: false, detail: "permission block has neither array nor object shape" }
+}
 
 /**
  * FR-030b step 4: run once per process per agent name, AFTER registration
  * (which happens in wave-3 wiring, not here). Reads back the resolved
  * agents via `client.app.agents()` (`GET /agent`, `types.gen.d.ts:1399-1428`
  * — each `Agent` carries a resolved `tools: {[id]: boolean}` map and a
- * `permission` block) and requires:
+ * `permission` block, see `permissionDenied` above for its real live-host
+ * shape) and requires:
  *  - the named agent exists,
  *  - it resolves ZERO tools to `true`,
- *  - `permission.edit` and `permission.webfetch` are exactly `"deny"`,
- *  - `permission.bash` (resolved on `Agent`, unlike the raw `AgentConfig`
- *    input, ALWAYS as a `{[command]: "ask"|"allow"|"deny"}` map rather than
- *    a bare string — `types.gen.d.ts:1407-1415`) has at least one entry and
- *    every entry is `"deny"`. An empty bash permission map is treated as a
- *    failure (fail-closed): a live host was not exercised in this spec's
- *    authoring session (Open Question 1), so an empty/unproven map must not
- *    be read as "no bash access."
+ *  - `permission.edit`, `permission.bash`, and `permission.webfetch` are
+ *    each provably denied per `permissionDenied` above.
  *
  * Registers nothing itself. Any failure — agent absent, a tool resolving
- * `true`, a permission not `"deny"`, `client.app.agents()` throwing, or the
- * fields-style result carrying an `error` — returns `{ ok: false, reason }`
- * with a specific, non-generic reason string (SC-017 / FR-030b: callers log
- * this reason verbatim under `judge:unsupported` / `intake:unsupported`).
+ * `true`, a permission not provably `"deny"`, `client.app.agents()`
+ * throwing, or the fields-style result carrying an `error` — returns
+ * `{ ok: false, reason }` with a specific, non-generic reason string
+ * (SC-017 / FR-030b: callers log this reason verbatim under
+ * `judge:unsupported` / `intake:unsupported`).
  */
 export async function probeCapability(
   client: OpencodeClient,
@@ -245,34 +311,18 @@ export async function probeCapability(
     }
   }
 
-  const permission = agent.permission
+  const permission: unknown = agent.permission
   if (!permission) {
     return { ok: false, reason: `agent "${agentName}" has no resolved permission block` }
   }
 
   for (const key of DENY_REQUIRED_PERMISSIONS) {
-    const value = permission[key]
-    if (value !== "deny") {
+    const result = permissionDenied(permission, key)
+    if (!result.denied) {
       return {
         ok: false,
-        reason: `agent "${agentName}" permission.${key} is "${String(value)}", expected "deny"`,
+        reason: `agent "${agentName}" permission.${key} is not provably "deny" (${result.detail})`,
       }
-    }
-  }
-
-  const bash = permission.bash
-  const bashEntries = bash && typeof bash === "object" ? Object.entries(bash) : []
-  if (bashEntries.length === 0) {
-    return {
-      ok: false,
-      reason: `agent "${agentName}" permission.bash resolved to no entries (cannot confirm deny-all)`,
-    }
-  }
-  const notDenied = bashEntries.find(([, value]) => value !== "deny")
-  if (notDenied) {
-    return {
-      ok: false,
-      reason: `agent "${agentName}" permission.bash["${notDenied[0]}"] is "${String(notDenied[1])}", expected "deny"`,
     }
   }
 

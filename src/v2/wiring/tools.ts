@@ -22,12 +22,14 @@ import { resolve } from "node:path"
 import { tool } from "@opencode-ai/plugin"
 import type { VerificationReceiptStore } from "../../goals.js"
 import type { PhaseEngine } from "../phase.js"
+import type { PinStore } from "../pin.js"
 import type { StoryEngine } from "../story.js"
 import type { OpencodeClient } from "../types.js"
 import type { V2SessionState } from "./state.js"
 
 export interface PlanToolsDeps {
   storyEngine: StoryEngine
+  pinStore: PinStore
   verificationReceipts: VerificationReceiptStore
   client: OpencodeClient
   states: Map<string, V2SessionState>
@@ -115,7 +117,7 @@ function isFreshReceipt(
 }
 
 export function buildPlanTools(deps: PlanToolsDeps) {
-  const { storyEngine, verificationReceipts, client, states, phaseEngine } = deps
+  const { storyEngine, pinStore, verificationReceipts, client, states, phaseEngine } = deps
 
   const createTool = tool({
     description:
@@ -212,37 +214,42 @@ export function buildPlanTools(deps: PlanToolsDeps) {
     },
   })
 
+  const clearTool = tool({
+    description:
+      "Abandon the current elicify-vertex v2 plan and pinned criteria for this session. Reversible (the plan " +
+      "is archived under .elicify-vertex/archive/, never deleted) but not something to reach for to dodge an " +
+      "inconvenient checkpoint — only call this on an explicit user request to reset or abandon the plan.",
+    args: {},
+    async execute(_args, context) {
+      const planCleared = storyEngine.clearPlan(context.sessionID)
+      const pinsCleared = pinStore.clearPins(context.sessionID)
+      return JSON.stringify({ planCleared, pinsCleared }, null, 2)
+    },
+  })
+
   return {
     elicify_vertex_plan_create: createTool,
     elicify_vertex_plan_next: nextTool,
     elicify_vertex_plan_checkpoint: checkpointTool,
     elicify_vertex_plan_status: statusTool,
+    elicify_vertex_plan_clear: clearTool,
   }
 }
 
+/**
+ * Only ONE slash command besides `/elicify-vertex` itself: the plan is
+ * created/advanced/checkpointed by the model calling `elicify_vertex_plan_*`
+ * tools directly as the harness's directives prompt it to — those steps are
+ * driven by the LLM's own tool use, not a human typing a command. `clear` is
+ * the exception: abandoning a plan is a human-facing decision (an escape
+ * hatch), so it gets an explicit, discoverable slash command as well as the
+ * tool itself.
+ */
 export function planSlashCommands(): Record<string, { description: string; template: string }> {
   return {
-    "elicify-vertex-plan-create": {
-      description: "Create the elicify-vertex v2 story-contract plan (project/.elicify-vertex).",
-      template: `Create the elicify-vertex v2 plan with elicify_vertex_plan_create, using the stories the user just confirmed (text, acceptanceItems, scopeGlobs, verifiers per story).
-
-$ARGUMENTS`,
-    },
-    "elicify-vertex-plan-next": {
-      description: "Show the active story in the elicify-vertex v2 plan.",
-      template: `Call elicify_vertex_plan_next and report the active story (id, text, acceptanceItems). If there is no plan, tell the user to confirm a plan proposal first.
-
-$ARGUMENTS`,
-    },
-    "elicify-vertex-plan-checkpoint": {
-      description: "Checkpoint a story in the elicify-vertex v2 plan with evidence.",
-      template: `Call elicify_vertex_plan_checkpoint for the active story: status (complete|failed|blocked) and, for each acceptance item, either a receiptId from an observed verification this session or a waiverSourceMessageId naming the user message that explicitly waived it.
-
-$ARGUMENTS`,
-    },
-    "elicify-vertex-plan-status": {
-      description: "Show the elicify-vertex v2 plan status.",
-      template: `Call elicify_vertex_plan_status and report plan status, active story, and next legal step.
+    "elicify-vertex-plan-clear": {
+      description: "Abandon the current elicify-vertex v2 plan and pinned criteria for this session.",
+      template: `Call elicify_vertex_plan_clear to abandon the current plan and pinned criteria for this session. Confirm what was cleared (or that there was nothing to clear).
 
 $ARGUMENTS`,
     },

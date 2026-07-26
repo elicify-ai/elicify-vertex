@@ -444,6 +444,63 @@ describe("story_started_at (MAJOR fix, wave-4 cross-file dependency)", () => {
 })
 
 // ---------------------------------------------------------------------------
+// clearPlan — human-facing escape hatch (/elicify-vertex-plan-clear)
+// ---------------------------------------------------------------------------
+
+describe("clearPlan (human-facing escape hatch)", () => {
+  it("is a no-op returning false when the session has no plan", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se, logger } = engine(stateDir)
+    expect(se.clearPlan("s1")).toBe(false)
+    expect(logger).not.toHaveBeenCalledWith("story:plan-cleared", expect.anything())
+  })
+
+  it("archives the plan reversibly (never deletes) and removes it from the live plan", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se, logger } = engine(stateDir)
+    const plan = se.createPlan("s1", [story()])
+
+    const cleared = se.clearPlan("s1")
+
+    expect(cleared).toBe(true)
+    expect(se.getPlan("s1")).toBeNull()
+    expect(logger).toHaveBeenCalledWith("story:plan-cleared", { sessionID: "s1" })
+
+    const archiveDir = join(stateDir, "archive")
+    const files = readdirSync(archiveDir).filter((f) => f.startsWith("plan.s1."))
+    expect(files).toHaveLength(1)
+    const archived = JSON.parse(readFileSync(join(archiveDir, files[0]), "utf8"))
+    expect(archived.stories[0].id).toBe(plan.stories[0].id)
+  })
+
+  it("clears only the target session's plan, leaving other sessions' plans in plan.json untouched", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    se.createPlan("s1", [story()])
+    se.createPlan("s2", [story({ text: "other session's work" })])
+
+    se.clearPlan("s1")
+
+    expect(se.getPlan("s1")).toBeNull()
+    expect(se.getPlan("s2")).not.toBeNull()
+
+    const onDisk = JSON.parse(readFileSync(join(stateDir, "plan.json"), "utf8"))
+    expect(onDisk.s1).toBeUndefined()
+    expect(onDisk.s2).toBeDefined()
+  })
+
+  it("survives a fresh StoryEngine instance — the clear is durable, not just in-memory", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    se.createPlan("s1", [story()])
+    se.clearPlan("s1")
+
+    const restarted = new StoryEngine({ stateDir, logger: vi.fn() })
+    expect(restarted.getPlan("s1")).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Test 14: story_scope_watchdog_globs (FR-021)
 // ---------------------------------------------------------------------------
 

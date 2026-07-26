@@ -251,6 +251,55 @@ describe("test 44: judge_tools_denied_or_refused", () => {
       expect(result.reason).toMatch(/permission\.bash/)
     })
 
+    it("permission resolves as a live-host array-of-rules (not the documented flat object) — passes when edit/bash/webfetch are each denied", async () => {
+      const client = makeClient({
+        agents: [
+          denyAllAgent("vertex-judge", {
+            permission: [
+              { permission: "*", action: "allow", pattern: "*" },
+              { permission: "doom_loop", action: "ask", pattern: "*" },
+              { permission: "edit", action: "deny", pattern: "*" },
+              { permission: "bash", action: "deny", pattern: "*" },
+              { permission: "webfetch", action: "deny", pattern: "*" },
+            ] as unknown as Agent["permission"],
+          }),
+        ],
+      })
+      const result = await probeCapability(client, "vertex-judge")
+      expect(result).toEqual({ ok: true })
+    })
+
+    it("array-of-rules permission: a generic permission:'*' allow rule does not count as an edit/bash/webfetch-specific deny", async () => {
+      const client = makeClient({
+        agents: [
+          denyAllAgent("vertex-judge", {
+            permission: [{ permission: "*", action: "allow", pattern: "*" }] as unknown as Agent["permission"],
+          }),
+        ],
+      })
+      const result = await probeCapability(client, "vertex-judge")
+      expect(result.ok).toBe(false)
+      expect(result.reason).toMatch(/permission\.edit/)
+    })
+
+    it("array-of-rules permission: an edit rule that resolves to 'allow' is not read as denied even alongside a deny rule", async () => {
+      const client = makeClient({
+        agents: [
+          denyAllAgent("vertex-judge", {
+            permission: [
+              { permission: "edit", action: "deny", pattern: "*" },
+              { permission: "edit", action: "allow", pattern: "*.md" },
+              { permission: "bash", action: "deny", pattern: "*" },
+              { permission: "webfetch", action: "deny", pattern: "*" },
+            ] as unknown as Agent["permission"],
+          }),
+        ],
+      })
+      const result = await probeCapability(client, "vertex-judge")
+      expect(result.ok).toBe(false)
+      expect(result.reason).toMatch(/permission\.edit/)
+    })
+
     it("client.app.agents() throws", async () => {
       const client = makeClient({
         agentsImpl: async () => {

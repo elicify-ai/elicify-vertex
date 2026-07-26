@@ -274,6 +274,93 @@ describe("test 41: criteria_absent_falls_back_to_v1_gate", () => {
 })
 
 // ===========================================================================
+// verification receipt surfaced to the model (v1 parity)
+//
+// v1's tool.execute.after (src/index.ts, ~L1670) appends
+// "[vertex:verification-receipt] <id>" to the bash tool's own output text
+// and stashes vertexVerificationReceiptId in metadata, so the model sees the
+// id it must quote back in a checkpoint call. v2 minted the same receipt but
+// never wrote it back to toolOutput — the model had no way to know a valid
+// receiptId, so it fabricated one (rejected by isFreshReceipt) or fell back
+// to a waiver. This asserts the fix: v2 now surfaces it the same way v1 does.
+// ===========================================================================
+
+describe("verification receipt surfaced to the model (v1 parity fix)", () => {
+  it("appends [vertex:verification-receipt] <id> to the passing verifier's own tool output", async () => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "receipt-surface-session"
+
+    await activate(hooks, sid, "refactor the auth database migration end to end")
+    await toolAfter(hooks, sid, "edit", { filePath: "src/foo.ts" }, "updated")
+
+    const toolOutput = { title: "bash", output: "20 passed", metadata: { exit: 0 } }
+    await hooks["tool.execute.after"]!(
+      { tool: "bash", sessionID: sid, callID: "bash-1", args: { command: "npx vitest run" } } as never,
+      toolOutput as never,
+    )
+
+    expect(toolOutput.output).toMatch(/\[vertex:verification-receipt\] \S+/)
+    expect(toolOutput.output.startsWith("20 passed")).toBe(true)
+    expect(typeof (toolOutput.metadata as Record<string, unknown>).vertexVerificationReceiptId).toBe("string")
+  })
+
+  it("does not append a receipt line when the command fails (no receipt minted)", async () => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "receipt-surface-fail-session"
+
+    await activate(hooks, sid, "refactor the auth database migration end to end")
+    await toolAfter(hooks, sid, "edit", { filePath: "src/foo.ts" }, "updated")
+
+    const toolOutput = { title: "bash", output: "1 failed", metadata: { exit: 1 } }
+    await hooks["tool.execute.after"]!(
+      { tool: "bash", sessionID: sid, callID: "bash-1", args: { command: "npx vitest run" } } as never,
+      toolOutput as never,
+    )
+
+    expect(toolOutput.output).toBe("1 failed")
+    expect((toolOutput.metadata as Record<string, unknown>).vertexVerificationReceiptId).toBeUndefined()
+  })
+
+  it("a receipt surfaced via tool output round-trips as a valid checkpoint receiptId", async () => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "receipt-checkpoint-session"
+
+    await activate(hooks, sid, "refactor the auth database migration end to end")
+    await toolAfter(hooks, sid, "edit", { filePath: "src/foo.ts" }, "updated")
+
+    // Plan must exist (and the story must have started) BEFORE the
+    // verifying command runs — isFreshReceipt (tools.ts) correctly rejects a
+    // receipt observed earlier than the story's own startedAt (FR-020: a
+    // receipt must not predate the story it's evidence for).
+    const plan = await hooks.tool!.elicify_vertex_plan_create!.execute!(
+      { stories: [{ text: "do it", acceptanceItems: ["A1"], scopeGlobs: [], verifiers: [] }] } as never,
+      { sessionID: sid } as never,
+    )
+    const storyId = JSON.parse(plan as string).stories[0].id
+    const itemId = JSON.parse(plan as string).stories[0].acceptanceItems[0].id
+
+    const toolOutput = { title: "bash", output: "20 passed", metadata: { exit: 0 } }
+    await hooks["tool.execute.after"]!(
+      { tool: "bash", sessionID: sid, callID: "bash-1", args: { command: "npx vitest run" } } as never,
+      toolOutput as never,
+    )
+    const match = toolOutput.output.match(/\[vertex:verification-receipt\] (\S+)/)
+    expect(match).not.toBeNull()
+    const receiptId = match![1]
+
+    const checkpointResult = await hooks.tool!.elicify_vertex_plan_checkpoint!.execute!(
+      { storyId, status: "complete", items: [{ id: itemId, receiptId }] } as never,
+      { sessionID: sid } as never,
+    )
+    const checkpointed = JSON.parse(checkpointResult as string)
+    expect(checkpointed.stories[0].status).toBe("complete")
+  })
+})
+
+// ===========================================================================
 // Test 52: kill_switch_restores_v1 (FR-037 / US-11)
 // ===========================================================================
 
