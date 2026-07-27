@@ -459,12 +459,26 @@ describe("greenfield: there is no v1 engine to fall back to", () => {
 })
 describe("turn boundaries: a turn is a prompt, not an agent-loop step", () => {
   it("does NOT advance the turn on tool results or text parts within one reply cycle", async () => {
+    // REWRITTEN. The previous version asserted that zero
+    // `composer:turn-advanced` events were logged -- an event type that does not
+    // exist anywhere in src/, so the filter was unconditionally empty and the
+    // test could not fail. Proof: adding `composer.newTurn(sid)` to every tool
+    // result (literally the defect this block is named after) left it green.
+    //
+    // The observable consequence of a per-step turn advance is that per-turn
+    // CAPS reset per step, so a capped family renders repeatedly within one
+    // reply cycle instead of once. That is what is asserted now.
     const client = makeStubClient()
     const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
     const sid = "turn-per-step"
 
     await activate(hooks, sid, "implement the production database migration")
-    const first = await transform(hooks, sid)
+    await toolAfter(hooks, sid, "edit", { filePath: "src/f.ts" }, "updated")
+    await transform(hooks, sid)
+
+    const rendersAfterFirst = readEvents().filter(
+      (e: LoggedEvent) => e.session_id === sid && e.event_type === "directive_rendered",
+    ).length
 
     // A realistic agent loop: several tool results and text parts, no new prompt.
     for (let i = 0; i < 4; i++) {
@@ -473,13 +487,13 @@ describe("turn boundaries: a turn is a prompt, not an agent-loop step", () => {
       await transform(hooks, sid)
     }
 
-    // A capped family (cap 1/turn) must render exactly ONCE across the whole
-    // cycle. If the turn advanced per step it would render on every render.
-    const renders = [first, await transform(hooks, sid)]
-    void renders
-    const advanced = readEvents()
-      .filter((e: LoggedEvent) => e.session_id === sid && e.event_type === "composer:turn-advanced")
-    expect(advanced).toHaveLength(0)
+    const rendersAtEnd = readEvents().filter(
+      (e: LoggedEvent) => e.session_id === sid && e.event_type === "directive_rendered",
+    ).length
+
+    // Caps are per TURN. Four more tool results inside the same reply cycle must
+    // not buy four more renders of the same capped families.
+    expect(rendersAtEnd - rendersAfterFirst).toBeLessThan(4)
   })
 
   it("DOES advance the turn on a genuinely new user message", async () => {
@@ -796,16 +810,37 @@ describe("post-review fixes", () => {
   it("two sessions no longer collide in the toast dedupe key", async () => {
     // Reviewer proof: instanceIds restart at D-1 per session while `seen` is
     // per plugin instance, so session B's first directive was swallowed.
+    //
+    // REWRITTEN: the previous assertion was a GLOBAL
+    // `expect(showToast.mock.calls.length).toBeGreaterThanOrEqual(2)`, which
+    // passes WITH the bug present -- session A alone emits 2 toasts, so session
+    // B being swallowed entirely still cleared the threshold (measured: 4 -> 2
+    // with sessionID dropped from the dedupe key, still green).
+    //
+    // Toast bodies carry the FAMILY, not the session or the file, so the two
+    // sessions cannot be told apart by content. They are told apart by
+    // ORDER instead: run A to completion, snapshot, then run B and require
+    // that B contributed toasts of its own.
     const { client, showToast } = toastClient()
     const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
 
-    for (const sid of ["collideA", "collideB"]) {
-      await activate(hooks, sid, "implement the production database migration")
-      await toolAfter(hooks, sid, "edit", { filePath: "src/x.ts" }, "updated")
-      await transform(hooks, sid)
-    }
-    // Both sessions must have produced at least one toast each.
-    expect(showToast.mock.calls.length).toBeGreaterThanOrEqual(2)
+    await activate(hooks, "collideA", "implement the production database migration")
+    await toolAfter(hooks, "collideA", "edit", { filePath: "src/x.ts" }, "updated")
+    await transform(hooks, "collideA")
+    const afterA = showToast.mock.calls.length
+    expect(afterA, "PRE: session A must emit toasts at all").toBeGreaterThan(0)
+
+    // Session B does the IDENTICAL work -- identical families, identical
+    // prescriptions. Only the session id differs, so this is exactly the
+    // collision the dedupe key has to survive.
+    await activate(hooks, "collideB", "implement the production database migration")
+    await toolAfter(hooks, "collideB", "edit", { filePath: "src/x.ts" }, "updated")
+    await transform(hooks, "collideB")
+
+    expect(
+      showToast.mock.calls.length - afterA,
+      "session B's directives were swallowed by session A's dedupe entries",
+    ).toBeGreaterThan(0)
   })
 })
 
@@ -1019,55 +1054,37 @@ describe("inertness: a non-activated session writes nothing", () => {
 // per-session for every edit the tool layer sees and was never affected.
 // ===========================================================================
 
-describe("file.edited is attributed per session, not suppressed by session count", () => {
-  async function fileEdited(hooks: Hooks, file: string) {
-    await hooks.event!({ event: { type: "file.edited", properties: { file } } as never })
-  }
-
-  it("records the change even when two sessions are active", async () => {
+describe("file.edited is a deliberate no-op; tool.execute.after carries attribution", () => {
+  // This branch has been wrong in BOTH directions. It first required exactly
+  // one active session -- permanently false in a long-lived server, so the net
+  // never fired after the second session. The fix fanned out to "every active
+  // session whose workspace contains the file", which cannot discriminate at
+  // all: `workspaceRoot` is computed once and handed to every session, so a
+  // session that had done nothing got a stop-block for someone else's edit and
+  // its peers' PERSISTED receipts were deleted.
+  //
+  // `file.edited` carries no session id, so it is simply not attributable.
+  // What must keep working is the path that IS attributable.
+  it("records changed paths per session from tool.execute.after, at any session count", async () => {
     const client = makeStubClient()
     const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
 
-    await activate(hooks, "fe-a", "implement the production database migration")
-    await activate(hooks, "fe-b", "implement the production database migration")
+    await activate(hooks, "attrib-a", "implement the production database migration")
+    await activate(hooks, "attrib-b", "implement the production database migration")
 
-    await fileEdited(hooks, join(workDir, "src/service.ts"))
-    // With the change recorded and no verification, the idle gate must block.
-    await idle(hooks, "fe-a")
-    expect(idleContinuationTexts(client, "fe-a").length).toBeGreaterThan(0)
+    // Only session A edits.
+    await toolAfter(hooks, "attrib-a", "edit", { filePath: join(workDir, "src/a.ts") }, "updated")
+
+    await idle(hooks, "attrib-a")
+    await idle(hooks, "attrib-b")
+
+    expect(idleContinuationTexts(client, "attrib-a").length).toBeGreaterThan(0)
+    expect(
+      idleContinuationTexts(client, "attrib-b"),
+      "session B changed nothing and must not be blocked for a peer's edit",
+    ).toEqual([])
   })
-
-  // A second test asserting receipt INVALIDATION was written here and removed:
-  // it passed with the fix reverted, because the checkpoint it asserted on
-  // throws for an unrelated reason (unevidenced acceptance items). A test that
-  // cannot fail certifies the path as safe without exercising it, which is
-  // exactly the unearned green this project exists to refuse. Receipt staleness
-  // is covered where it belongs, in the receipt-store tests.
 })
-
-// ===========================================================================
-// Persisted receipts must reach the GATE, not just the checkpoint tool.
-//
-// Receipts are now persisted and survive a restart, but the plugin never told
-// the store which workspace a session belongs to, so `gateCtx.isValidReceipt`
-// -> `verificationReceipts.get()` could not hydrate from disk. After a restart
-// the gate re-demanded proof the user had already produced -- the exact "come
-// back tomorrow" complaint persistence was built to fix. Two components each
-// green on their own, with the defect in the seam between them.
-//
-// MUTATION STATUS -- compound, not single-edit. Hydration now happens at TWO
-// sites (`getOrCreateState` in plugin.ts and `isFreshReceipt` in tools.ts) and
-// they are redundant for THIS path, so removing either alone leaves the test
-// green; removing BOTH turns it red (verified). It is recorded that way rather
-// than dressed up as a single-edit proof.
-//
-// Still untested: `gateCtx.isValidReceipt` (plugin.ts) calls `get()` with no
-// `load()` of its own and is reached from gate.ts's criterion-evidence check.
-// The `getOrCreateState` hydration covers it in practice, because state is
-// created on `chat.message` long before any idle -- but a criteria-pinning
-// restart scenario would be needed to pin that down directly.
-// ===========================================================================
-
 describe("persisted receipts survive a restart and are visible to the gate", () => {
   it("hydrates a receipt minted by a previous plugin instance", async () => {
     const clientA = makeStubClient()

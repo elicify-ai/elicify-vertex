@@ -509,3 +509,41 @@ describe("cargo subset flags are narrowing, but --workspace is not", () => {
     expect(observedCoversPrescribed("npm test", "npm test")).toBe(true)
   })
 })
+
+// ===========================================================================
+// `||` on the observed side — previously UNGUARDED.
+//
+// coverage.ts's own header calls this "the single worst failure mode in this
+// codebase": `A || B` exits 0 whether A passed or B did, so you cannot tell
+// which ran, and crediting either fabricates a receipt. The drop was
+// implemented, but deleting it left the entire 1054-test suite green — the
+// nearby `parseSubcommands` test exercises splitting only, and reads as though
+// the behaviour were covered.
+// ===========================================================================
+
+describe("alternation on the observed side covers nothing", () => {
+  it("refuses `lint || test` even though the test half matches", () => {
+    expect(observedCoversPrescribed("npm test", "npm run lint || npm test")).toBe(false)
+    expect(observedCoversPrescribed("go test ./...", "go build ./... || go test ./...")).toBe(false)
+  })
+
+  it("still credits the same command without the alternation (discrimination)", () => {
+    expect(observedCoversPrescribed("npm test", "npm run lint && npm test")).toBe(true)
+  })
+})
+
+// A prescribed selector must be compared literally, not derived by regex.
+// The previous `it.each` row for `--testNamePattern` built its prescription with
+// `observed.replace(/\s+(-t|--testNamePattern=x|…)(\s+\S+)?/, " ")`, whose greedy
+// optional group also swallowed the ` src/` TARGET. The row therefore went false
+// because of target mismatch, and deleting `--testNamePattern` from
+// NARROWING_FLAGS left the whole suite green.
+describe("--testNamePattern is a real narrowing selector", () => {
+  it("does not credit a name-filtered run for the unfiltered suite", () => {
+    expect(observedCoversPrescribed("npx jest src/", "npx jest --testNamePattern=x src/")).toBe(false)
+  })
+
+  it("credits the unfiltered run (discrimination: targets are identical)", () => {
+    expect(observedCoversPrescribed("npx jest src/", "npx jest src/")).toBe(true)
+  })
+})

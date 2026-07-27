@@ -18,6 +18,7 @@
  * hook via `selfCreated.isSelfCreated(sessionID, selfCreatedGuard.resolveParent)`.
  */
 import { execFileSync } from "node:child_process"
+import { resolve as resolvePath } from "node:path"
 import { randomUUID } from "node:crypto"
 
 import type { Hooks, PluginInput, PluginOptions } from "@opencode-ai/plugin"
@@ -247,7 +248,13 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
     maxToastsPerMinute: opts.maxToastsPerMinute,
   })
   const evidenceLedger = new EvidenceLedger()
-  const verificationReceipts = new VerificationReceiptStore()
+  // Every other subsystem is constructed with { logger }; this one was not, so
+  // `receipts:stale-dropped`, `receipts:disk-corrupt`, `receipts:disk-unavailable`
+  // and `receipts:scope-unverifiable` all went to a no-op sink. The one
+  // subsystem that MINTS the evidence artifact had no telemetry at all, which
+  // made a disk failure or a silently-disabled staleness layer indistinguishable
+  // from healthy operation.
+  const verificationReceipts = new VerificationReceiptStore({ logger })
   // FIX #5: selfCreatedGuard must exist before the tracking wrapper below —
   // see TrackingSelfCreatedSessions's doc comment.
   const selfCreatedGuard = new SelfCreatedGuard()
@@ -309,7 +316,18 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
     // capability probe regardless of this flag.
     judgeEnabled: process.env.VERTEX_JUDGE !== "0",
     judgeModelOverride: parseModelRef(opts.judgeModel ?? null) ?? undefined,
-    isValidReceipt: (sessionID, receiptID) => !!verificationReceipts.get(sessionID, receiptID),
+    isValidReceipt: (sessionID, receiptID) => {
+      // Unlike `isFreshReceipt` (wiring/tools.ts) this had NO workspace check, so
+      // a receipt naming a different `workspaceRoot` was accepted -- and stayed
+      // accepted permanently, because staleness re-fingerprints the root named
+      // ON THE RECEIPT. A receipt pointing at a frozen directory could never go
+      // stale no matter what happened to the real workspace.
+      const receipt = verificationReceipts.get(sessionID, receiptID)
+      if (!receipt) return false
+      const sessionRoot = states.get(sessionID)?.workspaceRoot
+      if (sessionRoot && resolvePath(receipt.workspaceRoot) !== resolvePath(sessionRoot)) return false
+      return true
+    },
     // FIX #7: prefer the most recent verifier command's real output text
     // (captured in tool.execute.after) over the terse ledger summary string
     // ("verified: 1 · failed: 0") — the ledger summary is still the
@@ -1053,35 +1071,29 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
         return
       }
       if (event.type === "file.edited") {
-        // `file.edited` carries a path but NO session id, so it cannot be
-        // attributed the way a hook payload can. The old rule -- act only when
-        // exactly one session is active -- looked conservative but failed open
-        // in the dangerous direction, and did so permanently: `states` is never
-        // pruned and `active` is cleared only when a message names a different
-        // agent, so after the SECOND activated session in a long-lived server
-        // the count is >= 2 for the life of the process and this net never
-        // fired again.
+        // DELIBERATELY A NO-OP. This branch has been wrong in both directions.
         //
-        // Attribute by workspace instead: every active session whose workspace
-        // contains the edited file gets the change recorded and its receipts
-        // invalidated. When several sessions share a root the file genuinely
-        // belongs to all of them, so all of them are told.
+        // It first required EXACTLY ONE active session, which looked
+        // conservative but was permanently false in a long-lived server:
+        // `states` is never pruned and `active` clears only on an agent switch,
+        // so from the second activated session on, the net never fired again.
         //
-        // Erring toward OVER-invalidation is deliberate. Invalidating a receipt
-        // that was still good costs one re-run of a verifier; failing to
-        // invalidate one that is now stale lets changed code keep old evidence,
-        // which is evidence fabrication -- the worst defect this codebase can
-        // produce. This is a secondary net: `tool.execute.after` already
-        // records and invalidates per-session for every edit the tool layer
-        // sees, and that path was never affected by the session count.
-        const file = event.properties.file
-        for (const [sid, sessionState] of states.entries()) {
-          if (!sessionState.active) continue
-          const root = sessionState.workspaceRoot
-          if (root && !file.startsWith(root)) continue
-          verificationReceipts.invalidate(sid)
-          evidenceLedger.recordChangedFiles(sid, file)
-        }
+        // The fix for that fanned out to "every active session whose workspace
+        // contains the file" -- which cannot discriminate at all, because
+        // `workspaceRoot` is computed ONCE at plugin construction and handed to
+        // every session (`freshSessionState(workspaceRoot)`). Measured: a
+        // session that had done nothing received a stop-block for someone
+        // else's edit, and `invalidate()` deleted peers' PERSISTED receipts.
+        // That inverted the bug rather than fixing it.
+        //
+        // `file.edited` carries no session id, and one process has one
+        // workspace root, so the event is simply not attributable. Guessing
+        // either way corrupts evidence. `tool.execute.after` already records
+        // changed paths and invalidates receipts per session, from a payload
+        // that names its own session -- it was never affected by either bug and
+        // covers every edit the tool layer makes. Edits made outside the tool
+        // layer are genuinely unattributable and are left to the worktree
+        // fingerprint in `goals.ts`.
         return
       }
       if (event.type !== "session.idle") return

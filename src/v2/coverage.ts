@@ -89,6 +89,20 @@ export interface SubCommand {
    * reason as `narrowing`; `parseSubcommands` always sets it.
    */
   readonly nonExecuting?: boolean
+  /**
+   * Directory this sub-command actually runs in, relative to the repo root
+   * ("" = root), set by a preceding `cd`/`pushd` in the same chain.
+   *
+   * Blanket-refusing every `cd` (the previous rule) stopped a real fabrication
+   * but created a starvation trap: `cd backend && npm test` -- the most common
+   * monorepo verifier shape -- could never mint a receipt, EVEN WHEN THE MODEL
+   * RAN THE PRESCRIPTION VERBATIM. The gate then demanded that exact command
+   * and refused to credit it, looping until the block cap gave up. Tracking the
+   * directory instead keeps `cd internal/calc && go test ./...` from covering
+   * `go test ./internal/...` (its targets normalise to `internal/calc/...`,
+   * which is narrower) while letting an honest verbatim run match.
+   */
+  readonly cwd?: string
 }
 
 // ===========================================================================
@@ -483,12 +497,81 @@ function unwrapShellWrapper(command: string): string {
  */
 const DIRECTORY_CHANGING_RUNNERS: ReadonlySet<string> = new Set(["cd", "pushd", "popd", "chdir"])
 
+/**
+ * `go -C <dir>` changes directory as surely as `cd`, but `toSubCommand` breaks
+ * its runner scan at the leading `-C` and DROPS both the flag and the
+ * directory: `go -C other build ./...` reduced to runner "go", targets
+ * ["./..."], which then covered a prescribed `go -C services/api test ./...`
+ * -- a compile in a different directory credited as a test run. The directory
+ * is unrecoverable after parsing, so this shape is refused rather than
+ * normalised. The resolver never emits `go -C`; story verifiers are
+ * model-authored and pass through verbatim.
+ */
+export const DIR_CHANGING_FLAG_RE = /(?:^|\s)-C(?:\s|=)/
+
 export function changesWorkingDirectory(command: string): boolean {
   // Match the FIRST TOKEN, not the whole runner string: `cd internal/calc`
   // parses as runner "cd" (the arg is path-shaped) but `pushd sub` parses as
   // runner "pushd sub" (the arg is not), so an exact-string check silently
   // missed half the cases.
-  return parseSubcommands(command).some((part) => DIRECTORY_CHANGING_RUNNERS.has(part.runner.split(" ")[0]))
+  // Strip grouping punctuation: `{ cd other && go test ./...; }` parsed its
+  // first runner as "{", so the guard never saw the `cd` at all.
+  return parseSubcommands(command).some((part) => {
+    const words = part.runner.split(" ").filter((w) => !/^[{}()]+$/.test(w))
+    return words.length > 0 && DIRECTORY_CHANGING_RUNNERS.has(words[0])
+  })
+}
+
+function joinDir(base: string, next: string): string {
+  if (next.startsWith("/")) return next.replace(/\/+$/, "")
+  const parts = `${base}/${next}`.split("/").filter((p) => p.length > 0 && p !== ".")
+  const out: string[] = []
+  for (const part of parts) {
+    if (part === "..") out.pop()
+    else out.push(part)
+  }
+  return out.join("/")
+}
+
+/**
+ * Fold `cd` effects into the chain: each surviving sub-command records the
+ * directory it runs in, and its relative targets are re-expressed from the repo
+ * root. `cd` parts execute nothing, so they are dropped once folded.
+ */
+function applyDirectoryChanges(parts: SubCommand[]): SubCommand[] {
+  let cwd = ""
+  const out: SubCommand[] = []
+  for (const part of parts) {
+    const words = part.runner.split(" ").filter((w) => !/^[{}()]+$/.test(w))
+    if (words.length > 0 && DIRECTORY_CHANGING_RUNNERS.has(words[0])) {
+      const dir = part.targets[0] ?? words[1] ?? ""
+      if (dir) cwd = joinDir(cwd, dir)
+      continue
+    }
+    if (cwd === "") {
+      // Leave `cwd` ABSENT at the repo root rather than setting "". Absent and
+      // "" mean the same thing to every reader, and omitting it keeps the
+      // parsed shape byte-identical for the common case.
+      out.push(part)
+      continue
+    }
+    out.push({
+      ...part,
+      cwd,
+      targets: part.targets.map((t) => {
+        if (t.startsWith("/")) return t
+        const recursive = t.endsWith("/...")
+        const bare = recursive ? t.slice(0, -4) : t
+        const joined = joinDir(cwd, bare.replace(/^\.\//, ""))
+        // Preserve the leading "./": the prescribed side is parsed with no cwd,
+        // so it keeps `./internal/auth/...`. Dropping the prefix here made an
+        // honest `cd internal && go test ./auth/...` fail to match it.
+        const rooted = joined === "" ? "." : `./${joined}`
+        return recursive ? `${rooted}/...` : rooted
+      }),
+    })
+  }
+  return out
 }
 
 export function parseSubcommands(command: string): SubCommand[] {
@@ -505,7 +588,7 @@ export function parseSubcommands(command: string): SubCommand[] {
     if (parsed) subCommands.push(parsed)
   }
 
-  return subCommands
+  return applyDirectoryChanges(subCommands)
 }
 
 function toSubCommand(tokens: readonly string[]): SubCommand | null {
@@ -733,8 +816,31 @@ export function targetsCover(observedTargets: readonly string[], prescribedTarge
 // ===========================================================================
 
 /** One observed sub-command covers one prescribed sub-command. */
+/** `-w pkg` / `--workspace pkg` — selects WHICH package runs, not which tests. */
+const WORKSPACE_SELECTOR_RE = /^(?:-w|--workspace)=/
+
 export function subCommandCovers(observed: SubCommand, prescribed: SubCommand): boolean {
   if (!runnerEquivalent(observed.runner, prescribed.runner)) return false
+
+  // The observed run must happen at or ABOVE the prescribed directory. Running
+  // in `backend` cannot evidence a prescription rooted at the repo; running at
+  // the repo root can evidence one rooted at `backend`, subject to targets.
+  const observedCwd = observed.cwd ?? ""
+  const prescribedCwd = prescribed.cwd ?? ""
+  // Only for a BARE invocation. Once a sub-command names targets they have
+  // already been re-expressed from the repo root by `applyDirectoryChanges`, so
+  // they describe the true scope and the directory is redundant --
+  // `cd internal && go test ./auth/...` normalises to `./internal/auth/...`
+  // and must still cover a prescription written that way. A bare command has
+  // no targets to speak for it, so the directory is all there is.
+  if (
+    observed.targets.length === 0 &&
+    observedCwd !== "" &&
+    observedCwd !== prescribedCwd &&
+    !prescribedCwd.startsWith(`${observedCwd}/`)
+  ) {
+    return false
+  }
   if (!narrowingAllows(observed.narrowing, prescribed.narrowing)) return false
 
   // Ran nothing => covers nothing (see NON_EXECUTING_FLAGS).
@@ -744,6 +850,28 @@ export function subCommandCovers(observed: SubCommand, prescribed: SubCommand): 
   // everything when bare. `go test` does not — it runs the cwd package only,
   // so it must never be credited for a prescribed `./internal/auth/...`.
   // A bare-for-bare comparison still covers: it is the identical invocation.
+  // A bare whole-suite invocation does not cover a prescription that carries a
+  // SELECTOR. Measured: `npm test` was credited as covering
+  // `npm test -w packages/api`, but an npm workspace root's `test` script
+  // frequently does not recurse -- a receipt asserting `packages/api` was
+  // verified by a command that never entered it. This is the same hazard
+  // `go test` is excluded from WHOLE_SUITE_WHEN_BARE for, and the resolver only
+  // emits `-w` when a workspace layout exists, i.e. exactly when a bare root
+  // script is least likely to be the whole suite.
+  // WORKSPACE selectors only -- not test selectors. For a test selector,
+  // "broader is fine": an unfiltered run genuinely does cover a filtered
+  // prescription. A workspace selector is different in kind: an npm workspace
+  // root's `test` script frequently does not recurse, so bare `npm test` can
+  // exit 0 having entered no workspace at all, and crediting it for
+  // `npm test -w packages/api` asserts a package was verified by a command that
+  // never touched it. (This is the same hazard `go test` is excluded from
+  // WHOLE_SUITE_WHEN_BARE for.)
+  const prescribedWorkspaces = (prescribed.narrowing ?? []).filter((n) => WORKSPACE_SELECTOR_RE.test(n))
+  if (prescribedWorkspaces.length > 0) {
+    const observedWorkspaces = (observed.narrowing ?? []).filter((n) => WORKSPACE_SELECTOR_RE.test(n))
+    if (observedWorkspaces.length === 0) return false
+  }
+
   if (observed.targets.length === 0 && !WHOLE_SUITE_WHEN_BARE.has(observed.runner)) {
     return prescribed.targets.length === 0
   }
@@ -802,13 +930,19 @@ function narrowingAllows(
  */
 export function isNonExecutingCommand(command: string): boolean {
   const parts = parseSubcommands(command)
-  return parts.length > 0 && parts.every((p) => p.nonExecuting === true)
+  // `some`, NOT `every`: `pytest --collect-only && echo done` slipped past an
+  // `every` check, because `echo done` is an ordinary executing sub-command, so
+  // the quantifier went false and the guard was skipped entirely -- a real
+  // receipt for a chain that ran zero tests. If ANY part lists/describes instead
+  // of running, the chain is not evidence.
+  return parts.length > 0 && parts.some((p) => p.nonExecuting === true)
 }
 
 export function observedCoversPrescribed(prescribed: string, observed: string): boolean {
-  // A `cd` anywhere in the chain makes every relative target incomparable with
-  // a root-relative prescription. Refuse before any target maths.
-  if (changesWorkingDirectory(observed)) return false
+  // `go -C` is refused on either side: the directory is unrecoverable after
+  // parsing (see DIR_CHANGING_FLAG_RE), so there is nothing to normalise.
+  // Plain `cd` is NOT refused -- it is folded into each sub-command's `cwd`.
+  if (DIR_CHANGING_FLAG_RE.test(observed) || DIR_CHANGING_FLAG_RE.test(prescribed)) return false
 
   const prescribedParts = parseSubcommands(prescribed)
   // `||` operands are dropped from the OBSERVED side: for `A || B` that exited

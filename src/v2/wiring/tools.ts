@@ -204,9 +204,21 @@ export function buildPlanTools(deps: PlanToolsDeps) {
         .default([]),
     },
     async execute(args, context) {
+      // Validate EVERYTHING before writing anything.
+      //
+      // These attachments used to happen inline, before `checkpoint` validated
+      // any of them, so a REFUSED checkpoint still persisted the model's claim:
+      // `checkpoint(S1, complete, receiptId: "vrf_totally_made_up")` threw, and
+      // plan.json was left holding `"evidence": {"receiptId": "vrf_totally_made_up"}`.
+      // The story could not be completed -- validation re-runs every attempt --
+      // but the durable audit record showed fabricated evidence, contradicting
+      // story.ts's guarantee that a thrown error leaves the plan byte-for-byte
+      // unchanged. Waiver verification is an await, so it must also finish
+      // before the first write.
+      const pending: Array<{ itemId: string; evidence: { receiptId: string } | { waiver: true; sourceMessageId: string } }> = []
       for (const item of args.items) {
         if (item.receiptId) {
-          storyEngine.attachEvidence(context.sessionID, args.storyId, item.id, { receiptId: item.receiptId })
+          pending.push({ itemId: item.id, evidence: { receiptId: item.receiptId } })
         } else if (item.waiverSourceMessageId) {
           const verified = await isUserMessage(client, context.sessionID, item.waiverSourceMessageId)
           if (!verified) {
@@ -214,11 +226,32 @@ export function buildPlanTools(deps: PlanToolsDeps) {
               `waiver for acceptance item ${item.id} references message ${item.waiverSourceMessageId}, which does not resolve to a user-authored chat message — rejected`,
             )
           }
-          storyEngine.attachEvidence(context.sessionID, args.storyId, item.id, {
-            waiver: true,
-            sourceMessageId: item.waiverSourceMessageId,
+          pending.push({
+            itemId: item.id,
+            evidence: { waiver: true, sourceMessageId: item.waiverSourceMessageId },
           })
         }
+      }
+      // Receipt ids are validated here too, not only inside `checkpoint`.
+      // Otherwise a fabricated id is written to plan.json first and rejected
+      // second, leaving the forgery in the durable record.
+      for (const { itemId, evidence } of pending) {
+        if ("receiptId" in evidence) {
+          const fresh = isFreshReceipt(
+            { verificationReceipts, states, storyEngine },
+            context.sessionID,
+            args.storyId,
+            evidence.receiptId,
+          )
+          if (!fresh) {
+            throw new Error(
+              `cannot complete story ${args.storyId}: acceptance item ${itemId}'s receipt ${evidence.receiptId} is not an observed receipt for this story`,
+            )
+          }
+        }
+      }
+      for (const { itemId, evidence } of pending) {
+        storyEngine.attachEvidence(context.sessionID, args.storyId, itemId, evidence)
       }
       storyEngine.checkpoint(context.sessionID, args.storyId, args.status, {
         isValidReceipt: (receiptId) =>

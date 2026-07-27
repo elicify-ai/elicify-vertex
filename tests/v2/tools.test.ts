@@ -15,7 +15,7 @@
  *   - a receipt whose worktree has moved on is REFUSED (otherwise persistence
  *     is an evidence-fabrication vector, which is worse than not persisting).
  */
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -199,5 +199,29 @@ describe("checkpoint with persisted verification receipts", () => {
 
     const second = boot(root)
     await expect(checkpoint(second, "S1", minted.id)).rejects.toThrow(/not an observed receipt/i)
+  })
+})
+
+describe("a refused checkpoint leaves no forged evidence in plan.json (R7)", () => {
+  // Evidence used to be attached BEFORE `checkpoint` validated it, so a refused
+  // checkpoint still wrote the model's claim to disk: the story could never be
+  // completed (validation re-runs every attempt) but the durable audit record
+  // showed a fabricated receipt id, contradicting story.ts's guarantee that a
+  // thrown error leaves the plan byte-for-byte unchanged.
+  //
+  // MUTATION PROOF: move the `attachEvidence` loop in wiring/tools.ts back above
+  // the validation loop -> this test goes red.
+  it("does not persist a fabricated receiptId when the checkpoint is rejected", async () => {
+    const root = temporaryRoot()
+    const h = boot(root)
+    await h.tools.elicify_vertex_plan_create.execute(
+      { stories: [{ text: "w", acceptanceItems: ["ok"], scopeGlobs: ["**"], verifiers: ["npx vitest run"] }] },
+      { sessionID: SESSION } as never,
+    )
+
+    await expect(checkpoint(h, "S1", "vrf_totally_made_up")).rejects.toThrow()
+
+    const planPath = join(root, ".elicify-vertex", "plan.json")
+    expect(readFileSync(planPath, "utf8")).not.toContain("vrf_totally_made_up")
   })
 })

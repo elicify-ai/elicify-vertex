@@ -613,7 +613,13 @@ export class VerificationReceiptStore {
     // Incomplete scope: never persisted (see `persist`), so this receipt is
     // in-memory-only and still governed by layer 1 (`invalidate` on
     // mutation) exactly as it was before persistence existed.
-    if (!scope.complete) return false
+    // FAIL CLOSED. This returned false ("not stale, serve it"), so a receipt
+  // whose scope could not be fingerprinted -- a worktree past the file/byte
+  // ceiling -- was treated as permanently fresh. Measured: with an oversized
+  // worktree, deleting the entire `src/` tree left the receipt valid. An
+  // unprovable scope is exactly the case where evidence must NOT be trusted,
+  // and line :618 already takes that view of the current side.
+  if (!scope.complete) return true
     const current = fingerprintWorktree(receipt.workspaceRoot)
     if (!current.complete) return true // cannot prove freshness now => refuse
     return current.digest !== scope.worktreeDigest
