@@ -40,7 +40,12 @@ export interface GateContext {
   selfCreated: SelfCreatedSessions
   manifests: ManifestCache
   states: Map<string, V2SessionState>
-  /** Every session id currently gate-active (mirrors v1's `SessionGate.activeSessionIDs()`), for the multi-session advisory rule. */
+  /**
+   * Every session id currently gate-active (mirrors v1's
+   * `SessionGate.activeSessionIDs()`). Read ONLY to emit the degraded-
+   * attribution advisory (`gate:multi-session-advisory`) — never to decide
+   * whether to enforce. See `handleSessionIdle` for why.
+   */
   activeSessionIDs: () => string[]
   maxCriteriaBlocks: number
   judgeEnabled: boolean
@@ -330,19 +335,92 @@ async function appendJudgeCloseOut(ctx: GateContext, sid: string, state: V2Sessi
 }
 
 /**
+ * Direct-membership-only parent lookup for the `selfCreated` filter below.
+ *
+ * `SelfCreatedSessions.isSelfCreated` checks the id itself against the
+ * recorded set BEFORE ever calling `resolveParent` (see `subturn.ts`), and
+ * the only sessions this harness creates are the judge and intake subturns —
+ * direct children, recorded by id, never nested further (`wiring/state.ts`'s
+ * `SelfCreatedGuard` doc says the same). `GateContext` carries no
+ * parent-lookup function, so supplying one here would mean inventing a seam
+ * `plugin.ts` does not fill; the direct-id check covers every case that
+ * actually occurs. The defensive grandchild case is noted, not silently
+ * claimed as covered.
+ */
+const NO_PARENT_LOOKUP = (): string | null => null
+
+/**
  * Full FR-015 decision tree for `event(session.idle)`. Caller is
- * responsible for the FR-036 self-created-session early return and the
- * in-flight (`idleContinuationInFlight`) guard before calling this.
+ * responsible for the FR-036 self-created-session early return before
+ * calling this.
+ *
+ * ── ENFORCEMENT IS PER-SESSION ────────────────────────────────────────────
+ * This function used to return early — skipping promise-no-act, the
+ * stop-block continuation, the criteria replay and the judge — whenever
+ * `ctx.activeSessionIDs().length > 1`. That came from spec FR-015's
+ * multi-session advisory clause (review MIN-007), whose stated premise was:
+ * with two sessions active, `file.edited` attribution is suppressed, "so
+ * evidence cannot accrue", therefore the gate must not block.
+ *
+ * That premise does not hold in v2, and the guard was removed for it:
+ *
+ *  - Multi-session only suppresses ONE input: `plugin.ts`'s `file.edited`
+ *    branch (`event()`, mirroring v1's `src/index.ts` `file.edited` handler),
+ *    which requires exactly one active session before calling
+ *    `recordChangedFiles` / `verificationReceipts.invalidate`.
+ *  - That input feeds the CHANGE side of the ledger only. Every EVIDENCE
+ *    input — `parseVerification` in `tool.execute.after`, checkpoint
+ *    receipts, criterion evidence — is carried on a hook payload that names
+ *    its own session id, so it still accrues normally with any number of
+ *    sessions active.
+ *  - Suppressing changes can therefore only make the gate quieter, never
+ *    produce a block the model cannot satisfy. There was no unsatisfiable-
+ *    block hazard for the bail-out to prevent, while the bail-out itself
+ *    disabled promise-no-act, the stop-block and the judge for BOTH
+ *    sessions the moment a second one existed (waves-review MAJ-007).
+ *  - v1 never had this bail-out either: `src/index.ts`'s `session.idle`
+ *    handler checks only `gate.isActive(sid)` and the in-flight set. The
+ *    session-count test lives solely in its `file.edited` branch.
+ *
+ * What the guard's real intent WAS — telling the operator that attribution
+ * is degraded — is preserved below: the advisory still logs and still sets
+ * `needsCriteriaReinject`. It just no longer suppresses anything.
+ *
+ * Everything this function then touches is session-keyed (`EvidenceLedger`,
+ * `PinStore`, `StoryEngine`'s per-session `plan.json` entry, `PhaseEngine`,
+ * `InjectionComposer`, `holdoutSuppresses`, `V2SessionState`), and this
+ * module holds no mutable module-level state, so two sessions running this
+ * concurrently cannot read or clobber each other's decisions.
  */
 export async function handleSessionIdle(ctx: GateContext, sid: string): Promise<void> {
   const state = ctx.states.get(sid)
   if (!state || !state.active) return
 
-  const activeSessionIDs = ctx.activeSessionIDs()
-  if (activeSessionIDs.length > 1) {
-    ctx.logger("gate:multi-session-advisory", { sessionID: sid, activeSessionCount: activeSessionIDs.length })
-    state.needsCriteriaReinject = true // best-effort advisory surface on the next transform, never a block
-    return
+  // Re-entrancy, per session. `promptContinuation` sets this flag while its
+  // `session.prompt` is outstanding, and that prompt re-enters the host's
+  // `chat.message`/`session.idle` path for THIS session. `plugin.ts`'s
+  // `event()` already checks it, but with the multi-session bail-out gone
+  // this is the only thing standing between a continuation and its own echo,
+  // so the gate enforces it itself rather than trusting one caller. It is a
+  // per-session flag, so a busy session never gates an idle peer.
+  if (state.idleContinuationInFlight) return
+
+  // Degraded-attribution ADVISORY (never a suppression — see doc above).
+  //
+  // FR-036: a session the harness itself created (judge/intake subturn) is
+  // not a peer user session. If one ever reaches this list, it must not make
+  // its own parent look multi-session — that would fire a spurious
+  // criteria-reinject on every judge close-out, and under the old bail-out
+  // would have let a single user session silently disable its own gate.
+  // `plugin.ts` keeps child sessions out of `states` today (every hook that
+  // creates state returns early for `isSelf`), so this filter is
+  // belt-and-braces on an injected callback the gate does not own.
+  const peerSessionIDs = ctx.activeSessionIDs().filter(
+    (id) => !ctx.selfCreated.isSelfCreated(id, NO_PARENT_LOOKUP),
+  )
+  if (peerSessionIDs.length > 1) {
+    ctx.logger("gate:multi-session-advisory", { sessionID: sid, activeSessionCount: peerSessionIDs.length })
+    state.needsCriteriaReinject = true // advisory surface on the next transform
   }
 
   // v1 ordering: promise-no-act is checked BEFORE the criteria/zero-criteria

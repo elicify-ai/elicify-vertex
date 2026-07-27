@@ -144,6 +144,29 @@ const NARROWING_FLAGS: ReadonlySet<string> = new Set([
 ])
 
 /**
+ * Narrowing flags that are narrowing only FOR A SPECIFIC RUNNER, and flags that
+ * must be EXEMPTED from the global set for a specific runner.
+ *
+ * `--workspace` is the cautionary case: for npm/pnpm it selects ONE workspace of
+ * many (narrowing, already in the global set), but for cargo it means the WHOLE
+ * workspace (broadening). Scoring a full `cargo test --workspace` as narrowed
+ * would suppress a legitimate receipt -- the same evidence-starvation direction
+ * as the `-n` bug (pytest-xdist worker count vs go's "print, don't run").
+ *
+ * Cargo's real subset selectors are measured: `cargo test -p mycrate` parsed as
+ * a bare whole-suite `cargo test`, because the crate name is not path-shaped and
+ * so became neither a target nor a flag value -- one crate minting a receipt for
+ * every crate.
+ */
+const RUNNER_NARROWING_FLAGS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ["cargo test", new Set(["-p", "--package", "--bin", "--lib", "--example", "--bench", "--exclude"])],
+])
+
+const RUNNER_NON_NARROWING_FLAGS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ["cargo test", new Set(["--workspace", "--all"])],
+])
+
+/**
  * Flags meaning "do not execute anything" — list, count, or describe tests
  * instead of running them. A sub-command carrying one of these verifies
  * NOTHING, yet exits 0, so without this it would satisfy any prescription
@@ -527,7 +550,7 @@ function toSubCommand(tokens: readonly string[]): SubCommand | null {
   return {
     runner,
     targets,
-    narrowing: extractNarrowing(rest),
+    narrowing: extractNarrowing(rest, runner),
     nonExecuting: rest.some((token) => {
       const flag = token.split("=")[0]
       return NON_EXECUTING_FLAGS.has(flag) || runnerScoped?.has(flag) === true
@@ -545,7 +568,14 @@ function toSubCommand(tokens: readonly string[]): SubCommand | null {
  * narrowing (recorded with an empty value) — fail-closed, because an
  * unparseable selector is more likely to restrict the run than to widen it.
  */
-function extractNarrowing(tokens: readonly string[]): string[] {
+function extractNarrowing(tokens: readonly string[], runner: string): string[] {
+  const scopedNarrowing = RUNNER_NARROWING_FLAGS.get(runner)
+  const scopedExempt = RUNNER_NON_NARROWING_FLAGS.get(runner)
+  const narrows = (flag: string): boolean => {
+    if (scopedExempt?.has(flag) === true) return false
+    return NARROWING_FLAGS.has(flag) || scopedNarrowing?.has(flag) === true
+  }
+
   const found: string[] = []
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[i]
@@ -554,11 +584,11 @@ function extractNarrowing(tokens: readonly string[]): string[] {
     const eq = token.indexOf("=")
     if (eq > 0) {
       const name = token.slice(0, eq)
-      if (NARROWING_FLAGS.has(name)) found.push(`${name}=${token.slice(eq + 1)}`)
+      if (narrows(name)) found.push(`${name}=${token.slice(eq + 1)}`)
       continue
     }
 
-    if (!NARROWING_FLAGS.has(token)) continue
+    if (!narrows(token)) continue
     const value = tokens[i + 1]
     if (value !== undefined && !isFlagToken(value)) {
       found.push(`${token}=${value}`)

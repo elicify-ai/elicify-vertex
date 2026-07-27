@@ -477,3 +477,35 @@ describe("shell wrappers are unwrapped (O-02)", () => {
     expect(observedCoversPrescribed("go test ./internal/...", 'bash -lc "cd internal/calc && go test ./..."')).toBe(false)
   })
 })
+
+// ===========================================================================
+// Cargo subset selection (found by the polyglot-resolver workstream).
+//
+// `cargo test -p mycrate` parsed as a bare whole-suite `cargo test`: the crate
+// name is not path-shaped, so it became neither a target nor a flag value, and
+// one crate's tests were credited as covering an entire workspace.
+//
+// The fix had to be runner-scoped, not global -- `--workspace` narrows for
+// npm/pnpm (one workspace of many) but BROADENS for cargo (all crates). A
+// global entry would have suppressed every legitimate `cargo test --workspace`
+// receipt: evidence starvation, the same direction as the `-n` bug.
+// ===========================================================================
+
+describe("cargo subset flags are narrowing, but --workspace is not", () => {
+  it("refuses a single-crate run as evidence for the workspace", () => {
+    for (const observed of ["cargo test -p mycrate", "cargo test --package mycrate", "cargo test --lib"]) {
+      expect(observedCoversPrescribed("cargo test", observed), observed).toBe(false)
+    }
+  })
+
+  it("still credits a genuine whole-workspace cargo run (discrimination)", () => {
+    expect(observedCoversPrescribed("cargo test", "cargo test")).toBe(true)
+    expect(observedCoversPrescribed("cargo test", "cargo test --workspace")).toBe(true)
+  })
+
+  it("keeps npm's OPPOSITE meaning of --workspace intact", () => {
+    // npm --workspace selects ONE of many, so it must still narrow.
+    expect(observedCoversPrescribed("npm test", "npm test --workspace pkg-a")).toBe(false)
+    expect(observedCoversPrescribed("npm test", "npm test")).toBe(true)
+  })
+})

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import {
   accessSync,
   appendFileSync,
@@ -10,6 +10,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   renameSync,
   rmSync,
   statSync,
@@ -94,6 +95,48 @@ export function resolveGoalWorkspaceRoot(candidates: readonly (string | undefine
 export type StoryStatus = "pending" | "in_progress" | "complete" | "failed" | "blocked"
 export type PlanStatus = "active" | "complete" | "failed" | "blocked"
 
+/**
+ * What a verification receipt is evidence FOR.
+ *
+ * Product requirement this shape answers, verbatim in substance: *test
+ * results must be linked to the plan — per user story it must be validated
+ * once — and the verification must be linked to the scope or goal it
+ * verifies. This must also work for executions with no plan.*
+ *
+ *  - `storyId` is the GOAL link. It is the id of the story that was active
+ *    when the verification was observed (read from the v2 `plan.json` that
+ *    `StoryEngine` writes into the same `.elicify-vertex/` directory), or
+ *    `null` when the session had no plan — the "executions with no plan"
+ *    path, which still gets a fully-formed, persistable receipt. Consumers
+ *    (`src/v2/wiring/tools.ts`) refuse a receipt minted while story S1 was
+ *    active as evidence for story S2, which is what turns "per story,
+ *    validated once" into a checkable fact instead of a coincidence of
+ *    timing.
+ *  - `paths` is the SCOPE link: the declared scope the verification covered
+ *    (the active story's `scopeGlobs`, or caller-supplied changed paths).
+ *    It is recorded for provenance and audit only — deliberately NOT used to
+ *    narrow invalidation, see `worktreeDigest`.
+ *  - `worktreeDigest` is the INVALIDATION key, and it is deliberately a
+ *    SUPERSET of `paths`: a bounded fingerprint of the entire worktree (see
+ *    `fingerprintWorktree`). Narrowing invalidation to `paths` would be an
+ *    under-invalidation trap — a verifier run (`npm test`, `tsc`) exercises
+ *    far more of the tree than the story's declared globs, so an edit
+ *    outside those globs can absolutely break it. Any change anywhere in the
+ *    worktree therefore retires the receipt.
+ *  - `complete` is `false` when the fingerprint could not be computed in
+ *    full (worktree missing, or past `RECEIPT_SCOPE_MAX_FILES` /
+ *    `RECEIPT_SCOPE_MAX_HASHED_BYTES`). An incomplete-scope receipt is never
+ *    written to disk and is never accepted from disk: freshness that cannot
+ *    be proven is not persisted.
+ */
+export interface VerificationScope {
+  storyId: string | null
+  paths: string[]
+  worktreeDigest: string
+  fileCount: number
+  complete: boolean
+}
+
 export interface VerificationReceipt {
   id: string
   sessionID: string
@@ -103,6 +146,15 @@ export interface VerificationReceipt {
   outcome: "verified"
   outputSummary: string
   observedAt: string
+  /**
+   * ADDED alongside persistence. Optional in the TYPE so receipt literals
+   * written before this field existed (v1 call sites, `goals.json` files on
+   * disk) still typecheck and still load; `record()` always populates it.
+   * A receipt reaching `VerificationReceiptStore.get()` WITHOUT a scope
+   * cannot be proven fresh and is therefore refused — absent is never
+   * treated as "fine".
+   */
+  scope?: VerificationScope
 }
 
 export interface GoalStory {
@@ -154,33 +206,583 @@ function isValidTimestamp(value: unknown): value is string {
   return typeof value === "string" && value.trim() !== "" && Number.isFinite(Date.parse(value))
 }
 
-/** In-memory verified-command receipts. The persisted final checkpoint embeds
- * a sanitized copy of observed receipts rather than caller-authored verify strings. */
+// ---------------------------------------------------------------------------
+// Verification receipts — persisted evidence.
+// ---------------------------------------------------------------------------
+
+/** On-disk schema version of `.elicify-vertex/receipts.json`. Bumping this
+ * archives (never deletes) the old file, mirroring how `story.ts` handles a
+ * `goals.json` it does not understand. */
+export const RECEIPTS_SCHEMA_VERSION = 1
+const RECEIPTS_FILE_NAME = "receipts.json"
+const RECEIPTS_LOCK_NAME = "receipts.lock"
+const MAX_RECEIPTS_PER_SESSION = 20
+/** Sessions untouched for this long are pruned on the next write, so the
+ * file cannot grow without bound (same 7-day horizon `pin.ts` uses). */
+const RECEIPTS_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
+const MAX_SCOPE_PATHS = 50
+
+/**
+ * Directory names skipped by the worktree fingerprint. Two rules decided
+ * membership: (1) the harness's OWN state must be excluded or every receipt
+ * would invalidate itself the moment it is written (`.elicify-vertex`), and
+ * (2) build/dependency output is a derived artifact that a verifier run
+ * routinely rewrites — including it would retire every receipt the instant
+ * it was minted, which is indistinguishable from having no persistence.
+ * Source, tests, config and docs are all still covered.
+ */
+const RECEIPT_SCOPE_IGNORED_DIRS: ReadonlySet<string> = new Set([
+  ".elicify-vertex",
+  ".git",
+  ".gradle",
+  ".idea",
+  ".mypy_cache",
+  ".next",
+  ".nuxt",
+  ".pytest_cache",
+  ".turbo",
+  ".venv",
+  ".vscode",
+  "__pycache__",
+  "build",
+  "coverage",
+  "dist",
+  "node_modules",
+  "out",
+  "target",
+  "vendor",
+  "venv",
+])
+
+/** Hard ceilings on the fingerprint walk. Past either one the scope is marked
+ * incomplete rather than silently partial — a partial fingerprint would miss
+ * exactly the edits it failed to reach, which is under-invalidation, which is
+ * the failure mode this whole mechanism exists to prevent. */
+const RECEIPT_SCOPE_MAX_FILES = 20_000
+const RECEIPT_SCOPE_MAX_HASHED_BYTES = 64 * 1024 * 1024
+/** Files above this size are fingerprinted by metadata instead of content, so
+ * one large binary/fixture cannot disable persistence for a whole worktree. */
+const RECEIPT_SCOPE_MAX_FILE_BYTES = 4 * 1024 * 1024
+
+export interface WorktreeFingerprint {
+  /** `sha256` over one sorted `path size sha256(content)` line per file. */
+  digest: string
+  fileCount: number
+  /** `false` when the walk could not cover the whole worktree (missing root,
+   * more than `RECEIPT_SCOPE_MAX_FILES` files, or more than
+   * `RECEIPT_SCOPE_MAX_HASHED_BYTES` of hashable content). */
+  complete: boolean
+}
+
+/**
+ * Bounded, deterministic fingerprint of a worktree — the durable half of the
+ * staleness rule (the in-process half is `invalidate()`, which wiring already
+ * calls on every mutation).
+ *
+ * CONTENT-hashed, not mtime-stamped, and that choice was forced by evidence:
+ * an inode+size+mtime fingerprint let a same-size edit through UNDETECTED in
+ * test, because Linux stamps file mtimes from a coarse (jiffy-resolution)
+ * clock — `answer = 42` -> `answer = 44` inside one tick is byte-different
+ * but metadata-identical. That is silent under-invalidation, i.e. a stale
+ * receipt that still counts, so metadata alone is not an acceptable basis for
+ * evidence. Content hashing is also exact in the other direction: a checkout
+ * that rewrites files with identical bytes does NOT retire a receipt, because
+ * the code it verified is genuinely unchanged.
+ *
+ * Symlinks are recorded by name and never followed (no cycles, no escaping
+ * the worktree). Lines are sorted before hashing so the digest does not
+ * depend on readdir order.
+ *
+ * Known limits (restated in the report): files larger than
+ * `RECEIPT_SCOPE_MAX_FILE_BYTES` fall back to size+inode+mtime, so a
+ * same-size, same-tick edit to a >4MB file is still invisible; changes under
+ * `RECEIPT_SCOPE_IGNORED_DIRS` are not seen; and anything outside the
+ * worktree (a global dependency store, an env var, a remote service) is out
+ * of scope entirely.
+ */
+export function fingerprintWorktree(root: string): WorktreeFingerprint {
+  const resolvedRoot = resolve(root)
+  let rootIsDirectory = false
+  try {
+    rootIsDirectory = statSync(resolvedRoot).isDirectory()
+  } catch {
+    rootIsDirectory = false
+  }
+  // A worktree we cannot even open is a scope we cannot prove anything
+  // about. Report it as incomplete instead of returning the digest of the
+  // empty set, which would compare equal to every other unreadable root.
+  if (!rootIsDirectory) return { digest: "", fileCount: 0, complete: false }
+
+  const lines: string[] = []
+  const pending: string[] = [""]
+  let hashedBytes = 0
+  let complete = true
+
+  walk: while (pending.length > 0) {
+    const relativeDirectory = pending.pop() as string
+    let entries
+    try {
+      entries = readdirSync(join(resolvedRoot, relativeDirectory), { withFileTypes: true })
+    } catch {
+      continue // unreadable directory — skip it rather than aborting the walk
+    }
+    for (const entry of entries) {
+      const relativePath = relativeDirectory ? `${relativeDirectory}/${entry.name}` : entry.name
+      if (entry.isSymbolicLink()) {
+        lines.push(`${relativePath} symlink`)
+        continue
+      }
+      if (entry.isDirectory()) {
+        if (!RECEIPT_SCOPE_IGNORED_DIRS.has(entry.name)) pending.push(relativePath)
+        continue
+      }
+      if (!entry.isFile()) continue
+      if (lines.length >= RECEIPT_SCOPE_MAX_FILES) {
+        complete = false
+        break walk
+      }
+
+      const absolutePath = join(resolvedRoot, relativePath)
+      let stats
+      try {
+        stats = statSync(absolutePath, { bigint: true })
+      } catch {
+        lines.push(`${relativePath} missing`)
+        continue
+      }
+      if (stats.size > BigInt(RECEIPT_SCOPE_MAX_FILE_BYTES)) {
+        lines.push(`${relativePath} large ${stats.size} ${stats.ino} ${stats.mtimeNs}`)
+        continue
+      }
+      hashedBytes += Number(stats.size)
+      if (hashedBytes > RECEIPT_SCOPE_MAX_HASHED_BYTES) {
+        complete = false
+        break walk
+      }
+      try {
+        const content = createHash("sha256").update(readFileSync(absolutePath)).digest("hex")
+        lines.push(`${relativePath} ${stats.size} ${content}`)
+      } catch {
+        lines.push(`${relativePath} unreadable ${stats.size} ${stats.mtimeNs}`)
+      }
+    }
+  }
+
+  if (!complete) return { digest: "", fileCount: lines.length, complete: false }
+
+  lines.sort()
+  const hash = createHash("sha256")
+  for (const line of lines) hash.update(`${line}\n`)
+  return { digest: hash.digest("hex"), fileCount: lines.length, complete: true }
+}
+
+interface ReceiptsFileEntry {
+  updatedAt: string
+  receipts: VerificationReceipt[]
+}
+
+interface ReceiptsFile {
+  schemaVersion: number
+  sessions: Record<string, ReceiptsFileEntry>
+}
+
+/** Thrown internally when `receipts.json` is unparseable — the write is then
+ * ABORTED rather than clobbering other sessions' receipts with our own
+ * (same reasoning as `pin.ts`'s `pins:disk-corrupt` branch). */
+class CorruptReceiptsFileError extends Error {}
+
+function isPersistedScope(value: unknown): value is VerificationScope {
+  if (!isRecord(value)) return false
+  if (value.storyId !== null && typeof value.storyId !== "string") return false
+  if (!Array.isArray(value.paths) || value.paths.some((path) => typeof path !== "string")) return false
+  if (typeof value.worktreeDigest !== "string" || value.worktreeDigest.trim() === "") return false
+  if (!Number.isFinite(value.fileCount)) return false
+  // Only `complete: true` scopes are ever written; refusing anything else on
+  // read closes the "hand-craft a receipts.json whose scope is unprovable,
+  // and therefore never checked" fabrication path.
+  return value.complete === true
+}
+
+function isPersistedReceipt(value: unknown): value is VerificationReceipt {
+  if (!isRecord(value)) return false
+  if (typeof value.id !== "string" || !value.id.trim()) return false
+  if (typeof value.sessionID !== "string" || !value.sessionID.trim()) return false
+  if (typeof value.workspaceRoot !== "string" || !value.workspaceRoot.trim()) return false
+  if (typeof value.command !== "string") return false
+  if (typeof value.outputSummary !== "string") return false
+  if (value.exitCode !== 0 || value.outcome !== "verified") return false
+  if (!isValidTimestamp(value.observedAt)) return false
+  return isPersistedScope(value.scope)
+}
+
+export type ReceiptLogger = (event: string, payload: Record<string, unknown>) => void
+
+export interface VerificationReceiptStoreOptions {
+  /** Overrides the state directory otherwise derived from each receipt's own
+   * `workspaceRoot` (`<workspaceRoot>/.elicify-vertex`). Tests use this; the
+   * plugin does not need to, which is why `new VerificationReceiptStore()`
+   * still persists with no wiring change. */
+  stateDir?: string
+  logger?: ReceiptLogger
+  /**
+   * Resolves what a receipt is evidence FOR at record time. The default
+   * reads the v2 `plan.json` sitting next to `receipts.json` and returns the
+   * ACTIVE story's id plus its declared `scopeGlobs`; with no plan (or an
+   * unreadable one) it returns `{ storyId: null, paths: [] }`, which is the
+   * supported "execution with no plan" path, not an error.
+   */
+  resolveScopeLink?: (sessionID: string, stateDir: string) => { storyId: string | null; paths: string[] }
+}
+
+/** Default `resolveScopeLink`: shape-probes `plan.json` rather than importing
+ * `src/v2/story.ts`, so this v1 module keeps zero dependencies on v2. */
+function readPlanScopeLink(sessionID: string, stateDir: string): { storyId: string | null; paths: string[] } {
+  const empty = { storyId: null, paths: [] as string[] }
+  try {
+    const planPath = join(stateDir, "plan.json")
+    if (!existsSync(planPath)) return empty
+    const parsed: unknown = JSON.parse(readFileSync(planPath, "utf8"))
+    if (!isRecord(parsed)) return empty
+    const plan = parsed[sessionID]
+    if (!isRecord(plan) || !Array.isArray(plan.stories)) return empty
+    const active = plan.stories.find((story) => isRecord(story) && story.status === "active")
+    if (!isRecord(active) || typeof active.id !== "string") return empty
+    const globs = Array.isArray(active.scopeGlobs)
+      ? active.scopeGlobs.filter((glob): glob is string => typeof glob === "string")
+      : []
+    return { storyId: active.id, paths: globs }
+  } catch {
+    return empty
+  }
+}
+
+/**
+ * Verified-command receipts, persisted to `<workspaceRoot>/.elicify-vertex/
+ * receipts.json` (same directory, same atomic-write discipline and same
+ * stale-lock reclaim as `pin.ts`'s `pins.json` and `story.ts`'s `plan.json`).
+ *
+ * Why persist at all: a receipt that dies with the process means "come back
+ * tomorrow" re-demands proof of things already proved. Why persistence is
+ * dangerous, and how that is contained: a receipt from last week is NOT
+ * evidence that today's code passes, so a stale receipt that still counts is
+ * strictly worse than no persistence. Two independent invalidation layers
+ * exist, and a receipt must survive BOTH to be served:
+ *
+ *   1. In-process: wiring already calls `invalidate(sessionID)` on every
+ *      mutation. That now clears disk as well as memory, so an edit made in
+ *      this process cannot be "recovered" by restarting.
+ *   2. Cross-process: every receipt carries `scope.worktreeDigest`, a bounded
+ *      fingerprint of the whole worktree at observation time. `get()`
+ *      recomputes it on every lookup and drops the receipt on any mismatch —
+ *      which covers edits made while no process was running (a `git pull`, a
+ *      second agent, a human in an editor).
+ *
+ * `get()` is the single choke point: every existing caller (wiring's
+ * `isValidReceipt`, `tools.ts`'s `isFreshReceipt`, v1's checkpoint tool) gets
+ * the staleness check without changing its call site.
+ */
 export class VerificationReceiptStore {
   private readonly bySession = new Map<string, VerificationReceipt[]>()
+  /** Workspace root last seen for a session — the only way `get()`, whose
+   * signature carries no root, can find the file to hydrate from. Populated
+   * by `record()` and by the explicit `load()` wiring calls after a restart. */
+  private readonly rootBySession = new Map<string, string>()
+  private readonly hydratedSessions = new Set<string>()
+  private readonly stateDirOverride: string | null
+  private readonly logger: ReceiptLogger
+  private readonly resolveScopeLink: (sessionID: string, stateDir: string) => { storyId: string | null; paths: string[] }
 
-  record(input: Omit<VerificationReceipt, "id" | "command" | "outputSummary"> & {
+  constructor(options: VerificationReceiptStoreOptions = {}) {
+    this.stateDirOverride = options.stateDir ? resolve(options.stateDir) : null
+    this.logger = options.logger ?? (() => {})
+    this.resolveScopeLink = options.resolveScopeLink ?? readPlanScopeLink
+  }
+
+  record(input: Omit<VerificationReceipt, "id" | "command" | "outputSummary" | "scope"> & {
     command: string
     outputSummary: string
+    /** Optional explicit link. Wiring may supply the real changed-path scope
+     * (and story id) it already knows; omitted, both are resolved from
+     * `plan.json` by `resolveScopeLink`. */
+    scope?: { storyId?: string | null; paths?: readonly string[] }
   }): VerificationReceipt {
+    const workspaceRoot = resolve(input.workspaceRoot)
+    const stateDir = this.stateDirFor(workspaceRoot)
+    this.rootBySession.set(input.sessionID, workspaceRoot)
+    this.hydrate(input.sessionID)
+
+    const link = this.safeScopeLink(input.sessionID, stateDir)
+    const fingerprint = fingerprintWorktree(workspaceRoot)
+    const declaredPaths = input.scope?.paths ?? link.paths
     const receipt: VerificationReceipt = {
       ...input,
       id: `vrf_${randomUUID().replace(/-/g, "")}`,
       command: redactSecrets(input.command).slice(0, 500),
       outputSummary: redactSecrets(input.outputSummary).slice(0, 500),
+      scope: {
+        storyId: input.scope?.storyId !== undefined ? input.scope.storyId : link.storyId,
+        paths: declaredPaths.slice(0, MAX_SCOPE_PATHS).map((path) => redactSecrets(path).slice(0, 300)),
+        worktreeDigest: fingerprint.digest,
+        fileCount: fingerprint.fileCount,
+        complete: fingerprint.complete,
+      },
     }
-    const receipts = this.bySession.get(receipt.sessionID) ?? []
+
+    const receipts = this.bySession.get(input.sessionID) ?? []
     receipts.push(receipt)
-    this.bySession.set(receipt.sessionID, receipts.slice(-20))
+    this.bySession.set(input.sessionID, receipts.slice(-MAX_RECEIPTS_PER_SESSION))
+    if (!fingerprint.complete) {
+      this.logger("receipts:scope-unverifiable", {
+        sessionID: input.sessionID,
+        receiptID: receipt.id,
+        fileCount: fingerprint.fileCount,
+      })
+    }
+    this.persist(input.sessionID)
     return receipt
   }
 
+  /**
+   * Returns the receipt only if it is still valid RIGHT NOW. A receipt whose
+   * worktree fingerprint no longer matches is dropped (memory and disk) and
+   * reported as absent, so no caller can accept last week's proof for
+   * today's code.
+   */
   get(sessionID: string, receiptID: string): VerificationReceipt | null {
-    return this.bySession.get(sessionID)?.find((receipt) => receipt.id === receiptID) ?? null
+    this.hydrate(sessionID)
+    const receipt = this.bySession.get(sessionID)?.find((candidate) => candidate.id === receiptID) ?? null
+    if (!receipt) return null
+    if (!this.isStale(receipt)) return receipt
+
+    const remaining = (this.bySession.get(sessionID) ?? []).filter((candidate) => candidate.id !== receiptID)
+    if (remaining.length > 0) this.bySession.set(sessionID, remaining)
+    else this.bySession.delete(sessionID)
+    this.logger("receipts:stale-dropped", { sessionID, receiptID, observedAt: receipt.observedAt })
+    this.persist(sessionID)
+    return null
   }
 
+  /**
+   * Hydrates a session's persisted receipts from `workspaceRoot`. Needed
+   * because `get()`'s two-argument signature carries no workspace, so after a
+   * process restart nothing else can tell the store where to look. Callers
+   * that hold the session's workspace root (`wiring/tools.ts`; ideally also
+   * `plugin.ts`'s `getOrCreateState`, next to `pinStore.load`) call this
+   * before the first lookup. Idempotent and never throws.
+   */
+  load(sessionID: string, workspaceRoot: string): void {
+    const resolved = resolve(workspaceRoot)
+    if (this.rootBySession.get(sessionID) !== resolved) {
+      this.rootBySession.set(sessionID, resolved)
+      this.hydratedSessions.delete(sessionID)
+    }
+    this.hydrate(sessionID)
+  }
+
+  /** Retires every receipt for a session — in memory AND on disk, so a
+   * mutation-driven invalidation cannot be undone by restarting the process. */
   invalidate(sessionID: string): void {
     this.bySession.delete(sessionID)
+    this.persist(sessionID)
+  }
+
+  // -- internals ------------------------------------------------------------
+
+  private stateDirFor(workspaceRoot: string): string {
+    return this.stateDirOverride ?? join(workspaceRoot, ".elicify-vertex")
+  }
+
+  private safeScopeLink(sessionID: string, stateDir: string): { storyId: string | null; paths: string[] } {
+    try {
+      const link = this.resolveScopeLink(sessionID, stateDir)
+      return {
+        storyId: typeof link.storyId === "string" ? link.storyId : null,
+        paths: Array.isArray(link.paths) ? link.paths.filter((path) => typeof path === "string") : [],
+      }
+    } catch {
+      return { storyId: null, paths: [] }
+    }
+  }
+
+  private isStale(receipt: VerificationReceipt): boolean {
+    const scope = receipt.scope
+    // No scope at all: unprovable, therefore refused. `record()` always sets
+    // one, and `isPersistedReceipt` rejects scope-less entries on read, so
+    // this only fires for a receipt handed in from outside this store.
+    if (!scope) return true
+    // Incomplete scope: never persisted (see `persist`), so this receipt is
+    // in-memory-only and still governed by layer 1 (`invalidate` on
+    // mutation) exactly as it was before persistence existed.
+    if (!scope.complete) return false
+    const current = fingerprintWorktree(receipt.workspaceRoot)
+    if (!current.complete) return true // cannot prove freshness now => refuse
+    return current.digest !== scope.worktreeDigest
+  }
+
+  private hydrate(sessionID: string): void {
+    if (this.hydratedSessions.has(sessionID)) return
+    const workspaceRoot = this.rootBySession.get(sessionID)
+    if (!workspaceRoot) return
+    this.hydratedSessions.add(sessionID)
+
+    let file: ReceiptsFile
+    try {
+      file = this.readFile(this.stateDirFor(workspaceRoot))
+    } catch {
+      return // corrupt/unreadable — serve whatever is in memory
+    }
+    const persisted = file.sessions[sessionID]?.receipts ?? []
+    if (persisted.length === 0) return
+
+    const memory = this.bySession.get(sessionID) ?? []
+    const known = new Set(memory.map((receipt) => receipt.id))
+    const merged = [...memory]
+    for (const receipt of persisted) {
+      if (!known.has(receipt.id)) merged.push(receipt)
+    }
+    merged.sort((a, b) => (a.observedAt < b.observedAt ? -1 : a.observedAt > b.observedAt ? 1 : 0))
+    this.bySession.set(sessionID, merged.slice(-MAX_RECEIPTS_PER_SESSION))
+  }
+
+  /** Read + validate `receipts.json`. Throws `CorruptReceiptsFileError` when
+   * the JSON itself is unparseable; archives (never deletes) a file written
+   * by a different schema version, mirroring `story.ts`'s v1 archival. */
+  private readFile(stateDir: string): ReceiptsFile {
+    const empty: ReceiptsFile = { schemaVersion: RECEIPTS_SCHEMA_VERSION, sessions: {} }
+    const receiptsPath = join(stateDir, RECEIPTS_FILE_NAME)
+    if (!existsSync(receiptsPath)) return empty
+
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(readFileSync(receiptsPath, "utf8"))
+    } catch (error) {
+      throw new CorruptReceiptsFileError((error as Error).message)
+    }
+    if (!isRecord(parsed)) return empty
+    if (parsed.schemaVersion !== RECEIPTS_SCHEMA_VERSION) {
+      this.archiveReceiptsFile(stateDir, receiptsPath)
+      return empty
+    }
+    if (!isRecord(parsed.sessions)) return empty
+
+    const sessions: Record<string, ReceiptsFileEntry> = {}
+    for (const [sessionID, entry] of Object.entries(parsed.sessions)) {
+      if (!isRecord(entry) || !isValidTimestamp(entry.updatedAt) || !Array.isArray(entry.receipts)) continue
+      const receipts = entry.receipts.filter(isPersistedReceipt)
+      if (receipts.length === 0) continue
+      sessions[sessionID] = { updatedAt: entry.updatedAt, receipts }
+    }
+    return { schemaVersion: RECEIPTS_SCHEMA_VERSION, sessions }
+  }
+
+  private archiveReceiptsFile(stateDir: string, receiptsPath: string): void {
+    try {
+      const archiveDirectory = join(stateDir, "archive")
+      mkdirSync(archiveDirectory, { recursive: true, mode: 0o700 })
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-")
+      let archivePath = join(archiveDirectory, `receipts.${stamp}.json`)
+      let suffix = 0
+      while (existsSync(archivePath)) {
+        suffix += 1
+        archivePath = join(archiveDirectory, `receipts.${stamp}-${suffix}.json`)
+      }
+      renameSync(receiptsPath, archivePath)
+      this.logger("receipts:schema-archived", { archivePath })
+    } catch (error) {
+      this.logger("receipts:archive-failed", { reason: (error as Error).message })
+    }
+  }
+
+  /**
+   * Write this session's receipts through. Never throws: a disk fault
+   * degrades to memory-only for the session (the pre-persistence behaviour),
+   * it does not fail the verification that produced the receipt.
+   */
+  private persist(sessionID: string): void {
+    const workspaceRoot = this.rootBySession.get(sessionID)
+    if (!workspaceRoot) return
+    const stateDir = this.stateDirFor(workspaceRoot)
+    try {
+      withFileLock(join(stateDir, RECEIPTS_LOCK_NAME), () => {
+        const file = this.readFile(stateDir)
+        // Only receipts whose freshness can actually be re-proven later are
+        // written; an incomplete scope on disk would be an unfalsifiable
+        // claim, and that is the exact shape of an evidence fabrication.
+        const durable = (this.bySession.get(sessionID) ?? []).filter((receipt) => receipt.scope?.complete === true)
+        if (durable.length > 0) {
+          file.sessions[sessionID] = { updatedAt: new Date().toISOString(), receipts: durable }
+        } else {
+          delete file.sessions[sessionID]
+        }
+        this.pruneExpired(file)
+
+        const receiptsPath = join(stateDir, RECEIPTS_FILE_NAME)
+        if (Object.keys(file.sessions).length === 0) {
+          if (existsSync(receiptsPath)) unlinkSync(receiptsPath)
+          return
+        }
+        atomicWriteJson(stateDir, receiptsPath, `.receipts.`, file)
+      })
+    } catch (error) {
+      const event = error instanceof CorruptReceiptsFileError ? "receipts:disk-corrupt" : "receipts:disk-unavailable"
+      this.logger(event, { sessionID, path: join(stateDir, RECEIPTS_FILE_NAME), reason: (error as Error).message })
+    }
+  }
+
+  private pruneExpired(file: ReceiptsFile): void {
+    const cutoff = Date.now() - RECEIPTS_MAX_AGE_MS
+    for (const [sessionID, entry] of Object.entries(file.sessions)) {
+      const updated = Date.parse(entry.updatedAt)
+      if (!Number.isFinite(updated) || updated < cutoff) delete file.sessions[sessionID]
+    }
+  }
+}
+
+/** Atomic write (`wx` temp file + rename, mode 0600) — the same discipline
+ * `writePlan` above and `pin.ts`/`story.ts` use. */
+function atomicWriteJson(stateDir: string, targetPath: string, tempPrefix: string, value: unknown): void {
+  mkdirSync(stateDir, { recursive: true, mode: 0o700 })
+  const temporaryPath = join(stateDir, `${tempPrefix}${process.pid}.${randomUUID()}.tmp`)
+  try {
+    writeFileSync(temporaryPath, `${JSON.stringify(redactForDisk(value), null, 2)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600,
+    })
+    renameSync(temporaryPath, targetPath)
+    chmodSync(targetPath, 0o600)
+  } finally {
+    if (existsSync(temporaryPath)) unlinkSync(temporaryPath)
+  }
+}
+
+/** Dedicated-file variant of `MultiStoryGoalEngine.withLock` (same 30s stale
+ * reclaim). Deliberately its own lock file rather than the shared
+ * `state.lock` `pin.ts`/`story.ts` take: receipt writes happen inside
+ * `StoryEngine.checkpoint`'s validation callback, and reusing their lock
+ * there would risk a self-deadlock the moment either module starts holding it
+ * across a callback. */
+function withFileLock<T>(lockPath: string, operation: () => T): T {
+  mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 })
+  let descriptor: number | null = null
+  let ownsLock = false
+  try {
+    try {
+      descriptor = openSync(lockPath, "wx", 0o600)
+      ownsLock = true
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code !== "EEXIST" || Date.now() - statSync(lockPath).mtimeMs < STALE_LOCK_MS) {
+        throw new Error(`elicify-vertex state file is locked by another process: ${lockPath}`)
+      }
+      unlinkSync(lockPath)
+      descriptor = openSync(lockPath, "wx", 0o600)
+      ownsLock = true
+    }
+    return operation()
+  } finally {
+    if (descriptor !== null) closeSync(descriptor)
+    if (ownsLock && existsSync(lockPath)) unlinkSync(lockPath)
   }
 }
 

@@ -275,6 +275,17 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       state = freshSessionState(workspaceRoot)
       states.set(sessionID, state)
       pinStore.load(sessionID)
+      // Hydrate persisted receipts at the same moment as pins, and for the
+      // same reason. Without this the store has no workspace root for the
+      // session, so `gateCtx.isValidReceipt` -> `verificationReceipts.get()`
+      // never hydrates from disk: after a restart, criteria evidence pointing
+      // at a perfectly valid persisted receipt reads as UNEVIDENCED and the
+      // gate re-demands proof the user already produced. That is the "come
+      // back tomorrow" complaint persistence exists to fix, so leaving it out
+      // would make the feature inert on the one path that motivated it.
+      // Staleness is still enforced inside `get()`, which re-fingerprints the
+      // worktree on every lookup -- hydrating cannot resurrect a stale receipt.
+      verificationReceipts.load(sessionID, state.workspaceRoot)
     }
     return state
   }
@@ -1042,11 +1053,34 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
         return
       }
       if (event.type === "file.edited") {
-        const active = [...states.entries()].filter(([, s]) => s.active)
-        if (active.length === 1) {
-          const [sid] = active[0]
+        // `file.edited` carries a path but NO session id, so it cannot be
+        // attributed the way a hook payload can. The old rule -- act only when
+        // exactly one session is active -- looked conservative but failed open
+        // in the dangerous direction, and did so permanently: `states` is never
+        // pruned and `active` is cleared only when a message names a different
+        // agent, so after the SECOND activated session in a long-lived server
+        // the count is >= 2 for the life of the process and this net never
+        // fired again.
+        //
+        // Attribute by workspace instead: every active session whose workspace
+        // contains the edited file gets the change recorded and its receipts
+        // invalidated. When several sessions share a root the file genuinely
+        // belongs to all of them, so all of them are told.
+        //
+        // Erring toward OVER-invalidation is deliberate. Invalidating a receipt
+        // that was still good costs one re-run of a verifier; failing to
+        // invalidate one that is now stale lets changed code keep old evidence,
+        // which is evidence fabrication -- the worst defect this codebase can
+        // produce. This is a secondary net: `tool.execute.after` already
+        // records and invalidates per-session for every edit the tool layer
+        // sees, and that path was never affected by the session count.
+        const file = event.properties.file
+        for (const [sid, sessionState] of states.entries()) {
+          if (!sessionState.active) continue
+          const root = sessionState.workspaceRoot
+          if (root && !file.startsWith(root)) continue
           verificationReceipts.invalidate(sid)
-          evidenceLedger.recordChangedFiles(sid, event.properties.file)
+          evidenceLedger.recordChangedFiles(sid, file)
         }
         return
       }

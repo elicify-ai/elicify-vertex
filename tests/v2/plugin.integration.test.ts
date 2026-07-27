@@ -6,7 +6,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { Hooks, PluginInput } from "@opencode-ai/plugin"
 import type { Agent } from "@opencode-ai/sdk"
 
-import { ElicifyVertexPlugin } from "../../src/index.js"
 import { eventsPath } from "../../src/measurement.js"
 import { server } from "../../src/plugin.js"
 import { ElicifyVertexPluginV2 } from "../../src/v2/plugin.js"
@@ -409,66 +408,6 @@ describe("promise-no-act port: stale text cleared by the next tool call", () => 
 // Test 52: kill_switch_restores_v1 (FR-037 / US-11)
 // ===========================================================================
 
-describe("test 52: kill_switch_restores_v1", () => {
-  it("VERTEX_V2=0 makes src/plugin.ts's server behaviourally identical to importing ElicifyVertexPlugin directly, and touches no .elicify-vertex/ file", async () => {
-    process.env.VERTEX_V2 = "0"
-
-    const promptA = vi.fn(async () => ({}))
-    const promptB = vi.fn(async () => ({}))
-    const inputA = { client: { session: { prompt: promptA } }, directory: workDir, worktree: workDir } as unknown as PluginInput
-    const inputB = { client: { session: { prompt: promptB } }, directory: workDir, worktree: workDir } as unknown as PluginInput
-
-    const hooksFromSwitch = await server(inputA, undefined)
-    const hooksFromV1Direct = await ElicifyVertexPlugin(inputB, undefined)
-
-    const sid = "kill-switch-session"
-    for (const hooks of [hooksFromSwitch, hooksFromV1Direct]) {
-      await activate(hooks as Hooks, sid, "implement the production database migration")
-      await toolAfter(hooks as Hooks, sid, "edit", { filePath: "src/baz.ts" }, "updated")
-      await idle(hooks as Hooks, sid)
-    }
-
-    expect(promptA.mock.calls.length).toBe(promptB.mock.calls.length)
-    expect(promptA.mock.calls.length).toBeGreaterThan(0)
-    const bodyA = (promptA.mock.calls[0] as unknown as [{ body: { parts: Array<{ text: string }> } }])[0].body
-    const bodyB = (promptB.mock.calls[0] as unknown as [{ body: { parts: Array<{ text: string }> } }])[0].body
-    expect(bodyA.parts[0].text).toBe(bodyB.parts[0].text)
-
-    expect(existsSync(join(workDir, ".elicify-vertex"))).toBe(false)
-  })
-
-  it("plugin option engine:'v1' has the same effect as the env var", async () => {
-    const prompt = vi.fn(async () => ({}))
-    const input = { client: { session: { prompt } }, directory: workDir, worktree: workDir } as unknown as PluginInput
-    const hooks = await server(input, { engine: "v1" })
-    const sid = "engine-option-session"
-    await activate(hooks, sid, "implement the production database migration")
-    await toolAfter(hooks, sid, "edit", { filePath: "src/qux.ts" }, "updated")
-    await idle(hooks, sid)
-    expect(prompt).toHaveBeenCalledTimes(1)
-    expect(existsSync(join(workDir, ".elicify-vertex"))).toBe(false)
-  })
-})
-
-// ===========================================================================
-// Tests 63 / 64 / 65: D4 — turn advancement during autonomous work
-// (FR-051, FR-052; US-14)
-//
-// Measured defect these cover: in a real 1h34m session (93 messages, 2 of
-// them from the user) the composer's `turnIndex` reached 1 and never advanced
-// again for the remaining 43 minutes, because `composer.newTurn` was reachable
-// only from `chat.message`'s activation branch (which early-returns on a
-// harness continuation) and from `wiring/gate.ts`'s `promptContinuation`
-// (which dispatched zero times in that session). Result: 250
-// `per-turn-cap:dropped` against 5 `directive_rendered` — ~2% delivery.
-//
-// `intake-scaffold` (DEFAULT_FAMILY_CAPS cap 1) is the probe family: its
-// trigger condition ("mode != quick and zero pinned criteria") stays true
-// across the whole run without any further stimulus, so whether it renders
-// again is a direct read of whether the turn advanced. Its prescription text
-// is the only place "OUTCOME:" appears in an injected system block.
-// ===========================================================================
-
 interface LoggedEvent {
   event_type: string
   session_id: string
@@ -486,21 +425,38 @@ function readEvents(): LoggedEvent[] {
     .map((line) => JSON.parse(line) as LoggedEvent)
 }
 
-// ===========================================================================
-// Turn-boundary semantics.
-//
-// REPLACES the former "D4 turn advancement" tests, which asserted that the
-// turn advanced on every assistant reply cycle AND every tool result. That
-// requirement rested on a misdiagnosis: the session it came from had exactly
-// ONE activated user message, so `turnIndex == 1` was correct and the ~250
-// `per-turn-cap:dropped` events were the cap behaving as designed. Live-host
-// measurement then showed `experimental.chat.system.transform` fires after
-// EVERY tool result, so a per-step advance drove the index 1 -> 4 within a
-// single reply cycle, collapsing every per-turn cap and cooldown into
-// per-step. These tests lock in the corrected semantics so that regression
-// cannot come back unnoticed.
-// ===========================================================================
+describe("greenfield: there is no v1 engine to fall back to", () => {
+  // REPLACES "test 52: kill_switch_restores_v1". The kill switch was removed
+  // deliberately, not by accident:
+  //   - it registered a SECOND tool set (`elicify_vertex_goal_*` vs
+  //     `elicify_vertex_plan_*`), so which tools the model saw depended on an
+  //     env var and the agent prompt could not name its own tools;
+  //   - it never meant "harness off" -- it swapped in an older harness that
+  //     still minted receipts and still injected directives;
+  //   - `VERTEX_V2=0` + `--agent elicify-vertex-agent` failed with
+  //     `UnknownError` on every measured attempt.
+  it("ignores VERTEX_V2=0 and runs v2 regardless", async () => {
+    process.env.VERTEX_V2 = "0"
+    const client = makeStubClient()
+    const hooks = await server(pluginInput(client), undefined)
 
+    const sid = "greenfield-env"
+    await hooks["chat.message"]!(
+      { sessionID: sid, agent: "elicify-vertex-agent" } as never,
+      { message: {} as never, parts: [{ type: "text", text: "implement the production database migration" } as never] },
+    )
+    // v2 registers the plan tools; v1 registered goal tools and no plan tools.
+    expect(Object.keys(hooks.tool ?? {})).toEqual(expect.arrayContaining(["elicify_vertex_plan_create"]))
+    expect(Object.keys(hooks.tool ?? {}).filter((k) => k.includes("goal"))).toEqual([])
+  })
+
+  it("ignores the engine:'v1' plugin option too", async () => {
+    const client = makeStubClient()
+    const hooks = await server(pluginInput(client), { engine: "v1" } as never)
+    expect(Object.keys(hooks.tool ?? {})).toEqual(expect.arrayContaining(["elicify_vertex_plan_create"]))
+    expect(Object.keys(hooks.tool ?? {}).filter((k) => k.includes("goal"))).toEqual([])
+  })
+})
 describe("turn boundaries: a turn is a prompt, not an agent-loop step", () => {
   it("does NOT advance the turn on tool results or text parts within one reply cycle", async () => {
     const client = makeStubClient()
@@ -1046,5 +1002,105 @@ describe("inertness: a non-activated session writes nothing", () => {
 
     const mine = readEvents().filter((e) => e.session_id === sid)
     expect(mine.some((e) => e.event_type === "dosing:unknown-model")).toBe(true)
+  })
+})
+
+// ===========================================================================
+// `file.edited` attribution across sessions.
+//
+// The old rule fired only when EXACTLY ONE session was active. That reads as
+// conservative but failed open, and permanently: `states` is never pruned and
+// `active` is cleared only when a message names a different agent, so after
+// the SECOND activated session in a long-lived server the count is >= 2 for
+// the life of the process and this net never fired again -- no changed-path
+// recording and no receipt invalidation from filesystem edits, for anyone.
+//
+// This is the SECONDARY net; `tool.execute.after` records and invalidates
+// per-session for every edit the tool layer sees and was never affected.
+// ===========================================================================
+
+describe("file.edited is attributed per session, not suppressed by session count", () => {
+  async function fileEdited(hooks: Hooks, file: string) {
+    await hooks.event!({ event: { type: "file.edited", properties: { file } } as never })
+  }
+
+  it("records the change even when two sessions are active", async () => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+
+    await activate(hooks, "fe-a", "implement the production database migration")
+    await activate(hooks, "fe-b", "implement the production database migration")
+
+    await fileEdited(hooks, join(workDir, "src/service.ts"))
+    // With the change recorded and no verification, the idle gate must block.
+    await idle(hooks, "fe-a")
+    expect(idleContinuationTexts(client, "fe-a").length).toBeGreaterThan(0)
+  })
+
+  // A second test asserting receipt INVALIDATION was written here and removed:
+  // it passed with the fix reverted, because the checkpoint it asserted on
+  // throws for an unrelated reason (unevidenced acceptance items). A test that
+  // cannot fail certifies the path as safe without exercising it, which is
+  // exactly the unearned green this project exists to refuse. Receipt staleness
+  // is covered where it belongs, in the receipt-store tests.
+})
+
+// ===========================================================================
+// Persisted receipts must reach the GATE, not just the checkpoint tool.
+//
+// Receipts are now persisted and survive a restart, but the plugin never told
+// the store which workspace a session belongs to, so `gateCtx.isValidReceipt`
+// -> `verificationReceipts.get()` could not hydrate from disk. After a restart
+// the gate re-demanded proof the user had already produced -- the exact "come
+// back tomorrow" complaint persistence was built to fix. Two components each
+// green on their own, with the defect in the seam between them.
+//
+// MUTATION STATUS -- compound, not single-edit. Hydration now happens at TWO
+// sites (`getOrCreateState` in plugin.ts and `isFreshReceipt` in tools.ts) and
+// they are redundant for THIS path, so removing either alone leaves the test
+// green; removing BOTH turns it red (verified). It is recorded that way rather
+// than dressed up as a single-edit proof.
+//
+// Still untested: `gateCtx.isValidReceipt` (plugin.ts) calls `get()` with no
+// `load()` of its own and is reached from gate.ts's criterion-evidence check.
+// The `getOrCreateState` hydration covers it in practice, because state is
+// created on `chat.message` long before any idle -- but a criteria-pinning
+// restart scenario would be needed to pin that down directly.
+// ===========================================================================
+
+describe("persisted receipts survive a restart and are visible to the gate", () => {
+  it("hydrates a receipt minted by a previous plugin instance", async () => {
+    const clientA = makeStubClient()
+    const hooksA = await ElicifyVertexPluginV2(pluginInput(clientA), undefined)
+    const sid = "restart-session"
+
+    await activate(hooksA, sid, "implement the production database migration")
+    // The plan must exist BEFORE the verifier runs: a receipt is linked to the
+    // story that was active when it was observed, and a receipt earned before
+    // the story existed must not complete it. That linkage is the feature, not
+    // an obstacle -- an earlier draft of this test got the order wrong and was
+    // correctly refused twice over (null story link, and observedAt < startedAt).
+    await hooksA.tool!.elicify_vertex_plan_create!.execute!(
+      { stories: [{ text: "w", acceptanceItems: ["ok"], scopeGlobs: ["**"], verifiers: ["go test ./..."] }] } as never,
+      { sessionID: sid } as never,
+    )
+    const out = { title: "bash", output: "ok  pkg  0.01s", metadata: { exit: 0 } }
+    await hooksA["tool.execute.after"]!(
+      { tool: "bash", sessionID: sid, callID: "r1", args: { command: "go test ./..." } } as never,
+      out as never,
+    )
+    const receiptId = /vrf_[0-9a-f]+/.exec(out.output)?.[0]
+    expect(receiptId, "PRE: a receipt must have been minted to test hydration").toBeTruthy()
+
+    // A brand-new plugin instance over the SAME workspace == a restart.
+    const clientB = makeStubClient()
+    const hooksB = await ElicifyVertexPluginV2(pluginInput(clientB), undefined)
+    await activate(hooksB, sid, "implement the production database migration")
+
+    const res = await hooksB.tool!.elicify_vertex_plan_checkpoint!.execute!(
+      { storyId: "S1", status: "complete", receiptId, items: [{ id: "A1", receiptId }] } as never,
+      { sessionID: sid } as never,
+    )
+    expect(JSON.stringify(res)).not.toMatch(/not an observed receipt/i)
   })
 })

@@ -88,6 +88,32 @@ function isValidTimestampString(value: unknown): value is string {
  * resolve to a valid timestamp — it never crashes on a field that may or
  * may not exist, and never skips the workspace/outcome/exitCode checks just
  * because the time bound can't be computed.
+ *
+ * ------------------------------------------------------------------
+ * Reconciliation with PERSISTED receipts (`VerificationReceiptStore` now
+ * writes `.elicify-vertex/receipts.json`):
+ *
+ *  - Hydration. `store.get()`'s two-argument signature carries no workspace
+ *    root, so a receipt observed in an EARLIER process is invisible until
+ *    the store is told where to read from. The `load()` call below does
+ *    that, using the session's own `workspaceRoot`. Without it persistence
+ *    would be inert on exactly the path it exists for: resuming tomorrow.
+ *  - Staleness. This function does NOT re-implement freshness. `store.get()`
+ *    is the single choke point: it recomputes the receipt's worktree
+ *    fingerprint and returns `null` when anything under the worktree changed
+ *    since the verification was observed. So "legitimately still valid from
+ *    an earlier process" is accepted here through the ordinary `!receipt`
+ *    branch, and "stale" is refused through the same branch — no second,
+ *    drift-prone copy of the rule lives here.
+ *  - Plan link. The product requirement is that a verification is linked to
+ *    the story it verifies and that each story is validated once. A receipt
+ *    minted while story S1 was active is evidence for S1; reusing it to
+ *    close S2 is precisely the coincidence-of-timing loophole this closes.
+ *    Hence: with a plan present, the receipt's `scope.storyId` must equal
+ *    the story being checkpointed. With no plan the store records
+ *    `scope.storyId: null` and this check is vacuous, which is the
+ *    supported "executions with no plan" path.
+ * ------------------------------------------------------------------
  */
 function isFreshReceipt(
   deps: Pick<PlanToolsDeps, "verificationReceipts" | "states" | "storyEngine">,
@@ -95,17 +121,24 @@ function isFreshReceipt(
   storyId: string,
   receiptId: string,
 ): boolean {
+  const state = deps.states.get(sessionID)
+  // Make receipts persisted by an earlier process visible before looking one
+  // up. Idempotent and non-throwing (see `VerificationReceiptStore.load`).
+  if (state) deps.verificationReceipts.load(sessionID, state.workspaceRoot)
+
+  // `get()` enforces staleness itself and returns null for a retired receipt.
   const receipt = deps.verificationReceipts.get(sessionID, receiptId)
   if (!receipt) return false
   if (receipt.outcome !== "verified" || receipt.exitCode !== 0) return false
 
-  const state = deps.states.get(sessionID)
   if (state && resolve(receipt.workspaceRoot) !== resolve(state.workspaceRoot)) return false
 
   const now = new Date().toISOString()
   if (receipt.observedAt > now) return false
 
   const plan = deps.storyEngine.getPlan(sessionID)
+  if (plan && (receipt.scope?.storyId ?? null) !== storyId) return false
+
   const story = plan?.stories.find((s) => s.id === storyId)
   const storyStart =
     (story as Record<string, unknown> | undefined)?.startedAt ??

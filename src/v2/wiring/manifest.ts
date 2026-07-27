@@ -20,7 +20,7 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs"
 import { join, relative } from "node:path"
 
-import type { Manifest } from "../resolve.js"
+import type { Manifest, ProjectRoot } from "../resolve.js"
 
 const SKIP_DIR_NAMES = new Set([
   "node_modules",
@@ -33,6 +33,26 @@ const SKIP_DIR_NAMES = new Set([
   ".vite",
 ])
 const TEST_FILE_RE = /\.(?:test|spec)\.[^./]+$/
+
+/**
+ * Manifest filenames that mark the root of a non-npm project, and the ecosystem
+ * each implies. Collected on the SAME bounded walk as the test-file scan rather
+ * than a second traversal, because this read sits on the per-turn latency budget
+ * (SC-003).
+ *
+ * Without this, `resolve.ts`'s per-ecosystem scoping is inert in production: it
+ * falls back to the repo root for every non-npm ecosystem. That is still correct
+ * for a single-module repo and never cross-ecosystem, but a nested Go module or
+ * a Cargo workspace member resolves to a command that is too broad.
+ */
+const PROJECT_ROOT_FILES: ReadonlyMap<string, ProjectRoot["ecosystem"]> = new Map([
+  ["go.mod", "go"],
+  ["pyproject.toml", "python"],
+  ["setup.cfg", "python"],
+  ["pytest.ini", "python"],
+  ["tox.ini", "python"],
+  ["Cargo.toml", "rust"],
+])
 const MAX_FILES_SCANNED = 5000
 const MAX_SCAN_DEPTH = 8
 
@@ -88,8 +108,9 @@ function expandWorkspaceGlob(root: string, glob: string): string[] {
   }
 }
 
-function scanTestFiles(root: string): string[] {
+function scanRepo(root: string): { testFiles: string[]; projectRoots: ProjectRoot[] } {
   const results: string[] = []
+  const projectRoots: ProjectRoot[] = []
   let scanned = 0
   const walk = (dir: string, depth: number): void => {
     if (depth > MAX_SCAN_DEPTH || scanned > MAX_FILES_SCANNED) return
@@ -112,13 +133,20 @@ function scanTestFiles(root: string): string[] {
       if (stat.isDirectory()) {
         if (name.startsWith(".") || SKIP_DIR_NAMES.has(name)) continue
         walk(full, depth + 1)
-      } else if (stat.isFile() && TEST_FILE_RE.test(name)) {
-        results.push(relative(root, full).split("\\").join("/"))
+      } else if (stat.isFile()) {
+        if (TEST_FILE_RE.test(name)) {
+          results.push(relative(root, full).split("\\").join("/"))
+        }
+        const ecosystem = PROJECT_ROOT_FILES.get(name)
+        if (ecosystem) {
+          // "" is the repo root itself, matching `workspaces[].root` convention.
+          projectRoots.push({ ecosystem, root: relative(root, dir).split("\\").join("/") })
+        }
       }
     }
   }
   walk(root, 0)
-  return results
+  return { testFiles: results, projectRoots }
 }
 
 export function buildManifest(workspaceRoot: string): Manifest {
@@ -131,8 +159,8 @@ export function buildManifest(workspaceRoot: string): Manifest {
       if (pkg) workspaces.push({ root: wsRoot, scripts: pkg.scripts })
     }
   }
-  const testFiles = scanTestFiles(workspaceRoot)
-  return { scripts, workspaceRoot, testFiles, workspaces }
+  const { testFiles, projectRoots } = scanRepo(workspaceRoot)
+  return { scripts, workspaceRoot, testFiles, workspaces, projectRoots }
 }
 
 /** Per-turn manifest cache, keyed by workspace root. `invalidate()` is

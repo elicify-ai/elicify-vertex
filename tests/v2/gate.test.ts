@@ -60,13 +60,25 @@ function harness(opts: { maxCriteriaBlocks?: number } = {}) {
     diffSummary: () => "",
     composer,
   }
-  return { ctx, composer, evidenceLedger, prompt, states, stateDir }
+  return { ctx, composer, evidenceLedger, logger, prompt, selfCreated, states, stateDir }
 }
 
 function promiseTexts(prompt: ReturnType<typeof vi.fn>): string[] {
   return prompt.mock.calls
     .map((call) => (call[0] as { body: { parts: Array<{ text: string }> } }).body.parts[0].text)
     .filter((text) => text.includes("vertex:promise-no-act"))
+}
+
+/** Every dispatched continuation, paired with the session it was addressed to. */
+function continuations(prompt: ReturnType<typeof vi.fn>): Array<{ sid: string; text: string }> {
+  return prompt.mock.calls.map((call) => {
+    const arg = call[0] as { path: { id: string }; body: { parts: Array<{ text: string }> } }
+    return { sid: arg.path.id, text: arg.body.parts[0].text }
+  })
+}
+
+function loggedEventTypes(logger: ReturnType<typeof vi.fn>): string[] {
+  return logger.mock.calls.map((call) => String(call[0]))
 }
 
 // ===========================================================================
@@ -231,5 +243,126 @@ describe("handleSessionIdle — turn-freeze fix (composer.newTurn on every conti
 
     const stillCapped = composer.render(sid, [{ ...finding, instanceId: "f3" }], { priorCompliance: () => false })
     expect(stillCapped.dropped).toEqual([{ family: "scope-watchdog", reason: "per-turn-cap" }])
+  })
+})
+
+// ===========================================================================
+// Per-session enforcement (replaces the multi-session bail-out).
+//
+// `handleSessionIdle` used to `return` before any enforcement whenever
+// `activeSessionIDs().length > 1`, which silently switched off promise-no-act,
+// the stop-block and the judge for EVERY session as soon as a second one
+// existed. Enforcement is now per-session; the multi-session signal survives
+// only as a log/advisory. See gate.ts's `handleSessionIdle` doc comment.
+// ===========================================================================
+
+/** Deep mode + a changed code file + no verification -> zero-criteria stop-block. */
+function activateBlockableSession(
+  h: ReturnType<typeof harness>,
+  sid: string,
+  changedPath: string,
+): ReturnType<typeof freshSessionState> {
+  const state = freshSessionState(h.stateDir)
+  state.active = true
+  h.states.set(sid, state)
+  h.evidenceLedger.reset(sid, "deep")
+  h.evidenceLedger.recordChangedFiles(sid, changedPath)
+  return state
+}
+
+describe("handleSessionIdle — per-session enforcement under concurrent sessions", () => {
+  it("two concurrently active sessions each get their own stop-block continuation", async () => {
+    const h = harness()
+    activateBlockableSession(h, "s1", "src/alpha.ts")
+    activateBlockableSession(h, "s2", "src/beta.ts")
+    expect(h.ctx.activeSessionIDs()).toEqual(["s1", "s2"])
+
+    await handleSessionIdle(h.ctx, "s1")
+    await handleSessionIdle(h.ctx, "s2")
+
+    const fired = continuations(h.prompt).filter((c) => c.text.includes("vertex:stop-block"))
+    expect(fired.map((c) => c.sid)).toEqual(["s1", "s2"])
+    // Each continuation cites only its OWN session's changed path — no
+    // cross-session bleed through the shared EvidenceLedger instance.
+    expect(fired[0].text).toContain("src/alpha.ts")
+    expect(fired[0].text).not.toContain("src/beta.ts")
+    expect(fired[1].text).toContain("src/beta.ts")
+    expect(fired[1].text).not.toContain("src/alpha.ts")
+
+    // The multi-session signal survives as an advisory, not a suppression.
+    expect(loggedEventTypes(h.logger)).toContain("gate:multi-session-advisory")
+  })
+
+  it("neither session suppresses the other: a verified peer does not silence the unverified one", async () => {
+    const h = harness()
+    activateBlockableSession(h, "verified", "src/alpha.ts")
+    h.evidenceLedger.recordVerification("verified", "npx vitest run", 0, "verified")
+    activateBlockableSession(h, "unverified", "src/beta.ts")
+
+    await handleSessionIdle(h.ctx, "verified")
+    await handleSessionIdle(h.ctx, "unverified")
+
+    const fired = continuations(h.prompt).filter((c) => c.text.includes("vertex:stop-block"))
+    expect(fired.map((c) => c.sid)).toEqual(["unverified"])
+  })
+
+  it("a promise-no-act deferral in one session blocks only that session", async () => {
+    const h = harness()
+    const deferring = activateBlockableSession(h, "deferring", "src/alpha.ts")
+    deferring.lastAssistantText = "I changed it.\nTODO: handle the edge case next."
+    const quiet = activateBlockableSession(h, "quiet", "src/beta.ts")
+    quiet.lastAssistantText = null
+    h.evidenceLedger.recordVerification("quiet", "npx vitest run", 0, "verified")
+
+    await handleSessionIdle(h.ctx, "deferring")
+    await handleSessionIdle(h.ctx, "quiet")
+
+    expect(continuations(h.prompt).map((c) => c.sid)).toEqual(["deferring"])
+    expect(promiseTexts(h.prompt)).toHaveLength(1)
+  })
+
+  it("one session exhausting its block cap leaves its peer's cap untouched", async () => {
+    const h = harness({ maxCriteriaBlocks: 1 })
+    activateBlockableSession(h, "noisy", "src/alpha.ts")
+    activateBlockableSession(h, "peer", "src/beta.ts")
+
+    await handleSessionIdle(h.ctx, "noisy") // blocks (1 of 1)
+    await handleSessionIdle(h.ctx, "noisy") // past cap — silent
+    await handleSessionIdle(h.ctx, "peer") // still has its own full budget
+
+    expect(continuations(h.prompt).map((c) => c.sid)).toEqual(["noisy", "peer"])
+  })
+
+  it("a session with a continuation in flight is skipped without suppressing its peer", async () => {
+    const h = harness()
+    const inFlight = activateBlockableSession(h, "in-flight", "src/alpha.ts")
+    inFlight.idleContinuationInFlight = true
+    activateBlockableSession(h, "peer", "src/beta.ts")
+
+    await handleSessionIdle(h.ctx, "in-flight")
+    await handleSessionIdle(h.ctx, "peer")
+
+    expect(continuations(h.prompt).map((c) => c.sid)).toEqual(["peer"])
+  })
+
+  it("a self-created child session does not disable its parent's gate or read as multi-session", async () => {
+    const h = harness()
+    activateBlockableSession(h, "parent", "src/alpha.ts")
+    // A judge/intake subturn child leaking into the active list (FR-036):
+    // recorded in SelfCreatedSessions exactly as `runSubturn` records it.
+    const child = freshSessionState(h.stateDir)
+    child.active = true
+    h.states.set("judge-child-1", child)
+    h.selfCreated.record("judge-child-1", "parent")
+    expect(h.ctx.activeSessionIDs()).toEqual(["parent", "judge-child-1"])
+
+    await handleSessionIdle(h.ctx, "parent")
+
+    const fired = continuations(h.prompt).filter((c) => c.text.includes("vertex:stop-block"))
+    expect(fired.map((c) => c.sid)).toEqual(["parent"])
+    // The parent is still the only real session — no degraded-attribution
+    // advisory, and therefore no spurious criteria re-injection.
+    expect(loggedEventTypes(h.logger)).not.toContain("gate:multi-session-advisory")
+    expect(h.states.get("parent")!.needsCriteriaReinject).toBe(false)
   })
 })
