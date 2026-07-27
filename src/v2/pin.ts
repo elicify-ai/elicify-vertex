@@ -1,9 +1,9 @@
 /**
  * Vertex 2 — pin.ts (FR-012, FR-013, FR-013a)
  *
- * Owns `.elicify-vertex/pins.json`: session-keyed pinned acceptance criteria,
+ * Owns `.opencode/elicify-vertex/pins.json`: session-keyed pinned acceptance criteria,
  * always persisted (never conditional on a plan existing), written under the
- * shared `.elicify-vertex/` directory lock (30s staleness reclaim, the same
+ * shared `.opencode/elicify-vertex/` directory lock (30s staleness reclaim, the same
  * lock `story.ts` uses for `plan.json`). On a disk write fault the store
  * falls back to serving criteria from memory and retries on the next write,
  * per the FR-013 fault state machine. A genuinely unparseable on-disk
@@ -75,7 +75,7 @@ const LOCK_FILE_NAME = "state.lock"
 // ---------------------------------------------------------------------------
 
 /**
- * Acquire the shared `.elicify-vertex/` directory lock. Reclaims a lock file
+ * Acquire the shared `.opencode/elicify-vertex/` directory lock. Reclaims a lock file
  * older than 30s. Throws if held by a live writer.
  */
 export function acquireStateLock(stateDir: string): { release(): void } {

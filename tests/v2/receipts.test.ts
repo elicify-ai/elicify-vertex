@@ -36,7 +36,7 @@ function temporaryRoot(): string {
 }
 
 function stateDirOf(root: string): string {
-  return join(root, ".elicify-vertex")
+  return join(root, ".opencode", "elicify-vertex")
 }
 
 function receiptsPathOf(root: string): string {
@@ -365,6 +365,6 @@ describe("VerificationReceiptStore file handling", () => {
     })
 
     expect(minted.scope?.complete).toBe(false)
-    expect(existsSync(join(missing, ".elicify-vertex", "receipts.json"))).toBe(false)
+    expect(existsSync(join(missing, ".opencode", "elicify-vertex", "receipts.json"))).toBe(false)
   })
 })

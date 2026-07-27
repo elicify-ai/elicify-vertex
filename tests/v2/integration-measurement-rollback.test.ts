@@ -327,7 +327,7 @@ describe("test 53: archival_is_reversible (integration)", () => {
   }
 
   it("a real elicify_vertex_plan_create call archives a v1 goals.json byte-identically (rename, not copy), and the session continues without further touching archive/", async () => {
-    const stateDir = join(workDir, ".elicify-vertex")
+    const stateDir = join(workDir, ".opencode", "elicify-vertex")
     mkdirSync(stateDir, { recursive: true })
     const goalsPath = join(stateDir, "goals.json")
 
@@ -432,7 +432,7 @@ describe("test 53: archival_is_reversible (integration)", () => {
   })
 
   it("does not archive a v2 (schemaVersion 2+) goals.json — not ours to touch", async () => {
-    const stateDir = join(workDir, ".elicify-vertex")
+    const stateDir = join(workDir, ".opencode", "elicify-vertex")
     mkdirSync(stateDir, { recursive: true })
     const goalsPath = join(stateDir, "goals.json")
     const v2ish = JSON.stringify({ schemaVersion: 2, note: "not a v1 file" })

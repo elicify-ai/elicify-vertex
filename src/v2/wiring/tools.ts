@@ -91,7 +91,7 @@ function isValidTimestampString(value: unknown): value is string {
  *
  * ------------------------------------------------------------------
  * Reconciliation with PERSISTED receipts (`VerificationReceiptStore` now
- * writes `.elicify-vertex/receipts.json`):
+ * writes `.opencode/elicify-vertex/receipts.json`):
  *
  *  - Hydration. `store.get()`'s two-argument signature carries no workspace
  *    root, so a receipt observed in an EARLIER process is invisible until
@@ -154,7 +154,7 @@ export function buildPlanTools(deps: PlanToolsDeps) {
 
   const createTool = tool({
     description:
-      "Create the elicify-vertex v2 story-contract plan under <project>/.elicify-vertex/plan.json. " +
+      "Create the elicify-vertex v2 story-contract plan under <project>/.opencode/elicify-vertex/plan.json. " +
       "Call only after the user has confirmed a proposed plan. Pass the confirmed stories.",
     args: {
       stories: tool.schema

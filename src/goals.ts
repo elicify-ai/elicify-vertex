@@ -29,7 +29,47 @@ export function isFilesystemRoot(path: string): boolean {
   return parent === resolved
 }
 
-/** True when we can create `.elicify-vertex` under this directory. */
+/**
+ * Directory, relative to the project root, holding EVERYTHING this plugin
+ * persists: the story plan, pinned criteria, verification receipts and their
+ * archives.
+ *
+ * It lives under `.opencode/` deliberately. Receipts are the tokens that let a
+ * model mark work complete, and a review demonstrated end to end that a model
+ * could simply open the receipts file, clone a still-valid receipt with a new
+ * id and a different story, and have the checkpoint accept it. Nothing bound a
+ * receipt to the store having actually observed a command. Storing evidence in
+ * a directory the model is free to edit means the evidence proves nothing.
+ *
+ * Moving it here is half the fix; the other half is `isProtectedStatePath`
+ * below, which the plugin enforces on every write tool. Both are required —
+ * relocation alone just moves the file.
+ */
+export const PLUGIN_STATE_DIR = ".opencode/elicify-vertex"
+
+/**
+ * Is this path inside the plugin's protected state directory?
+ *
+ * Accepts absolute or workspace-relative paths, and normalises `..` so
+ * `src/../.opencode/elicify-vertex/receipts.json` cannot slip past.
+ */
+export function isProtectedStatePath(path: string, workspaceRoot: string): boolean {
+  const normalise = (p: string): string => {
+    const abs = p.startsWith("/") ? p : join(workspaceRoot, p)
+    const out: string[] = []
+    for (const part of abs.split("/")) {
+      if (part === "" || part === ".") continue
+      if (part === "..") out.pop()
+      else out.push(part)
+    }
+    return `/${out.join("/")}`
+  }
+  const target = normalise(path)
+  const guarded = normalise(join(workspaceRoot, PLUGIN_STATE_DIR))
+  return target === guarded || target.startsWith(`${guarded}/`)
+}
+
+/** True when we can create the plugin state directory under this directory. */
 export function isWritableGoalRoot(path: string): boolean {
   if (!path || isFilesystemRoot(path)) return false
   try {
@@ -56,7 +96,7 @@ function rmProbe(path: string): void {
 }
 
 /**
- * Pick a writable project root for multi-story goal state (`.elicify-vertex/`).
+ * Pick a writable project root for multi-story goal state (`.opencode/elicify-vertex/`).
  * Never uses filesystem root. Prefers explicit worktree/directory, then cwd,
  * then `$HOME`. Throws a clear error if nothing is usable.
  */
@@ -105,7 +145,7 @@ export type PlanStatus = "active" | "complete" | "failed" | "blocked"
  *
  *  - `storyId` is the GOAL link. It is the id of the story that was active
  *    when the verification was observed (read from the v2 `plan.json` that
- *    `StoryEngine` writes into the same `.elicify-vertex/` directory), or
+ *    `StoryEngine` writes into the same `.opencode/elicify-vertex/` directory), or
  *    `null` when the session had no plan — the "executions with no plan"
  *    path, which still gets a fully-formed, persistable receipt. Consumers
  *    (`src/v2/wiring/tools.ts`) refuse a receipt minted while story S1 was
@@ -210,7 +250,7 @@ function isValidTimestamp(value: unknown): value is string {
 // Verification receipts — persisted evidence.
 // ---------------------------------------------------------------------------
 
-/** On-disk schema version of `.elicify-vertex/receipts.json`. Bumping this
+/** On-disk schema version of `.opencode/elicify-vertex/receipts.json`. Bumping this
  * archives (never deletes) the old file, mirroring how `story.ts` handles a
  * `goals.json` it does not understand. */
 export const RECEIPTS_SCHEMA_VERSION = 1
@@ -225,14 +265,14 @@ const MAX_SCOPE_PATHS = 50
 /**
  * Directory names skipped by the worktree fingerprint. Two rules decided
  * membership: (1) the harness's OWN state must be excluded or every receipt
- * would invalidate itself the moment it is written (`.elicify-vertex`), and
+ * would invalidate itself the moment it is written (`.opencode/elicify-vertex`), and
  * (2) build/dependency output is a derived artifact that a verifier run
  * routinely rewrites — including it would retire every receipt the instant
  * it was minted, which is indistinguishable from having no persistence.
  * Source, tests, config and docs are all still covered.
  */
 const RECEIPT_SCOPE_IGNORED_DIRS: ReadonlySet<string> = new Set([
-  ".elicify-vertex",
+  ".opencode",
   ".git",
   ".gradle",
   ".idea",
@@ -419,7 +459,7 @@ export type ReceiptLogger = (event: string, payload: Record<string, unknown>) =>
 
 export interface VerificationReceiptStoreOptions {
   /** Overrides the state directory otherwise derived from each receipt's own
-   * `workspaceRoot` (`<workspaceRoot>/.elicify-vertex`). Tests use this; the
+   * `workspaceRoot` (`<workspaceRoot>/.opencode/elicify-vertex`). Tests use this; the
    * plugin does not need to, which is why `new VerificationReceiptStore()`
    * still persists with no wiring change. */
   stateDir?: string
@@ -457,7 +497,7 @@ function readPlanScopeLink(sessionID: string, stateDir: string): { storyId: stri
 }
 
 /**
- * Verified-command receipts, persisted to `<workspaceRoot>/.elicify-vertex/
+ * Verified-command receipts, persisted to `<workspaceRoot>/.opencode/elicify-vertex/
  * receipts.json` (same directory, same atomic-write discipline and same
  * stale-lock reclaim as `pin.ts`'s `pins.json` and `story.ts`'s `plan.json`).
  *
@@ -589,7 +629,7 @@ export class VerificationReceiptStore {
   // -- internals ------------------------------------------------------------
 
   private stateDirFor(workspaceRoot: string): string {
-    return this.stateDirOverride ?? join(workspaceRoot, ".elicify-vertex")
+    return this.stateDirOverride ?? join(workspaceRoot, PLUGIN_STATE_DIR)
   }
 
   private safeScopeLink(sessionID: string, stateDir: string): { storyId: string | null; paths: string[] } {
@@ -809,7 +849,7 @@ export class MultiStoryGoalEngine {
       )
     }
     this.root = resolved
-    this.stateDirectory = join(this.root, ".elicify-vertex")
+    this.stateDirectory = join(this.root, PLUGIN_STATE_DIR)
     this.statePath = join(this.stateDirectory, "goals.json")
     this.ledgerPath = join(this.stateDirectory, "goals.ledger.jsonl")
     this.lockPath = join(this.stateDirectory, "goals.lock")

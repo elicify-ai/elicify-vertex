@@ -545,7 +545,7 @@ describe("test 27: plan_propose_confirm_create", () => {
     expect(text).toContain("elicify_vertex_plan_create")
 
     // No plan file written before the create tool is invoked.
-    expect(existsSync(join(workDir, ".elicify-vertex", "plan.json"))).toBe(false)
+    expect(existsSync(join(workDir, ".opencode", "elicify-vertex", "plan.json"))).toBe(false)
     const status = await hooks.tool!.elicify_vertex_plan_status.execute({}, toolContext(sid))
     expect(status).toBe("null")
   })

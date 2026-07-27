@@ -1,7 +1,7 @@
 /**
  * Vertex 2 — story.ts (US-5: FR-017 through FR-022, FR-018/018a/018b).
  *
- * Owns two on-disk concerns under `.elicify-vertex/`:
+ * Owns two on-disk concerns under `.opencode/elicify-vertex/`:
  *
  *  1. `plan.json` — the v2 story contract plan, session-keyed
  *     (`Record<sessionID, PlanV2>`), written under the SAME shared

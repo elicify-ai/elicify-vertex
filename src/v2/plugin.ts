@@ -31,7 +31,7 @@ import {
   formatActivateCue,
   parseVerification,
 } from "../index.js"
-import { VerificationReceiptStore, resolveGoalWorkspaceRoot } from "../goals.js"
+import { PLUGIN_STATE_DIR, VerificationReceiptStore, isProtectedStatePath, resolveGoalWorkspaceRoot } from "../goals.js"
 import { holdoutSuppresses, logHoldoutSuppress } from "../measurement.js"
 
 import { compareExpectation, parseCriteriaBlock, parseExpectArtifact } from "./artifacts.js"
@@ -221,7 +221,7 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       return process.cwd()
     }
   })()
-  const stateDir = `${workspaceRoot}/.elicify-vertex`
+  const stateDir = `${workspaceRoot}/${PLUGIN_STATE_DIR}`
 
   // -- Shared long-lived components -----------------------------------------
   const states = new Map<string, V2SessionState>()
@@ -540,6 +540,54 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       } else if (msgInput.agent !== undefined && msgInput.agent !== opts.activeAgent) {
         state.active = false
         state.activateCueShown = false
+      }
+    },
+
+    // ── TOOL.EXECUTE.BEFORE: the evidence store is not writable by the model ─
+    //
+    // Relocating state under `.opencode/` is only half a fix; without this it
+    // is just a different path the model can open. A review demonstrated the
+    // whole attack end to end: read the receipts file, clone a still-valid
+    // receipt with a fresh id and a different story id, append it, and the
+    // checkpoint accepts it. The story link and the worktree digest both hold
+    // — neither binds a receipt to the store having OBSERVED a command, so
+    // forging one costs a single write.
+    //
+    // Refusing here, at the tool boundary, is the narrowest place that covers
+    // every writer: `edit`, `write`, `patch`, and a `bash` command whose text
+    // targets the directory. Reads are untouched — the model may inspect its
+    // own evidence, it just cannot author it.
+    async "tool.execute.before"(toolInput, toolOutput) {
+      const sid = toolInput.sessionID
+      if (isSelf(sid)) return
+      const state = states.get(sid)
+      const root = state?.workspaceRoot ?? workspaceRoot
+
+      const args = (toolOutput?.args ?? {}) as Record<string, unknown>
+      const candidates: string[] = []
+      for (const key of ["filePath", "path", "file"]) {
+        const value = args[key]
+        if (typeof value === "string") candidates.push(value)
+      }
+      if (toolInput.tool === "bash" && typeof args.command === "string") {
+        // A bash command names its target inline; match the directory itself
+        // rather than trying to parse shell redirection.
+        if (args.command.includes(PLUGIN_STATE_DIR)) {
+          throw new Error(
+            `elicify-vertex: refusing to run a command that targets ${PLUGIN_STATE_DIR}. ` +
+              `That directory holds verification evidence and is written only by the harness — ` +
+              `a receipt you authored yourself would not be evidence of anything.`,
+          )
+        }
+      }
+      for (const candidate of candidates) {
+        if (isProtectedStatePath(candidate, root)) {
+          throw new Error(
+            `elicify-vertex: ${candidate} is inside ${PLUGIN_STATE_DIR}, which holds verification ` +
+              `evidence and is written only by the harness. Record work with ` +
+              `elicify_vertex_plan_checkpoint instead of editing the store.`,
+          )
+        }
       }
     },
 

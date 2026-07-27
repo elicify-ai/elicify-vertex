@@ -51,7 +51,7 @@ interface Harness {
 
 /** Build (or REBUILD, i.e. restart) the whole wiring over one worktree. */
 function boot(root: string): Harness {
-  const stateDir = join(root, ".elicify-vertex")
+  const stateDir = join(root, ".opencode", "elicify-vertex")
   const logger = (): void => {}
   const storyEngine = new StoryEngine({ stateDir, logger })
   const receipts = new VerificationReceiptStore()
@@ -221,7 +221,7 @@ describe("a refused checkpoint leaves no forged evidence in plan.json (R7)", () 
 
     await expect(checkpoint(h, "S1", "vrf_totally_made_up")).rejects.toThrow()
 
-    const planPath = join(root, ".elicify-vertex", "plan.json")
+    const planPath = join(root, ".opencode", "elicify-vertex", "plan.json")
     expect(readFileSync(planPath, "utf8")).not.toContain("vrf_totally_made_up")
   })
 })

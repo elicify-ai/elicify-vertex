@@ -1121,3 +1121,60 @@ describe("persisted receipts survive a restart and are visible to the gate", () 
     expect(JSON.stringify(res)).not.toMatch(/not an observed receipt/i)
   })
 })
+
+// ===========================================================================
+// The evidence store is not writable by the model.
+//
+// A review demonstrated the forgery end to end: read `receipts.json`, clone a
+// still-valid receipt with a fresh id and a different story id, append it, and
+// the checkpoint accepts it. Neither the story link nor the worktree digest
+// stops it — neither binds a receipt to the store having OBSERVED a command,
+// so forging one cost a single file write.
+//
+// Relocating the store under `.opencode/` is only half the fix; without this
+// guard it is just a different path the model can open. Reads stay allowed:
+// the model may inspect its evidence, it just cannot author it.
+// ===========================================================================
+
+describe("the plugin's persisted state is protected from the model", () => {
+  const cases: Array<[string, string, Record<string, unknown>]> = [
+    ["write", "write", { filePath: ".opencode/elicify-vertex/receipts.json" }],
+    ["edit", "edit", { filePath: ".opencode/elicify-vertex/plan.json" }],
+    ["patch", "patch", { filePath: ".opencode/elicify-vertex/pins.json" }],
+    ["traversal", "write", { filePath: "src/../.opencode/elicify-vertex/receipts.json" }],
+    ["bash redirect", "bash", { command: "echo '{}' > .opencode/elicify-vertex/receipts.json" }],
+    ["bash sed", "bash", { command: "sed -i s/a/b/ .opencode/elicify-vertex/receipts.json" }],
+  ]
+
+  it.each(cases)("refuses a %s targeting the evidence store", async (_label, tool, args) => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "guard"
+    await activate(hooks, sid, "implement the production database migration")
+
+    await expect(
+      hooks["tool.execute.before"]!({ tool, sessionID: sid, callID: "g1" } as never, { args } as never),
+    ).rejects.toThrow(/elicify-vertex/)
+  })
+
+  it("still allows ordinary writes elsewhere in the repo (discrimination)", async () => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "guard-ok"
+    await activate(hooks, sid, "implement the production database migration")
+
+    await expect(
+      hooks["tool.execute.before"]!(
+        { tool: "write", sessionID: sid, callID: "g2" } as never,
+        { args: { filePath: "src/service.ts" } } as never,
+      ),
+    ).resolves.toBeUndefined()
+    // ...and a bash command that merely mentions a normal path.
+    await expect(
+      hooks["tool.execute.before"]!(
+        { tool: "bash", sessionID: sid, callID: "g3" } as never,
+        { args: { command: "go test ./..." } } as never,
+      ),
+    ).resolves.toBeUndefined()
+  })
+})

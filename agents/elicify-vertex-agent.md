@@ -80,7 +80,7 @@ Then proceed with the task. Never ask again — the consent file persists.
 
 <multi_story_goals>
 elicify-vertex provides optional **multi-story goal tools** for sequenced work with a
-hard final verification gate. State lives at `<project>/.elicify-vertex/goals.json`.
+hard final verification gate. State lives at `<project>/.opencode/elicify-vertex/goals.json`.
 
 **When to use**
 - The user asks for a multi-step plan, epic, or "stories" with checkpoints.
