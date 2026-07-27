@@ -253,5 +253,18 @@ export function planSlashCommands(): Record<string, { description: string; templ
 
 $ARGUMENTS`,
     },
+    // FR-064. The template body is deliberately inert: the mode change is
+    // performed by `command.execute.before` in plugin.ts intercepting this
+    // command name, because a slash command is only a prompt template and
+    // cannot call plugin code itself.
+    "elicify-vertex-visibility": {
+      description: "Cycle elicify-vertex notification visibility (all -> off -> gates -> all).",
+      template: `The elicify-vertex visibility mode has been cycled by the harness. Briefly tell the user the new mode and what it means:
+- "all"   — toast on every rendered directive, gate fire and health signal
+- "gates" — toast only on gate fires and health signals
+- "off"   — no toasts (injection into the model's context is unchanged either way)
+
+$ARGUMENTS`,
+    },
   }
 }

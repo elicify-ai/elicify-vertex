@@ -49,9 +49,16 @@ export interface GateContext {
   /** Recent verifier output summaries this session, for the judge payload (best-effort, bounded). */
   recentVerifierSummaries: (sessionID: string) => string[]
   diffSummary: (sessionID: string) => string
-  /** FIX (turn-freeze): `promptContinuation` calls `composer.newTurn(sid)` on
-   * every dispatched continuation — see that function's doc comment for why. */
+  /** `promptContinuation` opens a new composer turn per dispatched
+   * continuation — see that function for the rationale and the reverted
+   * alternatives. */
   composer: InjectionComposer
+  /** FR-060/FR-061: surfaces gate fires and health signals to the operator.
+   * Optional so existing callers and tests need no change; when absent the
+   * gate simply reports nothing, exactly as before. */
+  visibility?: {
+    notify(kind: "directive" | "gate" | "health", input: Record<string, unknown> & { message: string }): Promise<void>
+  }
 }
 
 const CONTINUATION_TIMEOUT_MS = 30_000
@@ -68,31 +75,45 @@ async function promptContinuation(
     // no longer enforce anything for this session, which is exactly the
     // kind of failure an operator needs surfaced, not swallowed.
     ctx.logger("gate:continuation-failed", { sessionID: sid, reason: "session.prompt unavailable" })
+    void ctx.visibility?.notify("health", {
+      sessionID: sid,
+      family: "gate:continuation-failed",
+      message: "the idle gate cannot enforce anything: session.prompt is unavailable",
+      variant: "error",
+    })
     console.error("[vertex-v2] session.prompt unavailable; cannot enforce idle gate")
     return
   }
   const state = ctx.states.get(sid)
   if (state) state.idleContinuationInFlight = true
 
-  // FIX (turn-freeze, discovered via a real long-running unattended session):
-  // `composer.newTurn()` was only ever called from `chat.message` for a
-  // genuinely new user-authored message. The continuation THIS function
-  // sends re-enters as a `chat.message`, but `idleContinuationInFlight`
-  // makes that reentrant call a no-op (by design — it must not reset
-  // phase/ledger/pins as if new user intent arrived). The unintended side
-  // effect: on an unattended session where the harness itself is the only
-  // thing keeping the conversation going (no new human message ever
-  // arrives), `turnIndex` never advances again after the first real turn.
-  // Every per-turn-capped family (most default caps are 1) spends its
-  // budget once and is then dropped by `per-turn-cap:dropped` for the rest
-  // of the session, however long that runs — a real session showed 435 such
-  // drops over ~1.5 hours with turnIndex stuck at 7. Advancing the turn
-  // here (once per continuation the gate actually dispatches, a natural
-  // "next round" boundary distinct from "new user intent") resets per-turn
-  // spend so a capped family becomes eligible again on the next round,
-  // without touching phase/resetTurnState/pin-gc — those remain genuinely
-  // gated on real user messages only.
+  // A dispatched continuation is a fresh prompt, so it opens a new turn in
+  // the same sense a user message does — per-family spend resets, phase and
+  // pins do not (those stay gated on real user intent).
+  //
+  // History worth keeping: an earlier change made this DEFERRED, and a
+  // separate change advanced the turn on every tool result, both on the
+  // belief that `turnIndex` was "frozen" during long autonomous runs. That
+  // diagnosis was wrong. In the session that prompted it there was exactly
+  // ONE activated user message, so `turnIndex == 1` was correct, and the
+  // ~250 `per-turn-cap:dropped` events were the cap working as designed.
+  // Live-host measurement then showed `system.transform` fires after every
+  // tool result, so a per-step advance ran the index 1 -> 4 inside a single
+  // reply cycle and collapsed every cap and cooldown into per-step. Both
+  // changes were reverted. The real, still-open issue is a design one: a
+  // 90-minute agent turn gets one nudge per family for its whole duration,
+  // which wants a deliberate cadence decision, not a turn-boundary hack.
   ctx.composer.newTurn(sid)
+
+  // FR-060: a dispatched continuation IS the gate firing. Without this the
+  // "gates" visibility mode — sold as "the signals you must not miss" — had
+  // no gate to report and showed almost nothing.
+  void ctx.visibility?.notify("gate", {
+    sessionID: sid,
+    family: "gate",
+    message: text.split("\n").find((l) => l.trim()) ?? "harness gate fired",
+    variant: "warning",
+  })
   let timeoutHandle: ReturnType<typeof setTimeout> | undefined
   try {
     const timeoutPromise = new Promise<never>((_, reject) => {
@@ -113,6 +134,12 @@ async function promptContinuation(
     const isTimeout = err instanceof Error && err.message === CONTINUATION_TIMEOUT_ERROR
     const reason = isTimeout ? CONTINUATION_TIMEOUT_ERROR : "session.prompt failed"
     ctx.logger("gate:continuation-failed", { sessionID: sid, reason })
+    void ctx.visibility?.notify("health", {
+      sessionID: sid,
+      family: "gate:continuation-failed",
+      message: `the idle gate could not dispatch its continuation: ${reason}`,
+      variant: "error",
+    })
     console.error("[vertex-v2] session.prompt", err)
   } finally {
     if (timeoutHandle) clearTimeout(timeoutHandle)
@@ -283,7 +310,17 @@ async function appendJudgeCloseOut(ctx: GateContext, sid: string, state: V2Sessi
     },
   )
 
-  if (!result.verdict) return
+  if (!result.verdict) {
+    // FR-061: a judge that silently does not run is indistinguishable from a
+    // judge that passed. Say so.
+    void ctx.visibility?.notify("health", {
+      sessionID: sid,
+      family: "judge:unavailable",
+      message: `the completion judge did not run (${result.reason ?? "unknown"}) — no verdict for this plan`,
+      variant: "warning",
+    })
+    return
+  }
   const verdict: JudgeVerdict = result.verdict
   await promptContinuation(
     ctx,

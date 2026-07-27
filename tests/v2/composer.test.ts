@@ -497,3 +497,87 @@ describe("DEFAULT_FAMILY_CAPS", () => {
     expect(r1.renderedFamilies.length + r2.renderedFamilies.length).toBe(3)
   })
 })
+
+// ===========================================================================
+// D4 — turn advancement per assistant reply cycle (FR-051, FR-052; US-14)
+//
+// Field evidence this fixes: a 1h34m unattended session held `turnIndex` at 1
+// for its last 43 minutes and logged 250 `per-turn-cap:dropped` against 5
+// `directive_rendered` — a ~2% delivery rate — because `newTurn()` was only
+// ever called for a genuinely new USER message (and, later, for a gate
+// continuation that in that session never dispatched).
+//
+
+
+
+/** `turnIndex` stamped on each `directive_rendered`, in order — the composer's
+ * own observable record of which turn a directive was delivered under. */
+
+
+// ===========================================================================
+// Turn boundaries.
+//
+// REPLACES four "D4" blocks that exercised a deferred `requestNewTurn()`
+// mode. That mode was REVERTED and its machinery deleted: live-host
+// measurement showed `experimental.chat.system.transform` fires after every
+// tool result, so advancing per reply cycle / per tool call ran the index
+// 1 -> 4 within ONE reply cycle and collapsed every per-turn cap and
+// cooldown into per-step. The premise was also wrong — the field session had
+// exactly one activated user message, so `turnIndex == 1` was correct.
+//
+// A turn is a PROMPT boundary: a user message, or a gate-dispatched
+// continuation. These tests pin that.
+// ===========================================================================
+
+describe("turn boundaries: a turn is a prompt, not an agent-loop step", () => {
+  const finding = (id: string): Finding => ({
+    family: "scope-watchdog", // DEFAULT_FAMILY_CAPS: 1 per turn
+    priority: "correction",
+    observation: "o",
+    diagnosis: "d",
+    prescription: "p",
+    instanceId: id,
+  })
+
+  it("many render() calls inside one turn do NOT advance it — the cap holds", () => {
+    const composer = new InjectionComposer({ logger: vi.fn() })
+    composer.newTurn("s")
+
+    const rendered: string[][] = []
+    for (let i = 0; i < 5; i++) {
+      rendered.push(composer.render("s", [finding(`F-${i}`)], { priorCompliance: () => false }).renderedFamilies)
+    }
+
+    // Cap is 1/turn: exactly one render across all five invocations.
+    expect(rendered.flat()).toEqual(["scope-watchdog"])
+  })
+
+  it("a new prompt boundary DOES advance the turn, freeing the cap again", () => {
+    const composer = new InjectionComposer({ logger: vi.fn() })
+
+    composer.newTurn("s")
+    const first = composer.render("s", [finding("A")], { priorCompliance: () => false })
+    const blocked = composer.render("s", [finding("B")], { priorCompliance: () => false })
+
+    composer.newTurn("s") // next prompt
+    const second = composer.render("s", [finding("C")], { priorCompliance: () => false })
+
+    expect(first.renderedFamilies).toEqual(["scope-watchdog"])
+    expect(blocked.dropped).toEqual([{ family: "scope-watchdog", reason: "per-turn-cap" }])
+    expect(second.renderedFamilies).toEqual(["scope-watchdog"])
+  })
+
+  it("turn advancement is per session", () => {
+    const composer = new InjectionComposer({ logger: vi.fn() })
+    composer.newTurn("a")
+    composer.newTurn("a")
+    composer.newTurn("b")
+
+    expect(composer.render("a", [finding("X")], { priorCompliance: () => false }).renderedFamilies).toEqual([
+      "scope-watchdog",
+    ])
+    expect(composer.render("b", [finding("Y")], { priorCompliance: () => false }).renderedFamilies).toEqual([
+      "scope-watchdog",
+    ])
+  })
+})

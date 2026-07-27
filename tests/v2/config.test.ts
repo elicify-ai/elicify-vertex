@@ -31,9 +31,9 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe("planSlashCommands (2-command design)", () => {
-  it("registers exactly elicify-vertex-plan-clear, not create/next/checkpoint/status", () => {
+  it("registers only plan-clear and the visibility toggle — never create/next/checkpoint/status", () => {
     const commands = planSlashCommands()
-    expect(Object.keys(commands)).toEqual(["elicify-vertex-plan-clear"])
+    expect(Object.keys(commands).sort()).toEqual(["elicify-vertex-plan-clear", "elicify-vertex-visibility"])
     expect(commands["elicify-vertex-plan-clear"].template).toContain("elicify_vertex_plan_clear")
   })
 })
@@ -47,7 +47,11 @@ describe("applyV2Config", () => {
     const cfgInput: { command?: Record<string, unknown>; agent?: Record<string, unknown> } = {}
     await applyV2Config(cfgInput as never, {} as OpencodeClient, "elicify-vertex")
 
-    expect(Object.keys(cfgInput.command!).sort()).toEqual(["elicify-vertex", "elicify-vertex-plan-clear"])
+    expect(Object.keys(cfgInput.command!).sort()).toEqual([
+      "elicify-vertex",
+      "elicify-vertex-plan-clear",
+      "elicify-vertex-visibility",
+    ])
   })
 
   it("registers vertex-judge/vertex-intake with the wildcard permission deny that actually delivers zero tools", async () => {

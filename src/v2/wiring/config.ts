@@ -113,7 +113,9 @@ const ACTIVATE_TEMPLATE = `Activate the elicify-vertex 2 verification harness fo
 
 Follow observed evidence over intent: ground every "done" claim in a tool result from this turn, run the narrowest relevant verifier after changing files, and state gaps explicitly rather than assuming success.
 
-For multi-step work, confirm a story plan first (elicify_vertex_plan_create) and checkpoint each story with evidence (elicify_vertex_plan_checkpoint).`
+For multi-step work, confirm a story plan first (elicify_vertex_plan_create) and checkpoint each story with evidence (elicify_vertex_plan_checkpoint).
+
+Run verifiers as a single standalone command — never chained with ';' and never piped into tail/grep. A chained or piped command reports the last command's exit status, so the harness cannot trust it and your passing test will not count as evidence.`
 
 export async function applyV2Config(
   cfgInput: V2ConfigHookInput,

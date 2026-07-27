@@ -31,9 +31,11 @@ import {
   parseVerification,
 } from "../index.js"
 import { VerificationReceiptStore, resolveGoalWorkspaceRoot } from "../goals.js"
-import { holdoutSuppresses, logHoldoutSuppress, verifiersEquivalent } from "../measurement.js"
+import { holdoutSuppresses, logHoldoutSuppress } from "../measurement.js"
 
 import { compareExpectation, parseCriteriaBlock, parseExpectArtifact } from "./artifacts.js"
+import { isNonExecutingCommand, observedCoversPrescribed } from "./coverage.js"
+import { VisibilityNotifier, resolveVisibilityMode, summarizeFinding } from "./visibility.js"
 import { InjectionComposer, type Finding } from "./composer.js"
 import { resolveProfile, type Profile } from "./dosing.js"
 import { PhaseEngine } from "./phase.js"
@@ -77,6 +79,10 @@ export interface ElicifyVertexV2Options {
   readonly dosingOverrides?: Record<string, Profile>
   readonly familyCaps?: Record<string, number>
   readonly cooldowns?: Record<string, number>
+  /** FR-057: `"off" | "gates" | "all"`, default `"all"`. `VERTEX_VISIBLE=0` forces `"off"`. */
+  readonly visibility?: string
+  /** FR-063 toast rate cap per minute (default 6). */
+  readonly maxToastsPerMinute?: number
   /** Consumed by `src/plugin.ts`'s kill switch; harmless if also present here. */
   readonly engine?: string
 }
@@ -202,6 +208,8 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
     dosingOverrides: userOpts.dosingOverrides,
     familyCaps: userOpts.familyCaps,
     cooldowns: userOpts.cooldowns,
+    visibility: userOpts.visibility,
+    maxToastsPerMinute: userOpts.maxToastsPerMinute,
   }
   const activateCommandName = opts.activeSkillTrigger.replace(/^\//, "")
 
@@ -226,6 +234,18 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
   const pinStore = new PinStore({ stateDir, logger })
   const storyEngine = new StoryEngine({ stateDir, logger })
   const composer = new InjectionComposer({ logger, familyCaps: opts.familyCaps, cooldowns: opts.cooldowns })
+  /**
+   * US-15: the user-facing half of every injection. The model keeps receiving
+   * the full O-D-P-E body through `system.transform` unchanged (FR-058) — this
+   * only mirrors a one-line summary to the TUI, and every call is fail-safe
+   * (FR-062), so visibility can never alter harness behaviour.
+   */
+  const visibility = new VisibilityNotifier({
+    client,
+    mode: resolveVisibilityMode(opts.visibility),
+    logger,
+    maxToastsPerMinute: opts.maxToastsPerMinute,
+  })
   const evidenceLedger = new EvidenceLedger()
   const verificationReceipts = new VerificationReceiptStore()
   // FIX #5: selfCreatedGuard must exist before the tracking wrapper below —
@@ -300,6 +320,7 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       return stat || formatChangedPathsSummary(changedPaths)
     },
     composer,
+    visibility,
   }
 
   function formatChangedPathsSummary(paths: readonly string[]): string {
@@ -342,6 +363,35 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
         const state = getOrCreateState(commandInput.sessionID)
         state.active = true
       }
+
+      // FR-064: `/elicify-vertex-visibility` cycles off -> gates -> all.
+      // Slash commands are prompt templates and cannot call plugin code, so
+      // the toggle is implemented by intercepting the command here — the same
+      // mechanism activation already uses.
+      // Hardcoded to match `planSlashCommands()`'s registration key
+      // (wiring/tools.ts), which does NOT vary with activeSkillTrigger.
+      // Deriving it from the trigger made the toggle a silent no-op under
+      // any custom trigger while the template still told the user it had
+      // been cycled.
+      if (commandInput.command === "elicify-vertex-visibility") {
+        const sid = commandInput.sessionID
+        const current = visibility.modeFor(sid)
+        const next = current === "all" ? "off" : current === "off" ? "gates" : "all"
+        // Per-session (FR-064): one plugin instance serves every concurrent
+        // session, so a process-global mode would let one operator silence
+        // another's toasts with no way to tell why.
+        visibility.setMode(next, sid)
+        logger("visibility:mode-changed", { sessionID: sid, mode: next })
+        // notifyControl, not notify: this acknowledges an explicit user action
+        // and must not be suppressed by the mode that action just set —
+        // otherwise toggling `all -> off` silently confirms nothing.
+        void visibility.notifyControl({
+          sessionID: sid,
+          family: "visibility",
+          message: `elicify-vertex visibility is now "${next}"`,
+          variant: "info",
+        })
+      }
     },
 
     // ── CHAT.MESSAGE: activation, phase reset, intake classification ───────
@@ -355,7 +405,16 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
         state.modelId = modelId
         const resolution = resolveProfile(modelId, opts.dosingOverrides)
         state.profile = resolution.profile
-        if (resolution.unknown) {
+        // Resolving the profile is a pure computation and always safe, but the
+        // LOG is a side effect: it creates `.vertex-events.jsonl` in the data
+        // dir. Emitting it before the activation check meant a session that
+        // never activates the harness still left a trace on disk — UAT G1
+        // (no --agent, no trigger) caught exactly that. The sibling call site
+        // in `system.transform` is already behind `state.active`; this one now
+        // matches. On the activating message `state.active` is still false
+        // here (activation is decided further down), so the first log simply
+        // comes from `system.transform`, which runs before the model call.
+        if (resolution.unknown && state.active) {
           logger("dosing:unknown-model", { sessionID: sid, rawModelId: resolution.rawModelId })
         }
       }
@@ -462,6 +521,7 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       const state = states.get(sid)
       if (!state || !state.active) return
 
+
       // v1 parity (src/index.ts's tool.execute.after): once a tool runs,
       // any prior assistant text is no longer the turn's "final" reply — the
       // model may still produce more text after this tool call. Clearing it
@@ -524,6 +584,27 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       if (toolName === "bash" && verification?.isVerificationCommand) {
         const rawSuccess = verification.outcome === "verified"
 
+        // FR-061 health signal: a REAL verifier ran, but its aggregate exit
+        // code is unreliable, so no receipt can be minted. Almost always
+        // caused by `;`-chaining (`go test ./... ; echo "---exit:$?---"`),
+        // where the compound's status is the trailing command's and is
+        // therefore always 0. `parseVerification` correctly refuses it — but
+        // silently, so the model re-runs the same shape forever and evidence
+        // never accrues. Measured: 4 of 25 bash commands in the field session
+        // had this shape, and the agent's own prompt models `;`-chaining, so
+        // the model learns it by example.
+        if (verification.outcome === "ambiguous" && exitCode === 0) {
+          void visibility.notify("health", {
+            sessionID: sid,
+            family: "verify:ambiguous-exit",
+            message:
+              `"${command.slice(0, 80)}" looks like a verifier but its exit code is not reliable ` +
+              `(usually ';' chaining) — no receipt minted. Run the verifier as a standalone command.`,
+            variant: "warning",
+          })
+          logger("verify:ambiguous-exit", { sessionID: sid, command })
+        }
+
         // FIX #6 (review MAJOR — "relevance gap" edge case unimplemented):
         // docs/vertex2-spec.md Edge Cases — "Verifier passes but is
         // unrelated to changed paths (relevance gap) -> evidence recorded
@@ -533,23 +614,65 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
         // changed paths; a real (non-generic) resolution the observed
         // command does not match is a relevance gap.
         let relevanceGap = false
-        if (rawSuccess && exitCode === 0) {
+
+        // A command that EXECUTES NOTHING can never be evidence, whether or
+        // not a prescription exists to compare it against. This is checked
+        // before (and independently of) the coverage comparison because with
+        // no plan and no changed paths there IS no prescription — and UAT
+        // proved `python3 -m pytest --collect-only` minted a real receipt
+        // through exactly that hole while running zero tests.
+        if (rawSuccess && exitCode === 0 && isNonExecutingCommand(command)) {
+          relevanceGap = true
+          void visibility.notify("health", {
+            sessionID: sid,
+            family: "verify:non-executing",
+            message: `"${command.slice(0, 80)}" executes no tests — no receipt minted.`,
+            variant: "warning",
+          })
+          logger("verify:non-executing", { sessionID: sid, command })
+        }
+
+        if (rawSuccess && exitCode === 0 && !relevanceGap) {
           const realChangedPaths = evidenceLedger.getChangedPaths(sid).filter((p) => !NON_PATH_MUTATION_MARKERS.has(p))
+          const storyForResolve = storyEngine.getActiveStory(sid)
+          const storyVerifiers = storyForResolve?.verifiers ?? null
+
+          // The prescription to compare against. Previously this whole check
+          // was gated on `realChangedPaths.length > 0`, which left a hole a
+          // review proved end to end: with no mutation observed yet this
+          // turn, ANY passing command minted a receipt — `npx eslint .`
+          // satisfied a story whose verifier was `go test ./internal/...`.
+          // `resolveVerifier` returns tier "none" for an empty path set
+          // before it ever consults `storyVerifiers`, so when there are no
+          // changed paths we fall back to the story's own declared verifiers,
+          // which are a prescription in their own right.
+          let prescribed: string | null = null
           if (realChangedPaths.length > 0) {
             const manifest = manifests.get(state.workspaceRoot)
-            const storyForResolve = storyEngine.getActiveStory(sid)
-            const resolution = resolveVerifier(
-              { changedPaths: realChangedPaths, storyVerifiers: storyForResolve?.verifiers ?? null },
+            prescribed = resolveVerifier(
+              { changedPaths: realChangedPaths, storyVerifiers },
               { readManifest: () => manifest },
-            )
-            if (resolution.command && !verifiersEquivalent(resolution.command, command, resolveVerifier)) {
-              relevanceGap = true
-              logger("verify:relevance-gap", {
-                sessionID: sid,
-                observedCommand: command,
-                expectedCommand: resolution.command,
-              })
-            }
+            ).command
+          } else if (storyVerifiers && storyVerifiers.length > 0) {
+            prescribed = storyVerifiers.join(" && ")
+          }
+
+          if (prescribed && !observedCoversPrescribed(prescribed, command)) {
+            relevanceGap = true
+            // FR-061 health signal. This is the exact condition that
+            // silently suppressed every receipt for 94 minutes in the
+            // field — the operator must be able to see it happening.
+            void visibility.notify("health", {
+              sessionID: sid,
+              family: "verify:relevance-gap",
+              message: `verifier did not cover the prescribed one — no receipt minted. observed: ${command}`,
+              variant: "warning",
+            })
+            logger("verify:relevance-gap", {
+              sessionID: sid,
+              observedCommand: command,
+              expectedCommand: prescribed,
+            })
           }
         }
         // `success` folds the relevance gap in: a relevance-gap pass must
@@ -609,6 +732,17 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
           const firstUnevidenced = pinStore.get(sid).find((c) => !c.evidence)
           if (firstUnevidenced) pinStore.attachEvidence(sid, firstUnevidenced.id, { receiptId: receipt.id })
           pinStore.persist(sid)
+        } else if (rawSuccess && exitCode === 0 && !relevanceGap) {
+          // FR-061: the command verified and covered the prescription, yet no
+          // receipt was minted (e.g. `success` was false for another reason).
+          // Silent evidence loss is the failure this whole feature exists to
+          // make visible.
+          void visibility.notify("health", {
+            sessionID: sid,
+            family: "receipt:not-minted",
+            message: `a passing verifier produced no receipt: ${command}`,
+            variant: "warning",
+          })
         }
 
         // FIX #1: same resolveStoryIdForPhase fallback as the mutation site
@@ -669,7 +803,7 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
 
         // FR-034 compliance join
         for (const rendered of state.renderedVerifyGaps) {
-          if (verifiersEquivalent(rendered.command, command, resolveVerifier)) {
+          if (observedCoversPrescribed(rendered.command, command)) {
             composer.recordCompliance(sid, "verify-gap", rendered.instanceId)
             state.compliedFamiliesEver.add("verify-gap")
           }
@@ -821,6 +955,13 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
 
       const renderResult = composer.render(sid, finalFindings, { priorCompliance: () => false })
 
+      // FR-059: one toast per rendered directive. Fire-and-forget — `notify`
+      // never throws and never rejects (FR-062), and `system.transform` is a
+      // hot path that must not wait on a TUI round trip.
+      for (const rendered of finalFindings.filter((f) => renderResult.renderedFamilies.includes(f.family))) {
+        void visibility.notify("directive", { ...summarizeFinding(rendered), sessionID: sid })
+      }
+
       if (renderResult.renderedFamilies.includes("pinned-criteria-reinject")) state.needsCriteriaReinject = false
       if (renderResult.renderedFamilies.includes("scope-watchdog")) state.scopeDriftPending = null
       if (renderResult.renderedFamilies.includes("anomaly-interrupt")) state.anomalyPending = null
@@ -829,6 +970,21 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       if (renderResult.renderedFamilies.some((f) => f.startsWith("repeat-failure:"))) state.repeatFailurePending = null
       if (renderResult.renderedFamilies.includes("verify-gap") && verifyGapCandidate?.command) {
         state.renderedVerifyGaps.push({ instanceId: verifyGapCandidate.instanceId, command: verifyGapCandidate.command })
+      }
+
+      // FR-061: a turn in which nearly every directive was dropped means the
+      // model is being starved of guidance. `renderResult.dropped` already
+      // carries the data; it was only ever going to the JSONL sink.
+      {
+        const attempted = renderResult.renderedFamilies.length + renderResult.dropped.length
+        if (attempted >= 5 && renderResult.renderedFamilies.length / attempted <= 0.1) {
+          void visibility.notify("health", {
+            sessionID: sid,
+            family: "directive:starved",
+            message: `${renderResult.dropped.length} of ${attempted} directives dropped this turn — the model is getting almost no guidance`,
+            variant: "warning",
+          })
+        }
       }
 
       if (renderResult.text) {
@@ -848,6 +1004,7 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       if (!state || !state.active) return
       if (!textOutput.text.trim()) return
       state.lastAssistantText = textOutput.text
+
 
       const criteriaBlock = parseCriteriaBlock(textOutput.text)
       if (criteriaBlock) {
@@ -900,6 +1057,10 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       if (!state || !state.active) return
       if (state.idleContinuationInFlight) return
       await handleSessionIdle(gateCtx, sid)
+      // FR-063: drain any pending suppressed-toast roll-up. Without this a
+      // burst at the very end of a run is capped and then never reported,
+      // which is the failure mode visibility exists to remove.
+      await visibility.flush()
     },
   }
 }

@@ -19,10 +19,32 @@
  * per-turn cap is untouched by an earlier invocation rendering *other*
  * families, so it remains eligible in a later invocation of the same turn.
  *
- * The turn index is caller-driven via `newTurn()` — it is NOT wall clock and
- * NOT an invocation counter. One `newTurn()` call corresponds to one
- * `chat.message` (a new user message); many `render()` calls (many
- * `system.transform` invocations) can share the same turn index.
+ * The turn index is caller-driven — it is NOT wall clock and NOT an
+ * invocation counter. There are two ways to drive it:
+ *
+ *   - `newTurn()` — EAGER. Advances immediately. Used for a genuinely new
+ *     user message (`chat.message`) and for a gate-dispatched continuation
+ *     (`wiring/gate.ts`'s `promptContinuation`).
+ *   (A DEFERRED `requestNewTurn()` mode existed briefly and was REVERTED: it
+ *   advanced the turn per agent-loop step, which live-host measurement showed
+ *   runs the index 1 -> 4 inside one reply cycle and collapses every per-turn
+ *   cap and cooldown into per-step. A turn is a PROMPT boundary.)
+ *     top of the NEXT `render()` call.
+ *
+ * The deferred form is what makes FR-052 ("a reentrant `chat.message`
+ * produced by a harness continuation MUST NOT advance the turn more than
+ * once for the same reply cycle") structurally true rather than merely
+ * intended: because a pending request is consumed by `render()` and cleared
+ * by an eager `newTurn()`, ANY number of boundary signals arriving between
+ * two renders — several text parts in one assistant message, several tool
+ * calls, a reply cycle followed by a gate continuation followed by the
+ * reentrant `chat.message` it causes — collapse into AT MOST ONE advance.
+ * The invariant is: **the turn index advances at most once per `render()`
+ * from deferred requests**, and `render()` is the only thing per-turn caps
+ * gate, so no reply cycle can be double-counted against a cap.
+ *
+ * Many `render()` calls (many `system.transform` invocations) can still
+ * share one turn index — a turn is a reply cycle, not an invocation.
  *
  * Findings dropped for budget/cap/cooldown reasons are logged and reported
  * in `RenderResult.dropped`, but never retained internally — the caller
@@ -158,7 +180,12 @@ export class InjectionComposer {
   private getState(sessionID: string): SessionState {
     let state = this.sessions.get(sessionID)
     if (!state) {
-      state = { turnIndex: 0, turnSpend: new Map(), lastRenderedTurn: new Map(), complianceTurn: new Map() }
+      state = {
+        turnIndex: 0,
+        turnSpend: new Map(),
+        lastRenderedTurn: new Map(),
+        complianceTurn: new Map(),
+      }
       this.sessions.set(sessionID, state)
     }
     return state
@@ -174,15 +201,25 @@ export class InjectionComposer {
     return cd === undefined ? 1 : cd
   }
 
-  /** Call once per `chat.message` (new user message). Increments the
-   * session's turn index and resets THIS turn's per-family spend counters
-   * (per-turn caps are scoped to the new turn; cooldowns are not reset here
-   * — they are evaluated against the running turn index so they can span
-   * turn boundaries per `cooldownTurns`). */
-  newTurn(sessionID: string): void {
-    const state = this.getState(sessionID)
+  private advanceTurn(state: SessionState): void {
     state.turnIndex += 1
     state.turnSpend.clear()
+  }
+
+  /** EAGER turn advance. Call once per `chat.message` (new user message) and
+   * once per gate-dispatched continuation. Increments the session's turn
+   * index and resets THIS turn's per-family spend counters (per-turn caps
+   * are scoped to the new turn; cooldowns are not reset here — they are
+   * evaluated against the running turn index so they can span turn
+   * boundaries per `cooldownTurns`).
+   *
+   * FR-052: this also CANCELS any pending deferred advance
+   * (historical: a deferred advance). A gate continuation is dispatched at the very
+   * boundary a completed reply cycle has usually just flagged, so without
+   * the cancellation the same boundary would be counted twice — once by the
+   * reply cycle, once by the continuation it triggered. */
+  newTurn(sessionID: string): void {
+    this.advanceTurn(this.getState(sessionID))
   }
 
   /** Called by wiring when FR-034 detects a compliance match. Feeds the next
@@ -206,6 +243,8 @@ export class InjectionComposer {
    * One call = one `experimental.chat.system.transform` invocation.
    *
    * Pipeline (order is load-bearing — see module doc comment):
+   *      BEFORE any filtering, so a family capped out by the previous reply
+   *      cycle is eligible again in this one.
    *   1. Drop findings whose family already spent its per-turn cap this turn.
    *   2. Drop findings whose family is within its `cooldownTurns` window.
    *   3. Sort survivors by priority (correction > phase-guidance > enrichment)
@@ -226,6 +265,11 @@ export class InjectionComposer {
     opts: { priorCompliance: (family: string) => boolean },
   ): RenderResult {
     const state = this.getState(sessionID)
+
+    // FR-051 step 0: a reply cycle completed since the last render, so this
+    // render belongs to a NEW turn. Advancing here (rather than at the
+    // boundary itself) is what bounds the advance to at most one per render
+    // no matter how many boundary signals arrived — see the module doc.
     const dropped: RenderResult["dropped"] = []
 
     // Provisional per-call spend, keyed by family: `state.turnSpend` only

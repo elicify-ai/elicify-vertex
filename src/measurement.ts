@@ -821,6 +821,21 @@ function extractVerifierTargetTokens(strippedCommand: string): string[] {
  * guard fires before it even looks at `storyVerifiers`) — so the two are
  * correctly non-equivalent by `rationale` mismatch, matching Dataset row 11.
  */
+/**
+ * @deprecated NO LONGER USED IN PRODUCTION. Both former call sites in
+ * `src/v2/plugin.ts` now use `observedCoversPrescribed` (`src/v2/coverage.ts`),
+ * because this function's `rationale` + `matchedPaths` SET EQUALITY cannot
+ * express "broader": it scored `go test ./...` as not-equivalent to a
+ * prescribed `go test ./internal/auth/...`, which suppressed the receipt and
+ * produced zero evidence across a 94-minute field session.
+ *
+ * Kept only so nothing importing the symbol breaks, and because
+ * `tests/v2/measurement.test.ts` still pins its historical semantics. Note
+ * those tests assert the OPPOSITE of the coverage module by design — e.g.
+ * `verifiersEquivalent("npx vitest run tests/lexer.test.ts", "npm test")` is
+ * `false` here and `true` under coverage. Do not "reconcile" them; this
+ * function records what the old rule did.
+ */
 export function verifiersEquivalent(rendered: string, observed: string, resolve: ResolveVerifierFn): boolean {
   const strippedRendered = stripIgnoredVerifierFlags(rendered).trim()
   const strippedObserved = stripIgnoredVerifierFlags(observed).trim()
