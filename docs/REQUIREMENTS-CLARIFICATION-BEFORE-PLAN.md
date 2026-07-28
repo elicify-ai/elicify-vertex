@@ -56,9 +56,31 @@ point**: when `elicify_vertex_plan_create` fires, its return text puts the
 question in front of the model while the plan is still fresh and cheap to
 change:
 
-> Before you act on this plan — did you ground it in research and user
-> interview? Have you eliminated the unknowns as far as possible? If material
-> questions remain, ask them now rather than encoding a guess into stories.
+> **Before you act on this plan — was it grounded, or guessed?**
+>
+> - Did you ground it in research and user interview?
+> - Have you eliminated the unknowns as far as possible?
+>
+> If material questions remain, do ONE of these now, before writing any code:
+>
+> 1. **Ask the user** — use the question tool for the decisions that fork the
+>    architecture. Cheaper now than after four stories are built on a guess.
+> 2. **Research it** — read the code, the docs, the existing conventions, and
+>    resolve what can be resolved without asking.
+> 3. **Clear and re-plan** — if the stories encode assumptions rather than
+>    findings, call `elicify_vertex_plan_clear`, ground the work, then
+>    `elicify_vertex_plan_create` again. The old plan is archived, not lost.
+>
+> Proceeding is also a valid answer — but only if you can say what the plan is
+> grounded IN.
+
+**Naming the remedy is load-bearing, not politeness.** An open question with no
+stated escape route defaults to "yes, I grounded it" — that is the cheapest
+answer and requires no work. Listing the three concrete moves, and naming the
+exact tools, makes the expensive answer available and legitimate. Saying "the
+old plan is archived, not lost" matters for the same reason: without it,
+clearing a plan reads as destructive and the model will avoid it. (It is true —
+`createPlan` and `clearPlan` both archive as of `57dcc3f`.)
 
 Properties that make this the right shape:
 
@@ -90,6 +112,11 @@ No new plumbing.
 - **AC-2** The challenge is specific to the plan just created where it can be —
   e.g. naming stories whose acceptance items are vague — rather than being
   identical boilerplate on every call.
+- **AC-2b** The challenge NAMES the remedy, with the exact tool calls: ask via
+  the question tool, research, or `plan_clear` -> ground -> `plan_create`. It
+  must also state that clearing archives rather than destroys, or the model will
+  treat re-planning as costly and avoid it. A challenge that only asks the
+  question defaults to "yes" and changes nothing.
 - **AC-3** `plan_create` still SUCCEEDS. It is a challenge, not a gate: no
   refusal, no deadlock in headless runs.
 - **AC-4** The challenge is proportionate: a single-story plan with concrete
