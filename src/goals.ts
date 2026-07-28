@@ -914,7 +914,27 @@ export class VerificationReceiptStore {
     try {
       parsed = JSON.parse(readFileSync(receiptsPath, "utf8"))
     } catch (error) {
-      throw new CorruptReceiptsFileError((error as Error).message)
+      // ARCHIVE AND RESET, rather than refusing forever.
+      //
+      // Aborting the write was meant to avoid clobbering a file we could not
+      // read — but the file never healed, so one bad byte disabled receipt
+      // persistence for every session until a human deleted it, with the only
+      // signal a JSONL line. A truncated file is a realistic outcome:
+      // `atomicWriteJson` does not fsync before rename, so a crash can leave
+      // exactly this.
+      //
+      // Nothing is lost that could have been used: the content is unparseable,
+      // so no receipt in it was readable anyway, and archiving keeps it for
+      // inspection. A schema-version mismatch already takes this path; a parse
+      // failure is strictly less recoverable, so treating it more harshly made
+      // no sense.
+      this.logger("receipts:disk-corrupt", {
+        path: receiptsPath,
+        reason: (error as Error).message,
+        action: "archived and reset",
+      })
+      this.archiveReceiptsFile(stateDir, receiptsPath)
+      return empty
     }
     if (!isRecord(parsed)) return empty
     if (parsed.schemaVersion !== RECEIPTS_SCHEMA_VERSION) {
@@ -1020,22 +1040,65 @@ function atomicWriteJson(stateDir: string, targetPath: string, tempPrefix: strin
  * `StoryEngine.checkpoint`'s validation callback, and reusing their lock
  * there would risk a self-deadlock the moment either module starts holding it
  * across a callback. */
+/** Bounded spin before giving up on a contended lock. Measured: with NO retry,
+ * two processes recording 15 receipts each lost 18 of 30 writes — and because
+ * `persist` rewrites the whole session list, what is permanently lost is the
+ * TAIL, i.e. exactly the receipts a checkpoint is about to cite. The waits are
+ * short and synchronous because the critical section is a small read-modify-
+ * write; the point is to survive a peer's write, not to queue behind a hang. */
+const LOCK_RETRY_ATTEMPTS = 20
+const LOCK_RETRY_DELAY_MS = 25
+
+function sleepBriefly(ms: number): void {
+  // Synchronous by necessity: every caller is inside a synchronous hook path.
+  const until = Date.now() + ms
+  while (Date.now() < until) {
+    // busy-wait; bounded by LOCK_RETRY_ATTEMPTS * LOCK_RETRY_DELAY_MS
+  }
+}
+
 function withFileLock<T>(lockPath: string, operation: () => T): T {
   mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 })
   let descriptor: number | null = null
   let ownsLock = false
   try {
-    try {
-      descriptor = openSync(lockPath, "wx", 0o600)
-      ownsLock = true
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code
-      if (code !== "EEXIST" || Date.now() - statSync(lockPath).mtimeMs < STALE_LOCK_MS) {
-        throw new Error(`elicify-vertex state file is locked by another process: ${lockPath}`)
+    for (let attempt = 0; ; attempt++) {
+      try {
+        descriptor = openSync(lockPath, "wx", 0o600)
+        ownsLock = true
+        break
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code
+        if (code !== "EEXIST") throw error
+
+        let heldForMs = 0
+        try {
+          heldForMs = Date.now() - statSync(lockPath).mtimeMs
+        } catch {
+          // The holder released between our failed create and this stat —
+          // just try again. Previously this threw a raw ENOENT dressed up as
+          // "locked by another process".
+          continue
+        }
+
+        if (heldForMs >= STALE_LOCK_MS) {
+          // Reclaim a lock whose owner died. Not atomic: two processes past
+          // the threshold can both unlink and both create. Rare (needs a crash
+          // plus a thundering herd) and the write itself is atomic
+          // temp+rename, so the cost is a lost update rather than corruption.
+          try {
+            unlinkSync(lockPath)
+          } catch {
+            // someone else reclaimed first
+          }
+          continue
+        }
+
+        if (attempt >= LOCK_RETRY_ATTEMPTS) {
+          throw new Error(`elicify-vertex state file is locked by another process: ${lockPath}`)
+        }
+        sleepBriefly(LOCK_RETRY_DELAY_MS)
       }
-      unlinkSync(lockPath)
-      descriptor = openSync(lockPath, "wx", 0o600)
-      ownsLock = true
     }
     return operation()
   } finally {

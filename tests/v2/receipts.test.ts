@@ -334,16 +334,36 @@ describe("VerificationReceiptStore file handling", () => {
   // proceeds and overwrites the unreadable file -> RED. Same reasoning as
   // pin.ts's `pins:disk-corrupt` branch: other sessions' receipts may be in
   // there.
-  it("aborts the write (and logs) rather than clobbering a corrupt receipts file", () => {
+  it("ARCHIVES and resets a corrupt receipts file rather than refusing forever", () => {
+    // DELIBERATE CONTRACT CHANGE (was: "aborts the write rather than
+    // clobbering a corrupt receipts file").
+    //
+    // Aborting was meant to protect other sessions' receipts from being
+    // overwritten — but the file never healed, so ONE bad byte disabled receipt
+    // persistence for every session until a human deleted it, with the only
+    // signal a JSONL line nothing surfaces. And a truncated file is a realistic
+    // outcome, not a hypothetical: `atomicWriteJson` does not fsync before
+    // rename, so a crash leaves exactly this.
+    //
+    // Nothing recoverable is lost. The content is unparseable, so no receipt in
+    // it was readable anyway, and archiving keeps it for inspection. A
+    // schema-version mismatch already took this path; a parse failure is
+    // strictly less recoverable, so treating it more harshly made no sense.
     const root = temporaryRoot()
     mkdirSync(stateDirOf(root), { recursive: true })
     writeFileSync(receiptsPathOf(root), "{ not json at all", "utf8")
 
     const events: Array<[string, Record<string, unknown>]> = []
-    recordOn(restart(events), root)
+    const minted = recordOn(restart(events), root)
 
-    expect(readFileSync(receiptsPathOf(root), "utf8")).toBe("{ not json at all")
     expect(events.map(([event]) => event)).toContain("receipts:disk-corrupt")
+    // The corrupt bytes are archived, never deleted.
+    const archived = readdirSync(join(stateDirOf(root), "archive"))
+    expect(archived.some((name) => name.startsWith("receipts.")), "corrupt file must be archived").toBe(true)
+    // ...and persistence works again immediately.
+    const restarted = restart()
+    restarted.load("s1", root)
+    expect(restarted.get("s1", minted.id), "the store heals instead of staying broken").not.toBeNull()
   })
 
   // MUTATION PROOF: delete the `if (!rootIsDirectory) return { ..., complete:
