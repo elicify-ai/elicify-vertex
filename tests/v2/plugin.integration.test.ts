@@ -1186,3 +1186,64 @@ describe("the plugin's persisted state is protected from the model", () => {
     ).resolves.toBeUndefined()
   })
 })
+
+// ===========================================================================
+// A verifier that relates to NO work must not answer a criterion.
+//
+// With no plan and no changed paths, `prescribed` is null, so every
+// verifier-shaped command mints a receipt — an audit measured `npx eslint .`,
+// `tsc --noEmit`, `make check` and `curl -sf` all minting. Auto-attaching
+// those closed the criteria gate on evidence of nothing: criteria "auth
+// service tests pass" and "migration applies cleanly" were both satisfied by
+// running eslint.
+//
+// The receipt itself is a TRUE statement — that command really did pass — and
+// is still minted and citable. What it must not do is silently answer a
+// criterion nobody measured it against.
+// ===========================================================================
+
+describe("a verifier unrelated to any work does not evidence criteria", () => {
+  it("does not attach a no-work receipt to a pinned criterion", async () => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "nowork"
+    // The audit's actual shape: a file DID change, but one the resolver cannot
+    // classify (Ruby), so there is no prescription — and then a LINT pass is
+    // offered as evidence for criteria about tests.
+    await activate(hooks, sid, "implement the production database migration")
+    // Exactly ONE criterion: auto-attach only ever takes the oldest
+    // unevidenced one, so with two pinned the gate would still block on the
+    // second and this test would pass whether the fix is present or not.
+    await completeText(hooks, sid, "CRITERIA:\n1. auth service tests pass")
+    await toolAfter(hooks, sid, "edit", { filePath: join(workDir, "src/app.rb") }, "updated")
+    const out = { title: "bash", output: "ok", metadata: { exit: 0 } }
+    await hooks["tool.execute.after"]!(
+      { tool: "bash", sessionID: sid, callID: "c1", args: { command: "npx eslint ." } } as never,
+      out as never,
+    )
+
+    await idle(hooks, sid)
+    expect(
+      idleContinuationTexts(client, sid).length,
+      "criteria were pinned and nothing verified them — the gate must still block",
+    ).toBeGreaterThan(0)
+  })
+
+  it("DOES attach when the session actually changed files (discrimination)", async () => {
+    // Without this, "never auto-attach" would satisfy the test above while
+    // silently removing the feature.
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "realwork"
+    await activate(hooks, sid, "implement the production database migration")
+    await completeText(hooks, sid, "CRITERIA:\n1. the suite passes")
+    await toolAfter(hooks, sid, "edit", { filePath: join(workDir, "src/service.ts") }, "updated")
+
+    const out = { title: "bash", output: "ok  pkg  0.01s", metadata: { exit: 0 } }
+    await hooks["tool.execute.after"]!(
+      { tool: "bash", sessionID: sid, callID: "c2", args: { command: "npx vitest run" } } as never,
+      out as never,
+    )
+    expect(out.output, "a real verifier after a real edit still mints").toMatch(/verification-receipt/)
+  })
+})

@@ -35,7 +35,7 @@ import { PLUGIN_STATE_DIR, VerificationReceiptStore, isProtectedStatePath, resol
 import { holdoutSuppresses, logHoldoutSuppress } from "../measurement.js"
 
 import { compareExpectation, parseCriteriaBlock, parseExpectArtifact } from "./artifacts.js"
-import { isNonExecutingCommand, observedCoversPrescribed } from "./coverage.js"
+import { isNonExecutingCommand, isTestRunnerCommand, observedCoversPrescribed } from "./coverage.js"
 import { VisibilityNotifier, resolveVisibilityMode, summarizeFinding } from "./visibility.js"
 import { InjectionComposer, type Finding } from "./composer.js"
 import { resolveProfile, type Profile } from "./dosing.js"
@@ -693,6 +693,16 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
         // changed paths; a real (non-generic) resolution the observed
         // command does not match is a relevance gap.
         let relevanceGap = false
+        // Hoisted: the auto-attach decision below needs to know whether this run
+        // related to any work at all.
+        let prescribed: string | null = null
+        // Did the session have anything for this verifier to be ABOUT -- files
+        // changed this turn, or a story declaring what proves it? This is the
+        // distinction that matters, and it is NOT `prescribed !== null`:
+        // `resolveVerifier` also returns null when files DID change but it has
+        // no opinion about which verifier covers them, and a passing run is
+        // perfectly good evidence there.
+        let hadWorkToMeasure = false
 
         // A command that EXECUTES NOTHING can never be evidence, whether or
         // not a prescription exists to compare it against. This is checked
@@ -725,7 +735,7 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
           // before it ever consults `storyVerifiers`, so when there are no
           // changed paths we fall back to the story's own declared verifiers,
           // which are a prescription in their own right.
-          let prescribed: string | null = null
+          hadWorkToMeasure = realChangedPaths.length > 0 || (storyVerifiers?.length ?? 0) > 0
           if (realChangedPaths.length > 0) {
             const manifest = manifests.get(state.workspaceRoot)
             prescribed = resolveVerifier(
@@ -828,9 +838,27 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
           // distinct successful verifications to clear them all, matching
           // the dataset's implicit "each criterion needs its own evidence"
           // model far more closely than all-or-nothing ever did.
-          const firstUnevidenced = pinStore.get(sid).find((c) => !c.evidence)
-          if (firstUnevidenced) pinStore.attachEvidence(sid, firstUnevidenced.id, { receiptId: receipt.id })
-          pinStore.persist(sid)
+          //
+          // ...and only when the run was measured against a PRESCRIPTION. With
+          // no plan and no changed paths, `prescribed` is null, so every
+          // verifier-shaped command mints -- `npx eslint .`, `tsc --noEmit`,
+          // `make check` all did. Auto-attaching those closed the criteria gate
+          // on evidence of nothing: an audit pinned "auth service tests pass"
+          // and "migration applies cleanly", ran eslint, and the session was
+          // allowed to close. The receipt itself is a true statement (that
+          // command really did pass) and is still minted and citable; what it
+          // must not do is silently answer a criterion nobody checked it
+          // against.
+          // Only a TEST RUN may answer a criterion nobody explicitly measured
+          // it against. `hadWorkToMeasure` alone was not enough: the audit's
+          // case edited `src/app.rb`, which the resolver cannot classify, so
+          // `prescribed` was null AND files had changed -- and `npx eslint .`
+          // still closed criteria reading "auth service tests pass".
+          if (hadWorkToMeasure && isTestRunnerCommand(command)) {
+            const firstUnevidenced = pinStore.get(sid).find((c) => !c.evidence)
+            if (firstUnevidenced) pinStore.attachEvidence(sid, firstUnevidenced.id, { receiptId: receipt.id })
+            pinStore.persist(sid)
+          }
         } else if (rawSuccess && exitCode === 0 && verification.outcome === "verified" && relevanceGap) {
           // FR-061: the command DID verify and exited 0, but its evidence was
           // refused. Silent evidence loss is the failure this whole feature

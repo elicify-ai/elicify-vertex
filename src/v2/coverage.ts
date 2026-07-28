@@ -317,6 +317,53 @@ const IGNORED_PREFIX_FLAGS: readonly string[] = ["--reporter=", "--reporters="]
  * broad its target. Likewise the JS class and the Python class are separate
  * arrays, which is what makes cross-ecosystem coverage impossible.
  */
+/**
+ * Runner words that mean "this command RUNS TESTS", as opposed to linting,
+ * type-checking, building or fetching.
+ *
+ * Needed because `parseVerification` (v1, frozen) treats a wide set of commands
+ * as "verification", so with no prescription to compare against, `npx eslint .`,
+ * `tsc --noEmit` and `make check` all minted receipts — and auto-attaching
+ * those closed the criteria gate on evidence of nothing: an audit pinned "auth
+ * service tests pass" and "migration applies cleanly", ran eslint, and the
+ * session was allowed to close.
+ *
+ * A lint pass is a true statement about linting. It is not evidence that tests
+ * pass, and only a test runner should be allowed to answer a criterion nobody
+ * explicitly measured it against.
+ */
+const TEST_RUNNER_WORDS: ReadonlySet<string> = new Set([
+  "test",
+  "tests",
+  "vitest",
+  "jest",
+  "mocha",
+  "ava",
+  "tap",
+  "pytest",
+  "unittest",
+  "nose2",
+  "tox",
+  "rspec",
+  "minitest",
+  "phpunit",
+  "pest",
+  "ctest",
+  "gotestsum",
+  "cucumber",
+  "playwright",
+  "cypress",
+])
+
+/**
+ * Does this command run tests? Judged on the runner only — flags and targets
+ * are irrelevant to the question.
+ */
+export function isTestRunnerCommand(command: string): boolean {
+  const parts = parseSubcommands(command)
+  return parts.some((part) => part.runner.split(/\s+/).some((word) => TEST_RUNNER_WORDS.has(word)))
+}
+
 export const WHOLE_SUITE_ALIASES: readonly (readonly string[])[] = [
   // JavaScript / TypeScript whole-suite invocations. Per the spec:
   // `npm test` == `npx vitest run` == `npx jest` within a JS project.
