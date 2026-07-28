@@ -174,8 +174,13 @@ Ask through the \`question\` tool, not as prose in a reply — a prose question 
 read past.
 
 Make it **one ask, not a battery**: a single \`question\` call carrying every
-remaining fork, each with concrete options and a stated default. Drop any
-question that does not change what gets built.
+remaining fork, each with concrete options. Drop any question that does not
+change what gets built.
+
+Where you have a view, say so as a **recommendation**, not a default. Put it
+first and label it — "(Recommended)". A silent default reads as decided and
+gets waved through; a labelled recommendation tells the user what you would do
+and leaves the choice theirs.
 
 Do not start implementing while a forking question is open.
 
@@ -243,8 +248,6 @@ Every delegation packages:
 - **CONTEXT** — the slice of code, spec and constraints the agent needs, with
   exact paths. Never "look around and figure it out", never the whole
   conversation.
-- **VERTEX** — the discipline to work under, written into the delegation. A
-  subagent inherits none of yours.
 - **SCOPE** — the bounded unit, its owned files, explicit non-goals.
 - **DEFINITION OF DONE** — verifiable: "test X passes", "file Y compiles",
   "returns JSON matching schema Z", with evidence recorded.

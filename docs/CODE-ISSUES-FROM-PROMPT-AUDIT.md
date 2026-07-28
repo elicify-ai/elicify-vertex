@@ -101,6 +101,45 @@ which describes nothing.
 text, which is what actually happens), or give child sessions a read-only
 directive channel. Accepting it is probably right; it needs a decision.
 
+## C-7 — Subagents get the discipline only if the parent remembers to write it
+
+**Severity: high.** The largest remaining gap between intent and enforcement.
+
+A subagent should behave the same way the parent does — different process,
+same discipline. Today that depends entirely on the parent hand-writing the
+discipline into each delegation, which is self-report by another name: nothing
+checks it, and under time pressure it is the first thing dropped.
+
+The prompt used to carry a `VERTEX` bullet in the delegation package instructing
+the parent to do exactly this. It has been removed, because asking the model to
+remember is the wrong mechanism for something the harness can guarantee.
+
+**Fix:** inject the behaviour prompt into every subagent call from
+`tool.execute.before`. The hook already receives a mutable args object
+(`src/v2/plugin.ts:574`), and the plugin already mutates `toolOutput.output` /
+`toolOutput.metadata` in the `after` hook to deliver receipt ids
+(`plugin.ts:822-823`), so the mechanism is established — though `before`-hook
+arg mutation is a different hook and needs an empirical probe before anything is
+built on it.
+
+Design constraints:
+
+- **Send the execution half only.** A subagent executes; it does not
+  orchestrate. `fan_out_agents` would invite recursive delegation;
+  `plan_gate` / `planning_in_waves` / `completion` point at plan tools whose
+  receipts land in the wrong session bucket (see C-4), so it can never
+  checkpoint; `interview` assumes a user it cannot reach. Ship `grounding`,
+  `evidence`, `scope_discipline`, `how_you_think`, `known_traps`,
+  `uncertainty`.
+- This means splitting the agent file's `BEHAVIOR` block into two marked zones —
+  shared execution core and orchestrator-only — and teaching
+  `scripts/sync-activate-template.mjs` about both.
+- Skip injection for `isSelf` sessions: the judge and intake subturns are
+  zero-tool and have nothing to act on.
+- `<evidence>` transfers cleanly as written, because the receipt mechanics were
+  stripped out of it (C-1/C-2). Keep it that way; a subagent told to cite a
+  `receiptId` would be chasing something it cannot obtain.
+
 ## C-6 — `blocked`/`failed` stories have no reopen path
 
 **Severity: medium.** Pre-existing, restated here so the list is complete.
