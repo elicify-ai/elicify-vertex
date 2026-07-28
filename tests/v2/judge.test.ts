@@ -29,7 +29,7 @@ vi.mock("../../src/v2/subturn.js", async (importOriginal) => {
   }
 })
 
-import { buildJudgePayload, JUDGE_TOTAL_BUDGET_MS, runJudge } from "../../src/v2/judge.js"
+import { buildJudgePayload, JUDGE_TOTAL_BUDGET_MS, runJudge, parseJudgeResponse } from "../../src/v2/judge.js"
 import { probeCapabilityBounded, runSubturn, SelfCreatedSessions } from "../../src/v2/subturn.js"
 import type { OpencodeClient } from "../../src/v2/types.js"
 
@@ -600,5 +600,47 @@ describe("runJudge", () => {
         },
       ),
     ).resolves.toEqual({ verdict: null, reason: "unavailable" })
+  })
+})
+
+// ===========================================================================
+// Judge reply parsing — found by UAT G12.
+//
+// A real judge run was discarded with `judge:malformed {reason:"response is
+// not valid JSON"}`: the plan had completed, the subturn had run, and the
+// verdict was thrown away because the model fenced its JSON. A zero-tool agent
+// is told to return JSON and usually does, but "usually" is not a contract,
+// and each miss costs a full judge budget (up to 90s and a model call).
+// ===========================================================================
+
+describe("parseJudgeResponse", () => {
+  const verdict = { fit: "pass", notes: "tests cover the change" }
+
+  it("accepts bare JSON", () => {
+    expect(parseJudgeResponse(JSON.stringify(verdict))).toEqual(verdict)
+  })
+
+  it("accepts fenced JSON, with and without a language tag", () => {
+    expect(parseJudgeResponse("```json\n" + JSON.stringify(verdict) + "\n```")).toEqual(verdict)
+    expect(parseJudgeResponse("```\n" + JSON.stringify(verdict) + "\n```")).toEqual(verdict)
+  })
+
+  it("accepts JSON preceded by prose", () => {
+    expect(parseJudgeResponse(`Here is my verdict:\n\n${JSON.stringify(verdict)}`)).toEqual(verdict)
+  })
+
+  it("handles braces inside string values", () => {
+    const tricky = { fit: "concern", notes: "saw a literal } and { in the diff" }
+    expect(parseJudgeResponse(`prose ${JSON.stringify(tricky)} trailing`)).toEqual(tricky)
+  })
+
+  it("still returns undefined for a reply with no JSON at all (discrimination)", () => {
+    // A genuinely non-JSON reply must remain malformed, not be guessed at.
+    expect(parseJudgeResponse("I think this looks fine to me, honestly.")).toBeUndefined()
+    expect(parseJudgeResponse("")).toBeUndefined()
+  })
+
+  it("does not repair malformed JSON", () => {
+    expect(parseJudgeResponse("{fit: pass, notes: unquoted}")).toBeUndefined()
   })
 })

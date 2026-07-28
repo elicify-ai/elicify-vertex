@@ -395,6 +395,72 @@ const JUDGE_SYSTEM_PROMPT = [
   "Do not ask questions, do not request tool access, and do not output anything other than the JSON object.",
 ].join(" ")
 
+/**
+ * Parse the judge's reply, tolerating the wrappers models actually emit.
+ *
+ * `JSON.parse(text)` alone rejected a real judge run in UAT G12 with
+ * `judge:malformed {reason:"response is not valid JSON"}` -- the plan had
+ * completed, the subturn had run, and the whole thing was discarded because the
+ * model fenced its JSON. A zero-tool agent is instructed to return JSON and
+ * usually does, but "usually" is not a contract: markdown fences and a leading
+ * sentence are the two most common deviations, and each costs a full judge
+ * budget (up to 90s and a model call) for nothing.
+ *
+ * Deliberately narrow: strip fences, then take the outermost balanced object.
+ * No repair of malformed JSON, no regex extraction of individual fields --
+ * shape validation still happens in `isJudgeVerdictShape`, and a reply that is
+ * genuinely not a verdict must still be reported as malformed rather than
+ * guessed at.
+ *
+ * Returns `undefined` for "could not parse", which is distinguishable from a
+ * successfully parsed `null`.
+ */
+export function parseJudgeResponse(text: string): unknown {
+  const attempt = (candidate: string): unknown => {
+    try {
+      return JSON.parse(candidate)
+    } catch {
+      return undefined
+    }
+  }
+
+  const direct = attempt(text.trim())
+  if (direct !== undefined) return direct
+
+  // ```json … ``` or ``` … ```
+  const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(text)
+  if (fenced) {
+    const inner = attempt(fenced[1].trim())
+    if (inner !== undefined) return inner
+  }
+
+  // Outermost balanced object, ignoring braces inside strings.
+  const start = text.indexOf("{")
+  if (start === -1) return undefined
+  let depth = 0
+  let inString = false
+  let escaped = false
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i]
+    if (escaped) {
+      escaped = false
+      continue
+    }
+    if (ch === "\\") {
+      escaped = true
+      continue
+    }
+    if (ch === '"') inString = !inString
+    if (inString) continue
+    if (ch === "{") depth++
+    else if (ch === "}") {
+      depth--
+      if (depth === 0) return attempt(text.slice(start, i + 1))
+    }
+  }
+  return undefined
+}
+
 function isJudgeVerdictShape(value: unknown): value is JudgeVerdict {
   if (typeof value !== "object" || value === null) return false
   const v = value as Record<string, unknown>
@@ -488,10 +554,8 @@ export async function runJudge(
     return { verdict: null, reason: "unavailable" }
   }
 
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(last.text)
-  } catch {
+  const parsed = parseJudgeResponse(last.text)
+  if (parsed === undefined) {
     logger("judge:malformed", { reason: "response is not valid JSON" })
     return { verdict: null, reason: "malformed" }
   }
