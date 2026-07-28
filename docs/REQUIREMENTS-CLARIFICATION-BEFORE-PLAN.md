@@ -62,15 +62,27 @@ Two layers, mirroring how receipts and waivers work:
    substantive request, the tool returns a **constructive refusal** naming what
    is unclear-by-default: unstated acceptance criteria, unstated scope
    boundaries, and any story whose `acceptanceItems` are vague.
-2. **Recorded attestation.** `plan_create` gains optional-but-recorded fields:
-   - `clarifiedWith: string[]` — the questions actually put to the user
-   - `openUnknowns: string[]` — what remains unresolved and how the plan handles it
-   These persist into `plan.json` so the plan carries its own provenance, and
-   the judge can read them at close-out.
+2. ~~**Recorded attestation.**~~ **DROPPED after review.**
 
-Layer 2 alone is self-report and worth little on its own; layer 1 is what makes
-it true. Layer 2 is still valuable because articulating open unknowns changes
-the plan that gets written.
+   The first draft added `clarifiedWith: string[]` and `openUnknowns: string[]`
+   to `plan_create`. Both are removed:
+
+   - `clarifiedWith` duplicates data that already exists in a TRUSTWORTHY place.
+     The real questions and the user's real answers are recorded in
+     `opencode.db` as tool parts, written by the host. Copying them into
+     `plan.json` produces an unverifiable duplicate of verifiable data — written
+     by the model. That is exactly the pattern receipts and waivers were signed
+     to eliminate, and it is worse than useless: a plan showing a populated
+     `clarifiedWith` LOOKS clarified to a reviewer whether or not it is.
+   - `openUnknowns` has some value as a forcing function — writing down what you
+     could not resolve changes the plan you write — but that is a behavioural
+     nudge, and nudges belong in the agent prompt, not in a schema field the
+     harness cannot verify.
+
+   If the judge needs the clarification content at close-out, it should read the
+   session's actual `question` tool parts, not the model's summary of them.
+
+   Layer 1 carries the whole requirement.
 
 ## Acceptance criteria
 
@@ -82,8 +94,9 @@ the plan that gets written.
 - **AC-3** After a real `question` call, the same `plan_create` succeeds.
 - **AC-4** A trivial plan (single story with concrete acceptance items) is NOT
   blocked — the gate must not tax one-shot work.
-- **AC-5** `clarifiedWith` / `openUnknowns` are persisted in `plan.json` and
-  included in the judge's close-out payload.
+- **AC-5** No self-reported clarification field is added to `plan.json`. If the
+  judge needs clarification context, it reads the session's real `question` tool
+  parts.
 - **AC-6** Mutation-verified: removing the observed-clarification check turns a
   named test red, and the AC-4 discrimination test proves trivial plans pass.
 
