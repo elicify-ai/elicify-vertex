@@ -494,7 +494,7 @@ export function buildPlanTools(deps: PlanToolsDeps) {
   const clearTool = tool({
     description:
       "Abandon the current elicify-vertex v2 plan and pinned criteria for this session. Reversible (the plan " +
-      "is archived under .elicify-vertex/archive/, never deleted) but not something to reach for to dodge an " +
+      "is archived under .opencode/elicify-vertex/archive/, never deleted) but not something to reach for to dodge an " +
       "inconvenient checkpoint — only call this on an explicit user request to reset or abandon the plan.",
     args: {},
     async execute(_args, context) {
