@@ -588,6 +588,16 @@ describe("test 28: scope_directive_no_block", () => {
     // unrelated blocking path) does not confound "no block for scope alone".
     await toolAfter(hooks, sid, "bash", { command: "npx vitest run" }, "3 passed", { exit: 0 })
 
+    // Same reason, second confound: the stage-1 plan-completion gate
+    // (docs/REQUIREMENTS-IDLE-COMPLETION-GATE.md, tested in
+    // tests/v2/gate.test.ts) blocks at idle whenever a plan still has an open
+    // story, and this fixture's single story is deliberately never
+    // checkpointed. Clearing the plan AFTER the scope directive has already
+    // been rendered and asserted above leaves this test measuring exactly its
+    // own subject — that scope drift alone produces zero blocks — instead of
+    // passing vacuously because an earlier gate short-circuited the tree.
+    await hooks.tool!.elicify_vertex_plan_clear.execute({}, toolContext(sid))
+
     await idle(hooks, sid)
     expect(idleContinuationTexts(client, sid).length).toBe(0)
   })

@@ -1,10 +1,12 @@
-import { mkdtempSync, rmSync } from "node:fs"
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import { EvidenceLedger } from "../../src/index.js"
+import { holdoutArm } from "../../src/measurement.js"
+import type { PlanV2 } from "../../src/v2/story.js"
 import { InjectionComposer, type Finding } from "../../src/v2/composer.js"
 import { PhaseEngine } from "../../src/v2/phase.js"
 import { PinStore } from "../../src/v2/pin.js"
@@ -28,7 +30,7 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
 })
 
-function harness(opts: { maxCriteriaBlocks?: number } = {}) {
+function harness(opts: { maxCriteriaBlocks?: number; judgeEnabled?: boolean } = {}) {
   const stateDir = temporaryRoot()
   const logger = vi.fn()
   const composer = new InjectionComposer({ logger })
@@ -41,6 +43,11 @@ function harness(opts: { maxCriteriaBlocks?: number } = {}) {
   const prompt = vi.fn(async () => ({ data: {}, error: undefined }))
   const client = { session: { prompt } } as unknown as OpencodeClient
   const states = new Map<string, ReturnType<typeof freshSessionState>>()
+  // `appendJudgeCloseOut` is the ONLY caller of `recentVerifierSummaries` in
+  // gate.ts, and it reads it only after the `judgeEnabled`/`modelId` guards —
+  // so "was this mock called?" is an exact, side-effect-free probe of
+  // "did the judge stage run?" with no agent/network stubbing.
+  const recentVerifierSummaries = vi.fn(() => [] as string[])
 
   const ctx: GateContext = {
     client,
@@ -54,13 +61,25 @@ function harness(opts: { maxCriteriaBlocks?: number } = {}) {
     states,
     activeSessionIDs: () => [...states.entries()].filter(([, s]) => s.active).map(([id]) => id),
     maxCriteriaBlocks: opts.maxCriteriaBlocks ?? 3,
-    judgeEnabled: false,
+    judgeEnabled: opts.judgeEnabled ?? false,
     isValidReceipt: () => false,
-    recentVerifierSummaries: () => [],
+    recentVerifierSummaries,
     diffSummary: () => "",
     composer,
   }
-  return { ctx, composer, evidenceLedger, logger, prompt, selfCreated, states, stateDir }
+  return {
+    ctx,
+    composer,
+    evidenceLedger,
+    logger,
+    phaseEngine,
+    prompt,
+    recentVerifierSummaries,
+    selfCreated,
+    states,
+    stateDir,
+    storyEngine,
+  }
 }
 
 function promiseTexts(prompt: ReturnType<typeof vi.fn>): string[] {
@@ -80,6 +99,282 @@ function continuations(prompt: ReturnType<typeof vi.fn>): Array<{ sid: string; t
 function loggedEventTypes(logger: ReturnType<typeof vi.fn>): string[] {
   return logger.mock.calls.map((call) => String(call[0]))
 }
+
+// ===========================================================================
+// Stage-1 deterministic completion gate — plan stories not complete.
+// (docs/REQUIREMENTS-IDLE-COMPLETION-GATE.md, AC-1..AC-6)
+//
+// Every fixture below is built so the story-completion check is the ONLY
+// thing that can produce the asserted outcome: `evidenceLedger.reset(deep)`
+// with NO changed files makes `shouldBlockStop` false, no pins means the
+// criteria-replay branch is never entered, and `lastAssistantText` is left
+// null so promise-no-act cannot fire. Tests that deliberately arm a second
+// cause say so and assert which continuation won.
+// ===========================================================================
+
+/** A session that is active and gate-eligible but has no OTHER block cause. */
+function quietSession(h: ReturnType<typeof harness>, sid: string): ReturnType<typeof freshSessionState> {
+  const state = freshSessionState(h.stateDir)
+  state.active = true
+  state.lastAssistantText = null
+  h.states.set(sid, state)
+  h.evidenceLedger.reset(sid, "deep") // deep, but zero changed files -> shouldBlockStop() === false
+  return state
+}
+
+/** The evidence session's plan shape: a scaffold story, then untouched successors. */
+function createSixStoryStylePlan(h: ReturnType<typeof harness>, sid: string): void {
+  h.storyEngine.createPlan(sid, [
+    {
+      text: "Scaffold the app",
+      acceptanceItems: ["dev server boots", "unit tests pass"],
+      scopeGlobs: [],
+      verifiers: ["npx vitest run tests/scaffold.test.ts"],
+    },
+    { text: "Sources management page", acceptanceItems: ["source list renders"], scopeGlobs: [], verifiers: [] },
+    { text: "End-to-end UAT via Playwright", acceptanceItems: ["uat suite green"], scopeGlobs: [], verifiers: [] },
+  ])
+}
+
+/** Drive the phase machine to `elevate` for `storyId` so `onIdle` can close (T7). */
+function driveToElevate(h: ReturnType<typeof harness>, sid: string, storyId: string | null): void {
+  h.phaseEngine.onMutation(sid, storyId)
+  h.phaseEngine.onVerifierOutcome(sid, storyId, { success: true, coversFinalStory: true })
+}
+
+const planTexts = (prompt: ReturnType<typeof vi.fn>): string[] =>
+  continuations(prompt)
+    .map((c) => c.text)
+    .filter((text) => text.includes("vertex:plan-incomplete"))
+
+describe("handleSessionIdle — stage-1 plan-completion gate", () => {
+  it("AC-1/AC-2: dispatches one continuation naming every open story with its status, the active story's declared verifier, and ONLY the acceptance items that lack evidence", async () => {
+    const h = harness()
+    const sid = "s1"
+    quietSession(h, sid)
+    createSixStoryStylePlan(h, sid)
+    // A1 is evidenced, A2 is not — so "names what still lacks evidence"
+    // cannot be satisfied by simply reciting every acceptance item.
+    h.storyEngine.attachEvidence(sid, "S1", "A1", { receiptId: "receipt-scaffold" })
+
+    await handleSessionIdle(h.ctx, sid)
+
+    const fired = continuations(h.prompt)
+    expect(fired).toHaveLength(1)
+    const text = fired[0].text
+    expect(fired[0].sid).toBe(sid)
+    expect(text).toContain("[vertex:plan-incomplete]")
+    // AC-2: which stories are incomplete, and their status.
+    expect(text).toContain('S1 (active): "Scaffold the app"')
+    expect(text).toContain('S2 (pending): "Sources management page"')
+    expect(text).toContain('S3 (pending): "End-to-end UAT via Playwright"')
+    // AC-2: what evidence would close the active story — its declared verifier...
+    expect(text).toContain("npx vitest run tests/scaffold.test.ts")
+    // ...and which acceptance items lack evidence (A2 only, never A1).
+    expect(text).toContain('A2: "unit tests pass"')
+    expect(text).not.toContain("A1")
+    expect(text).not.toContain("dev server boots")
+    expect(loggedEventTypes(h.logger)).toContain("gate:plan-incomplete")
+  })
+
+  it("AC-2: an active story with no declared verifiers says so instead of inventing a command", async () => {
+    const h = harness()
+    const sid = "s1"
+    quietSession(h, sid)
+    h.storyEngine.createPlan(sid, [
+      { text: "Unverified story", acceptanceItems: ["something works"], scopeGlobs: [], verifiers: [] },
+      { text: "Later story", acceptanceItems: ["later thing"], scopeGlobs: [], verifiers: [] },
+    ])
+
+    await handleSessionIdle(h.ctx, sid)
+
+    const texts = planTexts(h.prompt)
+    expect(texts).toHaveLength(1)
+    expect(texts[0]).toContain("S1 declares no verifiers")
+    expect(texts[0]).toContain("amend S1 to declare the verifier you intend to use")
+  })
+
+  it("AC-6 discrimination: a fully complete plan is NOT blocked, and the judge stage still runs exactly as before (AC-4)", async () => {
+    const h = harness({ judgeEnabled: true })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    h.storyEngine.createPlan(sid, [
+      { text: "First story", acceptanceItems: ["first done"], scopeGlobs: [], verifiers: ["npm test"] },
+      { text: "Final story", acceptanceItems: ["final done"], scopeGlobs: [], verifiers: ["npm test"] },
+    ])
+    h.storyEngine.attachEvidence(sid, "S1", "A1", { receiptId: "r-1" })
+    h.storyEngine.checkpoint(sid, "S1", "complete", { isValidReceipt: () => true })
+    h.storyEngine.attachEvidence(sid, "S2", "A1", { receiptId: "r-2" })
+    h.storyEngine.checkpoint(sid, "S2", "complete", { isValidReceipt: () => true })
+    expect(h.storyEngine.getPlan(sid)!.stories.every((s) => s.status === "complete")).toBe(true)
+
+    // getActiveStory() is null once the final story completes, so the gate
+    // resolves the phase slot to finalStoryId — drive THAT slot to elevate.
+    driveToElevate(h, sid, "S2")
+
+    await handleSessionIdle(h.ctx, sid)
+
+    expect(continuations(h.prompt)).toHaveLength(0)
+    expect(h.recentVerifierSummaries).toHaveBeenCalledTimes(1) // judge stage entered
+    expect(state.criteriaBlocks).toBe(0) // no block budget consumed
+    expect(loggedEventTypes(h.logger)).not.toContain("gate:plan-incomplete")
+  })
+
+  it("AC-3: the judge does NOT run while an earlier story is still open, even though the plan's final story is complete", async () => {
+    const h = harness({ judgeEnabled: true })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    // Written straight to disk: `checkpoint` promotes stories in order, so
+    // this state (final complete, S1 still pending) is unreachable through
+    // the tool surface — which is exactly why it isolates the judge gate.
+    // Before this requirement, `appendJudgeCloseOut` looked ONLY at the
+    // final story, so this plan would have been judged as done.
+    const plan: PlanV2 = {
+      schemaVersion: 2,
+      finalStoryId: "S2",
+      createdAt: new Date().toISOString(),
+      stories: [
+        {
+          id: "S1",
+          text: "Sources management page",
+          acceptanceItems: [{ id: "A1", text: "source list renders", evidence: null }],
+          scopeGlobs: [],
+          verifiers: [],
+          assumptions: [],
+          rejectedAlternatives: [],
+          amendments: [],
+          status: "pending",
+        },
+        {
+          id: "S2",
+          text: "End-to-end UAT via Playwright",
+          acceptanceItems: [{ id: "A1", text: "uat suite green", evidence: { receiptId: "r-2" } }],
+          scopeGlobs: [],
+          verifiers: [],
+          assumptions: [],
+          rejectedAlternatives: [],
+          amendments: [],
+          status: "complete",
+        },
+      ],
+    }
+    writeFileSync(join(h.stateDir, "plan.json"), JSON.stringify({ [sid]: plan }, null, 2), "utf8")
+    driveToElevate(h, sid, "S2") // phase would otherwise close and call the judge
+
+    await handleSessionIdle(h.ctx, sid)
+
+    expect(h.recentVerifierSummaries).not.toHaveBeenCalled()
+    const texts = planTexts(h.prompt)
+    expect(texts).toHaveLength(1)
+    expect(texts[0]).toContain('S1 (pending): "Sources management page"')
+    // Only S1 is open, so the completed final story is not recited as open.
+    expect(texts[0]).not.toContain("S2 (")
+  })
+
+  it("AC-5: stops nudging after maxCriteriaBlocks and lets the rest of the idle tree run (warn-then-allow, v1 parity)", async () => {
+    const h = harness({ maxCriteriaBlocks: 1 })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    createSixStoryStylePlan(h, sid)
+    // Arm the zero-criteria fallback too, so "the rest of the tree still
+    // runs once the plan branch is capped" is observable rather than assumed.
+    h.evidenceLedger.recordChangedFiles(sid, "src/app.tsx")
+
+    await handleSessionIdle(h.ctx, sid) // block 1 of 1 -> plan-incomplete
+    await handleSessionIdle(h.ctx, sid) // past cap -> falls through to the stop-block
+
+    const texts = continuations(h.prompt).map((c) => c.text)
+    expect(texts).toHaveLength(2)
+    expect(texts[0]).toContain("vertex:plan-incomplete")
+    expect(texts[1]).toContain("vertex:stop-block")
+    expect(texts[1]).not.toContain("vertex:plan-incomplete")
+    expect(state.criteriaBlocks).toBe(1)
+    expect(loggedEventTypes(h.logger)).toContain("gate:plan-incomplete-capped")
+  })
+
+  it("an incomplete plan short-circuits the rest of the tree: one idle event produces exactly one continuation, and it is the plan one", async () => {
+    const h = harness()
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    createSixStoryStylePlan(h, sid)
+    // Arm BOTH other deterministic causes at once.
+    state.lastAssistantText = "I changed it.\nTODO: handle the edge case next."
+    h.evidenceLedger.recordChangedFiles(sid, "src/app.tsx")
+
+    await handleSessionIdle(h.ctx, sid)
+
+    const texts = continuations(h.prompt).map((c) => c.text)
+    expect(texts).toHaveLength(1)
+    expect(texts[0]).toContain("vertex:plan-incomplete")
+    expect(promiseTexts(h.prompt)).toHaveLength(0)
+    expect(texts[0]).not.toContain("vertex:stop-block")
+  })
+
+  it("a session with no plan at all is untouched by the new branch", async () => {
+    const h = harness()
+    const sid = "s1"
+    quietSession(h, sid)
+
+    await handleSessionIdle(h.ctx, sid)
+
+    expect(continuations(h.prompt)).toHaveLength(0)
+    expect(loggedEventTypes(h.logger)).not.toContain("gate:plan-incomplete")
+  })
+
+  it("a story checkpointed blocked still counts as open and is named with that status", async () => {
+    const h = harness()
+    const sid = "s1"
+    quietSession(h, sid)
+    h.storyEngine.createPlan(sid, [
+      { text: "Blocked story", acceptanceItems: ["cannot be done"], scopeGlobs: [], verifiers: [] },
+      { text: "Trailing story", acceptanceItems: ["never started"], scopeGlobs: [], verifiers: [] },
+    ])
+    h.storyEngine.checkpoint(sid, "S1", "blocked", { isValidReceipt: () => true })
+    expect(h.storyEngine.getActiveStory(sid)).toBeNull()
+
+    await handleSessionIdle(h.ctx, sid)
+
+    const texts = planTexts(h.prompt)
+    expect(texts).toHaveLength(1)
+    expect(texts[0]).toContain('S1 (blocked): "Blocked story"')
+    expect(texts[0]).toContain("No story is active")
+  })
+
+  it("AC-5: an off-arm holdout session is not blocked by the plan branch, and the rest of the tree still runs", async () => {
+    const savedHoldout = process.env.VERTEX_HOLDOUT
+    const savedData = process.env.VERTEX_DATA
+    process.env.VERTEX_HOLDOUT = "1"
+    process.env.VERTEX_DATA = temporaryRoot()
+    try {
+      let sid: string | null = null
+      for (let i = 0; i < 500 && sid === null; i += 1) {
+        const candidate = `holdout-session-${i}`
+        if (holdoutArm(candidate, "plan-incomplete") === "off") sid = candidate
+      }
+      expect(sid).not.toBeNull()
+
+      const h = harness()
+      const state = quietSession(h, sid!)
+      createSixStoryStylePlan(h, sid!)
+      h.evidenceLedger.recordChangedFiles(sid!, "src/app.tsx")
+
+      await handleSessionIdle(h.ctx, sid!)
+
+      const texts = continuations(h.prompt).map((c) => c.text)
+      expect(texts.filter((t) => t.includes("vertex:plan-incomplete"))).toHaveLength(0)
+      expect(texts).toHaveLength(1)
+      expect(texts[0]).toContain("vertex:stop-block") // suppression is scoped, not a global mute
+      expect(state.criteriaBlocks).toBe(0)
+    } finally {
+      if (savedHoldout === undefined) delete process.env.VERTEX_HOLDOUT
+      else process.env.VERTEX_HOLDOUT = savedHoldout
+      if (savedData === undefined) delete process.env.VERTEX_DATA
+      else process.env.VERTEX_DATA = savedData
+    }
+  })
+})
 
 // ===========================================================================
 // Promise-no-act port (v1 parity — see gate.ts's handlePromiseNoAct doc)

@@ -28,8 +28,9 @@ import { resolveVerifier } from "../resolve.js"
 import { runJudge, buildJudgePayload, type JudgeVerdict } from "../judge.js"
 import type { SelfCreatedSessions } from "../subturn.js"
 import type { ManifestCache } from "./manifest.js"
+import { incompletePlanFinding } from "./findings.js"
 import { bindSession } from "./logger.js"
-import type { V2SessionState } from "./state.js"
+import { nextInstanceId, type V2SessionState } from "./state.js"
 
 export interface GateContext {
   client: OpencodeClient
@@ -165,6 +166,117 @@ function narrowestPrescription(ctx: GateContext, state: V2SessionState, sid: str
     return "a relevant test, lint, typecheck, build, check, validate, verify, or HTTP probe command covering the changed paths"
   }
   return resolution.command
+}
+
+/**
+ * STAGE 1 of the two-stage idle completion gate
+ * (`docs/REQUIREMENTS-IDLE-COMPLETION-GATE.md`).
+ *
+ * Before this existed, `getPlan()` was read in this file ONLY inside
+ * `appendJudgeCloseOut`, to decide whether the judge was *permitted* to
+ * run — never to *demand* completion. So a plan whose stories were all
+ * still `pending` closed silently whenever the other three checks happened
+ * to pass (no pinned criteria, no unverified changed files), which is
+ * exactly what a real 517-message session did with 5 of 6 stories
+ * untouched.
+ *
+ * Design decisions, each one an open question the requirement left to the
+ * implementer:
+ *
+ *  - **Ordering.** Checked FIRST, ahead of promise-no-act. The requirement's
+ *    headline is that deterministic validation runs first and story
+ *    completion is "chief among" those checks, and an open story roster
+ *    strictly dominates a promise-no-act hit as a continuation: it names
+ *    the same "you are not done" fact plus which stories, their status, and
+ *    the evidence that would close the active one. Firing short-circuits
+ *    the rest of the FR-015 tree exactly as promise-no-act does, so one
+ *    idle event still produces at most one continuation.
+ *
+ *  - **Cap (open question 1): warn-then-allow, v1 parity.** Blocking
+ *    indefinitely was rejected — every other gate in v1 and v2 warns
+ *    `maxCriteriaBlocks` times and then goes quiet, and a gate that can
+ *    never be satisfied is a gate the operator has to disable. The counter
+ *    reused is `state.criteriaBlocks`, deliberately SHARED with the
+ *    criteria-replay branch rather than adding a second knob: both are
+ *    "the deterministic completion contract is unmet" blocks, v1 itself
+ *    runs one shared `maxStopBlocks` budget across its gate families, and
+ *    `resetTurnState` already zeroes this counter on every real user
+ *    message (and correctly does NOT zero it for the reentrant
+ *    `chat.message` our own continuation causes — see plugin.ts's
+ *    `idleContinuationInFlight` branch), which is precisely the per-turn
+ *    budget AC-5 asks for. Consequence, accepted knowingly: within one turn
+ *    the two branches draw on one budget, so a plan that spends it can
+ *    leave the criteria branch quiet for the rest of that turn.
+ *
+ *  - **Past the cap we stop NUDGING, but the judge still cannot run.** The
+ *    early return below is skipped once capped, so the rest of the tree
+ *    (zero-criteria fallback, phase close) runs normally — but
+ *    `appendJudgeCloseOut` independently requires the plan's final story to
+ *    be `complete`, and `StoryEngine.checkpoint` only promotes stories in
+ *    order, so "final complete" implies every earlier story completed.
+ *    AC-3 therefore holds structurally, not by this function's grace.
+ *
+ *  - **Scope (open question 2): no abandonment is inferred.** Nothing here
+ *    tries to detect that the user "moved on". That reuses the scope
+ *    watchdog's existing opinion: `StoryEngine.checkScope` surfaces a
+ *    mutation outside the story's globs and offers fold/amend/revert — it
+ *    never treats the drift as consent to drop the story — and
+ *    `clearPlan`'s own doc comment makes abandonment a human-initiated
+ *    escape hatch that the findings system must never proactively offer.
+ *    Guessing "unrelated request" from message text would be exactly the
+ *    inference those two refuse to make. The in-contract outs are named in
+ *    the directive text instead (checkpoint `blocked`/`failed` with a
+ *    reason), and the cap bounds the cost of being wrong.
+ *
+ * Returns `true` iff it dispatched a continuation (caller must skip the
+ * rest of the FR-015 tree for this idle event).
+ */
+async function handleIncompletePlan(ctx: GateContext, sid: string, state: V2SessionState): Promise<boolean> {
+  const plan = ctx.storyEngine.getPlan(sid)
+  if (!plan) return false
+
+  // The requirement's literal bar: "any story is not `complete`". Terminal-
+  // but-not-complete statuses (`blocked`/`failed`) count as open too — they
+  // are named with their status in the directive rather than silently
+  // treated as settled, since `checkpoint` requires no evidence for them and
+  // would otherwise be a one-call escape from the whole gate.
+  const incomplete = plan.stories.filter((story) => story.status !== "complete")
+  if (incomplete.length === 0) return false
+
+  const openStoryIds = incomplete.map((story) => story.id).join(",")
+
+  if (holdoutSuppresses(sid, "plan-incomplete")) {
+    logHoldoutSuppress(sid, "v2 plan-incomplete stop-block skipped (holdout arm=off)", { family: "plan-incomplete" })
+    return false
+  }
+
+  if (state.criteriaBlocks >= ctx.maxCriteriaBlocks) {
+    ctx.logger("gate:plan-incomplete-capped", { sessionID: sid, openStoryIds, openCount: incomplete.length })
+    return false // past cap — allow through, warn only (v1 parity)
+  }
+  state.criteriaBlocks += 1
+
+  const finding = incompletePlanFinding({
+    instanceId: nextInstanceId(state),
+    totalStories: plan.stories.length,
+    incomplete,
+    activeStory: ctx.storyEngine.getActiveStory(sid),
+  })
+  ctx.logger("gate:plan-incomplete", {
+    sessionID: sid,
+    openStoryIds,
+    openCount: incomplete.length,
+    totalStories: plan.stories.length,
+    instanceId: finding.instanceId,
+  })
+
+  const reason = [
+    `[vertex:plan-incomplete] ${finding.observation}`,
+    `Diagnosis: ${finding.diagnosis}`,
+    `Do now: ${finding.prescription}`,
+  ].join("\n")
+  await promptContinuation(ctx, sid, formatGateContinuationText(reason))
+  return true
 }
 
 /**
@@ -432,6 +544,11 @@ export async function handleSessionIdle(ctx: GateContext, sid: string): Promise<
     ctx.logger("gate:multi-session-advisory", { sessionID: sid, activeSessionCount: peerSessionIDs.length })
     state.needsCriteriaReinject = true // advisory surface on the next transform
   }
+
+  // STAGE 1 (deterministic completion) — ahead of every other branch,
+  // including promise-no-act. See `handleIncompletePlan` for the ordering,
+  // cap and scope decisions this encodes.
+  if (await handleIncompletePlan(ctx, sid, state)) return
 
   // v1 ordering: promise-no-act is checked BEFORE the criteria/zero-criteria
   // branches and short-circuits the rest of the tree when it fires.

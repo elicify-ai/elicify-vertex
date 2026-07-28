@@ -24,7 +24,7 @@ import { signWaiver } from "../../goals.js"
 import type { VerificationReceiptStore } from "../../goals.js"
 import type { PhaseEngine } from "../phase.js"
 import type { PinStore } from "../pin.js"
-import type { StoryEngine } from "../story.js"
+import type { PlanV2, StoryEngine } from "../story.js"
 import type { OpencodeClient } from "../types.js"
 import type { V2SessionState } from "./state.js"
 
@@ -150,6 +150,165 @@ function isFreshReceipt(
   return true
 }
 
+// ---------------------------------------------------------------------------
+// The reflective planning challenge (docs/REQUIREMENTS-CLARIFICATION-BEFORE-PLAN.md)
+// ---------------------------------------------------------------------------
+/**
+ * `elicify_vertex_plan_create`'s return text puts a reflective challenge in
+ * front of the model while the plan is still fresh and cheap to change
+ * (AC-1..AC-4). It is a CHALLENGE, not a gate. Two other designs were
+ * considered and rejected first, and neither should be re-invented here:
+ *
+ *  - A `clarifiedWith` / `openUnknowns` field on the plan schema — rejected
+ *    because it duplicates, as an unverifiable MODEL-authored copy, data the
+ *    HOST already records trustworthily in `opencode.db` (the real `question`
+ *    tool parts and the user's real answers). A populated field *looks*
+ *    clarified whether or not it is: exactly the pattern that signed receipts
+ *    and signed waivers exist to eliminate. Hence AC-5 — nothing here is
+ *    written to `plan.json`, and this challenge asks the model for nothing
+ *    that gets recorded as evidence.
+ *  - Refusing the plan when the `question` tool has not been called —
+ *    rejected because it measures a proxy. The model may legitimately have
+ *    clarified in conversation without the tool, or (the case that matters)
+ *    may need to clarify and not realise it. Tool usage catches neither.
+ *
+ * So the plan is ALWAYS created (AC-3): nothing below can refuse, and nothing
+ * below can deadlock a headless `opencode run` or CI where no one can answer.
+ *
+ * Delivery: the challenge rides in the tool's return JSON as its FIRST key,
+ * `planningChallenge`, ahead of the plan body — not as loose prose appended
+ * after the JSON, because callers `JSON.parse` this tool's return value
+ * (`scripts/uat-harness.mjs` and three v2 integration test files), and a
+ * trailing prose block would break every one of them.
+ */
+
+/**
+ * AC-2/AC-4's mechanical question: which acceptance items are too vague to
+ * be worth anything as a contract?
+ *
+ * The heuristic is deliberately cheap and deliberately UNDER-eager. A
+ * challenge that fires identically on trivial work becomes wallpaper, so a
+ * false positive costs more here than a false negative. An item counts as
+ * vague only when it carries no verifiable anchor AND is either too short to
+ * state a condition or leans on a subjective quality word:
+ *
+ *  - ANCHOR — a digit, a quoted/backticked fragment, or a path/call/flag
+ *    shaped token (`/`, `.ts`, `foo()`, `--flag`). These are the things a
+ *    verifier command can actually be pointed at, so their presence alone
+ *    exempts the item.
+ *  - SHORT — fewer than `MIN_CONCRETE_WORDS` words: not enough room to say
+ *    what would count as done ("done", "it works", "tests pass").
+ *  - SUBJECTIVE — "works", "properly", "clean", "robust", "intuitive": a
+ *    quality claim with no stated measurement.
+ *
+ * Cannot throw: it is pure string work over values `StoryEngine.createPlan`
+ * already validated as non-blank strings, it type-guards anyway, and every
+ * regex is short and linear (no nested quantifiers, so no backtracking
+ * blowup). `buildPlanningChallenge`'s caller additionally wraps the whole
+ * build in a try/catch, so a bug here can never fail a plan creation.
+ */
+const MIN_CONCRETE_WORDS = 5
+const VERIFIABLE_ANCHOR = /[0-9]|`[^`]+`|"[^"]+"|'[^']+'|\/|\.[A-Za-z]{2,4}\b|\w\(\)|--[A-Za-z]/
+const SUBJECTIVE_QUALITY =
+  /\b(works?|working|properly|correct|correctly|good|nice|clean|robust|solid|polished|mature|modern|intuitive|seamless|user-friendly|better|improved|appropriate|reasonable|sensible|handled|expected|etc)\b/i
+
+function isVagueAcceptanceItem(text: unknown): boolean {
+  if (typeof text !== "string") return true
+  const trimmed = text.trim()
+  if (trimmed === "") return true
+  if (VERIFIABLE_ANCHOR.test(trimmed)) return false
+  return trimmed.split(/\s+/).length < MIN_CONCRETE_WORDS || SUBJECTIVE_QUALITY.test(trimmed)
+}
+
+/** Keep the challenge readable on a 20-story plan: name the worst few. */
+const MAX_STORIES_LISTED = 4
+const MAX_ITEMS_LISTED = 3
+
+function truncate(text: string, max: number): string {
+  return text.length <= max ? text : `${text.slice(0, max - 1).trimEnd()}…`
+}
+
+/**
+ * Returns the challenge as an array of lines (renders one-per-line under
+ * `JSON.stringify(..., 2)`, where a single `\n`-joined string would render as
+ * one unreadable escaped blob).
+ *
+ * Proportionality (AC-4): a single-story plan whose acceptance items are all
+ * concrete gets the two-line short form — no remedy list, no headline — so
+ * one-shot work is not taxed. Everything else gets the full challenge.
+ */
+function buildPlanningChallenge(plan: PlanV2): string[] {
+  const stories = Array.isArray(plan.stories) ? plan.stories : []
+  const flagged = stories
+    .map((story) => ({
+      story,
+      vague: (Array.isArray(story.acceptanceItems) ? story.acceptanceItems : []).filter((item) =>
+        isVagueAcceptanceItem(item?.text),
+      ),
+    }))
+    .filter((entry) => entry.vague.length > 0)
+
+  if (stories.length <= 1 && flagged.length === 0) {
+    return [
+      "Grounding check (short form: one story, acceptance items that state what would prove them).",
+      "Was this grounded in research and in what the user actually said, or guessed? If any decision here " +
+        "forks the design and you assumed the answer, ask the user via the question tool before writing code.",
+    ]
+  }
+
+  const totalItems = stories.reduce(
+    (sum, story) => sum + (Array.isArray(story.acceptanceItems) ? story.acceptanceItems.length : 0),
+    0,
+  )
+  const vagueCount = flagged.reduce((sum, entry) => sum + entry.vague.length, 0)
+
+  const lines: string[] = [
+    "Before you act on this plan — was it grounded, or guessed?",
+    "- Did you ground it in research and user interview?",
+    "- Have you eliminated the unknowns as far as possible?",
+    // AC-2: specific to THIS plan, so it cannot read as boilerplate.
+    `This plan: ${stories.length} ${stories.length === 1 ? "story" : "stories"}, ${totalItems} acceptance ` +
+      `${totalItems === 1 ? "item" : "items"}, ${vagueCount} of which do not say what would prove them.`,
+  ]
+
+  if (flagged.length > 0) {
+    lines.push("Acceptance items with nothing verifiable in them — these are where a guess hides:")
+    for (const entry of flagged.slice(0, MAX_STORIES_LISTED)) {
+      const quoted = entry.vague
+        .slice(0, MAX_ITEMS_LISTED)
+        .map((item) => `"${truncate(String(item?.text ?? ""), 60)}"`)
+        .join(", ")
+      const more = entry.vague.length > MAX_ITEMS_LISTED ? `, +${entry.vague.length - MAX_ITEMS_LISTED} more` : ""
+      lines.push(`  ${entry.story.id} (${truncate(String(entry.story.text ?? ""), 60)}): ${quoted}${more}`)
+    }
+    if (flagged.length > MAX_STORIES_LISTED) {
+      lines.push(`  …and ${flagged.length - MAX_STORIES_LISTED} further stories with vague acceptance items.`)
+    }
+  }
+
+  // AC-2b. Naming the remedy is load-bearing, not politeness: an open question
+  // with no stated escape route defaults to "yes, I grounded it" — the cheapest
+  // answer, which changes nothing. Naming the exact tool calls makes the
+  // expensive answer available and legitimate.
+  lines.push(
+    "If material questions remain, do ONE of these now, before writing any code:",
+    "1. Ask the user — call the question tool for the decisions that fork the architecture (scope, surface, " +
+      "data model). Cheaper now than after four stories are built on a guess.",
+    "2. Research it — read the code, the docs and the existing conventions, and resolve what can be resolved " +
+      "without asking.",
+    // Verified against src/v2/story.ts as of 57dcc3f: `clearPlan` archives to
+    // archive/plan.<session>.<ts>.json before dropping the session's entry, and
+    // `createPlan` archives any existing plan before replacing it. Say so, or
+    // the model reads re-planning as destructive and avoids it.
+    "3. Clear and re-plan — if the stories encode assumptions rather than findings, call " +
+      "elicify_vertex_plan_clear, ground the work, then elicify_vertex_plan_create again. The old plan is " +
+      "ARCHIVED under .opencode/elicify-vertex/archive/, never deleted, so re-planning costs a tool call and " +
+      "loses nothing.",
+    "Proceeding is also a valid answer — but only if you can say what the plan is grounded IN.",
+  )
+  return lines
+}
+
 export function buildPlanTools(deps: PlanToolsDeps) {
   const { storyEngine, pinStore, verificationReceipts, client, states, phaseEngine } = deps
 
@@ -172,7 +331,19 @@ export function buildPlanTools(deps: PlanToolsDeps) {
     async execute(args, context) {
       const plan = storyEngine.createPlan(context.sessionID, args.stories)
       deps.onPlanCreated(context.sessionID)
-      return JSON.stringify(plan, null, 2)
+      // AC-3: the challenge is additive and never fatal. If building it ever
+      // throws, the plan that was just persisted is still returned intact —
+      // a reflection prompt must not be able to fail a plan creation.
+      let planningChallenge: string[] | null = null
+      try {
+        planningChallenge = buildPlanningChallenge(plan)
+      } catch {
+        planningChallenge = null
+      }
+      // `planningChallenge` FIRST so the model meets it before the plan body;
+      // the plan's own keys follow unchanged, so callers that `JSON.parse`
+      // this return value keep working.
+      return JSON.stringify(planningChallenge ? { planningChallenge, ...plan } : plan, null, 2)
     },
   })
 
