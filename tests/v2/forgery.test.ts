@@ -20,7 +20,7 @@
  * and it is organised by artifact rather than by bug. Adding a new persisted
  * evidence type without signing it should fail here.
  */
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -184,5 +184,45 @@ describe("waivers cannot be forged on disk", () => {
       verifyWaiverSignature({ sessionID: "other-session", criterionId: first.id, sourceMessageId: "msg_real" }, signature),
       "a waiver must not cross sessions",
     ).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SIGNING KEY — the one thing that must never live in the worktree
+// ---------------------------------------------------------------------------
+
+describe("the signing key is not reachable from the repository", () => {
+  // The whole design rests on this: the evidence store lives IN the repo (so it
+  // travels with the project) while the thing that makes it unforgeable does
+  // not. If the key ever landed under the worktree, a model with a write tool
+  // could sign its own receipts and every other guard becomes decoration.
+  it("keeps no key material inside the workspace after minting", () => {
+    const root = worktree()
+    const store = new VerificationReceiptStore()
+    store.record({
+      sessionID: SESSION,
+      workspaceRoot: root,
+      command: "go test ./...",
+      exitCode: 0,
+      outcome: "verified",
+      outputSummary: "ok",
+      observedAt: new Date().toISOString(),
+    })
+
+    const walk = (dir: string): string[] => {
+      const out: string[] = []
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = join(dir, entry.name)
+        if (entry.isDirectory()) out.push(...walk(full))
+        else out.push(full)
+      }
+      return out
+    }
+    const files = walk(root)
+    expect(files.some((f) => f.includes("receipts.json")), "PRE: the store must have written").toBe(true)
+    expect(
+      files.filter((f) => /key|secret|hmac/i.test(f)),
+      "no key material may live under the worktree",
+    ).toEqual([])
   })
 })
