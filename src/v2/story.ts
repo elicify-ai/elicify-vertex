@@ -100,7 +100,7 @@ export const fsIO = {
 export interface AcceptanceItem {
   id: string
   text: string
-  evidence: { receiptId: string } | { waiver: true; sourceMessageId: string } | null
+  evidence: { receiptId: string } | { waiver: true; sourceMessageId: string; signature?: string } | null
 }
 
 export interface StoryV2 {

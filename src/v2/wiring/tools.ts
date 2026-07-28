@@ -20,6 +20,7 @@
 import { resolve } from "node:path"
 
 import { tool } from "@opencode-ai/plugin"
+import { signWaiver } from "../../goals.js"
 import type { VerificationReceiptStore } from "../../goals.js"
 import type { PhaseEngine } from "../phase.js"
 import type { PinStore } from "../pin.js"
@@ -226,9 +227,25 @@ export function buildPlanTools(deps: PlanToolsDeps) {
               `waiver for acceptance item ${item.id} references message ${item.waiverSourceMessageId}, which does not resolve to a user-authored chat message — rejected`,
             )
           }
+          // Sign the waiver to the (session, criterion, message) it was
+          // validated for. Unsigned, this was the cheapest forgery left in the
+          // system: `pins.json` is an ordinary file and the gate trusts a
+          // waiver forever, so writing one over each criterion silenced the
+          // gate outright (measured: continuations 1 -> 0) -- no receipt to
+          // clone, no worktree digest to satisfy. Signing also stops a
+          // LEGITIMATE waiver being moved to a different criterion.
+          const waiverSignature = signWaiver({
+            sessionID: context.sessionID,
+            criterionId: item.id,
+            sourceMessageId: item.waiverSourceMessageId,
+          })
           pending.push({
             itemId: item.id,
-            evidence: { waiver: true, sourceMessageId: item.waiverSourceMessageId },
+            evidence: {
+              waiver: true,
+              sourceMessageId: item.waiverSourceMessageId,
+              ...(waiverSignature ? { signature: waiverSignature } : {}),
+            },
           })
         }
       }
@@ -250,13 +267,36 @@ export function buildPlanTools(deps: PlanToolsDeps) {
           }
         }
       }
+      // `checkpoint` reads evidence off the plan, so it has to be attached
+      // before validation can run -- but a REFUSED checkpoint must not leave
+      // the model's claim behind. An audit showed exactly that: a checkpoint
+      // rejected for being out of order still wrote its waivers into
+      // plan.json, and they then satisfied the story on a later attempt with
+      // no further proof. Snapshot the prior evidence and restore it if
+      // `checkpoint` throws, so story.ts's stated guarantee -- "a thrown error
+      // leaves the plan file byte-for-byte unchanged" -- actually holds.
+      type Evidence = { receiptId: string } | { waiver: true; sourceMessageId: string; signature?: string } | null
+      const priorEvidence = new Map<string, Evidence>()
+      const storyBefore = storyEngine.getPlan(context.sessionID)?.stories.find((s) => s.id === args.storyId)
+      for (const { itemId } of pending) {
+        const item = storyBefore?.acceptanceItems.find((a) => a.id === itemId)
+        priorEvidence.set(itemId, (item?.evidence ?? null) as Evidence)
+      }
+
       for (const { itemId, evidence } of pending) {
         storyEngine.attachEvidence(context.sessionID, args.storyId, itemId, evidence)
       }
-      storyEngine.checkpoint(context.sessionID, args.storyId, args.status, {
-        isValidReceipt: (receiptId) =>
-          isFreshReceipt({ verificationReceipts, states, storyEngine }, context.sessionID, args.storyId, receiptId),
-      })
+      try {
+        storyEngine.checkpoint(context.sessionID, args.storyId, args.status, {
+          isValidReceipt: (receiptId) =>
+            isFreshReceipt({ verificationReceipts, states, storyEngine }, context.sessionID, args.storyId, receiptId),
+        })
+      } catch (error) {
+        for (const [itemId, evidence] of priorEvidence) {
+          storyEngine.attachEvidence(context.sessionID, args.storyId, itemId, evidence)
+        }
+        throw error
+      }
       const plan = storyEngine.getPlan(context.sessionID)
       // T8 (FR-001): a non-final story completing rebinds phase to `execute`
       // for the newly-active successor story. `storyEngine.checkpoint` above

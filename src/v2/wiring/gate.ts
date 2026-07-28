@@ -17,6 +17,7 @@
 import { detectPromiseNoAct, shouldBlockPromiseNoAct } from "../../index.js"
 import type { EvidenceLedger } from "../../index.js"
 import { classifyFileKind, formatChangedPathsForReason, formatGateContinuationText } from "../../index.js"
+import { verifyWaiverSignature } from "../../goals.js"
 import { holdoutSuppresses, logHoldoutSuppress } from "../../measurement.js"
 import type { InjectionComposer } from "../composer.js"
 import type { EventLogger, OpencodeClient } from "../types.js"
@@ -256,9 +257,15 @@ async function handleCriteriaReplay(ctx: GateContext, sid: string, state: V2Sess
   const criteria = ctx.pinStore.get(sid)
   const unmet = criteria.find((c) => {
     if (!c.evidence) return true
-    // Waiver-typed evidence is validated at attach-time (tools.ts resolves
-    // waiverSourceMessageId against a real chat message before ever calling
-    // attachEvidence) — never re-checked here. Receipt-typed evidence is
+    // Waiver-typed evidence USED to be trusted here, on the grounds that
+    // tools.ts validates `waiverSourceMessageId` against a real chat message at
+    // attach time. That reasoning only holds if nothing else can write a waiver
+    // -- and `pins.json` is an ordinary file. An audit wrote
+    // `{"waiver":true,"sourceMessageId":"msg_i_made_this_up"}` over every
+    // criterion and the gate went silent (measured: continuations 1 -> 0). It
+    // was the cheapest forgery in the system: no receipt to clone, no worktree
+    // digest to satisfy. Waivers are now signed at attach time and
+    // re-validated here, exactly like receipts. Receipt-typed evidence is
     // only as good as the receipt still being observable right now: without
     // this, a criterion with a non-null receiptId is trusted forever, even
     // after a process restart drops the underlying VerificationReceiptStore
@@ -266,7 +273,10 @@ async function handleCriteriaReplay(ctx: GateContext, sid: string, state: V2Sess
     // the injected isValidReceipt and treat a stale/unknown receipt as
     // unevidenced.
     if ("receiptId" in c.evidence) return !ctx.isValidReceipt(sid, c.evidence.receiptId)
-    return false
+    return !verifyWaiverSignature(
+      { sessionID: sid, criterionId: c.id, sourceMessageId: c.evidence.sourceMessageId },
+      c.evidence.signature,
+    )
   })
   if (!unmet) return true // all evidenced (or zero pins handled by caller) — eligible to close
 

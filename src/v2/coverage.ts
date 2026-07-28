@@ -178,7 +178,31 @@ const RUNNER_NARROWING_FLAGS: ReadonlyMap<string, ReadonlySet<string>> = new Map
 
 const RUNNER_NON_NARROWING_FLAGS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   ["cargo test", new Set(["--workspace", "--all"])],
+  // `-w` is npm/pnpm's workspace SELECTOR (narrowing, in the global set) but
+  // jest/vitest's `--maxWorkers` -- parallelism, not selection. A full
+  // `npx jest -w 4` was scored as narrowed and minted nothing.
+  ["jest", new Set(["-w"])],
+  ["vitest", new Set(["-w"])],
+  // `-o` is jest's `--onlyChanged` (narrowing) but go's OUTPUT BINARY PATH and
+  // pytest's `--override-ini`; neither restricts what runs.
+  ["go test", new Set(["-o"])],
+  ["pytest", new Set(["-o"])],
 ])
+
+/**
+ * Runner strings carry their launcher (`jest`, `npx jest`, `yarn jest`,
+ * `python3 -m pytest`), so the scoped tables are keyed by TOOL WORD and matched
+ * against the runner's tokens. An exact-string key catches `jest` and silently
+ * misses `npx jest` -- a half-applied fix that reads as working.
+ */
+function scopedFlags(table: ReadonlyMap<string, ReadonlySet<string>>, runner: string): ReadonlySet<string> {
+  const tokens = new Set(runner.split(/\s+/))
+  const merged = new Set<string>()
+  for (const [tool, flags] of table) {
+    if (tool.split(/\s+/).every((t) => tokens.has(t))) for (const f of flags) merged.add(f)
+  }
+  return merged
+}
 
 /**
  * Flags meaning "do not execute anything" — list, count, or describe tests
@@ -679,7 +703,7 @@ function toSubCommand(tokens: readonly string[]): SubCommand | null {
     .filter((token) => isPathShaped(token))
 
   const runner = normalizeRunner(runnerTokens.join(" "))
-  const runnerScoped = RUNNER_NON_EXECUTING_FLAGS.get(runner)
+  const runnerScoped = scopedFlags(RUNNER_NON_EXECUTING_FLAGS, runner)
 
   return {
     runner,
@@ -687,7 +711,7 @@ function toSubCommand(tokens: readonly string[]): SubCommand | null {
     narrowing: extractNarrowing(rest, runner),
     nonExecuting: rest.some((token) => {
       const flag = token.split("=")[0]
-      return NON_EXECUTING_FLAGS.has(flag) || runnerScoped?.has(flag) === true
+      return NON_EXECUTING_FLAGS.has(flag) || runnerScoped.has(flag)
     }),
   }
 }
@@ -703,11 +727,11 @@ function toSubCommand(tokens: readonly string[]): SubCommand | null {
  * unparseable selector is more likely to restrict the run than to widen it.
  */
 function extractNarrowing(tokens: readonly string[], runner: string): string[] {
-  const scopedNarrowing = RUNNER_NARROWING_FLAGS.get(runner)
-  const scopedExempt = RUNNER_NON_NARROWING_FLAGS.get(runner)
+  const scopedNarrowing = scopedFlags(RUNNER_NARROWING_FLAGS, runner)
+  const scopedExempt = scopedFlags(RUNNER_NON_NARROWING_FLAGS, runner)
   const narrows = (flag: string): boolean => {
-    if (scopedExempt?.has(flag) === true) return false
-    return NARROWING_FLAGS.has(flag) || scopedNarrowing?.has(flag) === true
+    if (scopedExempt.has(flag)) return false
+    return NARROWING_FLAGS.has(flag) || scopedNarrowing.has(flag)
   }
 
   const found: string[] = []

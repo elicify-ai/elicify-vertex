@@ -11,6 +11,7 @@ import {
   openSync,
   readFileSync,
   readdirSync,
+  readlinkSync,
   renameSync,
   rmSync,
   statSync,
@@ -245,6 +246,41 @@ export function signReceipt(receipt: VerificationReceipt): string | null {
   return createHmac("sha256", secret).update(signingPayload(receipt)).digest("hex")
 }
 
+/**
+ * Sign a WAIVER, using the same out-of-worktree key as receipts.
+ *
+ * Waivers were the cheapest forgery left in the system once receipts were
+ * signed. `gate.ts` re-validates receipt evidence on every idle but returns
+ * "evidenced" for a waiver unconditionally, and `pins.json` / `plan.json` are
+ * ordinary files -- so writing `{"waiver":true,"sourceMessageId":"msg_anything"}`
+ * over every criterion silenced the gate outright (measured: continuations
+ * 1 -> 0). No receipt to clone, no worktree digest to satisfy.
+ *
+ * The signature binds the waiver to the session, criterion and source message
+ * the harness actually validated, so a hand-written one cannot be substituted
+ * and a legitimate one cannot be moved to a different criterion.
+ */
+export function signWaiver(input: { sessionID: string; criterionId: string; sourceMessageId: string }): string | null {
+  const secret = receiptSecret()
+  if (!secret) return null
+  return createHmac("sha256", secret)
+    .update(JSON.stringify(["waiver", input.sessionID, input.criterionId, input.sourceMessageId]))
+    .digest("hex")
+}
+
+export function verifyWaiverSignature(
+  input: { sessionID: string; criterionId: string; sourceMessageId: string },
+  signature: unknown,
+): boolean {
+  const expected = signWaiver(input)
+  if (!expected || typeof signature !== "string" || signature.length !== expected.length) return false
+  try {
+    return timingSafeEqual(Buffer.from(signature, "hex"), Buffer.from(expected, "hex"))
+  } catch {
+    return false
+  }
+}
+
 export function verifyReceiptSignature(receipt: VerificationReceipt): boolean {
   const expected = signReceipt(receipt)
   const actual = receipt.signature
@@ -357,27 +393,45 @@ const MAX_SCOPE_PATHS = 50
  * it was minted, which is indistinguishable from having no persistence.
  * Source, tests, config and docs are all still covered.
  */
-const RECEIPT_SCOPE_IGNORED_DIRS: ReadonlySet<string> = new Set([
-  ".opencode",
+/**
+ * Ignored WHEREVER they appear. These are tool-managed or vendored trees whose
+ * contents are never hand-edited source, at any depth: a nested
+ * `packages/app/node_modules` is as derived as a root one.
+ */
+const RECEIPT_SCOPE_IGNORED_ANYWHERE: ReadonlySet<string> = new Set([
   ".git",
   ".gradle",
   ".idea",
   ".mypy_cache",
   ".next",
   ".nuxt",
+  ".opencode",
   ".pytest_cache",
   ".turbo",
   ".venv",
   ".vscode",
   "__pycache__",
+  "node_modules",
+  "venv",
+])
+
+/**
+ * Ignored ONLY at the repository root, where they are conventionally build
+ * output. Matching these by basename at any depth was a fabrication vector:
+ * `src/build/compiler.ts` and a Go project's checked-in `vendor/` sources are
+ * ordinary source that happens to sit under a directory with a derived-looking
+ * name, and edits to them never touched the digest -- so a receipt outlived the
+ * code it verified. A nested `dist/` might still be output, but wrongly
+ * INCLUDING it only costs a re-verification, while wrongly excluding it
+ * attests to code nobody checked.
+ */
+const RECEIPT_SCOPE_IGNORED_AT_ROOT: ReadonlySet<string> = new Set([
   "build",
   "coverage",
   "dist",
-  "node_modules",
   "out",
   "target",
   "vendor",
-  "venv",
 ])
 
 /** Hard ceilings on the fingerprint walk. Past either one the scope is marked
@@ -455,11 +509,33 @@ export function fingerprintWorktree(root: string): WorktreeFingerprint {
     for (const entry of entries) {
       const relativePath = relativeDirectory ? `${relativeDirectory}/${entry.name}` : entry.name
       if (entry.isSymbolicLink()) {
-        lines.push(`${relativePath} symlink`)
+        // Hash the TARGET PATH, not just the fact that a symlink exists.
+        // Recording only the name made retargeting invisible: flipping
+        // `src/config.ts` from `./good.ts` to `./bad.ts` left the digest
+        // unchanged, so a receipt survived a change that swapped the code it
+        // attested. Reading THROUGH the link would be worse -- an out-of-tree
+        // target reintroduces unbounded walks -- so the link's own content
+        // (where it points) is what gets hashed.
+        let target = "?"
+        try {
+          target = readlinkSync(join(resolvedRoot, relativePath))
+        } catch {
+          target = "unreadable"
+        }
+        lines.push(`${relativePath} symlink ${target}`)
         continue
       }
       if (entry.isDirectory()) {
-        if (!RECEIPT_SCOPE_IGNORED_DIRS.has(entry.name)) pending.push(relativePath)
+        // Ignore by ROOT-RELATIVE PATH, not by basename at any depth. The
+        // basename test made real source invisible wherever a directory
+        // happened to be called `build`, `out`, `dist`, `target` or `vendor`:
+        // an edit to `src/build/compiler.ts`, or to checked-in Go `vendor/`
+        // sources, never touched the digest, so a receipt outlived the code it
+        // verified.
+        const ignored =
+          RECEIPT_SCOPE_IGNORED_ANYWHERE.has(entry.name) ||
+          (relativeDirectory === "" && RECEIPT_SCOPE_IGNORED_AT_ROOT.has(entry.name))
+        if (!ignored) pending.push(relativePath)
         continue
       }
       if (!entry.isFile()) continue
@@ -476,8 +552,18 @@ export function fingerprintWorktree(root: string): WorktreeFingerprint {
         lines.push(`${relativePath} missing`)
         continue
       }
+      // Mode is part of a file's meaning: clearing an exec bit breaks a real
+      // program with zero content change, and that was invisible.
+      const mode = (stats.mode & BigInt(0o7777)).toString(8)
       if (stats.size > BigInt(RECEIPT_SCOPE_MAX_FILE_BYTES)) {
-        lines.push(`${relativePath} large ${stats.size} ${stats.ino} ${stats.mtimeNs}`)
+        // Metadata fallback for very large files -- the same size+inode+mtime
+        // scheme already proven insufficient for small ones (`42` -> `44` is
+        // metadata-identical), and `rsync -a` / `cp -p` / restore-from-backup
+        // all preserve mtimes exactly. A large file is therefore UNPROVABLE
+        // rather than unchanged: mark the scope incomplete so `isStale` fails
+        // closed, instead of quietly attesting what the digest cannot see.
+        complete = false
+        lines.push(`${relativePath} large ${stats.size} ${stats.ino} ${stats.mtimeNs} ${mode}`)
         continue
       }
       hashedBytes += Number(stats.size)
@@ -487,7 +573,7 @@ export function fingerprintWorktree(root: string): WorktreeFingerprint {
       }
       try {
         const content = createHash("sha256").update(readFileSync(absolutePath)).digest("hex")
-        lines.push(`${relativePath} ${stats.size} ${content}`)
+        lines.push(`${relativePath} ${stats.size} ${mode} ${content}`)
       } catch {
         lines.push(`${relativePath} unreadable ${stats.size} ${stats.mtimeNs}`)
       }

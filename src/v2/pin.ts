@@ -54,7 +54,7 @@ export type EventLogger = (eventType: string, payload: Record<string, unknown>) 
 export interface Criterion {
   id: string // "C1", "C2", ... stable per session (positional within the current pin set)
   text: string // redacted before storage
-  evidence: { receiptId: string } | { waiver: true; sourceMessageId: string } | null
+  evidence: { receiptId: string } | { waiver: true; sourceMessageId: string; signature?: string } | null
 }
 
 export interface PinsFileEntry {
