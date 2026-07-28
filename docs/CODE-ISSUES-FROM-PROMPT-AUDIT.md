@@ -115,14 +115,56 @@ the parent to do exactly this. It has been removed, because asking the model to
 remember is the wrong mechanism for something the harness can guarantee.
 
 **Fix:** inject the behaviour prompt into every subagent call from
-`tool.execute.before`. The hook already receives a mutable args object
-(`src/v2/plugin.ts:574`), and the plugin already mutates `toolOutput.output` /
-`toolOutput.metadata` in the `after` hook to deliver receipt ids
-(`plugin.ts:822-823`), so the mechanism is established — though `before`-hook
-arg mutation is a different hook and needs an empirical probe before anything is
-built on it.
+`tool.execute.before`.
 
-Design constraints:
+### Feasibility — probed empirically, opencode 1.18.4
+
+The hook's arg mutation **does** reach the subagent, but only in place:
+
+```js
+toolOutput.args.prompt = TEXT + "\n\n" + toolOutput.args.prompt   // works
+toolOutput.args = { ...toolOutput.args, prompt: ... }             // silently discarded
+```
+
+The dispatcher passes the same object reference to the hook and then to the
+tool (`{args: b}` is a fresh wrapper, so assigning to `output.args` rebinds only
+the wrapper); `TaskTool.execute` reads `prompt` off the live args object at
+execution time.
+
+Confirmed by running both variants and reading the child session out of the
+opencode DB rather than trusting the subagent's reply — the in-place run's child
+message carried the injected sentinel and the subagent obeyed it; the reassign
+run's child message carried the original prompt, unmutated. That control is what
+separates "the hook mutated an object" from "the subagent received the text".
+
+Tool name is `task`. Args: `description` (string, required), `prompt` (string,
+required — this is the injection point), `subagent_type` (string, required),
+`task_id` (optional, resumes a prior subagent session), `command` (optional).
+
+### Consequences to design around
+
+- **The injected text echoes back into the parent's context.** The parent's
+  persisted tool part records the *mutated* input and re-enters the parent
+  model's history, verified by asking the parent on a later turn to quote its
+  own earlier `prompt` argument — it reproduced the full injected text. So the
+  behaviour prompt is paid for once per subagent call *and* carried in parent
+  context thereafter. This argues for a compact subagent variant rather than
+  shipping the execution core verbatim; at ~1,200 words × a wave of 8, the
+  parent's own context is the thing that suffers.
+- **This is an implementation detail, not a documented contract.** Reference
+  sharing between hook and executor could change in any opencode release. Guard
+  defensively (verify the arg is a string and the mutation took) and pin the
+  in-place-vs-reassign distinction in a test, because a silent regression here
+  fails open — subagents would quietly run undisciplined.
+- **A second trigger site exists** for programmatically-spawned tasks (the
+  `@agent` mention / command path), which builds its own args object and passes
+  the same reference. In-place mutation should work there too — established by
+  reading the binary, not by running it.
+- **Integration point:** `src/v2/plugin.ts:574` returns early unless
+  `WRITE_TOOL_NAMES.has(toolInput.tool)`. The `task` branch has to go *before*
+  that early return.
+
+### Design constraints
 
 - **Send the execution half only.** A subagent executes; it does not
   orchestrate. `fan_out_agents` would invite recursive delegation;
