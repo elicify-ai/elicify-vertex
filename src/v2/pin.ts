@@ -351,16 +351,30 @@ export class PinStore {
    */
   gc(knownSessionIds: ReadonlySet<string>): void {
     const cutoff = Date.now() - SEVEN_DAYS_MS
-    const shouldDrop = (entry: PinsFileEntry, sessionID: string): boolean => {
+    const shouldDrop = (entry: PinsFileEntry): boolean => {
       const updatedMs = Date.parse(entry.updatedAt)
       const expired = !Number.isFinite(updatedMs) || updatedMs < cutoff
-      return expired || !knownSessionIds.has(sessionID)
+      // AGE ONLY. `knownSessionIds` is the sessions THIS PROCESS has seen, and
+      // absence of knowledge is not evidence of absence: opencode runs one
+      // process per invocation, so a second session -- or a second window on
+      // the same repo -- used to delete the first session's pinned acceptance
+      // criteria outright. Measured: pins.json holding [alpha, beta], open a
+      // session as alpha only, restart, and beta's criteria are gone; returning
+      // to beta then reports "No acceptance criteria were captured for this
+      // session." The user's contract, silently destroyed by opening a
+      // different session. Two concurrent processes did it to each other
+      // continuously.
+      //
+      // The parameter is kept (callers pass it, and it documents intent) but is
+      // no longer a deletion authority. The 7-day rule alone bounds the file.
+      void knownSessionIds
+      return expired
     }
 
     // Prune in-memory state too (covers sessions currently in memory-fallback
     // mode whose entries never made it to disk).
     for (const [sessionID, entry] of [...this.entries]) {
-      if (shouldDrop(entry, sessionID)) {
+      if (shouldDrop(entry)) {
         this.entries.delete(sessionID)
         this.faultState.delete(sessionID)
       }
@@ -380,7 +394,7 @@ export class PinStore {
       const kept: PinsFile = {}
       let changed = false
       for (const [sessionID, entry] of Object.entries(parsed)) {
-        if (shouldDrop(entry, sessionID)) {
+        if (shouldDrop(entry)) {
           changed = true
           continue
         }

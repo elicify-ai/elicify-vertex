@@ -368,3 +368,67 @@ describe("VerificationReceiptStore file handling", () => {
     expect(existsSync(join(missing, ".opencode", "elicify-vertex", "receipts.json"))).toBe(false)
   })
 })
+
+// ===========================================================================
+// Receipt SIGNING — the control that makes forgery inert.
+//
+// An audit completed a story with ZERO verifier runs: it walked ~15 ways past
+// the tool-boundary write filter (`file_path` instead of `filePath`, a path
+// inside `patchText`, a symlink to the directory, string concatenation and
+// base64 inside a bash command, case differences), hand-wrote a cloned receipt
+// with a fresh id and a different story id into `receipts.json`, and the
+// checkpoint accepted it after a restart.
+//
+// A filter has to be exhaustive to work. A signature does not: a receipt the
+// harness never minted has no valid HMAC, so `get()` refuses it however it
+// arrived. The key lives beside the event log, OUTSIDE the worktree, which is
+// what lets the store itself stay in the repo and travel with the project.
+// ===========================================================================
+
+describe("receipt signatures", () => {
+  // MUTATION PROOF: delete the `verifyReceiptSignature` block in `get()` ->
+  // both tests go red. Delete the `signReceipt` call in `record()` -> the
+  // "genuine receipt survives" half goes red (nothing signed, nothing
+  // verifies), which is the discrimination.
+  const SID = "s1"
+
+  function forgeInto(root: string, mutate: (r: Record<string, unknown>) => void): string {
+    const file = receiptsPathOf(root)
+    const disk = JSON.parse(readFileSync(file, "utf8"))
+    const cloned = { ...disk.sessions[SID].receipts[0] }
+    mutate(cloned)
+    disk.sessions[SID].receipts.push(cloned)
+    writeFileSync(file, JSON.stringify(disk), "utf8")
+    return cloned.id as string
+  }
+
+  it("refuses a forged receipt written directly into the store", () => {
+    const root = temporaryRoot()
+    const real = recordOn(restart(), root)
+
+    const forgedId = forgeInto(root, (r) => {
+      r.id = `vrf_${"f".repeat(32)}`
+      r.scope = { ...(r.scope as object), storyId: "S2" }
+      r.observedAt = new Date(Date.now() + 1000).toISOString()
+    })
+
+    const afterRestart = restart()
+    afterRestart.load(SID, root)
+    expect(afterRestart.get(SID, forgedId), "a hand-written receipt is not evidence").toBeNull()
+    expect(afterRestart.get(SID, real.id), "a genuine receipt survives the restart").not.toBeNull()
+  })
+
+  it("refuses a receipt whose signed fields were edited after minting", () => {
+    const root = temporaryRoot()
+    const real = recordOn(restart(), root)
+    const tamperedId = forgeInto(root, (r) => {
+      r.id = `vrf_${"e".repeat(32)}`
+      r.command = "echo pretend-this-was-a-test-run"
+    })
+
+    const afterRestart = restart()
+    afterRestart.load(SID, root)
+    expect(afterRestart.get(SID, tamperedId)).toBeNull()
+    expect(afterRestart.get(SID, real.id)).not.toBeNull()
+  })
+})

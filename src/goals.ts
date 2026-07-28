@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto"
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto"
 import {
   accessSync,
   appendFileSync,
@@ -20,6 +20,7 @@ import {
 import { homedir } from "node:os"
 import { basename, dirname, join, resolve } from "node:path"
 
+import { dataRoot } from "./measurement.js"
 import { redactForDisk, redactSecrets } from "./redaction.js"
 
 /** True when path is filesystem root (`/` or `C:\`) — never a project worktree. */
@@ -177,7 +178,92 @@ export interface VerificationScope {
   complete: boolean
 }
 
+/**
+ * Secret used to bind a receipt to THIS harness having observed the command.
+ *
+ * Kept beside the event log, OUTSIDE the project worktree, and never written
+ * into `.opencode/`. That separation is the whole point: the evidence store
+ * lives in the repo so it travels with the project, while the thing that makes
+ * a receipt unforgeable does not.
+ *
+ * Why this exists at all: an audit walked ~15 ways around the tool-boundary
+ * write filter -- `file_path` instead of `filePath`, a path inside `patchText`,
+ * a symlink to the state dir, string concatenation and base64 in a bash
+ * command, case differences -- and completed a story with zero verifier runs by
+ * appending a hand-written receipt. Enumerating every possible writer is a
+ * losing game. Signing is not: a receipt the harness did not mint has no valid
+ * signature, so every one of those bypasses becomes inert without the filter
+ * having to be exhaustive.
+ *
+ * Failure is CLOSED. If the key cannot be read or created, signing yields null
+ * and `verifyReceiptSignature` rejects, so receipts stop being accepted rather
+ * than silently becoming unverifiable.
+ */
+const RECEIPT_KEY_FILE = "receipt-signing.key"
+let cachedSecret: Buffer | null = null
+
+function receiptSecret(): Buffer | null {
+  if (cachedSecret) return cachedSecret
+  try {
+    const path = join(dataRoot(), RECEIPT_KEY_FILE)
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
+    let raw: Buffer
+    try {
+      raw = readFileSync(path)
+    } catch {
+      raw = randomBytes(32)
+      writeFileSync(path, raw, { mode: 0o600 })
+    }
+    if (raw.length < 16) return null
+    cachedSecret = raw
+    return cachedSecret
+  } catch {
+    return null
+  }
+}
+
+/** Fields a signature binds. Anything a forger would need to change to make a
+ * receipt say something else must be in here. */
+function signingPayload(receipt: VerificationReceipt): string {
+  return JSON.stringify([
+    receipt.id,
+    receipt.sessionID,
+    resolve(receipt.workspaceRoot),
+    receipt.command,
+    receipt.exitCode,
+    receipt.outcome,
+    receipt.observedAt,
+    receipt.scope?.storyId ?? null,
+    receipt.scope?.worktreeDigest ?? null,
+    receipt.scope?.complete ?? null,
+  ])
+}
+
+export function signReceipt(receipt: VerificationReceipt): string | null {
+  const secret = receiptSecret()
+  if (!secret) return null
+  return createHmac("sha256", secret).update(signingPayload(receipt)).digest("hex")
+}
+
+export function verifyReceiptSignature(receipt: VerificationReceipt): boolean {
+  const expected = signReceipt(receipt)
+  const actual = receipt.signature
+  if (!expected || typeof actual !== "string" || actual.length !== expected.length) return false
+  try {
+    return timingSafeEqual(Buffer.from(actual, "hex"), Buffer.from(expected, "hex"))
+  } catch {
+    return false
+  }
+}
+
 export interface VerificationReceipt {
+  /**
+   * HMAC binding this receipt to the harness that observed the command (see
+   * `signReceipt`). Optional in the TYPE so pre-signature receipt literals and
+   * v1 `goals.json` records still typecheck; a receipt reaching `get()` without
+   * a VALID signature is refused, so absent is never treated as trusted.
+   */
+  signature?: string
   id: string
   sessionID: string
   workspaceRoot: string
@@ -567,6 +653,30 @@ export class VerificationReceiptStore {
         complete: fingerprint.complete,
       },
     }
+    // An UNPROVABLE scope must not become a receipt at all.
+    //
+    // Refusing it at lookup time (the previous behaviour) was worse than either
+    // alternative: on a worktree past the file/byte ceiling the harness minted
+    // a receipt, appended its id to the tool output telling the model to cite
+    // it, and then refused that id at every consumer forever -- same process
+    // and every later one. No story on a large monorepo could be closed by a
+    // receipt, and the only route left was a waiver. Failing here instead makes
+    // the refusal immediate, attributable and visible, rather than a receipt
+    // that exists but can never be used.
+    if (!fingerprint.complete) {
+      this.logger("receipts:scope-unverifiable", {
+        sessionID: input.sessionID,
+        fileCount: fingerprint.fileCount,
+        reason: "worktree too large to fingerprint; no receipt minted",
+      })
+    }
+
+    // Sign LAST: the signature covers the finished record, including the scope
+    // digest, so neither the story link nor the worktree it attests can be
+    // edited after the fact.
+    const signature = signReceipt(receipt)
+    if (signature) receipt.signature = signature
+    else this.logger("receipts:unsigned", { sessionID: input.sessionID, receiptId: receipt.id })
 
     const receipts = this.bySession.get(input.sessionID) ?? []
     receipts.push(receipt)
@@ -592,6 +702,22 @@ export class VerificationReceiptStore {
     this.hydrate(sessionID)
     const receipt = this.bySession.get(sessionID)?.find((candidate) => candidate.id === receiptID) ?? null
     if (!receipt) return null
+
+    // Provenance BEFORE freshness. Staleness asks "does this still describe the
+    // code?"; the signature asks the prior question "did this harness ever
+    // observe this command?". Without it, an audit completed a story with zero
+    // verifier runs by hand-writing a receipt into the store -- the path filter
+    // at the tool boundary had ~15 bypasses, and a filter has to be exhaustive
+    // to work while a signature does not.
+    if (!verifyReceiptSignature(receipt)) {
+      const remaining = (this.bySession.get(sessionID) ?? []).filter((candidate) => candidate.id !== receiptID)
+      if (remaining.length > 0) this.bySession.set(sessionID, remaining)
+      else this.bySession.delete(sessionID)
+      this.logger("receipts:signature-invalid", { sessionID, receiptID })
+      this.persist(sessionID)
+      return null
+    }
+
     if (!this.isStale(receipt)) return receipt
 
     const remaining = (this.bySession.get(sessionID) ?? []).filter((candidate) => candidate.id !== receiptID)

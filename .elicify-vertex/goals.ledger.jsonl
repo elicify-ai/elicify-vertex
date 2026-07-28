@@ -1,0 +1,39 @@
+{"ts":"2026-07-24T06:39:00.232Z","event":"plan_created","revision":1,"storyCount":6}
+{"ts":"2026-07-24T06:39:00.234Z","event":"story_started","revision":2,"storyID":"G001"}
+{"ts":"2026-07-24T06:40:41.569Z","event":"plan_created","revision":1,"storyCount":6}
+{"ts":"2026-07-24T06:40:41.571Z","event":"story_started","revision":2,"storyID":"G001"}
+{"ts":"2026-07-24T06:49:17.707Z","event":"checkpoint","revision":3,"storyID":"G001","status":"complete","evidence":"Operator interview via question tool (2026-07-24). Answers: audience=both; routine=soft cue on activate; when=activate+gate fire; channel=minimal chat line (reuse compact OpenCode UX patterns); full contract text=on gate block only; stance=gate-visible-only reconciled with activate cue. Requirements written to docs/REQUIREMENTS-INJECTION-VISIBILITY.md — awaiting operator \"approved\" before G002 code.","verificationReceiptID":null}
+{"ts":"2026-07-24T06:52:38.822Z","event":"story_started","revision":4,"storyID":"G002"}
+{"ts":"2026-07-24T06:52:38.825Z","event":"checkpoint","revision":5,"storyID":"G002","status":"complete","evidence":"Implemented formatActivateCue + chat.message one-shot user-visible line; formatGateContinuationText on session.prompt stop/promise paths; docs USAGE + requirements sign-off; tests 289 green.","verificationReceiptID":null}
+{"ts":"2026-07-24T06:52:38.828Z","event":"story_started","revision":6,"storyID":"G003"}
+{"ts":"2026-07-24T10:10:45.269Z","event":"plan_created","revision":1,"storyCount":7}
+{"ts":"2026-07-24T10:10:45.273Z","event":"story_started","revision":2,"storyID":"G001"}
+{"ts":"2026-07-24T10:42:39.286Z","event":"checkpoint","revision":3,"storyID":"G001","status":"complete","evidence":"Detection: watch-mode=ambiguous, tee /dev/null ok, reader-filtered MUTATING_BASH_RE, git switch/curl -o added, python heredoc, read-only intent stays quick; regression tests added.","verificationReceiptID":null}
+{"ts":"2026-07-24T10:42:48.291Z","event":"story_started","revision":4,"storyID":"G002"}
+{"ts":"2026-07-24T10:42:57.829Z","event":"checkpoint","revision":5,"storyID":"G002","status":"complete","evidence":"All items shipped for G002. See git log/tag 0.9.4.","verificationReceiptID":null}
+{"ts":"2026-07-24T10:42:57.830Z","event":"story_started","revision":6,"storyID":"G003"}
+{"ts":"2026-07-24T10:42:57.831Z","event":"checkpoint","revision":7,"storyID":"G003","status":"complete","evidence":"All items shipped for G003. See git log/tag 0.9.4.","verificationReceiptID":null}
+{"ts":"2026-07-24T10:42:57.833Z","event":"story_started","revision":8,"storyID":"G004"}
+{"ts":"2026-07-24T10:42:57.834Z","event":"checkpoint","revision":9,"storyID":"G004","status":"complete","evidence":"All items shipped for G004. See git log/tag 0.9.4.","verificationReceiptID":null}
+{"ts":"2026-07-24T10:42:57.835Z","event":"story_started","revision":10,"storyID":"G005"}
+{"ts":"2026-07-24T10:42:57.836Z","event":"checkpoint","revision":11,"storyID":"G005","status":"complete","evidence":"All items shipped for G005. See git log/tag 0.9.4.","verificationReceiptID":null}
+{"ts":"2026-07-24T10:42:57.837Z","event":"story_started","revision":12,"storyID":"G006"}
+{"ts":"2026-07-24T10:42:57.838Z","event":"checkpoint","revision":13,"storyID":"G006","status":"complete","evidence":"All items shipped for G006. See git log/tag 0.9.4.","verificationReceiptID":null}
+{"ts":"2026-07-24T10:42:57.839Z","event":"story_started","revision":14,"storyID":"G007"}
+{"ts":"2026-07-24T16:21:53.308Z","event":"plan_created","revision":1,"storyCount":8}
+{"ts":"2026-07-24T16:21:53.311Z","event":"story_started","revision":2,"storyID":"G001"}
+{"ts":"2026-07-24T17:17:32.702Z","event":"checkpoint","revision":3,"storyID":"G001","status":"complete","evidence":"7-reviewer sweep complete: code-reviewer, silent-failure-hunter, pr-test-analyzer, type-design-analyzer, code-simplifier, comment-analyzer, architect — findings aggregated and dispatched to 3 parallel fix agents.","verificationReceiptID":null}
+{"ts":"2026-07-24T17:17:32.704Z","event":"story_started","revision":4,"storyID":"G002"}
+{"ts":"2026-07-24T17:17:32.705Z","event":"checkpoint","revision":5,"storyID":"G002","status":"complete","evidence":"Dedup complete: vertex_operating_mode block removed from agent md; vertex_behavior condensed to 4 bullets; plugin is sole signal-procedure surface; structural tests pin it.","verificationReceiptID":null}
+{"ts":"2026-07-24T17:17:32.706Z","event":"story_started","revision":6,"storyID":"G003"}
+{"ts":"2026-07-24T17:17:32.707Z","event":"checkpoint","revision":7,"storyID":"G003","status":"complete","evidence":"In-flight guard TTL: 30s Promise.race in attemptGateContinuation; timeout clears flag + logs gate_fire 'continuation timeout'; tests in fixes.test.ts.","verificationReceiptID":null}
+{"ts":"2026-07-24T17:17:32.708Z","event":"story_started","revision":8,"storyID":"G004"}
+{"ts":"2026-07-24T17:17:32.710Z","event":"checkpoint","revision":9,"storyID":"G004","status":"complete","evidence":"Native parity: segment-anchored MUTATING_BASH_RE + downloader option positions + quoted/tab heredoc variants + quote-aware shellSegments — fablize parity on all probed paths, plus watch-mode + retry normalization.","verificationReceiptID":null}
+{"ts":"2026-07-24T17:17:32.711Z","event":"story_started","revision":10,"storyID":"G005"}
+{"ts":"2026-07-24T17:17:32.712Z","event":"checkpoint","revision":11,"storyID":"G005","status":"complete","evidence":"Dead code removed: Directive.at dropped, magic numbers named, shell segment/unwrap helpers consolidated, ledger freshLedger extracted, stale fablize/M3 comment references scrubbed.","verificationReceiptID":null}
+{"ts":"2026-07-24T17:17:32.713Z","event":"story_started","revision":12,"storyID":"G006"}
+{"ts":"2026-07-24T17:17:32.713Z","event":"checkpoint","revision":13,"storyID":"G006","status":"complete","evidence":"UAT: 387 unit tests (13 files), host harness all-pass incl. new fixes.test.ts (26 regression pins), typecheck clean both configs.","verificationReceiptID":null}
+{"ts":"2026-07-24T17:18:52.352Z","event":"story_started","revision":14,"storyID":"G007"}
+{"ts":"2026-07-24T17:47:12.948Z","event":"checkpoint","revision":15,"storyID":"G007","status":"complete","evidence":"387/387 tests in 13 files; typecheck clean both configs; host UAT all-pass incl. fixes.test.ts regression pins; branch pushed; version bumped to 0.9.6 ready to publish.","verificationReceiptID":null}
+{"ts":"2026-07-24T17:47:12.952Z","event":"story_started","revision":16,"storyID":"G008"}
+{"ts":"2026-07-24T17:47:12.959Z","event":"checkpoint","revision":17,"storyID":"G008","status":"complete","evidence":"Final verification observed: npm test 387/387, npm run typecheck clean, npm run uat all-pass — receipt minted post-story-start.","verificationReceiptID":"vrf_bcb351784b4b4116803ef362cd3ff093"}

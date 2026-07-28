@@ -1,0 +1,83 @@
+{
+  "schemaVersion": 1,
+  "revision": 6,
+  "brief": "Make elicify-vertex work end-to-end (goals + harness). First: align with the operator on requirements for how visible system-prompt injection / steering should be in the OpenCode UI — then implement and prove E2E.",
+  "status": "active",
+  "activeStoryId": "G003",
+  "createdAt": "2026-07-24T06:40:41.565Z",
+  "updatedAt": "2026-07-24T06:52:38.827Z",
+  "stories": [
+    {
+      "id": "G001",
+      "ordinal": 1,
+      "kind": "work",
+      "title": "Ideate visibility requirements with operator",
+      "objective": "Discuss and lock written requirements with the user (this operator) on injection/steering visibility: what must stay invisible vs what must appear in chat/UI; when (always / debug only / on gate fire); audience (end user vs operator); channels (chat bubble, status line, debug log, events); non-goals and privacy. Deliverable: a short agreed requirements note the user confirms before any code. Do not implement visibility features until the user signs off on that note.",
+      "status": "complete",
+      "evidence": "Operator interview via question tool (2026-07-24). Answers: audience=both; routine=soft cue on activate; when=activate+gate fire; channel=minimal chat line (reuse compact OpenCode UX patterns); full contract text=on gate block only; stance=gate-visible-only reconciled with activate cue. Requirements written to docs/REQUIREMENTS-INJECTION-VISIBILITY.md — awaiting operator \"approved\" before G002 code.",
+      "startedAt": "2026-07-24T06:40:41.570Z",
+      "completedAt": "2026-07-24T06:49:17.703Z",
+      "verification": null
+    },
+    {
+      "id": "G002",
+      "ordinal": 2,
+      "kind": "work",
+      "title": "Implement agreed visibility behavior",
+      "objective": "Implement only what the signed-off requirements specify (may be zero UI change if user chooses fully invisible). Wire through system.transform and/or gate paths as required; tests + docs.",
+      "status": "complete",
+      "evidence": "Implemented formatActivateCue + chat.message one-shot user-visible line; formatGateContinuationText on session.prompt stop/promise paths; docs USAGE + requirements sign-off; tests 289 green.",
+      "startedAt": "2026-07-24T06:52:38.816Z",
+      "completedAt": "2026-07-24T06:52:38.823Z",
+      "verification": null
+    },
+    {
+      "id": "G003",
+      "ordinal": 3,
+      "kind": "work",
+      "title": "Prove injection/steering E2E in live OpenCode",
+      "objective": "With VERTEX_DEBUG and/or the agreed visible cues, demonstrate in a real OpenCode session that activation + inject + (if required) user-visible signals work; capture debug/event evidence.",
+      "status": "in_progress",
+      "evidence": null,
+      "startedAt": "2026-07-24T06:52:38.827Z",
+      "completedAt": null,
+      "verification": null
+    },
+    {
+      "id": "G004",
+      "ordinal": 4,
+      "kind": "work",
+      "title": "Goals E2E in a project dir",
+      "objective": "create → next → work → verify → checkpoint → final receipt gate under a writable project path; no root-path failures.",
+      "status": "pending",
+      "evidence": null,
+      "startedAt": null,
+      "completedAt": null,
+      "verification": null
+    },
+    {
+      "id": "G005",
+      "ordinal": 5,
+      "kind": "work",
+      "title": "Agent + slash UX + stop/promise gates",
+      "objective": "Agent multi-story guidance and slash templates produce correct tool use; deep unverified edit blocks; docs-only/verified allow; promise-no-act on TODO-later after edits.",
+      "status": "pending",
+      "evidence": null,
+      "startedAt": null,
+      "completedAt": null,
+      "verification": null
+    },
+    {
+      "id": "G006",
+      "ordinal": 6,
+      "kind": "verification",
+      "title": "Final verification",
+      "objective": "Run the integrated exit proof and checkpoint its observed successful verification receipt.",
+      "status": "pending",
+      "evidence": null,
+      "startedAt": null,
+      "completedAt": null,
+      "verification": null
+    }
+  ]
+}

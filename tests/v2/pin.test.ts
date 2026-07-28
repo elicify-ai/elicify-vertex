@@ -206,18 +206,31 @@ describe("PinStore — gc() lifecycle (Dataset: Pins persistence #6, #7)", () =>
     expect(after["fresh-known"]).toBeDefined()
   })
 
-  it("drops a fresh entry whose session is unknown to this process", () => {
+  it("KEEPS a fresh entry whose session this process has not seen", () => {
+    // DELIBERATE BEHAVIOUR CHANGE (was: "drops a fresh entry whose session is
+    // unknown to this process").
+    //
+    // `knownSessionIds` is the set of sessions THIS PROCESS has seen, and
+    // absence of knowledge is not evidence of absence. opencode runs a process
+    // per invocation, so the old rule meant opening a SECOND session deleted
+    // the first one's pinned acceptance criteria outright: pins.json holding
+    // [alpha, beta], open alpha, restart, and beta's criteria are gone --
+    // returning to beta then reports "No acceptance criteria were captured for
+    // this session." Two concurrent windows on one repo did it to each other
+    // continuously. The user's contract is not this process's to discard.
+    //
+    // The 7-day age rule still bounds the file (asserted in the tests above and
+    // below), so nothing grows without limit.
     const stateDir = temporaryRoot()
     const store = new PinStore({ stateDir, logger: vi.fn() })
     store.pin("known-session", ["kept"])
-    store.pin("orphan-session", ["dropped, session unknown"])
+    store.pin("other-window-session", ["kept: this process simply has not seen it"])
 
-    store.gc(new Set(["known-session"])) // orphan-session is absent from the known set
+    store.gc(new Set(["known-session"]))
 
     const after = readPinsFile(stateDir)
-    expect(after["orphan-session"]).toBeUndefined()
+    expect(after["other-window-session"], "another window's criteria must survive").toBeDefined()
     expect(after["known-session"]).toBeDefined()
-    expect(store.get("orphan-session")).toEqual([])
   })
 
   it("deletes pins.json entirely when the last remaining entry expires", () => {

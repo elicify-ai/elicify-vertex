@@ -192,7 +192,6 @@ const RUNNER_NON_NARROWING_FLAGS: ReadonlyMap<string, ReadonlySet<string>> = new
  */
 const NON_EXECUTING_FLAGS: ReadonlySet<string> = new Set([
   "--version",
-  "-V",
   "--help",
   "-h",
   "--collect-only",
@@ -222,6 +221,13 @@ const NON_EXECUTING_FLAGS: ReadonlySet<string> = new Set([
  */
 const RUNNER_NON_EXECUTING_FLAGS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   ["go test", new Set(["-list", "-c", "-n"])],
+  // `-V` is only "print the version" for SOME runners. `ctest -V` is the
+  // standard VERBOSE full test run and `mvn -V` prints the version and then
+  // builds -- both were being suppressed unconditionally, with the operator
+  // toasted "executes no tests" about a full suite.
+  ["npm", new Set(["-V"])],
+  ["npx", new Set(["-V"])],
+  ["node", new Set(["-V"])],
 ])
 
 /**
@@ -463,6 +469,42 @@ function normalizeRunner(runner: string): string {
  */
 const SHELL_WRAPPER_RE = /^(?:\/usr\/bin\/env\s+)?(?:bash|sh|zsh|dash|ksh)\s+-[a-z]*c\s+(.+)$/s
 
+/**
+ * Prefixes that run another command unchanged. `timeout 300 go test ./...`
+ * parsed as the runner string "timeout 300 go test ./...", so the numeric
+ * argument became part of the runner and the command could not match ANY
+ * prescription -- not even itself with a different timeout. `timeout`, `env`
+ * and `time` are near-universal in agent-run and CI-derived verifiers, so this
+ * was silently starving very ordinary commands.
+ *
+ * The number is how many of the prefix's OWN positional arguments to drop;
+ * flag-shaped tokens and `VAR=value` assignments are skipped generically.
+ */
+const TRANSPARENT_PREFIXES: ReadonlyMap<string, number> = new Map([
+  ["timeout", 1],
+  ["time", 0],
+  ["nice", 0],
+  ["ionice", 0],
+  ["stdbuf", 0],
+  ["command", 0],
+  ["env", 0],
+])
+
+function stripTransparentPrefixes(command: string): string {
+  let tokens = command.trim().split(/\s+/).filter(Boolean)
+  for (let guard = 0; guard < 4 && tokens.length > 1; guard++) {
+    const positional = TRANSPARENT_PREFIXES.get(tokens[0])
+    if (positional === undefined) break
+    let i = 1
+    while (i < tokens.length && tokens[i].startsWith("-")) i++
+    while (i < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i])) i++
+    i += positional
+    if (i >= tokens.length) break
+    tokens = tokens.slice(i)
+  }
+  return tokens.join(" ")
+}
+
 function unwrapShellWrapper(command: string): string {
   let current = command.trim()
   // Bounded: a wrapper nested more than a few deep is pathological, and an
@@ -478,7 +520,7 @@ function unwrapShellWrapper(command: string): string {
     if (!inner) break
     current = inner.trim()
   }
-  return current
+  return stripTransparentPrefixes(current)
 }
 
 /**

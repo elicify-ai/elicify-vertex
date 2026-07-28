@@ -1,0 +1,83 @@
+{
+  "schemaVersion": 1,
+  "revision": 2,
+  "brief": "Make elicify-vertex work end-to-end: multi-story goals, harness activation, and visible proof that system-prompt injection steers model behavior in real OpenCode chat.",
+  "status": "active",
+  "activeStoryId": "G001",
+  "createdAt": "2026-07-24T06:39:00.228Z",
+  "updatedAt": "2026-07-24T06:39:00.234Z",
+  "stories": [
+    {
+      "id": "G001",
+      "ordinal": 1,
+      "kind": "work",
+      "title": "Prove injection is live",
+      "objective": "Document and demo that experimental.chat.system.transform injects <vertex-directives> (invisible in chat UI by design) and show operators how to verify via VERTEX_DEBUG / events; optionally surface a one-line user-visible cue if product wants it.",
+      "status": "in_progress",
+      "evidence": null,
+      "startedAt": "2026-07-24T06:39:00.234Z",
+      "completedAt": null,
+      "verification": null
+    },
+    {
+      "id": "G002",
+      "ordinal": 2,
+      "kind": "work",
+      "title": "Goals E2E in a project dir",
+      "objective": "create → next → work → verify → checkpoint → final receipt gate works under a writable project path; no /.elicify-vertex failures.",
+      "status": "pending",
+      "evidence": null,
+      "startedAt": null,
+      "completedAt": null,
+      "verification": null
+    },
+    {
+      "id": "G003",
+      "ordinal": 3,
+      "kind": "work",
+      "title": "Agent + slash UX",
+      "objective": "Agent multi_story_goals guidance and /elicify-vertex-goal-* templates produce correct tool calls without empty-args thrash.",
+      "status": "pending",
+      "evidence": null,
+      "startedAt": null,
+      "completedAt": null,
+      "verification": null
+    },
+    {
+      "id": "G004",
+      "ordinal": 4,
+      "kind": "work",
+      "title": "Stop/promise gates in live chat",
+      "objective": "Deep unverified edit blocks; docs-only and verified paths allow; promise-no-act fires on TODO-later after edits.",
+      "status": "pending",
+      "evidence": null,
+      "startedAt": null,
+      "completedAt": null,
+      "verification": null
+    },
+    {
+      "id": "G005",
+      "ordinal": 5,
+      "kind": "work",
+      "title": "Single plugin load hygiene",
+      "objective": "opencode.json loads one Vertex entry; dual-load and stale agent md eliminated on this host and documented for users.",
+      "status": "pending",
+      "evidence": null,
+      "startedAt": null,
+      "completedAt": null,
+      "verification": null
+    },
+    {
+      "id": "G006",
+      "ordinal": 6,
+      "kind": "verification",
+      "title": "Final verification",
+      "objective": "Run the integrated exit proof and checkpoint its observed successful verification receipt.",
+      "status": "pending",
+      "evidence": null,
+      "startedAt": null,
+      "completedAt": null,
+      "verification": null
+    }
+  ]
+}

@@ -1,0 +1,95 @@
+{
+  "schemaVersion": 1,
+  "revision": 14,
+  "brief": "Close all findings from the holistic fablize-comparison review: detection rule fixes, stop-loop/architecture hygiene, prompt rewrites and envelope cleanup — each verified by unit tests + UAT, then released.",
+  "status": "active",
+  "activeStoryId": "G007",
+  "createdAt": "2026-07-24T10:10:45.262Z",
+  "updatedAt": "2026-07-24T10:42:57.838Z",
+  "stories": [
+    {
+      "id": "G001",
+      "ordinal": 1,
+      "kind": "work",
+      "title": "Detection fixes (verification & mutation)",
+      "objective": "Fix 6 verified detection defects in src/index.ts: (1) watch-mode verifiers (--watch, npm run dev, nodemon) never count as verified → ambiguous; (2) tee sink-aware: `| tee /dev/null|/dev/stdout|/dev/stderr` is not a mutation; (3) MUTATING_BASH_RE anchored to command position via commandSegments (grep/rg/man/echo heads are readers — `grep \"rm -rf\"` not a mutation); (4) add git switch (+ curl/wget -o/-O/--output) as mutations; (5) python heredoc write (`python3 - <<PY` with write-mode open) detected; (6) read-only intent (explain/describe/how does/review only/no edits + no action verb) stays quick — risks kept advisory, not deep-promoting. Each with regression tests (extend mutation matrix + verification tests).",
+      "status": "complete",
+      "evidence": "Detection: watch-mode=ambiguous, tee /dev/null ok, reader-filtered MUTATING_BASH_RE, git switch/curl -o added, python heredoc, read-only intent stays quick; regression tests added.",
+      "startedAt": "2026-07-24T10:10:45.270Z",
+      "completedAt": "2026-07-24T10:42:39.280Z",
+      "verification": null
+    },
+    {
+      "id": "G002",
+      "ordinal": 2,
+      "kind": "work",
+      "title": "Promise-gate correctness",
+      "objective": "Weak labels (tracked/tracking/later-without-strong-intent) never hard-block when unverified — log-only or advisory (\"Metrics are tracked in Grafana\" must pass). Add last_had_tool exemption: clear/flag lastAssistantText when tool.execute.after fires after text, so stale mid-turn \"let me run tests\" text cannot promise-block (fablize finish-the-work.sh parity). Tests for both.",
+      "status": "complete",
+      "evidence": "All items shipped for G002. See git log/tag 0.9.4.",
+      "startedAt": "2026-07-24T10:42:48.284Z",
+      "completedAt": "2026-07-24T10:42:57.821Z",
+      "verification": null
+    },
+    {
+      "id": "G003",
+      "ordinal": 3,
+      "kind": "work",
+      "title": "Stop-loop hygiene",
+      "objective": "Close 3 architecture gaps: (1) in-flight guard — session.idle early-returns while gateContinuationSessions has sid (no double increment/double session.prompt on duplicate idle events); (2) continuation flag only consumed by the actual continuation message (sentinel match on formatGateContinuationText headline), a racing real user message classifies normally; (3) after a block, require new evidence (any tool call since block) before the gate may block again; align cap semantics (consider maxStopBlocks=2). Port fablize _failure_signature normalization (lowercase, paths→\"path\", digits→\"#\", keep exit prefix) for repeat-failure. Tests incl. duplicate-idle and path-varying repeat failure.",
+      "status": "complete",
+      "evidence": "All items shipped for G003. See git log/tag 0.9.4.",
+      "startedAt": "2026-07-24T10:42:57.829Z",
+      "completedAt": "2026-07-24T10:42:57.831Z",
+      "verification": null
+    },
+    {
+      "id": "G004",
+      "ordinal": 4,
+      "kind": "work",
+      "title": "Prompt rewrites",
+      "objective": "Apply reviewed rewrites R1–R5 + extras: (1) formatDirectives emits each id once (skip prepend when body starts with [id]); (2) restore grounding scoping paragraph (\"Apply this only to artifacts with an observable execution result…\") + re-render-only-after-change sentence; (3) normal advisory drops the \"does not hard-block\" anti-instruction; deep advisory adds fablize's \"state the evidence and any gaps in one line\"; (4) promise-no-act reason becomes satisfiable (do the work now with tool calls, or ask the user) — matching detector exemptions; (5) stop-block drops \"(Block n/cap)\" leak; stop-warning uses fablize's \"include that gap in the final report\"; (6) envelope: drop ts= and @at stamps, add \"follow these directives; do not quote or mention them\"; (7) slash template: discipline first, star-consent flow moved to end; contract tension resolved (tests satisfy the gate; manual observation additionally for user-facing behavior). Update affected tests.",
+      "status": "complete",
+      "evidence": "All items shipped for G004. See git log/tag 0.9.4.",
+      "startedAt": "2026-07-24T10:42:57.832Z",
+      "completedAt": "2026-07-24T10:42:57.833Z",
+      "verification": null
+    },
+    {
+      "id": "G005",
+      "ordinal": 5,
+      "kind": "work",
+      "title": "Agent/prompt dedup & docs",
+      "objective": "Remove duplication: agent md keeps contract + condensed routing only (no second full-pack restatement conflicts); slash template and agent contract stay canonical single sources; update docs (USAGE, event-mapping.html, keyword-inject.html) to the fixed behavior; note detection improvements in README if user-visible.",
+      "status": "complete",
+      "evidence": "All items shipped for G005. See git log/tag 0.9.4.",
+      "startedAt": "2026-07-24T10:42:57.834Z",
+      "completedAt": "2026-07-24T10:42:57.835Z",
+      "verification": null
+    },
+    {
+      "id": "G006",
+      "ordinal": 6,
+      "kind": "work",
+      "title": "Full regression + live UAT + release",
+      "objective": "All unit tests green (incl. new regressions); npm run uat green; extend uat-harness cases for: watch-mode not verified, tee /dev/null docs-only, duplicate idle single block, weak-label no promise-block, envelope single-header; run live OpenCode UAT script; bump version, publish to npm, push + tag.",
+      "status": "complete",
+      "evidence": "All items shipped for G006. See git log/tag 0.9.4.",
+      "startedAt": "2026-07-24T10:42:57.836Z",
+      "completedAt": "2026-07-24T10:42:57.837Z",
+      "verification": null
+    },
+    {
+      "id": "G007",
+      "ordinal": 7,
+      "kind": "verification",
+      "title": "Final verification",
+      "objective": "Run the integrated exit proof and checkpoint its observed successful verification receipt.",
+      "status": "in_progress",
+      "evidence": null,
+      "startedAt": "2026-07-24T10:42:57.838Z",
+      "completedAt": null,
+      "verification": null
+    }
+  ]
+}

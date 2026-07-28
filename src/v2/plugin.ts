@@ -88,6 +88,18 @@ export interface ElicifyVertexV2Options {
   readonly engine?: string
 }
 
+/** Tools that unambiguously WRITE a file named by an argument. Read/search
+ * tools are excluded on purpose: blocking those broke `cat`, `grep` and `git
+ * commit` over this repo's own source without protecting anything, since the
+ * signature — not this list — is what makes a forged receipt inert. */
+const WRITE_TOOL_NAMES = new Set(["write", "edit", "patch", "multiedit", "notebookedit"])
+
+/** Every spelling of "the file I am about to write" observed across opencode's
+ * own tools and MCP servers. `changedPathsFromTool` (src/index.ts) already had
+ * to handle `file_path` as well as `filePath`; the first version of this guard
+ * checked only three of these. */
+const WRITE_TOOL_PATH_KEYS = ["filePath", "file_path", "path", "file", "notebookPath", "destination"]
+
 const NON_PATH_MUTATION_MARKERS = new Set(["edit-mutation", "patch-mutation", "bash-mutation"])
 const TEST_PATH_RE = /\.(?:test|spec)\.[^./]+$/
 const TEST_DIR_RE = /(^|\/)tests?\//
@@ -543,49 +555,39 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       }
     },
 
-    // ── TOOL.EXECUTE.BEFORE: the evidence store is not writable by the model ─
+    // ── TOOL.EXECUTE.BEFORE: defence in depth over the evidence store ──────
     //
-    // Relocating state under `.opencode/` is only half a fix; without this it
-    // is just a different path the model can open. A review demonstrated the
-    // whole attack end to end: read the receipts file, clone a still-valid
-    // receipt with a fresh id and a different story id, append it, and the
-    // checkpoint accepts it. The story link and the worktree digest both hold
-    // — neither binds a receipt to the store having OBSERVED a command, so
-    // forging one costs a single write.
+    // NOT the integrity control. That is the HMAC in `goals.ts`: a receipt the
+    // harness did not mint has no valid signature, so `get()` refuses it no
+    // matter how it reached the file. This hook exists to give a clear error at
+    // the moment of the attempt instead of a confusing refusal later.
     //
-    // Refusing here, at the tool boundary, is the narrowest place that covers
-    // every writer: `edit`, `write`, `patch`, and a `bash` command whose text
-    // targets the directory. Reads are untouched — the model may inspect its
-    // own evidence, it just cannot author it.
+    // It is deliberately NARROW, because the wide version was worse than
+    // useless. An audit walked ~15 ways around it -- `file_path` instead of
+    // `filePath`, a path inside `patchText`, a symlink to the directory, string
+    // concatenation and base64 inside a bash command -- so it never actually
+    // held the line; and the bash substring match ALSO refused `cat`, `grep`,
+    // `ls`, and `git commit -m "move state to .opencode/elicify-vertex"`,
+    // breaking ordinary work and contradicting its own promise that reads were
+    // untouched. Signing made exhaustiveness unnecessary, so the check now
+    // covers only unambiguous write tools by path and leaves bash alone.
     async "tool.execute.before"(toolInput, toolOutput) {
       const sid = toolInput.sessionID
       if (isSelf(sid)) return
+      if (!WRITE_TOOL_NAMES.has(toolInput.tool)) return
+
       const state = states.get(sid)
       const root = state?.workspaceRoot ?? workspaceRoot
-
       const args = (toolOutput?.args ?? {}) as Record<string, unknown>
-      const candidates: string[] = []
-      for (const key of ["filePath", "path", "file"]) {
+
+      for (const key of WRITE_TOOL_PATH_KEYS) {
         const value = args[key]
-        if (typeof value === "string") candidates.push(value)
-      }
-      if (toolInput.tool === "bash" && typeof args.command === "string") {
-        // A bash command names its target inline; match the directory itself
-        // rather than trying to parse shell redirection.
-        if (args.command.includes(PLUGIN_STATE_DIR)) {
+        if (typeof value === "string" && isProtectedStatePath(value, root)) {
           throw new Error(
-            `elicify-vertex: refusing to run a command that targets ${PLUGIN_STATE_DIR}. ` +
-              `That directory holds verification evidence and is written only by the harness — ` +
-              `a receipt you authored yourself would not be evidence of anything.`,
-          )
-        }
-      }
-      for (const candidate of candidates) {
-        if (isProtectedStatePath(candidate, root)) {
-          throw new Error(
-            `elicify-vertex: ${candidate} is inside ${PLUGIN_STATE_DIR}, which holds verification ` +
-              `evidence and is written only by the harness. Record work with ` +
-              `elicify_vertex_plan_checkpoint instead of editing the store.`,
+            `elicify-vertex: ${value} is inside ${PLUGIN_STATE_DIR}, which holds verification ` +
+              `evidence written only by the harness. Receipts are signed, so one you author ` +
+              `yourself will be rejected as evidence — record work with ` +
+              `elicify_vertex_plan_checkpoint instead.`,
           )
         }
       }
@@ -787,9 +789,29 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
           // (rejected by isFreshReceipt) or fell back to a waiver/generic
           // tool. Appending it to the tool's own output puts it exactly
           // where the model already reads the verifier's result.
-          const receiptText = `[vertex:verification-receipt] ${receipt.id}`
-          toolOutput.output = `${out}${out && !out.endsWith("\n") ? "\n" : ""}${receiptText}`
-          toolOutput.metadata = { ...meta, vertexVerificationReceiptId: receipt.id }
+          //
+          // A receipt whose scope could not be fingerprinted is NOT surfaced.
+          // It cannot pass the freshness check at any consumer, so telling the
+          // model to cite it produced the worst possible sequence: mint, print
+          // the id, then refuse that id forever -- on a worktree past the
+          // file/byte ceiling no story could be closed by a receipt at all, and
+          // the only route left was a waiver. Say so plainly instead.
+          if (receipt.scope && receipt.scope.complete === false) {
+            void visibility.notify("health", {
+              sessionID: sid,
+              family: "receipt:scope-unverifiable",
+              message:
+                `verifier passed, but this worktree is too large to fingerprint ` +
+                `(${receipt.scope.fileCount} files), so no citable receipt was issued. ` +
+                `Checkpoint with a waiver, or narrow the workspace.`,
+              variant: "warning",
+            })
+            logger("receipt:scope-unverifiable", { sessionID: sid, command, fileCount: receipt.scope.fileCount })
+          } else {
+            const receiptText = `[vertex:verification-receipt] ${receipt.id}`
+            toolOutput.output = `${out}${out && !out.endsWith("\n") ? "\n" : ""}${receiptText}`
+            toolOutput.metadata = { ...meta, vertexVerificationReceiptId: receipt.id }
+          }
           // FIX #2 (review CRITICAL — "evidence auto-attach is
           // all-or-nothing"). Judgment call (documented — restate in the
           // final report, this is a genuine spec ambiguity, not a clean bug
@@ -809,11 +831,17 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
           const firstUnevidenced = pinStore.get(sid).find((c) => !c.evidence)
           if (firstUnevidenced) pinStore.attachEvidence(sid, firstUnevidenced.id, { receiptId: receipt.id })
           pinStore.persist(sid)
-        } else if (rawSuccess && exitCode === 0 && !relevanceGap) {
-          // FR-061: the command verified and covered the prescription, yet no
-          // receipt was minted (e.g. `success` was false for another reason).
-          // Silent evidence loss is the failure this whole feature exists to
-          // make visible.
+        } else if (rawSuccess && exitCode === 0 && verification.outcome === "verified" && relevanceGap) {
+          // FR-061: the command DID verify and exited 0, but its evidence was
+          // refused. Silent evidence loss is the failure this whole feature
+          // exists to make visible.
+          //
+          // The previous condition was `rawSuccess && exitCode === 0 &&
+          // !relevanceGap`, which is exactly `success && exitCode === 0` --
+          // the `if` branch above it -- so this could never fire. The signal
+          // designed to expose silent receipt loss was itself silent. It now
+          // fires on the case that actually loses evidence: a genuine pass
+          // whose coverage or provenance check refused it.
           void visibility.notify("health", {
             sessionID: sid,
             family: "receipt:not-minted",

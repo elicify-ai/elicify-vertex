@@ -1137,44 +1137,52 @@ describe("persisted receipts survive a restart and are visible to the gate", () 
 // ===========================================================================
 
 describe("the plugin's persisted state is protected from the model", () => {
-  const cases: Array<[string, string, Record<string, unknown>]> = [
-    ["write", "write", { filePath: ".opencode/elicify-vertex/receipts.json" }],
+  // The tool-boundary check is DEFENCE IN DEPTH, not the integrity control --
+  // an audit walked ~15 ways around it. The control is the HMAC in goals.ts
+  // (see tests/v2/receipts.test.ts): a receipt the harness did not mint has no
+  // valid signature and `get()` refuses it however it reached the file.
+  //
+  // What this block pins is that the friendly early error still fires for the
+  // obvious write shapes, and -- equally important -- that READS and ordinary
+  // work are not blocked. An earlier version matched the directory name inside
+  // any bash command, which also refused `cat`, `grep`, `ls` and
+  // `git commit -m "move state to .opencode/elicify-vertex"`.
+  const blocked: Array<[string, string, Record<string, unknown>]> = [
+    ["write/filePath", "write", { filePath: ".opencode/elicify-vertex/receipts.json" }],
+    ["write/file_path (snake_case)", "write", { file_path: ".opencode/elicify-vertex/receipts.json" }],
     ["edit", "edit", { filePath: ".opencode/elicify-vertex/plan.json" }],
-    ["patch", "patch", { filePath: ".opencode/elicify-vertex/pins.json" }],
-    ["traversal", "write", { filePath: "src/../.opencode/elicify-vertex/receipts.json" }],
-    ["bash redirect", "bash", { command: "echo '{}' > .opencode/elicify-vertex/receipts.json" }],
-    ["bash sed", "bash", { command: "sed -i s/a/b/ .opencode/elicify-vertex/receipts.json" }],
+    ["multiedit", "multiedit", { filePath: ".opencode/elicify-vertex/pins.json" }],
+    ["notebookedit", "notebookedit", { notebookPath: ".opencode/elicify-vertex/x.ipynb" }],
+    ["path traversal", "write", { filePath: "src/../.opencode/elicify-vertex/receipts.json" }],
   ]
 
-  it.each(cases)("refuses a %s targeting the evidence store", async (_label, tool, args) => {
+  it.each(blocked)("refuses %s targeting the evidence store", async (_label, tool, args) => {
     const client = makeStubClient()
     const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
     const sid = "guard"
     await activate(hooks, sid, "implement the production database migration")
-
     await expect(
       hooks["tool.execute.before"]!({ tool, sessionID: sid, callID: "g1" } as never, { args } as never),
     ).rejects.toThrow(/elicify-vertex/)
   })
 
-  it("still allows ordinary writes elsewhere in the repo (discrimination)", async () => {
+  const allowed: Array<[string, string, Record<string, unknown>]> = [
+    ["an ordinary source write", "write", { filePath: "src/service.ts" }],
+    ["a read of the store", "read", { filePath: ".opencode/elicify-vertex/receipts.json" }],
+    ["a grep over the store", "grep", { path: ".opencode/elicify-vertex" }],
+    ["bash naming the store", "bash", { command: "cat .opencode/elicify-vertex/receipts.json" }],
+    ["a commit message mentioning it", "bash", { command: 'git commit -m "move state to .opencode/elicify-vertex"' }],
+    ["an ordinary verifier", "bash", { command: "go test ./..." }],
+    ["editing real .opencode config", "edit", { filePath: ".opencode/opencode.json" }],
+  ]
+
+  it.each(allowed)("allows %s", async (_label, tool, args) => {
     const client = makeStubClient()
     const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
     const sid = "guard-ok"
     await activate(hooks, sid, "implement the production database migration")
-
     await expect(
-      hooks["tool.execute.before"]!(
-        { tool: "write", sessionID: sid, callID: "g2" } as never,
-        { args: { filePath: "src/service.ts" } } as never,
-      ),
-    ).resolves.toBeUndefined()
-    // ...and a bash command that merely mentions a normal path.
-    await expect(
-      hooks["tool.execute.before"]!(
-        { tool: "bash", sessionID: sid, callID: "g3" } as never,
-        { args: { command: "go test ./..." } } as never,
-      ),
+      hooks["tool.execute.before"]!({ tool, sessionID: sid, callID: "g2" } as never, { args } as never),
     ).resolves.toBeUndefined()
   })
 })
