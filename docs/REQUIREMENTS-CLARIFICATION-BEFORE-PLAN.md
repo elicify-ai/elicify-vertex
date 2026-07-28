@@ -42,58 +42,58 @@ Compare the 07-25 turn in the same session, where the agent DID stop and ask
 four architecture questions before planning. The behaviour is not absent, it is
 unreliable — so it needs a gate, not more words.
 
-## Feasibility — both halves are already available
+## Design — a reflective challenge, NOT a checker
 
-**Deterministic (preferred).** `tool.execute.after` in `src/v2/plugin.ts` fires
-for EVERY tool; it filters only self-created sessions and inactive state. So the
-harness can record whether the `question` tool was actually invoked, and when,
-per session. That is observed evidence, in keeping with this codebase's rule of
-observed-over-intent — the agent cannot claim to have asked.
+**Revised after review.** The first two drafts both got this wrong in the same
+direction: they tried to VERIFY clarification (has the `question` tool been
+called?) and refuse if not. That measures a proxy, not the thing. The model may
+legitimately have clarified in conversation without the tool, or — the case that
+matters — may need to clarify and not realise it. Checking tool usage catches
+neither.
 
-**Self-attestation (secondary).** `plan_create` currently accepts only
-`stories`. Adding fields is additive and non-breaking.
+The mechanism is instead a **reflective challenge delivered at the decision
+point**: when `elicify_vertex_plan_create` fires, its return text puts the
+question in front of the model while the plan is still fresh and cheap to
+change:
 
-## Design
+> Before you act on this plan — did you ground it in research and user
+> interview? Have you eliminated the unknowns as far as possible? If material
+> questions remain, ask them now rather than encoding a guess into stories.
 
-Two layers, mirroring how receipts and waivers work:
+Properties that make this the right shape:
 
-1. **Observed check.** Track `question`-tool usage per session. At
-   `plan_create`, if no clarification has been observed since the user's last
-   substantive request, the tool returns a **constructive refusal** naming what
-   is unclear-by-default: unstated acceptance criteria, unstated scope
-   boundaries, and any story whose `acceptanceItems` are vague.
-2. ~~**Recorded attestation.**~~ **DROPPED after review.**
+- **Not a gate.** Cannot deadlock a headless `opencode run` or CI, where nobody
+  can answer. The plan is created; the model is asked to reflect on it.
+- **Right moment.** Fires exactly when the model has committed its assumptions
+  to stories, which is when re-opening them is cheapest. A prompt-level rule
+  fires at session start, thousands of tokens before it is relevant.
+- **Uses an existing channel.** Tool return text is already how receipt ids
+  reach the model, and it demonstrably reads it.
+- **Nothing to forge.** It asks nothing of the model that gets recorded as
+  evidence, so it introduces no new self-report to trust.
 
-   The first draft added `clarifiedWith: string[]` and `openUnknowns: string[]`
-   to `plan_create`. Both are removed:
+The model may answer the challenge by proceeding, by asking the user, or by
+calling `elicify_vertex_plan_clear` and re-planning. All three are acceptable;
+what is not acceptable is the current behaviour, where nothing prompts the
+question at all.
 
-   - `clarifiedWith` duplicates data that already exists in a TRUSTWORTHY place.
-     The real questions and the user's real answers are recorded in
-     `opencode.db` as tool parts, written by the host. Copying them into
-     `plan.json` produces an unverifiable duplicate of verifiable data — written
-     by the model. That is exactly the pattern receipts and waivers were signed
-     to eliminate, and it is worse than useless: a plan showing a populated
-     `clarifiedWith` LOOKS clarified to a reviewer whether or not it is.
-   - `openUnknowns` has some value as a forcing function — writing down what you
-     could not resolve changes the plan you write — but that is a behavioural
-     nudge, and nudges belong in the agent prompt, not in a schema field the
-     harness cannot verify.
+## Feasibility
 
-   If the judge needs the clarification content at close-out, it should read the
-   session's actual `question` tool parts, not the model's summary of them.
-
-   Layer 1 carries the whole requirement.
+`elicify_vertex_plan_create` already returns text to the model, and
+`tool.execute.after` fires for every tool if a stronger signal is ever wanted.
+No new plumbing.
 
 ## Acceptance criteria
 
-- **AC-1** With no `question` tool call observed in the session and a
-  non-trivial plan (>1 story, or any story lacking concrete acceptance items),
-  `plan_create` refuses and returns text naming what needs clarifying.
-- **AC-2** The refusal is constructive: it lists the specific unknowns it
-  detected, not a generic "ask the user first".
-- **AC-3** After a real `question` call, the same `plan_create` succeeds.
-- **AC-4** A trivial plan (single story with concrete acceptance items) is NOT
-  blocked — the gate must not tax one-shot work.
+- **AC-1** `elicify_vertex_plan_create`'s return text contains the reflective
+  challenge: grounding in research/user interview, and elimination of unknowns.
+- **AC-2** The challenge is specific to the plan just created where it can be —
+  e.g. naming stories whose acceptance items are vague — rather than being
+  identical boilerplate on every call.
+- **AC-3** `plan_create` still SUCCEEDS. It is a challenge, not a gate: no
+  refusal, no deadlock in headless runs.
+- **AC-4** The challenge is proportionate: a single-story plan with concrete
+  acceptance items gets a short form or none, so one-shot work is not taxed.
 - **AC-5** No self-reported clarification field is added to `plan.json`. If the
   judge needs clarification context, it reads the session's real `question` tool
   parts.
