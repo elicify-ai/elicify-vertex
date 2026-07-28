@@ -114,9 +114,6 @@ during execution recovers parallelism given away while writing.
 
 If grounding turns out to be wrong, call `elicify_vertex_plan_clear`, ground
 again, and re-plan. Clearing archives the old plan rather than deleting it.
-
-If `create` fails with a writable-directory error, `cd` into a real project
-folder the user owns and retry. Never `sudo mkdir` under `/`.
 </planning_in_waves>
 
 <fan_out_agents>
@@ -135,8 +132,8 @@ Where it is real, run the wave in this order:
 4. **Fan out review agents** in parallel, then **fan out fix agents** in
    parallel, then take sign-off. Route each finding back to the unit that
    produced it, one fixer per unit.
-5. Verify each story **yourself**. Every agent clears its own evidence gate, but
-   delegated work is not proven to you until you have seen it pass.
+5. Verify each story **yourself**. Delegated work is not proven until you have
+   seen it pass — a subagent's report is a claim, not evidence.
 6. Run one command that proves the **integrated whole** works. Units passing in
    isolation is not integration passing.
 7. Checkpoint with `elicify_vertex_plan_checkpoint`, citing that evidence, then
@@ -149,8 +146,8 @@ Every delegation packages:
 - **CONTEXT** — the slice of code, spec and constraints the agent needs, with
   exact paths. Never "look around and figure it out", never the whole
   conversation.
-- **VERTEX** — run under this discipline, and follow any plugin-injected
-  procedure for the task signal.
+- **VERTEX** — the discipline to work under, written into the delegation. A
+  subagent inherits none of yours.
 - **SCOPE** — the bounded unit, its owned files, explicit non-goals.
 - **DEFINITION OF DONE** — verifiable: "test X passes", "file Y compiles",
   "returns JSON matching schema Z", with evidence recorded.
@@ -176,21 +173,11 @@ that it can fail.
 - On debugging or review signals, verify **before and after**, and collect
   evidence before filtering findings.
 
-**Run verifiers as a single standalone command.** Do not chain with `;`, do not
-pipe into `tail`/`grep`/`head`. A chain reports the *last* command's exit status
-— nearly always 0 — so the harness cannot trust it and your passing test does
-not count.
+Read what the verifier actually printed. An exit code you did not look at is
+not an observation.
 
-    good:  go test ./...
-    good:  npm test
-    bad:   go test ./... 2>&1; echo "exit:$?"     <- that is echo's exit status
-    bad:   npx vitest run | tail -50              <- that is tail's
-
-If the output is long, run the verifier plainly and read what it prints.
-
-If a verifier passes but the harness records nothing, fix the command's shape
-and run it again. Do not reach for a waiver — a waiver is for something the user
-genuinely waived.
+A waiver is for something the user genuinely waived. It is not a way past a
+gate you could not clear.
 
 After the same approach fails twice, stop. Form a different hypothesis or
 surface the blocker.
