@@ -564,13 +564,22 @@ export function changesWorkingDirectory(command: string): boolean {
   })
 }
 
+/** Sentinel for a directory OUTSIDE the worktree. `..` popping an empty stack
+ * used to clamp silently to the repo root, so `cd .. && npm test` -- a run in
+ * the PARENT directory -- was scored as a root run and minted a receipt.
+ * Anything outside is incomparable with a root-relative prescription. */
+const OUTSIDE_WORKTREE = "\u0000outside"
+
 function joinDir(base: string, next: string): string {
-  if (next.startsWith("/")) return next.replace(/\/+$/, "")
+  if (base === OUTSIDE_WORKTREE) return OUTSIDE_WORKTREE
+  if (next.startsWith("/")) return OUTSIDE_WORKTREE
   const parts = `${base}/${next}`.split("/").filter((p) => p.length > 0 && p !== ".")
   const out: string[] = []
   for (const part of parts) {
-    if (part === "..") out.pop()
-    else out.push(part)
+    if (part === "..") {
+      if (out.length === 0) return OUTSIDE_WORKTREE
+      out.pop()
+    } else out.push(part)
   }
   return out.join("/")
 }
@@ -875,13 +884,21 @@ export function subCommandCovers(observed: SubCommand, prescribed: SubCommand): 
   // `cd internal && go test ./auth/...` normalises to `./internal/auth/...`
   // and must still cover a prescription written that way. A bare command has
   // no targets to speak for it, so the directory is all there is.
-  if (
-    observed.targets.length === 0 &&
-    observedCwd !== "" &&
-    observedCwd !== prescribedCwd &&
-    !prescribedCwd.startsWith(`${observedCwd}/`)
-  ) {
-    return false
+  // A run outside the worktree evidences nothing inside it.
+  if (observedCwd === OUTSIDE_WORKTREE) return false
+
+  if (observed.targets.length === 0) {
+    // Observed ran somewhere OTHER than at-or-above the prescribed directory.
+    if (observedCwd !== "" && observedCwd !== prescribedCwd && !prescribedCwd.startsWith(`${observedCwd}/`)) {
+      return false
+    }
+    // ...and the mirror case: a bare run at the ROOT against a prescription
+    // scoped by `cd`. `cd backend && npm test` was prescribed precisely because
+    // the root script does not necessarily enter `backend/` -- the same
+    // non-recursing-root hazard the `-w` rule below closes for npm workspaces.
+    if (observedCwd === "" && prescribedCwd !== "" && prescribed.targets.length === 0) {
+      return false
+    }
   }
   if (!narrowingAllows(observed.narrowing, prescribed.narrowing)) return false
 
@@ -971,20 +988,33 @@ function narrowingAllows(
  * comparison.
  */
 export function isNonExecutingCommand(command: string): boolean {
-  const parts = parseSubcommands(command)
+  // Sub-commands that are pure shell plumbing and can never BE the verifier.
+  // They must not decide the question either way: including them made `every`
+  // miss `pytest --collect-only && echo done` (echo executes, so the chain
+  // "wasn't" non-executing), while `some` then over-corrected and condemned
+  // `node --version && npm test` -- a version probe chained before a real
+  // suite, which the harness's own `&&`-joined prescriptions actively induce.
+  const NOOP_RUNNERS = new Set(["echo", "true", "false", ":", "printf", "cd", "pushd", "popd"])
+  const parts = parseSubcommands(command).filter((p) => !NOOP_RUNNERS.has(p.runner.split(" ")[0]))
   // `some`, NOT `every`: `pytest --collect-only && echo done` slipped past an
   // `every` check, because `echo done` is an ordinary executing sub-command, so
   // the quantifier went false and the guard was skipped entirely -- a real
   // receipt for a chain that ran zero tests. If ANY part lists/describes instead
   // of running, the chain is not evidence.
-  return parts.length > 0 && parts.some((p) => p.nonExecuting === true)
+  // With plumbing removed, EVERY remaining sub-command must be non-executing
+  // for the chain to prove nothing.
+  return parts.length > 0 && parts.every((p) => p.nonExecuting === true)
 }
 
 export function observedCoversPrescribed(prescribed: string, observed: string): boolean {
   // `go -C` is refused on either side: the directory is unrecoverable after
   // parsing (see DIR_CHANGING_FLAG_RE), so there is nothing to normalise.
   // Plain `cd` is NOT refused -- it is folded into each sub-command's `cwd`.
-  if (DIR_CHANGING_FLAG_RE.test(observed) || DIR_CHANGING_FLAG_RE.test(prescribed)) return false
+  // Test only the command HEADS: `-C` after a pipe (`| grep -C 3 FAIL`) is a
+  // display flag and cannot affect what ran, but a raw whole-string match
+  // refused that entire command -- a routine agent idiom.
+  const headOf = (c: string): string => unwrapShellWrapper(c).split("|")[0]
+  if (DIR_CHANGING_FLAG_RE.test(headOf(observed)) || DIR_CHANGING_FLAG_RE.test(headOf(prescribed))) return false
 
   const prescribedParts = parseSubcommands(prescribed)
   // `||` operands are dropped from the OBSERVED side: for `A || B` that exited

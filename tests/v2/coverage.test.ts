@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest"
 import {
+  isNonExecutingCommand,
   observedCoversPrescribed,
   parseSubcommands,
   runnerEquivalent,
@@ -545,5 +546,66 @@ describe("--testNamePattern is a real narrowing selector", () => {
 
   it("credits the unfiltered run (discrimination: targets are identical)", () => {
     expect(observedCoversPrescribed("npx jest src/", "npx jest src/")).toBe(true)
+  })
+})
+
+// ===========================================================================
+// Second-round review findings — all four were introduced by the FIRST round's
+// fixes, which is why they are pinned individually here.
+// ===========================================================================
+
+describe("a run outside the worktree evidences nothing inside it", () => {
+  // `..` popped an empty stack, so "above the repo" silently became "the repo":
+  // `cd .. && npm test` -- a run in the PARENT directory -- minted a receipt.
+  // MUTATION: make joinDir's `..` branch `out.pop()` again -> red.
+  it("refuses a cd that escapes above the root", () => {
+    for (const observed of ["cd .. && npm test", "cd ../../../.. && npm test", "cd ../sibling && npm test"]) {
+      expect(observedCoversPrescribed("npm test", observed), observed).toBe(false)
+    }
+  })
+
+  it("refuses an absolute cd", () => {
+    expect(observedCoversPrescribed("npm test", "cd /tmp/elsewhere && npm test")).toBe(false)
+  })
+
+  it("still credits a cd that stays inside (discrimination)", () => {
+    expect(observedCoversPrescribed("go test ./internal/auth/...", "cd internal && go test ./auth/...")).toBe(true)
+  })
+})
+
+describe("a bare root run does not cover a cd-scoped prescription", () => {
+  // The mirror of the -w workspace rule: `cd backend && npm test` is prescribed
+  // precisely because the root script does not necessarily enter backend/.
+  it("refuses bare `npm test` against `cd backend && npm test`", () => {
+    expect(observedCoversPrescribed("cd backend && npm test", "npm test")).toBe(false)
+  })
+
+  it("credits the verbatim prescription (discrimination)", () => {
+    expect(observedCoversPrescribed("cd backend && npm test", "cd backend && npm test")).toBe(true)
+  })
+})
+
+describe("a version probe chained before a real suite still counts", () => {
+  // `every` missed `--collect-only && echo done`; `some` then condemned
+  // `node --version && npm test`. Shell plumbing is filtered out instead, so
+  // neither direction is wrong.
+  it("does not treat a chain containing a real suite as non-executing", () => {
+    expect(isNonExecutingCommand("node --version && npm test")).toBe(false)
+    expect(isNonExecutingCommand("python3 --version && pytest")).toBe(false)
+  })
+
+  it("still catches a chain that only lists tests", () => {
+    expect(isNonExecutingCommand("pytest --collect-only && echo done")).toBe(true)
+    expect(isNonExecutingCommand("npx jest --listTests && true")).toBe(true)
+  })
+})
+
+describe("-C after a pipe is a display flag, not a directory change", () => {
+  it("credits a verifier whose output is grepped with -C", () => {
+    expect(observedCoversPrescribed("npm test", "npm test 2>&1 | grep -C 3 FAIL")).toBe(true)
+  })
+
+  it("still refuses go -C in the command head (discrimination)", () => {
+    expect(observedCoversPrescribed("go -C services/api test ./...", "go -C other build ./...")).toBe(false)
   })
 })

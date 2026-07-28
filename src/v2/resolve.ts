@@ -278,9 +278,37 @@ function normalizeRoot(root: string): string {
   return root.replace(/^\.\/+/, "").replace(/\/+$/, "")
 }
 
+/**
+ * Normalise a changed path to the bare repo-relative form the manifest's roots
+ * use.
+ *
+ * Roots come from `manifest.ts` as `relative(repoRoot, dir)` -- bare and
+ * repo-relative ("services/api"). Changed paths do NOT arrive that way:
+ * opencode's `edit`/`write` tools declare `filePath` as an ABSOLUTE path and
+ * `changedPathsFromTool` passes it through verbatim, and a `./`-prefixed form
+ * is equally common. Comparing those against a bare root silently matched
+ * nothing, so every nested project root fell back to the repo root -- the
+ * scoping feature was inert in production while its unit tests, which feed only
+ * bare-relative paths, stayed green. The npm case was worse than inert: it
+ * degraded `npm test -w packages/api` to bare `npm test`, re-opening the
+ * fabrication the workspace-selector rule exists to close.
+ *
+ * `workspaceRoot` is unknown here (this module is pure), so an absolute path is
+ * reduced by finding the root segment within it rather than by subtraction.
+ */
+function normalizeChangedPath(path: string, root: string): string {
+  const cleaned = path.replace(/^\.\/+/, "")
+  if (!cleaned.startsWith("/")) return cleaned
+  if (root === "") return cleaned
+  const marker = `/${root}/`
+  const at = cleaned.indexOf(marker)
+  return at === -1 ? cleaned : cleaned.slice(at + 1)
+}
+
 function isWithinWorkspace(path: string, root: string): boolean {
   if (root === "") return true
-  return path === root || path.startsWith(`${root}/`)
+  const normalised = normalizeChangedPath(path, root)
+  return normalised === root || normalised.startsWith(`${root}/`)
 }
 
 function collectWorkspaces(manifest: Manifest): WorkspaceCandidate[] {
