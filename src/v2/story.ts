@@ -406,6 +406,22 @@ export class StoryEngine {
     }
     if (!isPlanV2(plan)) throw new Error("internal error: constructed plan failed schema validation")
 
+    // Archive an existing plan before replacing it. `createPlan` used to
+    // overwrite unconditionally while `clearPlan` archived -- so a second
+    // `elicify_vertex_plan_create` call silently discarded the user's stories,
+    // their acceptance items AND their attached evidence, with no log and
+    // nothing to recover. Losing a contract is exactly as bad as losing the
+    // evidence for it.
+    const existing = this.plans.get(sessionID) ?? null
+    if (existing && existing.stories.length > 0) {
+      this.logger("plan:replaced", {
+        sessionID,
+        replacedStories: existing.stories.length,
+        replacedStatuses: existing.stories.map((story) => story.status).join(","),
+      })
+      this.archivePlan(sessionID, existing)
+    }
+
     this.plans.set(sessionID, plan)
     this.persistPlan(sessionID)
     return plan
@@ -640,6 +656,31 @@ export class StoryEngine {
    * every other session's entry untouched). Returns `false` (no-op) when
    * the session has no plan to clear.
    */
+  /** Write a plan to `archive/plan.<session>.<ts>.json`. Shared by
+   * `clearPlan` and by `createPlan`'s replace path — a plan discarded by a
+   * second create is exactly as unrecoverable as one that was cleared. */
+  private archivePlan(sessionID: string, plan: PlanV2): void {
+    try {
+      fsIO.mkdirSync(this.archiveDir, { recursive: true, mode: 0o700 })
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-")
+      let archivePath = join(this.archiveDir, `plan.${sessionID}.${timestamp}.json`)
+      let suffix = 0
+      while (fsIO.existsSync(archivePath)) {
+        suffix += 1
+        archivePath = join(this.archiveDir, `plan.${sessionID}.${timestamp}-${suffix}.json`)
+      }
+      fsIO.writeFileSync(archivePath, `${JSON.stringify(redactForDisk(plan), null, 2)}\n`, {
+        encoding: "utf8",
+        flag: "wx",
+        mode: 0o600,
+      })
+    } catch (error) {
+      // Best-effort: failing to keep a copy must not block the caller, but it
+      // must not be silent either.
+      this.logger("plan:archive-failed", { sessionID, reason: (error as Error).message })
+    }
+  }
+
   clearPlan(sessionID: string): boolean {
     const plan = this.getPlan(sessionID)
     if (!plan) return false

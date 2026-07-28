@@ -1041,3 +1041,52 @@ describe("intake capability probe (FR-030b, story.ts's obligation as the caller)
     )
   })
 })
+
+// ===========================================================================
+// A second `createPlan` must not silently discard the first plan.
+//
+// `clearPlan` archived; `createPlan` overwrote unconditionally. So a second
+// call threw away the user's stories, their acceptance items AND their
+// attached evidence, with no log and nothing to recover. Losing a contract is
+// exactly as bad as losing the evidence for it.
+// ===========================================================================
+
+describe("createPlan archives the plan it replaces", () => {
+  it("keeps a recoverable copy and logs the replacement", async () => {
+    const events: Array<[string, Record<string, unknown>]> = []
+    const root = temporaryRoot()
+    const engine = new StoryEngine({
+      stateDir: join(root, ".opencode", "elicify-vertex"),
+      logger: (event, payload) => events.push([event, payload as Record<string, unknown>]),
+    })
+
+    engine.createPlan("s1", [
+      { text: "migrate the schema", acceptanceItems: ["migration applies"], scopeGlobs: ["db/**"], verifiers: [] },
+      { text: "cut over traffic", acceptanceItems: ["traffic served"], scopeGlobs: ["lb/**"], verifiers: [] },
+    ])
+
+    engine.createPlan("s1", [
+      { text: "tidy up", acceptanceItems: ["ok"], scopeGlobs: ["**"], verifiers: [] },
+    ])
+
+    const archived = readdirSync(join(root, ".opencode", "elicify-vertex", "archive"))
+    const planCopies = archived.filter((name) => name.startsWith("plan.s1."))
+    expect(planCopies.length, "the replaced plan must be recoverable").toBeGreaterThan(0)
+    expect(readFileSync(join(root, ".opencode", "elicify-vertex", "archive", planCopies[0]), "utf8")).toContain(
+      "migrate the schema",
+    )
+    expect(events.map(([event]) => event)).toContain("plan:replaced")
+  })
+
+  it("does not archive when there was no prior plan (discrimination)", async () => {
+    const root = temporaryRoot()
+    const engine = new StoryEngine({
+      stateDir: join(root, ".opencode", "elicify-vertex"),
+      logger: () => {},
+    })
+    engine.createPlan("fresh", [{ text: "first", acceptanceItems: ["ok"], scopeGlobs: ["**"], verifiers: [] }])
+    const archiveDir = join(root, ".opencode", "elicify-vertex", "archive")
+    const archived = existsSync(archiveDir) ? readdirSync(archiveDir).filter((n) => n.startsWith("plan.fresh.")) : []
+    expect(archived, "a first plan replaces nothing").toEqual([])
+  })
+})

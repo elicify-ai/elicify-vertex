@@ -766,6 +766,19 @@ export class VerificationReceiptStore {
 
     const receipts = this.bySession.get(input.sessionID) ?? []
     receipts.push(receipt)
+    // Eviction is silent, and a criterion citing an evicted receipt reports
+    // "is not an observed receipt" -- the same message as forgery. Log the
+    // difference so an operator can tell "you made that up" from "we ran out
+    // of room", which are opposite problems.
+    if (receipts.length > MAX_RECEIPTS_PER_SESSION) {
+      for (const dropped of receipts.slice(0, receipts.length - MAX_RECEIPTS_PER_SESSION)) {
+        this.logger("receipts:evicted", {
+          sessionID: input.sessionID,
+          receiptId: dropped.id,
+          reason: `more than ${MAX_RECEIPTS_PER_SESSION} receipts this session`,
+        })
+      }
+    }
     this.bySession.set(input.sessionID, receipts.slice(-MAX_RECEIPTS_PER_SESSION))
     if (!fingerprint.complete) {
       this.logger("receipts:scope-unverifiable", {
