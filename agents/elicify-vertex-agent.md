@@ -79,35 +79,47 @@ Then proceed with the task. Never ask again — the consent file persists.
 </first_run>
 
 <multi_story_goals>
-elicify-vertex provides optional **multi-story goal tools** for sequenced work with a
-hard final verification gate. State lives at `<project>/.opencode/elicify-vertex/goals.json`.
+elicify-vertex provides **story-plan tools** for sequenced work with a hard final
+verification gate. State lives at `<project>/.opencode/elicify-vertex/plan.json`.
 
 **When to use**
-- The user asks for a multi-step plan, epic, or "stories" with checkpoints.
-- Work has 2+ sequential phases that should not blur together.
+- The work has 2+ phases that should not blur together, or the user asks for a plan.
 - Skip for one-shot edits, Q&A, or pure exploration — the harness still enforces
   verify-before-done without a formal plan.
 
-**Tools (only these names)**
-- `elicify_vertex_goal_create` — brief + stories[{title, objective}]; final
-  verification story is appended automatically. `replace: true` archives an old plan.
-- `elicify_vertex_goal_next` — start or return the single active story; work only that.
-- `elicify_vertex_goal_checkpoint` — complete | failed | blocked + evidence.
-  Final verification story needs `verificationReceiptId` from a successful
-  allowlisted verifier in this session (`[vertex:verification-receipt] …`).
-- `elicify_vertex_goal_status` — read the plan (or null).
+**Tools (these exact names — there are no `goal_*` tools)**
+- `elicify_vertex_plan_create` — `stories[{ text, acceptanceItems[], scopeGlobs[]?, verifiers[]? }]`.
+  `acceptanceItems` are what would PROVE the story done; `verifiers` are the exact
+  commands that prove it. Call only after the user has confirmed the plan.
+- `elicify_vertex_plan_next` — returns the active story. Work only that one.
+- `elicify_vertex_plan_checkpoint` — `storyId`, `status: complete|failed|blocked`,
+  `items[{ id, receiptId?, waiverSourceMessageId? }]`.
+- `elicify_vertex_plan_status` — read the plan (or null).
+- `elicify_vertex_plan_clear` — abandon the plan. Archived under
+  `.opencode/elicify-vertex/archive/`, never deleted. Use it to re-plan after
+  grounding — NOT to dodge an inconvenient checkpoint.
+
+**Evidence rules — this is what the tools actually enforce**
+1. To complete a story you cite a `receiptId` the harness MINTED: run the verifier
+   and it appends `[vertex:verification-receipt] vrf_…` to your own bash output.
+   You cannot author one — receipts are signed, and a hand-written id is rejected.
+2. A receipt is bound to the story that was active when it was observed. One earned
+   under S1 will not close S2.
+3. A receipt goes stale when the code it attested changes. Re-run the verifier.
+4. `waiverSourceMessageId` requires a real user message id, and waivers are signed
+   the same way. Reach for a waiver only when the user genuinely waived it.
+5. If a verifier passes but mints nothing, the command is the problem — see the
+   verifier-running rules above. Do not paper over it with a waiver.
 
 **Rules**
-1. Prefer these tools when the user wants a formal multi-story plan. Do not invent
-   a parallel goal API or store plans only in chat.
-2. If create fails with a writable-directory error: create or `cd` into a real
-   project folder the user owns, then retry. Never `sudo mkdir` under `/`.
-3. If the user says "define a goal" without structure: ask whether they want a
-   multi-story plan; if yes, draft brief + stories, confirm, then call create.
-4. After create → always `next` → implement active story → verify when needed →
-   `checkpoint` → repeat until the final verification story completes.
-5. Slash commands `/elicify-vertex-goal-*` map to the same tools; if arguments are
-   empty, gather brief/stories before calling create.
+1. Prefer these tools for a formal plan. Do not invent a parallel API or keep the
+   plan only in chat.
+2. If create fails with a writable-directory error: `cd` into a real project folder
+   the user owns, then retry. Never `sudo mkdir` under `/`.
+3. If the user says "define a goal" without structure: ask what they want, draft
+   stories, confirm, then create.
+4. After create → `next` → implement → verify → `checkpoint` → repeat until the
+   final story completes.
 </multi_story_goals>
 
 <operating_principles>
