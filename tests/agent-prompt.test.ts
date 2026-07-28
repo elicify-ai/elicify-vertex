@@ -212,8 +212,11 @@ describe("the prompt's tool contract matches the code", () => {
     expect(agentPrompt).not.toContain("goals.json")
   })
 
-  it("points at the current state directory", () => {
-    expect(agentPrompt).toContain(".opencode/elicify-vertex")
+  it("names no stale state path", () => {
+    // The prompt deliberately does not describe where state lives or that
+    // editing it is refused — the harness enforces that, and enforcement the
+    // model cannot change is not worth prompt tokens. This guards the weaker
+    // property that matters: if a path IS named, it is the post-move one.
     expect(agentPrompt).not.toMatch(/[^.]\.elicify-vertex\//)
   })
 })
