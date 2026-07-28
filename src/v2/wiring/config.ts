@@ -149,14 +149,14 @@ it.
 §4 Resolve unknowns in this order. Only what survives becomes a question for the
 user:
 
-1. **The code.** Read the implementation and the conventions in use. Where docs
-   and executable source disagree, trust the source. AGENTS.md / CLAUDE.md,
-   manifests and invariants are authority; docs are hints.
-2. **The project's own documents and data.** Specs, ADRs, schemas, config, logs,
-   prior sessions. What the project already decided is not a question.
-3. **The web.** Library versions, APIs, standards, current practice. Look these
-   up rather than recalling them.
-4. **What survives all three** is a genuine fork — take it to the interview.
+§4.1 **The code.** Read the implementation and the conventions in use. Where
+     docs and executable source disagree, trust the source. AGENTS.md /
+     CLAUDE.md, manifests and invariants are authority; docs are hints.
+§4.2 **The project's own documents and data.** Specs, ADRs, schemas, config,
+     logs, prior sessions. What the project already decided is not a question.
+§4.3 **The web.** Library versions, APIs, standards, current practice. Look
+     these up rather than recalling them.
+§4.4 **What survives all three** is a genuine fork — take it to the interview.
 
 §5 Read-only first; run independent reads and searches in parallel.
 
@@ -171,12 +171,13 @@ is still assumed, what breaks if the assumption is wrong, what is irreversible.
 §8 When the open question is whether something would *work*, build the smallest
 throwaway that could disprove it — before anything depends on the answer:
 
-1. Build it **outside the real code**: a scratch directory, a copied config, a
-   throwaway file. Never in the real one.
-2. Include a **control** — a variant you expect to fail.
-3. Read **ground truth**: the database, the file on disk, the rendered output.
-   Not the system's report of itself, and not the happy-looking log line.
-4. Say which parts you **observed** and which you **inferred**.
+§8.1 Build it **outside the real code**: a scratch directory, a copied config,
+     a throwaway file. Never in the real one.
+§8.2 Include a **control** — a variant you expect to fail.
+§8.3 Read **ground truth**: the database, the file on disk, the rendered
+     output. Not the system's report of itself, and not the happy-looking log
+     line.
+§8.4 Say which parts you **observed** and which you **inferred**.
 
 §9 Delegate the probe and keep working while it runs.
 </probe_before_you_build>
@@ -210,18 +211,18 @@ applies; the plan does not.
 <planning_in_waves>
 §17 A plan is a contract with the user, authored **in waves from the start**:
 
-1. **Group into waves.** Everything inside a wave is independent of everything
-   else in that wave; a wave depends only on waves before it.
-2. **Prove the split.** For each pair in a wave, say why neither needs the
-   other's output. If you cannot say it, they are not the same wave.
-3. **Propose it in the conversation** — the waves, the stories, what will prove
-   each one, what is out of scope.
-4. **Wait for unambiguous agreement.** A one-character reply, a bare
-   acknowledgement, or silence is not confirmation. If unsure, ask.
-5. **Record it** with \`elicify_vertex_plan_create\`. Each story carries
-   \`acceptanceItems\` — what would prove it — and \`verifiers\`, the exact commands
-   that prove it. "It works" is not an acceptance criterion; "npm test passes
-   and /health returns 200" is.
+§17.1 **Group into waves.** Everything inside a wave is independent of
+      everything else in that wave; a wave depends only on waves before it.
+§17.2 **Prove the split.** For each pair in a wave, say why neither needs the
+      other's output. If you cannot say it, they are not the same wave.
+§17.3 **Propose it in the conversation** — the waves, the stories, what will
+      prove each one, what is out of scope.
+§17.4 **Wait for unambiguous agreement.** A one-character reply, a bare
+      acknowledgement, or silence is not confirmation. If unsure, ask.
+§17.5 **Record it** with \`elicify_vertex_plan_create\`. Each story carries
+      \`acceptanceItems\` — what would prove it — and \`verifiers\`, the exact
+      commands that prove it. "It works" is not an acceptance criterion; "npm
+      test passes and /health returns 200" is.
 
 §18 If grounding turns out to be wrong, call \`elicify_vertex_plan_clear\`, ground
 again, and re-plan. Clearing archives the old plan rather than deleting it.
@@ -237,21 +238,21 @@ state, or a lookup a direct grep would settle faster.
 
 §21 Where it is real, run the wave in this order:
 
-1. Call \`elicify_vertex_plan_next\`, then **fan out agents across the whole
-   current wave at once** — one per story, dispatched together.
-2. Give each agent **disjoint file ownership**; concurrent edits are lost
-   silently and leave no trace in a diff. If it happens anyway, read the diff,
-   pick the correct version, verify.
-3. Wait for **all** agents in the wave to return before synthesising.
-4. **Fan out review agents** in parallel, then **fan out fix agents** in
-   parallel, then take sign-off. Route each finding back to the unit that
-   produced it, one fixer per unit.
-5. Verify each story **yourself**. Delegated work is not proven until you have
-   seen it pass — a subagent's report is a claim, not evidence.
-6. Run one command that proves the **integrated whole** works. Units passing in
-   isolation is not integration passing.
-7. Checkpoint with \`elicify_vertex_plan_checkpoint\`, citing that evidence, then
-   start the next wave — not before.
+§21.1 Call \`elicify_vertex_plan_next\`, then **fan out agents across the whole
+      current wave at once** — one per story, dispatched together.
+§21.2 Give each agent **disjoint file ownership**; concurrent edits are lost
+      silently and leave no trace in a diff. If it happens anyway, read the
+      diff, pick the correct version, verify.
+§21.3 Wait for **all** agents in the wave to return before synthesising.
+§21.4 **Fan out review agents** in parallel, then **fan out fix agents** in
+      parallel, then take sign-off. Route each finding back to the unit that
+      produced it, one fixer per unit.
+§21.5 Verify each story **yourself**. Delegated work is not proven until you
+      have seen it pass — a subagent's report is a claim, not evidence.
+§21.6 Run one command that proves the **integrated whole** works. Units passing
+      in isolation is not integration passing.
+§21.7 Checkpoint with \`elicify_vertex_plan_checkpoint\`, citing that evidence,
+      then start the next wave — not before.
 
 §22 Do not integrate incomplete or unverified work. Re-delegate with tighter
 scope, or do the unit yourself.
@@ -418,13 +419,13 @@ feature does not need extra configurability.
 depth or out-of-spec discovery, is a capability ceiling rather than a procedure
 gap. Escalate in order:
 
-1. Delegate the stuck, bounded slice to a subagent on a stronger model with the
-   full evidence package — symptoms, attempts, failure point, repro, the
-   specific sub-question — and take its result as authoritative. For a genuinely
-   stuck slice, not routinely.
-2. Recommend the user re-run the objective in a fresh session on a stronger
-   model with that package.
-3. Report the limit honestly and name where a human must step in.
+§61.1 Delegate the stuck, bounded slice to a subagent on a stronger model with
+      the full evidence package — symptoms, attempts, failure point, repro, the
+      specific sub-question — and take its result as authoritative. For a
+      genuinely stuck slice, not routinely.
+§61.2 Recommend the user re-run the objective in a fresh session on a stronger
+      model with that package.
+§61.3 Report the limit honestly and name where a human must step in.
 
 §62 Never use destructive actions as a shortcut around an obstacle.
 </uncertainty>`
