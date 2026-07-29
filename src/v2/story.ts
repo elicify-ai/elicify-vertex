@@ -806,7 +806,21 @@ export class StoryEngine {
 
     const wasActive = story.status === "active"
     story.status = status
-    if (status === "complete" && wasActive) {
+    // C-16 fix (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md): promote the next
+    // pending story whenever the active slot vacates, regardless of WHY --
+    // complete, blocked, OR failed -- not just "complete". Before this fix,
+    // blocking/failing the active story left the plan with zero active
+    // stories and no automatic recovery: if an EARLIER story had separately
+    // been reopened and rejoined the queue as "pending" (`reopenStory`'s
+    // "another story is already active" branch), it could never be promoted
+    // back to active once the story occupying the active slot also
+    // blocked/failed instead of completing -- nothing ran this same
+    // first-pending-match scan for those two transitions. Symmetric with the
+    // "complete" case in every other respect (same selection: first
+    // "pending" story in array order); does not change `reopenStory`'s own
+    // no-preemption guarantee -- a reopened story still only jumps straight
+    // to "active" when NOTHING is active, exactly as before.
+    if (wasActive) {
       const next = plan.stories.find((candidate) => candidate.status === "pending")
       if (next) {
         next.status = "active"

@@ -327,9 +327,14 @@ describe("handleSessionIdle — stage-1 plan-completion gate", () => {
     const h = harness()
     const sid = "s1"
     quietSession(h, sid)
+    // Single-story plan: C-16's fix promotes the next PENDING story whenever
+    // the active slot vacates (complete, blocked, or failed alike) -- with a
+    // trailing pending story present, blocking S1 would auto-promote it
+    // instead of leaving the plan with no active story, which is a
+    // different scenario than this test is for. One story leaves nothing to
+    // promote, preserving the "no active story" case this test targets.
     h.storyEngine.createPlan(sid, [
       { text: "Blocked story", acceptanceItems: ["cannot be done"], scopeGlobs: [], verifiers: [] },
-      { text: "Trailing story", acceptanceItems: ["never started"], scopeGlobs: [], verifiers: [] },
     ])
     h.storyEngine.checkpoint(sid, "S1", "blocked", { isValidReceipt: () => true })
     expect(h.storyEngine.getActiveStory(sid)).toBeNull()
@@ -351,9 +356,11 @@ describe("handleSessionIdle — stage-1 plan-completion gate", () => {
     const h = harness()
     const sid = "s1"
     quietSession(h, sid)
+    // Single-story plan: see the previous test's comment -- with a pending
+    // trailing story, C-16's fix would auto-promote it instead of leaving
+    // the plan genuinely stalled, which is the scenario this test needs.
     h.storyEngine.createPlan(sid, [
       { text: "Blocked story", acceptanceItems: ["cannot be done"], scopeGlobs: [], verifiers: [] },
-      { text: "Trailing story", acceptanceItems: ["never started"], scopeGlobs: [], verifiers: [] },
     ])
     h.storyEngine.checkpoint(sid, "S1", "blocked", { isValidReceipt: () => true })
 

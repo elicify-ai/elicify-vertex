@@ -1110,10 +1110,14 @@ console.log("\nT. V2 round-2 fixes (C-11 final-story gate, C-14 activation inter
 
   // Resolve S2. `reopenStory` rejoins S2 as "pending" (S3 is currently
   // active), NOT "active" -- it can only become active once the currently-
-  // active story closes, but S3 (final) can never close via "complete" while
-  // S2 is unresolved (the C-11 gate just proved above). The recovery path is
-  // to block S3 too first (blocked/failed transitions clear "active" without
-  // requiring promotion), which frees the active slot for S2's reopen.
+  // active slot vacates. Before C-16's fix, this required a convoluted
+  // "checkpoint the pending story to blocked, then reopen it again" trick,
+  // since only a "complete" transition ever ran the promotion scan. C-16
+  // extended that scan to fire on ANY active-slot vacancy (complete,
+  // blocked, or failed alike) -- so the natural move (block the stuck final
+  // story, which is exactly what a model discovers it needs to do from the
+  // T1-final-story-blocked rejection message above) now auto-promotes S2
+  // directly, no second trick required.
   await hooks.tool.elicify_vertex_plan_reopen.execute({ storyId: s2.id, reason: "unblocked for uat" }, ctx)
   let s2StillPending = false
   try {
@@ -1126,22 +1130,13 @@ console.log("\nT. V2 round-2 fixes (C-11 final-story gate, C-14 activation inter
   }
   assert("T1-reopened-story-rejoins-as-pending-not-active", s2StillPending, "S2 should rejoin as pending while S3 is active")
 
-  // S2 is now "pending", not "blocked"/"failed" -- reopenTool would reject a
-  // second reopen attempt outright. `checkpoint`'s blocked/failed branch has
-  // NO active-story or prior-status gate at all (unlike "complete"), so a
-  // pending story CAN be checkpointed straight to "blocked" -- a legitimate,
-  // ungated transition that exists purely to make it reopen-eligible again.
-  // Chaining these two already-existing primitives (checkpoint-to-blocked,
-  // then reopen) is the only path back to "active" once a story has been
-  // displaced to "pending" while its would-be active slot is occupied by a
-  // story that itself later blocks instead of completing -- non-obvious,
-  // found only by tracing checkpoint's exact branch structure, but genuinely
-  // supported by the code as written; not a defect to fix here (evidence
-  // integrity holds throughout -- the cost is operational friction, not
-  // correctness), just an interaction worth documenting.
   await hooks.tool.elicify_vertex_plan_checkpoint.execute({ storyId: s3.id, status: "blocked", items: [] }, ctx)
-  await hooks.tool.elicify_vertex_plan_checkpoint.execute({ storyId: s2.id, status: "blocked", items: [] }, ctx)
-  await hooks.tool.elicify_vertex_plan_reopen.execute({ storyId: s2.id, reason: "retry now that S3 vacated active" }, ctx)
+  const afterS3Blocked = JSON.parse(await hooks.tool.elicify_vertex_plan_status.execute({}, ctx))
+  assert(
+    "T1-blocking-final-story-auto-promotes-pending-predecessor",
+    afterS3Blocked.stories.find((s) => s.id === s2.id)?.status === "active",
+    JSON.stringify(afterS3Blocked.stories.map((s) => [s.id, s.status])),
+  )
   await hooks.tool.elicify_vertex_plan_checkpoint.execute(
     { storyId: s2.id, status: "complete", items: [{ id: s2.acceptanceItems[0].id, waiverSourceMessageId: t1UserMsgId }] },
     ctx,

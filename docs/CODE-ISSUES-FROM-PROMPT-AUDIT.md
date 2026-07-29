@@ -1,21 +1,23 @@
 # Code issues found by auditing the agent prompt
 
 Status: **CLOSED.** Raised 2026-07-28 while rewriting
-`agents/elicify-vertex-agent.md`. C-1 retracted (not a defect). C-5 and C-16
-decided (no code change; reasoning recorded per item). Every other item —
-C-2/C-3/C-4/C-6/C-7/C-8/C-9/C-10/C-11/C-12/C-13/C-14/C-15 — is implemented
-and tested, including the items originally deferred as pre-existing or
-higher-risk, on explicit instruction to close every remaining item,
-preexisting or not. C-15 was found by adversarial re-review of C-8/C-9
-themselves, during the re-review this same instruction also required — a gap
-in the entropy backstop C-8's own fix relied on, plus an unbounded cost
-regression in C-9's fix. Both closed; see C-15 for the full account,
-including a regression a first attempt at the fix caused and this session's
-own verification caught before it shipped. C-16 was found constructing new
-host-faithful UAT coverage for C-11/C-12 (`scripts/uat-harness.mjs` section
-T) — a narrow, low-severity story-promotion edge case with a real but
-non-obvious recovery path; documented rather than redesigning StoryEngine's
-promotion semantics under time pressure.
+`agents/elicify-vertex-agent.md`. C-1 retracted (not a defect). C-5 decided
+(no code change; reasoning recorded). Every other item —
+C-2/C-3/C-4/C-6/C-7/C-8/C-9/C-10/C-11/C-12/C-13/C-14/C-15/C-16 — is
+implemented and tested, including the items originally deferred as
+pre-existing or higher-risk, on explicit instruction to close every
+remaining item, preexisting or not. C-15 was found by adversarial re-review
+of C-8/C-9 themselves, during the re-review this same instruction also
+required — a gap in the entropy backstop C-8's own fix relied on, plus an
+unbounded cost regression in C-9's fix. Both closed; see C-15 for the full
+account, including a regression a first attempt at the fix caused and this
+session's own verification caught before it shipped. C-16 was found
+constructing new host-faithful UAT coverage for C-11/C-12
+(`scripts/uat-harness.mjs` section T) — a narrow story-promotion edge case,
+initially decided as "documented, not fixed" (a working but non-obvious
+recovery path existed), then genuinely fixed on the operator's explicit
+instruction to redesign the promotion trigger rather than accept the
+workaround.
 
 Each item below was a *prompt rule* compensating for a *code defect*. The rules
 have been removed from the prompt — a prompt that teaches the model to route
@@ -726,7 +728,7 @@ from the working tree).
 
 ---
 
-## C-16 — DECIDED. A story displaced to "pending" can be stranded if the story occupying its active slot later blocks instead of completing
+## C-16 — RESOLVED. A story displaced to "pending" could be stranded if the story occupying its active slot later blocked instead of completing
 
 **Severity: low — operational friction, not a correctness or evidence-integrity
 gap.** Found while writing new host-faithful UAT coverage for C-11/C-12
@@ -738,47 +740,53 @@ shape); successor-promotion skips it and promotes S3 (final) to active.
 `elicify_vertex_plan_reopen(S2)` correctly rejoins S2 as `"pending"` (S3 is
 active — see `reopenStory`'s documented "another story is active" branch). If
 S3 is now ALSO blocked (rather than completed), `story.status = status`'s
-transition sets no story `"active"` at all: `checkpoint`'s successor-promotion
-only fires `if (status === "complete" && wasActive)`, and `reopenStory`'s
-own "promote directly to active" branch requires the story being reopened to
-currently be `"blocked"`/`"failed"` — S2 is `"pending"`, neither. Grepped
-every `.status = "active"` assignment in `story.ts` (exactly two: the two
-just named) to confirm there is no third path.
+transition used to set no story `"active"` at all: `checkpoint`'s
+successor-promotion only fired `if (status === "complete" && wasActive)`,
+and `reopenStory`'s own "promote directly to active" branch requires the
+story being reopened to currently be `"blocked"`/`"failed"` — S2 is
+`"pending"`, neither. Grepped every `.status = "active"` assignment in
+`story.ts` (exactly two: the two just named) to confirm there was no third
+path.
 
-**The recovery path exists, but is non-obvious.** `checkpoint`'s
-`"blocked"`/`"failed"` branch has no active-story or prior-status gate at
-all — unlike `"complete"` — so a `"pending"` story CAN be checkpointed
-straight to `"blocked"` (a legitimate, ungated transition), making it
-reopen-eligible again. Chaining these two already-existing primitives —
-`checkpoint(S2, "blocked")` then `elicify_vertex_plan_reopen(S2)` — is the
-only way back to `"active"`, and it works (verified end-to-end in
-`scripts/uat-harness.mjs`'s new "T1" scenario, run against the real compiled
-`dist/v2/`). Nothing about this is documented anywhere a model would find it;
-it was found only by tracing `checkpoint`'s exact branch structure by hand.
+**Initially decided as "documented, not fixed"** (a genuinely non-obvious but
+working recovery path existed: checkpoint the stranded pending story to
+`"blocked"`, which is an ungated transition, then reopen it again). Revisited
+on the operator's explicit instruction to do the real fix rather than accept
+the workaround, given the risk was judged narrow.
 
-**Decision: documented, not fixed.** Reasons:
-- Evidence integrity holds throughout every step of this scenario — no
-  story can complete without genuine evidence, and the final story still
-  cannot close with an unresolved sibling. The cost of this gap is
-  confusion/extra tool calls, never a false "complete" claim.
-- Reachability requires a fairly specific double-displacement (an
-  out-of-order block, promotion skipping to a LATER story, THAT story also
-  blocking rather than completing) — narrower than the single-blocked-story
-  shape C-11/C-12 already cover, which is the common case.
-- A real fix belongs in `reopenStory`/`checkpoint`'s promotion semantics
-  (e.g. re-scanning for a displaced-but-recoverable story whenever the active
-  slot empties with no successor promoted) — a deliberate design change to
-  StoryEngine's core state machine, not a small patch, and not something to
-  bolt on hastily under the same time pressure that already produced one
-  regression this session (C-15's first attempt). Proportionate scope for
-  this re-review/re-UAT cycle is finding and verifying the existing recovery
-  path, not redesigning the state machine.
-- Genuinely reachable in practice, a real model given `elicify_vertex_plan_reopen`'s
-  tool description (which explicitly states it only accepts `"blocked"`/`"failed"`)
-  would receive a clear, specific rejection naming exactly what's wrong on the
-  first stuck reopen attempt — not a silent or confusing failure — leaving
-  room to reason its way to the checkpoint-to-blocked trick, ask the user, or
-  escalate, rather than being trapped with no diagnostic signal at all.
+**Fix applied.** `checkpoint`'s successor-promotion now fires whenever the
+active slot vacates for ANY reason — `"complete"`, `"blocked"`, or
+`"failed"` alike — not just `"complete"`. Symmetric with the existing
+`"complete"` case in every other respect: same selection (first `"pending"`
+story in array order), same `startedAt` stamping. Does not touch
+`reopenStory`'s own no-preemption guarantee — a reopened story still only
+jumps straight to `"active"` when nothing else is active, exactly as before.
+
+Retracing the scenario with the fix: S2 blocks while pending (nothing to
+promote, no-op) → S1 completes, promotion skips blocked S2, promotes S3 →
+reopening S2 correctly rejoins it as `"pending"` (S3 active) → S3, still
+stuck because C-11 rejects its completion while S2 is unresolved, gets
+blocked by the model (the natural next move, directly suggested by C-11's
+own rejection message) → **S2 is now auto-promoted to `"active"`
+immediately** → S2 completes normally → S3 is reopened (nothing active, so
+it resumes directly per the existing branch) → S3 completes, C-11's gate
+passes. No more "checkpoint-to-blocked-then-reopen" trick required anywhere
+in the flow.
+
+Covered by two new tests: `tests/v2/tools.test.ts`'s "blocking the active
+story promotes the next pending one; reopening the blocked story then
+rejoins as pending" (mutation-verified: reverting the promotion gate back to
+`status === "complete" && wasActive` turns it red), and
+`scripts/uat-harness.mjs`'s "T1" scenario, simplified to the natural
+recovery flow and re-verified end to end against the real compiled
+`dist/v2/` (112/112 UAT scenarios, stable across repeated runs). Three
+existing tests encoded the OLD "blocking the active story leaves nothing
+active" behavior as their premise (`tests/v2/gate.test.ts` ×2,
+`tests/v2/tools.test.ts` ×1) — updated: the two `gate.test.ts` tests moved to
+single-story plans (nothing pending to promote, preserving their original
+"no active story" intent unchanged); the `tools.test.ts` test was narrowed
+to a single-story plan for its original assertion, with the promotion-aware
+two-story case split into the new dedicated test above.
 
 ---
 

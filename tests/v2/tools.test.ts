@@ -415,13 +415,12 @@ describe("elicify_vertex_plan_reopen tool", () => {
   // stays "blocked" and both assertions below go RED.
   it("reopens a blocked story, called through the tool's execute (not storyEngine.reopenStory directly)", async () => {
     const harness = boot(temporaryRoot())
+    // Single story: nothing pending to auto-promote (C-16) when it blocks,
+    // so "nothing else is active" holds and this stays a clean test of the
+    // reopen TOOL's own wiring, not promotion mechanics (covered separately
+    // below).
     await harness.tools.elicify_vertex_plan_create.execute(
-      {
-        stories: [
-          { text: "story one", acceptanceItems: ["one"], scopeGlobs: [], verifiers: [] },
-          { text: "story two", acceptanceItems: ["two"], scopeGlobs: [], verifiers: [] },
-        ],
-      },
+      { stories: [{ text: "story one", acceptanceItems: ["one"], scopeGlobs: [], verifiers: [] }] },
       { sessionID: SESSION } as never,
     )
     await blockStory(harness, "S1")
@@ -439,6 +438,39 @@ describe("elicify_vertex_plan_reopen tool", () => {
     expect(parsed.becameActive).toBe(true)
     expect(harness.storyEngine.getPlan(SESSION)?.stories[0].status).toBe("active")
     expect(harness.storyEngine.getActiveStory(SESSION)?.id).toBe("S1")
+  })
+
+  // C-16 (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md): blocking the ACTIVE story
+  // now auto-promotes the next pending story (checkpoint's promotion scan
+  // fires on any active-slot vacancy, not just "complete") -- so reopening
+  // the blocked story afterward finds another story already active and
+  // correctly rejoins the queue as "pending" rather than preempting it.
+  // MUTATION PROOF: revert story.ts's checkpoint to gate promotion on
+  // `status === "complete" && wasActive` -> after blockStory(S1), S2 stays
+  // pending (getActiveStory is null) instead of becoming active -> RED.
+  it("blocking the active story promotes the next pending one; reopening the blocked story then rejoins as pending", async () => {
+    const harness = boot(temporaryRoot())
+    await harness.tools.elicify_vertex_plan_create.execute(
+      {
+        stories: [
+          { text: "story one", acceptanceItems: ["one"], scopeGlobs: [], verifiers: [] },
+          { text: "story two", acceptanceItems: ["two"], scopeGlobs: [], verifiers: [] },
+        ],
+      },
+      { sessionID: SESSION } as never,
+    )
+    await blockStory(harness, "S1")
+    expect(harness.storyEngine.getPlan(SESSION)?.stories[0].status).toBe("blocked")
+    expect(harness.storyEngine.getActiveStory(SESSION)?.id).toBe("S2")
+
+    const raw = (await harness.tools.elicify_vertex_plan_reopen.execute(
+      { storyId: "S1", reason: "the missing dependency now exists" },
+      { sessionID: SESSION } as never,
+    )) as string
+    const parsed = JSON.parse(raw) as { storyId: string; newStatus: string; becameActive: boolean }
+    expect(parsed.newStatus).toBe("pending")
+    expect(parsed.becameActive).toBe(false)
+    expect(harness.storyEngine.getActiveStory(SESSION)?.id).toBe("S2")
   })
 
   // MUTATION PROOF: in story.ts's `reopenStory`, change the `hasActiveStory`
