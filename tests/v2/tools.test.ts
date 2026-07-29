@@ -47,6 +47,7 @@ interface Harness {
   storyEngine: StoryEngine
   receipts: VerificationReceiptStore
   tools: ReturnType<typeof buildPlanTools>
+  phaseEngine: PhaseEngine
 }
 
 /** Build (or REBUILD, i.e. restart) the whole wiring over one worktree. */
@@ -56,16 +57,17 @@ function boot(root: string): Harness {
   const storyEngine = new StoryEngine({ stateDir, logger })
   const receipts = new VerificationReceiptStore()
   const states = new Map<string, V2SessionState>([[SESSION, freshSessionState(root)]])
+  const phaseEngine = new PhaseEngine(logger)
   const tools = buildPlanTools({
     storyEngine,
     pinStore: new PinStore({ stateDir, logger }),
     verificationReceipts: receipts,
     client,
     states,
-    phaseEngine: new PhaseEngine(logger),
+    phaseEngine,
     onPlanCreated: () => {},
   })
-  return { storyEngine, receipts, tools }
+  return { storyEngine, receipts, tools, phaseEngine }
 }
 
 function mintReceipt(
@@ -372,5 +374,340 @@ describe("a refused checkpoint leaves no forged evidence in plan.json (R7)", () 
 
     const planPath = join(root, ".opencode", "elicify-vertex", "plan.json")
     expect(readFileSync(planPath, "utf8")).not.toContain("vrf_totally_made_up")
+  })
+})
+
+// ===========================================================================
+// elicify_vertex_plan_reopen (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md C-6:
+// "a blocked/failed story can never be reopened, so a plan with a blocked
+// final story can never reach all-complete"). `StoryEngine.reopenStory` was
+// implemented and unit-tested, but had no caller anywhere in the wiring
+// layer -- these tests drive it the way the model actually would, through
+// the tool's own `execute`, never by calling `storyEngine.reopenStory`
+// directly.
+// ===========================================================================
+
+async function blockStory(harness: Harness, storyId: string): Promise<void> {
+  await harness.tools.elicify_vertex_plan_checkpoint.execute(
+    { storyId, status: "blocked", items: [] },
+    { sessionID: SESSION } as never,
+  )
+}
+
+describe("elicify_vertex_plan_reopen tool", () => {
+  // MUTATION PROOF: delete `elicify_vertex_plan_reopen` from the returned
+  // tool map (or from `buildPlanTools` entirely) -> `harness.tools.elicify_vertex_plan_reopen`
+  // is `undefined` and this test throws a TypeError before any assertion runs -> RED.
+  it("is registered in the tool map alongside the other five plan tools", () => {
+    const harness = boot(temporaryRoot())
+    expect(Object.keys(harness.tools).sort()).toEqual([
+      "elicify_vertex_plan_checkpoint",
+      "elicify_vertex_plan_clear",
+      "elicify_vertex_plan_create",
+      "elicify_vertex_plan_next",
+      "elicify_vertex_plan_reopen",
+      "elicify_vertex_plan_status",
+    ])
+  })
+
+  // MUTATION PROOF: replace the tool's `execute` body with a no-op that
+  // returns without calling `storyEngine.reopenStory` -> the story's status
+  // stays "blocked" and both assertions below go RED.
+  it("reopens a blocked story, called through the tool's execute (not storyEngine.reopenStory directly)", async () => {
+    const harness = boot(temporaryRoot())
+    await harness.tools.elicify_vertex_plan_create.execute(
+      {
+        stories: [
+          { text: "story one", acceptanceItems: ["one"], scopeGlobs: [], verifiers: [] },
+          { text: "story two", acceptanceItems: ["two"], scopeGlobs: [], verifiers: [] },
+        ],
+      },
+      { sessionID: SESSION } as never,
+    )
+    await blockStory(harness, "S1")
+    expect(harness.storyEngine.getPlan(SESSION)?.stories[0].status).toBe("blocked")
+
+    const raw = (await harness.tools.elicify_vertex_plan_reopen.execute(
+      { storyId: "S1", reason: "the missing dependency now exists" },
+      { sessionID: SESSION } as never,
+    )) as string
+    const parsed = JSON.parse(raw) as { storyId: string; newStatus: string; becameActive: boolean }
+
+    // S1 was the only story and nothing else is active, so it resumes as
+    // "active" directly (story.ts's `reopenStory`: "nothing else is active").
+    expect(parsed.newStatus).toBe("active")
+    expect(parsed.becameActive).toBe(true)
+    expect(harness.storyEngine.getPlan(SESSION)?.stories[0].status).toBe("active")
+    expect(harness.storyEngine.getActiveStory(SESSION)?.id).toBe("S1")
+  })
+
+  // MUTATION PROOF: in story.ts's `reopenStory`, change the `hasActiveStory`
+  // branch so a reopened story ALWAYS becomes "active" regardless of another
+  // story already being active -> two stories end up "active" at once and
+  // `getActiveStory` (which returns the FIRST match) silently hides the bug;
+  // this test instead asserts the reopened story's own status is "pending"
+  // and that the originally-active story is untouched, so it goes RED.
+  it("rejoins the queue as pending when another story is already active, instead of preempting it", async () => {
+    const harness = boot(temporaryRoot())
+    await harness.tools.elicify_vertex_plan_create.execute(
+      {
+        stories: [
+          { text: "story one", acceptanceItems: ["one"], scopeGlobs: [], verifiers: [] },
+          { text: "story two", acceptanceItems: ["two"], scopeGlobs: [], verifiers: [] },
+          { text: "story three", acceptanceItems: ["three"], scopeGlobs: [], verifiers: [] },
+        ],
+      },
+      { sessionID: SESSION } as never,
+    )
+    // S2 blocked directly while still pending (out of order); normal
+    // successor-promotion never touches it because it only fires on
+    // "complete", so S1 stays active throughout.
+    await blockStory(harness, "S2")
+    expect(harness.storyEngine.getActiveStory(SESSION)?.id).toBe("S1")
+
+    const raw = (await harness.tools.elicify_vertex_plan_reopen.execute(
+      { storyId: "S2", reason: "unblocked" },
+      { sessionID: SESSION } as never,
+    )) as string
+    const parsed = JSON.parse(raw) as { newStatus: string; becameActive: boolean }
+
+    expect(parsed.newStatus).toBe("pending")
+    expect(parsed.becameActive).toBe(false)
+    expect(harness.storyEngine.getActiveStory(SESSION)?.id).toBe("S1")
+    expect(harness.storyEngine.getPlan(SESSION)?.stories[1].status).toBe("pending")
+  })
+
+  // MUTATION PROOF: delete the `storyEngine.reopenStory(...)` call in the
+  // tool's `execute` (or swallow its error in a try/catch) -> this rejects
+  // nothing and the assertion goes RED.
+  it("errors on an unknown storyId, mirroring StoryEngine.reopenStory's own error", async () => {
+    const harness = boot(temporaryRoot())
+    await harness.tools.elicify_vertex_plan_create.execute(
+      { stories: [{ text: "story one", acceptanceItems: ["one"], scopeGlobs: [], verifiers: [] }] },
+      { sessionID: SESSION } as never,
+    )
+    await expect(
+      harness.tools.elicify_vertex_plan_reopen.execute(
+        { storyId: "S99", reason: "does not matter" },
+        { sessionID: SESSION } as never,
+      ),
+    ).rejects.toThrow(/unknown story: S99/)
+  })
+
+  // MUTATION PROOF: same as above -- if the tool stopped calling
+  // `storyEngine.reopenStory` (or wrapped/reworded its error), reopening a
+  // still-"active" story would silently succeed instead of throwing.
+  it("errors on a story that is not currently blocked or failed (still active), mirroring StoryEngine's own error", async () => {
+    const harness = boot(temporaryRoot())
+    await harness.tools.elicify_vertex_plan_create.execute(
+      { stories: [{ text: "story one", acceptanceItems: ["one"], scopeGlobs: [], verifiers: [] }] },
+      { sessionID: SESSION } as never,
+    )
+    // S1 is "active" straight out of createPlan -- not a valid reopen source.
+    await expect(
+      harness.tools.elicify_vertex_plan_reopen.execute(
+        { storyId: "S1", reason: "does not matter" },
+        { sessionID: SESSION } as never,
+      ),
+    ).rejects.toThrow(/cannot reopen story S1: status is active/)
+
+    // The rejected reopen must not have mutated anything.
+    expect(harness.storyEngine.getPlan(SESSION)?.stories[0].status).toBe("active")
+  })
+
+  // MUTATION PROOF: revert story.ts's `reopenStory` to leave prior evidence
+  // in place instead of resetting it to `null` -> `checkpoint`'s own
+  // "no evidence" branch never fires on the stale item, this stale-evidence
+  // guard silently disappears, and the assertion below (a second checkpoint
+  // attempt with NO items succeeding) goes from throwing to succeeding,
+  // flipping the `.rejects` expectation to RED.
+  it("resets acceptance evidence on reopen, so the reopened story must be re-proven before it can complete again", async () => {
+    const root = temporaryRoot()
+    const harness = boot(root)
+    await harness.tools.elicify_vertex_plan_create.execute(
+      { stories: [{ text: "story one", acceptanceItems: ["one"], scopeGlobs: ["**"], verifiers: ["npx vitest run"] }] },
+      { sessionID: SESSION } as never,
+    )
+    await blockStory(harness, "S1")
+    await harness.tools.elicify_vertex_plan_reopen.execute(
+      { storyId: "S1", reason: "unblocked" },
+      { sessionID: SESSION } as never,
+    )
+
+    // No evidence attached since the reopen -- completing must be refused.
+    await expect(
+      harness.tools.elicify_vertex_plan_checkpoint.execute(
+        { storyId: "S1", status: "complete", items: [] },
+        { sessionID: SESSION } as never,
+      ),
+    ).rejects.toThrow(/has no evidence/)
+  })
+})
+
+// ===========================================================================
+// C-6 end-to-end: the REAL failure mode the fix targets -- a plan whose
+// FINAL story blocks while active has nothing downstream to ever promote it,
+// so before this tool existed the plan could never reach all-complete. This
+// proves the actual scenario, not just the isolated reopen mechanism above.
+// ===========================================================================
+
+describe("C-6 end-to-end: a blocked FINAL story can be reopened, re-completed, and the plan reaches all-complete", () => {
+  it("recovers a plan stuck on a blocked final story via elicify_vertex_plan_reopen", async () => {
+    const root = temporaryRoot()
+    const harness = boot(root)
+    await harness.tools.elicify_vertex_plan_create.execute(
+      {
+        stories: [
+          { text: "story one", acceptanceItems: ["one"], scopeGlobs: [], verifiers: [] },
+          { text: "story two (final)", acceptanceItems: ["two"], scopeGlobs: [], verifiers: [] },
+        ],
+      },
+      { sessionID: SESSION } as never,
+    )
+
+    // Complete S1 normally -- successor-promotion activates S2 (the plan's
+    // finalStoryId).
+    const forS1 = mintReceipt(harness.receipts, root)
+    await checkpoint(harness, "S1", forS1.id)
+    expect(harness.storyEngine.getPlan(SESSION)?.finalStoryId).toBe("S2")
+    expect(harness.storyEngine.getActiveStory(SESSION)?.id).toBe("S2")
+
+    // S2 -- the FINAL story -- blocks while active. Nothing downstream exists
+    // to ever promote a successor: before this fix, the plan was stuck here
+    // permanently (the idle gate's finalStory.status === "complete" check
+    // could never be satisfied).
+    await blockStory(harness, "S2")
+    expect(harness.storyEngine.getPlan(SESSION)?.stories[1].status).toBe("blocked")
+    expect(harness.storyEngine.getActiveStory(SESSION)).toBeNull()
+
+    // Reopen it -- the real recovery path, driven through the tool.
+    const reopenRaw = (await harness.tools.elicify_vertex_plan_reopen.execute(
+      { storyId: "S2", reason: "the blocking dependency shipped upstream" },
+      { sessionID: SESSION } as never,
+    )) as string
+    const reopened = JSON.parse(reopenRaw) as { newStatus: string }
+    expect(reopened.newStatus).toBe("active")
+    expect(harness.storyEngine.getActiveStory(SESSION)?.id).toBe("S2")
+
+    // Re-complete it with fresh evidence (reopening cleared the old evidence
+    // pointer, so the FR-020 "observed receipt" bar still has to be cleared
+    // for real, not skipped because it was reopened).
+    const forS2 = mintReceipt(harness.receipts, root)
+    await checkpoint(harness, "S2", forS2.id)
+
+    const finalPlan = harness.storyEngine.getPlan(SESSION)
+    expect(finalPlan?.stories.map((s) => s.status)).toEqual(["complete", "complete"])
+    expect(finalPlan?.stories.every((s) => s.status === "complete")).toBe(true)
+  })
+})
+
+// ===========================================================================
+// C-11 fix (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md): checkpointTool places no
+// restriction on `blocked`/`failed` targeting a non-active storyId, and
+// StoryEngine.checkpoint's successor-promotion is a first-"pending"-match
+// scan -- so an earlier story blocked out of order can be silently skipped
+// while a later story, including the plan's final one, reaches "complete"
+// with the earlier one never resolved. Drives the exact audit scenario
+// through the real tool surface (elicify_vertex_plan_checkpoint /
+// elicify_vertex_plan_reopen), not storyEngine directly.
+// ===========================================================================
+
+describe("C-11 end-to-end: an out-of-order blocked story can no longer let the FINAL story silently complete", () => {
+  it("S2 blocked out of order, S1 completes (promotion skips to S3=final) -- completing S3 now rejects until S2 is genuinely resolved", async () => {
+    const root = temporaryRoot()
+    const harness = boot(root)
+    await harness.tools.elicify_vertex_plan_create.execute(
+      {
+        stories: [
+          { text: "story one", acceptanceItems: ["one"], scopeGlobs: [], verifiers: [] },
+          { text: "story two", acceptanceItems: ["two"], scopeGlobs: [], verifiers: [] },
+          { text: "story three (final)", acceptanceItems: ["three"], scopeGlobs: [], verifiers: [] },
+        ],
+      },
+      { sessionID: SESSION } as never,
+    )
+    expect(harness.storyEngine.getPlan(SESSION)?.finalStoryId).toBe("S3")
+
+    // Block S2 directly while it is still "pending" -- checkpointTool's
+    // schema/description impose no active-story requirement for blocked/failed.
+    await blockStory(harness, "S2")
+    expect(harness.storyEngine.getPlan(SESSION)?.stories[1].status).toBe("blocked")
+
+    // Complete S1 -- successor-promotion skips the blocked S2 and activates
+    // S3, the plan's final story, instead (pre-existing, unchanged behavior).
+    const forS1 = mintReceipt(harness.receipts, root, { storyId: "S1" })
+    await checkpoint(harness, "S1", forS1.id)
+    expect(harness.storyEngine.getActiveStory(SESSION)?.id).toBe("S3")
+
+    // Before the C-11 fix, this succeeded: the final story closed the plan
+    // while S2 sat permanently blocked. Now it must reject.
+    const forS3 = mintReceipt(harness.receipts, root, { storyId: "S3" })
+    await expect(checkpoint(harness, "S3", forS3.id)).rejects.toThrow(/S2:blocked/)
+
+    // Proves the gap actually closed: S3 is still active (not silently
+    // completed), S2 is still blocked, the plan is not all-complete.
+    const afterRejected = harness.storyEngine.getPlan(SESSION)!
+    expect(afterRejected.stories.find((s) => s.id === "S3")!.status).toBe("active")
+    expect(afterRejected.stories.find((s) => s.id === "S2")!.status).toBe("blocked")
+    expect(afterRejected.stories.every((s) => s.status === "complete")).toBe(false)
+
+    // Recovery through the real tool surface: free the active slot, reopen
+    // and complete S2, then reopen and complete S3.
+    await blockStory(harness, "S3")
+    expect(harness.storyEngine.getActiveStory(SESSION)).toBeNull()
+
+    await harness.tools.elicify_vertex_plan_reopen.execute(
+      { storyId: "S2", reason: "root cause identified and resolved" },
+      { sessionID: SESSION } as never,
+    )
+    expect(harness.storyEngine.getActiveStory(SESSION)?.id).toBe("S2")
+    const forS2 = mintReceipt(harness.receipts, root, { storyId: "S2" })
+    await checkpoint(harness, "S2", forS2.id)
+    expect(harness.storyEngine.getPlan(SESSION)?.stories[1].status).toBe("complete")
+
+    await harness.tools.elicify_vertex_plan_reopen.execute(
+      { storyId: "S3", reason: "resuming final story" },
+      { sessionID: SESSION } as never,
+    )
+    expect(harness.storyEngine.getActiveStory(SESSION)?.id).toBe("S3")
+    const forS3Fresh = mintReceipt(harness.receipts, root, { storyId: "S3" })
+    await checkpoint(harness, "S3", forS3Fresh.id)
+
+    const finalPlan = harness.storyEngine.getPlan(SESSION)
+    expect(finalPlan?.stories.every((s) => s.status === "complete")).toBe(true)
+  })
+})
+
+describe("C-12: reopening rebinds a phase stuck at close, not just StoryEngine status", () => {
+  it("a story whose phase reached close before it blocked is back at execute after reopen", async () => {
+    const root = temporaryRoot()
+    const harness = boot(root)
+    await harness.tools.elicify_vertex_plan_create.execute(
+      { stories: [{ text: "the only story", acceptanceItems: ["done"], scopeGlobs: [], verifiers: [] }] },
+      { sessionID: SESSION } as never,
+    )
+
+    // Drive S1's phase all the way to "close" -- the exact pre-condition
+    // C-12 describes: intake -> execute (T3) -> elevate (T4) -> close (T7).
+    harness.phaseEngine.onMutation(SESSION, "S1")
+    harness.phaseEngine.onVerifierOutcome(SESSION, "S1", { success: true, coversFinalStory: true })
+    harness.phaseEngine.onIdle(SESSION, "S1", { criteriaAllEvidenced: true, hasPins: true, unverifiedChangesExist: false })
+    expect(harness.phaseEngine.getPhase(SESSION, "S1")).toBe("close")
+
+    // Block it directly from here (mirroring the real trigger: a story can
+    // be blocked at any point, including after its phase already closed).
+    await blockStory(harness, "S1")
+    expect(harness.storyEngine.getPlan(SESSION)?.stories[0].status).toBe("blocked")
+
+    // Before the C-12 fix: reopen only touched StoryEngine, so phase stayed
+    // "close" here -- and onMutation is a documented no-op from "close" (no
+    // table arc), so nothing downstream could ever have fixed it either.
+    await harness.tools.elicify_vertex_plan_reopen.execute(
+      { storyId: "S1", reason: "root cause identified and resolved" },
+      { sessionID: SESSION } as never,
+    )
+
+    expect(harness.storyEngine.getActiveStory(SESSION)?.id).toBe("S1")
+    expect(harness.phaseEngine.getPhase(SESSION, "S1")).toBe("execute")
   })
 })

@@ -369,7 +369,7 @@ export class StoryEngine {
 
   createPlan(
     sessionID: string,
-    confirmed: Array<{ text: string; acceptanceItems: string[]; scopeGlobs: string[]; verifiers: string[] }>,
+    confirmed: Array<{ text: string; acceptanceItems: string[]; scopeGlobs?: string[]; verifiers?: string[] }>,
   ): PlanV2 {
     this.archiveV1IfPresent()
     if (confirmed.length === 0) throw new Error("a story plan requires at least one story")
@@ -386,8 +386,15 @@ export class StoryEngine {
           text: requireNonBlank(text, `stories[${index}].acceptanceItems[${itemIndex}]`),
           evidence: null,
         })),
-        scopeGlobs: [...input.scopeGlobs],
-        verifiers: [...input.verifiers],
+        // UAT finding: the host does not reliably apply the tool schema's
+        // `.default([])` for an omitted optional array arg -- a real model
+        // that simply leaves scopeGlobs/verifiers out (which "optional"
+        // invites) reaches here with `undefined`, not `[]`, despite what
+        // wiring/tools.ts's zod schema and this method's own TS signature
+        // both claim. Defend at the point of use rather than trust the
+        // caller's type.
+        scopeGlobs: [...(input.scopeGlobs ?? [])],
+        verifiers: [...(input.verifiers ?? [])],
         assumptions: [],
         rejectedAlternatives: [],
         amendments: [],
@@ -481,6 +488,124 @@ export class StoryEngine {
     this.persistPlan(sessionID)
   }
 
+  /**
+   * ADDED — not in the §9 contract's method list (see header comment).
+   * Fixes `docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md` C-6: `"active"` was
+   * previously assigned only at `createPlan` index 0 and by
+   * `checkpoint("complete")`'s successor-promotion, so a story that reached
+   * `"blocked"`/`"failed"` had NO path back to `"pending"`/`"active"` —
+   * the plan could never reach all-`"complete"`, and the idle gate's
+   * `handleIncompletePlan` (`wiring/gate.ts`) nudged forever (or, past its
+   * warn cap, just left the plan permanently unable to close out — the
+   * final-story judge close-out requires `finalStory.status === "complete"`,
+   * which a stuck blocked/failed story can never satisfy).
+   *
+   * DESIGN CHOICE — a dedicated method, not a new `checkpoint()` status
+   * value (option (a) from the fix's brief, rejected): `checkpoint`'s
+   * `"complete"` branch is already a single dense piece of logic
+   * (active-story gate, per-item evidence validation, the final-story
+   * "observed receipt" rule, successor promotion) whose docblock promises
+   * "a thrown error leaves the plan file byte-for-byte unchanged" — and
+   * this fix's own requirement is that COMPLETING a reopened story must
+   * run that exact validation IN FULL, every time, no exceptions. Folding
+   * "unblock" into the same `status` union `checkpoint` accepts would mean
+   * special-casing a fundamentally different transition (resuming work,
+   * not finishing it) inside that method, which is exactly the kind of
+   * future edit that could accidentally let a reopen skip evidence
+   * validation. A separate method — mirroring `attachEvidence` /
+   * `amendStory` immediately above, this file's other ADDED (not-in-§9)
+   * methods — keeps `checkpoint`'s `"complete"` path completely untouched
+   * by this fix, provable by the fact that none of `checkpoint`'s own code
+   * changed. It also leaves `checkpoint`'s `status` parameter type
+   * (`"complete" | "failed" | "blocked"`) exactly as `wiring/tools.ts`'s
+   * `checkpointTool` arg schema (`tool.schema.enum([...])`) already mirrors
+   * it — out of scope for this fix, so left alone.
+   *
+   * TARGET STATUS — grounded in this file's actual concurrency model, not
+   * assumed: `getActiveStory`, `checkpoint`'s active-story gate, and
+   * `wiring/tools.ts`'s `elicify_vertex_plan_next` tool ("Return THE active
+   * story", singular, "work only THAT story until checkpointed") all treat
+   * exactly one story as `"active"` at a time. There is no multi-active
+   * "wave" concept at the `StoryEngine` data-model level — the
+   * `<planning_in_waves>` / `<fan_out_agents>` system-prompt text in
+   * `wiring/config.ts` is guidance for how the MODEL organizes its OWN
+   * sub-agent dispatch while working a single story, not a second
+   * concurrency axis this engine implements or needs to preserve here. So
+   * reopening can only ever leave the plan with AT MOST one active story:
+   *  - If the plan currently has NO active story at all — which is exactly
+   *    what happens when the story being reopened was itself `"active"`
+   *    when it got blocked/failed, since `checkpoint` sets status without
+   *    promoting a successor on a non-`"complete"` outcome — the reopened
+   *    story becomes `"active"` immediately, with a fresh `startedAt`. This
+   *    is the direct resume-where-it-stalled case, including this fix's
+   *    headline scenario: the FINAL story blocked while active, with
+   *    nothing after it in the plan to ever promote it.
+   *  - If another story is CURRENTLY `"active"` (e.g. story 2 was blocked
+   *    directly while still `"pending"`, out of order, and normal
+   *    successor-promotion later activated story 3 without ever seeing
+   *    story 2 as `"pending"`), the reopened story becomes `"pending"`
+   *    instead and simply rejoins the queue at its original array
+   *    position — `checkpoint`'s existing successor-promotion
+   *    (`plan.stories.find(status === "pending")`, first array match)
+   *    already picks it up in due course with no changes needed there.
+   *    This never disrupts in-flight work on whichever story is currently
+   *    active, consistent with the single-active-story invariant above.
+   *
+   * Acceptance-item evidence is reset to `null` on every reopened story
+   * (mirrors a brand-new story's initial state in `createPlan`): the story
+   * is being reopened precisely because it did NOT reach `"complete"`
+   * cleanly, so whatever evidence was attached before the block/failure
+   * must be re-proven — not silently reused — the next time
+   * `checkpoint(..., "complete", ...)` is attempted. This is the mechanism
+   * that satisfies the fix's "must not skip acceptance-evidence
+   * requirements" bar: `checkpoint`'s own unmodified "no evidence" branch
+   * now rejects the reopened story exactly as it would a brand-new one,
+   * until fresh evidence is attached. The story's text/scope/verifiers and
+   * its `amendments` history are left untouched — only completion state
+   * resets; the reopen itself is additionally recorded as an amendment for
+   * audit purposes.
+   *
+   * Throws (never a silent no-op — reopening a story the caller
+   * misidentified must not be swallowed) on an unknown session/story, or
+   * when the story's CURRENT status is not `"blocked"`/`"failed"` —
+   * reopening is only ever a valid transition FROM one of those two
+   * terminal-but-not-complete states.
+   */
+  reopenStory(sessionID: string, storyId: string, opts: { reason: string }): void {
+    const plan = this.getPlan(sessionID)
+    if (!plan) throw new Error(`no story plan for session ${sessionID}`)
+    const story = plan.stories.find((candidate) => candidate.id === storyId)
+    if (!story) throw new Error(`unknown story: ${storyId}`)
+    if (story.status !== "blocked" && story.status !== "failed") {
+      throw new Error(
+        `cannot reopen story ${storyId}: status is ${story.status}, only a 'blocked' or 'failed' story can be reopened`,
+      )
+    }
+
+    const reason = requireNonBlank(opts.reason, "reopen reason")
+    const previousStatus = story.status
+    const hasActiveStory = plan.stories.some((candidate) => candidate.status === "active")
+
+    for (const item of story.acceptanceItems) item.evidence = null
+
+    if (hasActiveStory) {
+      // Another story is already in flight — rejoin the queue rather than
+      // preempting it. Successor-promotion (checkpoint's "complete" branch)
+      // will pick this story up, in array order, once the active one closes.
+      story.status = "pending"
+      story.startedAt = undefined
+    } else {
+      // Nothing else is active — this was the story stalling the whole
+      // plan, so resume it directly.
+      story.status = "active"
+      story.startedAt = new Date().toISOString()
+    }
+
+    story.amendments.push({ reason: `reopened from ${previousStatus}: ${reason}`, ts: new Date().toISOString() })
+    this.logger("story:reopened", { sessionID, storyId, previousStatus, newStatus: story.status })
+    this.persistPlan(sessionID)
+  }
+
   // -- FR-021: scope watchdog -----------------------------------------------
 
   /**
@@ -536,6 +661,18 @@ export class StoryEngine {
    * active story — completing a non-active story directly would silently
    * strand the plan, since successor-promotion below only fires off of
    * `wasActive`. This check runs before evidence validation.
+   *
+   * Also throws (naming every unresolved story and its status) when
+   * `status === "complete"`, `storyId` is the plan's `finalStoryId`, and any
+   * OTHER story is not `"complete"` — C-11 fix (`docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md`):
+   * successor-promotion's first-`"pending"`-match scan can skip an earlier
+   * story that was checkpointed `blocked`/`failed` directly while still
+   * `"pending"` (out of order — `blocked`/`failed` carry no active-story
+   * requirement), letting a later story, including this one, reach
+   * `"complete"` while that earlier story is never resolved. This check is
+   * scoped to the final story only; a non-final story completing while an
+   * earlier one sits blocked/failed is the intended skip-ahead/rejoin-queue
+   * shape `reopenStory` documents and this stays untouched.
    *
    * Evidence-shape enforcement performed HERE (structural only — see the
    * module header's "waiver-provenance boundary" note repeated below):
@@ -600,6 +737,44 @@ export class StoryEngine {
       }
 
       const isFinal = storyId === plan.finalStoryId
+
+      // C-11 fix (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md): successor-promotion
+      // below (`plan.stories.find((s) => s.status === "pending")`) is a
+      // first-match scan, not strict index order — deliberately so, since
+      // `reopenStory`'s documented "rejoins the queue at its original array
+      // position" recovery path depends on exactly this scan finding an
+      // earlier, since-reopened story before a later one. That same scan
+      // means an EARLIER story checkpointed `blocked`/`failed` directly
+      // while still `"pending"` (out of order — `blocked`/`failed` carry no
+      // active-story requirement, unlike `"complete"` above) gets silently
+      // skipped: a LATER story is promoted in its place and can march all
+      // the way to `"complete"` — including, eventually, THIS plan's final
+      // story — while the earlier one sits stuck, unresolved, forever,
+      // unless something calls `elicify_vertex_plan_reopen` on it (nothing
+      // does so automatically). `wiring/gate.ts`'s `appendJudgeCloseOut`
+      // treats `finalStory.status === "complete"` as "the plan is done"
+      // once its own nudge cap is exhausted, so leaving that possible would
+      // let the plan look finished while a real story never was. Reject the
+      // FINAL story's completion here unless every OTHER story is already
+      // `"complete"` — this is deliberately NOT extended to non-final
+      // stories: a later, non-final story completing while an earlier one
+      // sits blocked/failed IS the intended, tested shape (see
+      // `reopenStory`'s "rejoins the queue" case above) — only the plan's
+      // own "is everything really done" signal needs to be trustworthy.
+      if (isFinal) {
+        const unresolved = plan.stories.filter(
+          (candidate) => candidate.id !== storyId && candidate.status !== "complete",
+        )
+        if (unresolved.length > 0) {
+          const openList = unresolved.map((candidate) => `${candidate.id}:${candidate.status}`).join(", ")
+          throw new Error(
+            `cannot complete story ${storyId}: it is the plan's final story, but ` +
+              `${unresolved.length} other ${unresolved.length === 1 ? "story is" : "stories are"} not complete ` +
+              `(${openList}) — resolve and complete every story before the final one can close the plan`,
+          )
+        }
+      }
+
       for (const item of story.acceptanceItems) {
         if (!item.evidence) {
           throw new Error(`cannot complete story ${storyId}: acceptance item ${item.id} has no evidence`)

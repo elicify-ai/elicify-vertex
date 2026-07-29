@@ -85,6 +85,35 @@ describe("applyV2Config", () => {
       expect(Object.values(toolsMap).every((v) => v === false)).toBe(true)
     }
   })
+
+  // Sign-off finding: KNOWN_TOOL_NAMES (this file) is hand-maintained
+  // separately from buildPlanTools' actual tool map (wiring/tools.ts) and
+  // nothing previously caught the two drifting apart — confirmed live when
+  // elicify_vertex_plan_reopen shipped without a matching entry here. The
+  // tools deny map is documented as not the real security control (the
+  // permission wildcard is), so a missed entry isn't a capability hole today
+  // — but it should still fail loudly rather than silently, in case a future
+  // host ever does honour it.
+  it("the tools deny map names every elicify_vertex_plan_* tool buildPlanTools actually registers", async () => {
+    const stateDir = temporaryRoot()
+    const logger = vi.fn()
+    const tools = buildPlanTools({
+      storyEngine: new StoryEngine({ stateDir, logger }),
+      pinStore: new PinStore({ stateDir, logger }),
+      verificationReceipts: { get: () => undefined } as never,
+      client: { session: { messages: vi.fn(async () => ({ data: [], error: undefined })) } } as unknown as OpencodeClient,
+      states: new Map(),
+      phaseEngine: new PhaseEngine(logger),
+      onPlanCreated: () => {},
+    })
+
+    const cfgInput: { command?: Record<string, unknown>; agent?: Record<string, unknown> } = {}
+    await applyV2Config(cfgInput as never, {} as OpencodeClient, "elicify-vertex")
+    const judge = cfgInput.agent!["vertex-judge"] as { tools: Record<string, boolean> }
+
+    const missing = Object.keys(tools).filter((name) => !(name in judge.tools))
+    expect(missing, "registered plan tools missing from the deny map").toEqual([])
+  })
 })
 
 // ---------------------------------------------------------------------------

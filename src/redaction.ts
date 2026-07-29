@@ -13,12 +13,28 @@ const SECRET_PATTERNS: readonly { pattern: RegExp; replacement: string }[] = [
     pattern: /-----BEGIN [^-\r\n]*PRIVATE KEY-----[\s\S]*?-----END [^-\r\n]*PRIVATE KEY-----/g,
     replacement: "[REDACTED:PRIVATE_KEY]",
   },
+  // C-8 fix (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md): both of these entries used
+  // to accept a bare run of whitespace (`|\s+`) as the "assignment" between a
+  // sensitive-sounding label and its value, so ordinary prose like "no secrets
+  // leaked into the log output" or "the token refresh logic is fixed" — a
+  // label word followed by an unrelated sentence, not a key=value pair — was
+  // swallowed whole up to the next comma/semicolon/newline. Requiring an
+  // actual `[:=]` separator (verified against every case in
+  // tests/riskRedaction.test.ts's `redactSecrets` it.each block: each one
+  // already contains `:`/`=`, or is caught by a wholly separate dedicated
+  // pattern below — gh[pousr]_/npm_/glpat-/xoxb-/sk-/AKIA/JWT/private-key/
+  // Bearer/Basic/URL-credential — independent of this label pattern)
+  // eliminates the false positive without narrowing real `label: value` /
+  // `label=value` leaks. An unlabeled secret with no `:`/`=` nearby (e.g. "the
+  // password is hunter2...") is still covered by `judge.ts`'s separate
+  // high-entropy scan (`tripsEntropyScan`), which does not depend on this
+  // pattern matching at all.
   {
-    pattern: new RegExp(`\\b(${SENSITIVE_ASSIGNMENT_LABEL})(\\s*[:=]\\s*|\\s+)(["'])[^\\r\\n]*?\\3`, "gi"),
+    pattern: new RegExp(`\\b(${SENSITIVE_ASSIGNMENT_LABEL})(\\s*[:=]\\s*)(["'])[^\\r\\n]*?\\3`, "gi"),
     replacement: "$1$2[REDACTED]",
   },
   {
-    pattern: new RegExp(`\\b(${SENSITIVE_ASSIGNMENT_LABEL})(\\s*[:=]\\s*|\\s+)[^\\r\\n,;]+`, "gi"),
+    pattern: new RegExp(`\\b(${SENSITIVE_ASSIGNMENT_LABEL})(\\s*[:=]\\s*)[^\\r\\n,;]+`, "gi"),
     replacement: "$1$2[REDACTED]",
   },
   {

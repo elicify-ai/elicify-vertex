@@ -212,9 +212,19 @@ function narrowestPrescription(ctx: GateContext, state: V2SessionState, sid: str
  *    early return below is skipped once capped, so the rest of the tree
  *    (zero-criteria fallback, phase close) runs normally — but
  *    `appendJudgeCloseOut` independently requires the plan's final story to
- *    be `complete`, and `StoryEngine.checkpoint` only promotes stories in
- *    order, so "final complete" implies every earlier story completed.
- *    AC-3 therefore holds structurally, not by this function's grace.
+ *    be `complete`, and `StoryEngine.checkpoint` now REJECTS completing the
+ *    final story unless every OTHER story is already `complete` too (see
+ *    `story.ts`'s `checkpoint`, the `isFinal` branch — added for
+ *    `docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md` C-11). That check exists
+ *    because `checkpoint`'s successor-promotion is a first-`"pending"`-match
+ *    scan, not strict index order, so an earlier story checkpointed
+ *    `blocked`/`failed` directly while still `"pending"` — nothing requires
+ *    `blocked`/`failed` transitions to target the active story — can be
+ *    skipped by promotion and left permanently unresolved while later
+ *    stories reach `complete` on their own; "final complete only when every
+ *    earlier story completed" is therefore true because `checkpoint`
+ *    enforces it directly, not merely as a structural side effect of
+ *    promotion order. AC-3 holds on that basis.
  *
  *  - **Scope (open question 2): no abandonment is inferred.** Nothing here
  *    tries to detect that the user "moved on". That reuses the scope
@@ -409,6 +419,115 @@ async function handleCriteriaReplay(ctx: GateContext, sid: string, state: V2Sess
   return false
 }
 
+/**
+ * `docs/JUDGE-PROMPT.md` §5: bounded window of recent turns (both roles)
+ * folded into `recentTranscript`. Char-capped downstream by
+ * `buildJudgePayload` (`JUDGE_TRANSCRIPT_FIELD_CHAR_CAP`, 4000 chars) — this
+ * turn-count is a soft pre-filter, not the real bound. Judgment call: no
+ * number is given in the design doc beyond "the last few turns"; 8 messages
+ * (roughly 4 exchanges) is picked to comfortably carry an earlier hedge or
+ * admitted shortcut a couple of turns back, while the char cap is what
+ * actually keeps the payload bounded regardless of this constant.
+ */
+const JUDGE_RECENT_TRANSCRIPT_TURN_WINDOW = 8
+
+/**
+ * Structural shape of one `client.session.messages` entry. Deliberately
+ * loose (both `info`/`message` naming and an optional `parts` array) to
+ * mirror `wiring/tools.ts`'s own `isUserMessage`/`ClientMessage` handling of
+ * the same SDK call — that helper is not exported, so this is a parallel,
+ * intentionally-identical shape rather than a shared import (this module's
+ * SCOPE does not include editing `tools.ts`).
+ */
+interface JudgeTranscriptEntry {
+  info?: { id?: string; role?: string }
+  message?: { id?: string; role?: string }
+  parts?: Array<{ type?: string; text?: unknown }>
+}
+
+function isFieldsStyle(value: unknown): value is { data?: unknown; error?: unknown } {
+  return typeof value === "object" && value !== null && ("data" in value || "error" in value)
+}
+
+function extractEntryText(entry: JudgeTranscriptEntry): string {
+  return (entry.parts ?? [])
+    .filter((p): p is { type: string; text: string } => !!p && p.type === "text" && typeof p.text === "string")
+    .map((p) => p.text)
+    .join("\n")
+}
+
+/**
+ * `docs/JUDGE-PROMPT.md` §5: fetches the parent session's own last assistant
+ * message (verbatim) and a bounded recent-turn window (both roles, compact
+ * `role: text` format) to feed `buildJudgePayload`'s new `lastResponse`/
+ * `recentTranscript` raw fields. Uses the exact same `client.session.messages`
+ * call shape already proven working elsewhere in this codebase
+ * (`wiring/tools.ts:58`'s `isUserMessage`, for waiver-provenance validation)
+ * — not new capability.
+ *
+ * Fails open on any fetch/shape problem (empty strings, never throws),
+ * matching this module's "advisory, never gating" posture for the judge as a
+ * whole: a transcript fetch failure must degrade the judge's input, not
+ * break the close-out path that calls this.
+ */
+async function fetchJudgeTranscriptFields(
+  client: OpencodeClient,
+  sid: string,
+): Promise<{ lastResponse: string; recentTranscript: string }> {
+  const empty = { lastResponse: "", recentTranscript: "" }
+  try {
+    const raw = await client.session.messages({ path: { id: sid } } as never)
+    const list = isFieldsStyle(raw) ? raw.data : raw
+    if (!Array.isArray(list)) return empty
+
+    const turns = (list as JudgeTranscriptEntry[])
+      .map((entry) => {
+        const info = entry.info ?? entry.message
+        const role = info?.role
+        if (role !== "user" && role !== "assistant") return null
+        const text = extractEntryText(entry)
+        if (!text) return null
+        return { role, text }
+      })
+      .filter((t): t is { role: "user" | "assistant"; text: string } => t !== null)
+
+    let lastResponse = ""
+    for (let i = turns.length - 1; i >= 0; i--) {
+      if (turns[i].role === "assistant") {
+        lastResponse = turns[i].text
+        break
+      }
+    }
+
+    const recentTranscript = turns
+      .slice(-JUDGE_RECENT_TRANSCRIPT_TURN_WINDOW)
+      .map((t) => `${t.role}: ${t.text}`)
+      .join("\n")
+
+    return { lastResponse, recentTranscript }
+  } catch {
+    return empty
+  }
+}
+
+/**
+ * `docs/JUDGE-PROMPT.md` §4 "Proposed rendering": a `pass` verdict is a
+ * single line; a `concern` verdict is the same header line, then a numbered
+ * "what would close it" list built from `gaps`. Judgment call: the design
+ * doc's rendering is keyed on `fit`, but `isJudgeVerdictShape` (judge.ts)
+ * only hard-requires `gaps === []` when `fit === "pass"` — it does not
+ * forbid a `"concern"` verdict with an empty `gaps` array (deliberately, per
+ * the task brief). Rendering therefore branches on `gaps.length`, not `fit`,
+ * so a `concern` verdict with no gaps still degrades gracefully to the
+ * one-line form instead of printing an empty "To complete this..." list.
+ */
+function formatJudgeVerdict(verdict: JudgeVerdict): string {
+  const header = `[vertex:judge] fit=${verdict.fit} — ${verdict.summary}`
+  if (verdict.gaps.length === 0) return header
+  const gapLines = verdict.gaps.map((gap, i) => `${i + 1}. ${gap.issue} — ${gap.fix}`)
+  return [header, "", "To complete this to the standard expected:", ...gapLines].join("\n")
+}
+
 async function appendJudgeCloseOut(ctx: GateContext, sid: string, state: V2SessionState): Promise<void> {
   const plan = ctx.storyEngine.getPlan(sid)
   if (!plan) return
@@ -424,7 +543,11 @@ async function appendJudgeCloseOut(ctx: GateContext, sid: string, state: V2Sessi
   const criteria = ctx.pinStore.get(sid).map((c) => c.text)
   const verifierSummaries = ctx.recentVerifierSummaries(sid)
   const diffSummary = ctx.diffSummary(sid)
-  const payload = buildJudgePayload({ criteria, diffSummary, verifierSummaries }, bindSession(sid, ctx.logger))
+  const { lastResponse, recentTranscript } = await fetchJudgeTranscriptFields(ctx.client, sid)
+  const payload = buildJudgePayload(
+    { criteria, diffSummary, verifierSummaries, lastResponse, recentTranscript },
+    bindSession(sid, ctx.logger),
+  )
 
   const result = await runJudge(
     ctx.client,
@@ -449,11 +572,7 @@ async function appendJudgeCloseOut(ctx: GateContext, sid: string, state: V2Sessi
     return
   }
   const verdict: JudgeVerdict = result.verdict
-  await promptContinuation(
-    ctx,
-    sid,
-    `[vertex:judge] fit=${verdict.fit} — ${verdict.notes}`,
-  )
+  await promptContinuation(ctx, sid, formatJudgeVerdict(verdict))
 }
 
 /**

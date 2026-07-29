@@ -91,6 +91,7 @@ const KNOWN_TOOL_NAMES = [
   "elicify_vertex_plan_checkpoint",
   "elicify_vertex_plan_status",
   "elicify_vertex_plan_clear",
+  "elicify_vertex_plan_reopen",
 ]
 
 function buildStaticDenyMap(): Record<string, boolean> {
@@ -315,6 +316,9 @@ Documented tendencies; counteract them.
 - **Every story ends settled** — \`complete\` with evidence, or \`blocked\`/\`failed\`
   with a stated reason, through \`elicify_vertex_plan_checkpoint\`. Leaving a
   story silently open is not an ending.
+- **\`blocked\`/\`failed\` is not permanent.** Once whatever caused it is resolved,
+  call \`elicify_vertex_plan_reopen\` to resume the story rather than treating
+  the plan as stuck.
 - **Recover status** via \`elicify_vertex_plan_status\` if you have lost track of
   it. Without a plan, the same obligation holds in plain words.
 - **Report in order:** what changed, what you verified (the command and the

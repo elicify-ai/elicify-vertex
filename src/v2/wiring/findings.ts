@@ -260,11 +260,20 @@ export function incompletePlanFinding(opts: {
     "Idle was reached with an open story contract. Deterministic completion checks run before the completion " +
     "judge, so nothing has assessed this session as done — the plan itself already says it is not."
 
+  const stalledOnBlocked = incomplete.filter((story) => story.status === "blocked" || story.status === "failed")
+
   const prescription = activeStory
     ? activeStoryPrescription(activeStory)
     : `No story is active, so nothing can be checkpointed complete and the plan has stalled with ${incomplete
         .map((story) => story.id)
-        .join(", ")} unresolved. State plainly that the plan is stalled and what is needed to resume it, rather than ending the turn as if it were finished.`
+        .join(", ")} unresolved. ${
+        stalledOnBlocked.length > 0
+          ? `${stalledOnBlocked.map((story) => story.id).join(", ")} ${
+              stalledOnBlocked.length === 1 ? "is" : "are"
+            } blocked/failed with no active successor -- once whatever caused that is resolved, call ` +
+            `elicify_vertex_plan_reopen to resume it. `
+          : ""
+      }State plainly that the plan is stalled and what is needed to resume it, rather than ending the turn as if it were finished.`
 
   return {
     family: "plan-incomplete",

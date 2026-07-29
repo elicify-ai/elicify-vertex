@@ -1,10 +1,37 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs"
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import type { Hooks, PluginInput } from "@opencode-ai/plugin"
 import type { Agent } from "@opencode-ai/sdk"
+
+// C-3 (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md): the workspace-root fallback
+// only fires when EVERY candidate `resolveGoalWorkspaceRoot` tries --
+// including its own last-resort `process.cwd()`/`homedir()` fallbacks -- is
+// unwritable, which cannot be forced for real in a sandboxed CI checkout
+// without touching filesystem permissions outside this test's own temp dir.
+// `forceThrow` lets one test flip the real function to throw exactly the way
+// an unwritable root would, while every other test in this file (default
+// `forceThrow: false`) still exercises the REAL `resolveGoalWorkspaceRoot`
+// unchanged.
+const workspaceRootMock = vi.hoisted(() => ({ forceThrow: false }))
+
+vi.mock("../../src/goals.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/goals.js")>()
+  return {
+    ...actual,
+    resolveGoalWorkspaceRoot: (candidates: readonly (string | undefined | null)[]) => {
+      if (workspaceRootMock.forceThrow) {
+        throw new Error(
+          "elicify-vertex goals need a writable project directory (not filesystem root). " +
+            `Tried: ${candidates.filter(Boolean).join(", ")}`,
+        )
+      }
+      return actual.resolveGoalWorkspaceRoot(candidates)
+    },
+  }
+})
 
 import { eventsPath } from "../../src/measurement.js"
 import { server } from "../../src/plugin.js"
@@ -39,7 +66,16 @@ interface StubClient {
   created: Array<{ id: string; parentID: string | null }>
 }
 
-function makeStubClient(opts: { promptText?: (agent: string | undefined) => string } = {}): StubClient {
+function makeStubClient(
+  opts: {
+    promptText?: (agent: string | undefined) => string
+    /** `gate.ts`'s `fetchJudgeTranscriptFields` override — mirrors
+     * `tests/v2/integration-judge.test.ts`'s identical escape hatch. Defaults
+     * to the existing empty-history stub so every test that doesn't care
+     * about transcript content is unaffected. */
+    messagesImpl?: (args: { path?: { id?: string } }) => Promise<{ data?: unknown; error?: unknown }>
+  } = {},
+): StubClient {
   const created: Array<{ id: string; parentID: string | null }> = []
   let counter = 0
 
@@ -55,7 +91,10 @@ function makeStubClient(opts: { promptText?: (agent: string | undefined) => stri
     return { data: { info: {}, parts: [{ type: "text", text }] }, error: undefined }
   })
   const sessionDelete = vi.fn(async () => ({ data: {}, error: undefined }))
-  const sessionMessages = vi.fn(async () => ({ data: [], error: undefined }))
+  const sessionMessages = vi.fn(async (args: { path?: { id?: string } }) => {
+    if (opts.messagesImpl) return opts.messagesImpl(args)
+    return { data: [], error: undefined }
+  })
   const appAgents = vi.fn(async () => ({
     data: [denyAllAgent("vertex-judge"), denyAllAgent("vertex-intake")],
     error: undefined,
@@ -71,13 +110,29 @@ function makeStubClient(opts: { promptText?: (agent: string | undefined) => stri
 }
 
 let workDir: string
+let dataDir: string
+let savedVertexData: string | undefined
 
+// Sign-off finding: this file's readEvents()-based assertions (C-3,
+// subagent:injection-skipped) call eventsPath() with no override, so without
+// this isolation they read/append to the real shared
+// ~/.config/opencode/.vertex-events.jsonl — contaminated by whatever a prior
+// run (in this shared devpod, or a previous test file) left there. Sibling
+// files (integration-judge.test.ts) already isolate via VERTEX_DATA; this one
+// didn't, and this diff doubled its reliance on readEvents() (5 -> 10 call
+// sites), doubling exposure to the gap.
 beforeEach(() => {
   workDir = mkdtempSync(join(tmpdir(), "vertex-v2-plugin-test-"))
+  dataDir = mkdtempSync(join(tmpdir(), "vertex-v2-plugin-data-"))
+  savedVertexData = process.env.VERTEX_DATA
+  process.env.VERTEX_DATA = dataDir
 })
 
 afterEach(() => {
   rmSync(workDir, { recursive: true, force: true })
+  rmSync(dataDir, { recursive: true, force: true })
+  if (savedVertexData === undefined) delete process.env.VERTEX_DATA
+  else process.env.VERTEX_DATA = savedVertexData
   delete process.env.VERTEX_V2
   delete process.env.VERTEX_JUDGE
 })
@@ -425,6 +480,52 @@ function readEvents(): LoggedEvent[] {
     .map((line) => JSON.parse(line) as LoggedEvent)
 }
 
+// ===========================================================================
+// C-3 (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md) — v1's GoalStore constructor
+// threw on an unwritable workspace root; v2's plugin init catches that same
+// throw and falls back to process.cwd() SILENTLY. The fix keeps the
+// fallback (crashing plugin init is worse) but makes it observable.
+// ===========================================================================
+
+describe("C-3: the workspace-root fallback is now observable", () => {
+  afterEach(() => {
+    workspaceRootMock.forceThrow = false
+  })
+
+  it("logs workspace:unwritable-fallback when resolveGoalWorkspaceRoot throws at plugin construction", async () => {
+    workspaceRootMock.forceThrow = true
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    workspaceRootMock.forceThrow = false
+
+    // Plugin init must still succeed -- the fallback is a deliberate,
+    // lower-blast-radius choice, not a restored hard throw.
+    expect(hooks["chat.message"]).toBeDefined()
+
+    const events = readEvents().filter((e) => e.event_type === "workspace:unwritable-fallback")
+    expect(events.length, "the fallback must be logged, not silently swallowed").toBeGreaterThan(0)
+    const last = events[events.length - 1]
+    expect(last.payload.fallback).toBe(process.cwd())
+    expect(Array.isArray(last.payload.candidates)).toBe(true)
+    expect(typeof last.payload.error).toBe("string")
+  })
+
+  it("does NOT log the fallback event on ordinary (writable-root) plugin construction", async () => {
+    const client = makeStubClient()
+    await ElicifyVertexPluginV2(pluginInput(client), undefined)
+
+    // This only proves the event isn't logged on THIS construction; other
+    // tests' events may already be on disk, so we can't assert global
+    // absence -- just that a normal construction doesn't add one for our
+    // fresh, writable `workDir`.
+    const beforeCount = readEvents().filter((e) => e.event_type === "workspace:unwritable-fallback").length
+    const client2 = makeStubClient()
+    await ElicifyVertexPluginV2(pluginInput(client2), undefined)
+    const afterCount = readEvents().filter((e) => e.event_type === "workspace:unwritable-fallback").length
+    expect(afterCount).toBe(beforeCount)
+  })
+})
+
 describe("greenfield: there is no v1 engine to fall back to", () => {
   // REPLACES "test 52: kill_switch_restores_v1". The kill switch was removed
   // deliberately, not by accident:
@@ -512,6 +613,157 @@ describe("turn boundaries: a turn is a prompt, not an agent-loop step", () => {
     await toolAfter(hooks, sid, "edit", { filePath: "src/b.ts" }, "updated")
     const afterSecondPrompt = await transform(hooks, sid)
     expect(afterSecondPrompt.system.join("\n")).toBeTruthy()
+  })
+})
+
+// ===========================================================================
+// C-14 (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md): chat.message's deactivation
+// branch (`else if (msgInput.agent !== undefined && msgInput.agent !==
+// opts.activeAgent)`) used to fire on ANY non-default agent, including the
+// exact same agent that activated the session in the first place. A session
+// activated via `/elicify-vertex` trigger text while running under a
+// non-default agent (e.g. "build") necessarily sees that same "build" agent
+// again on its very next ordinary turn -- that is not a signal of anything
+// changing, but the old code read it as "user switched away" and
+// deactivated on the second turn, every time.
+//
+// Confirmed on TWO independent live-host probes (not just direct hook
+// calls) before this fix: a direct-hook probe against the real wired plugin
+// (repeated agent:"build" turns after a trigger-text activation) and a full
+// live opencode server probe (dist/plugin.js loaded by a real host, a
+// sidecar logging plugin recording the RAW chat.message input) both showed
+// msgInput.agent == "build" on every ordinary follow-up turn -- the host
+// faithfully forwards whatever `agent` the caller's session.prompt() body
+// set, it does not omit it for ordinary (non-continuation) turns. So the
+// mechanism was real and reachable; a SEPARATE live UAT run that appeared
+// to "stay active the whole time" only avoided it because a real model,
+// given one open-ended tool-calling turn, executed the entire plan
+// lifecycle (create, write, verify, checkpoint, judge) autonomously inside
+// that FIRST turn, before any second discrete chat.message ever arrived to
+// exercise the deactivation branch at all -- not because the branch didn't
+// fire once a genuine second turn showed up.
+//
+// The fix narrows deactivation to require the incoming agent differ from
+// BOTH the configured default AND whatever agent this specific session
+// itself activated under (`activatedAgentBySession`), so the classic
+// "started under the default agent, then user switches the UI's agent
+// selector to something else entirely" signal the branch was originally for
+// still fires (last test below), while "same non-default agent every turn"
+// no longer does (first test below).
+// ===========================================================================
+
+describe("C-14: agent-mismatch deactivation only fires on a genuine switch, not the session's own agent", () => {
+  const CUE = "[vertex] harness on"
+
+  async function chatMessage(hooks: Hooks, sessionID: string, text: string, agent: string | undefined) {
+    const output = {
+      message: { id: `msg-${sessionID}-${Math.random().toString(36).slice(2)}` } as never,
+      parts: [{ type: "text", text } as never],
+    }
+    await hooks["chat.message"]!({ sessionID, agent } as never, output)
+    return output
+  }
+
+  function cuePushed(output: { parts: Array<{ type?: string; text?: string }> }): boolean {
+    return output.parts.some((p) => p && p.type === "text" && typeof p.text === "string" && p.text.includes(CUE))
+  }
+
+  it("does NOT deactivate when the session's own activating agent reappears with no trigger text", async () => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "c14-same-agent"
+
+    // Turn 1: trigger text activates the harness under agent "build" (never
+    // the configured default "elicify-vertex-agent").
+    const out1 = await chatMessage(hooks, sid, "/elicify-vertex\n\ndo something", "build")
+    expect(cuePushed(out1)).toBe(true)
+
+    // Turn 2: an ordinary follow-up, no trigger text, SAME agent "build" --
+    // exactly what every subsequent turn of a real build-agent session looks
+    // like. Not an activating message itself (no trigger/command/default
+    // agent), so no cue is expected either way here.
+    const out2 = await chatMessage(hooks, sid, "just a normal follow-up message, no trigger text", "build")
+    expect(cuePushed(out2)).toBe(false)
+
+    // Turn 3: trigger text again. If turn 2 had deactivated the session,
+    // activateCueShown would have been reset to false, and this trigger
+    // message would re-activate and push the cue a SECOND time. Proving it
+    // does NOT reappear proves activation survived turn 2 uninterrupted.
+    const out3 = await chatMessage(hooks, sid, "/elicify-vertex\n\ndo something else", "build")
+    expect(cuePushed(out3)).toBe(false)
+  })
+
+  it("DOES deactivate when a later message names a genuinely different agent", async () => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "c14-genuine-switch"
+
+    // Turn 1: trigger text activates under agent "build".
+    const out1 = await chatMessage(hooks, sid, "/elicify-vertex\n\ndo something", "build")
+    expect(cuePushed(out1)).toBe(true)
+
+    // Turn 2: a DIFFERENT agent than both the default and the one that
+    // activated this session -- a genuine switch away, not a replay.
+    await chatMessage(hooks, sid, "switching to a different workflow entirely", "general")
+
+    // Turn 3: trigger text again. Deactivation on turn 2 reset
+    // activateCueShown, so this re-activates and the cue reappears.
+    const out3 = await chatMessage(hooks, sid, "/elicify-vertex\n\ndo something else", "build")
+    expect(cuePushed(out3)).toBe(true)
+  })
+
+  it("still deactivates the classic case: default-agent activation, then a switch to an unrelated agent", async () => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "c14-classic-default-agent-switch"
+
+    // Turn 1: activates via activatedByAgent (the configured default), no
+    // trigger text needed.
+    const out1 = await chatMessage(hooks, sid, "implement the feature", "elicify-vertex-agent")
+    expect(cuePushed(out1)).toBe(true)
+
+    // Turn 2: the user switches the session to an unrelated agent.
+    await chatMessage(hooks, sid, "never mind, do something unrelated", "general")
+
+    // Turn 3: back to the default agent -- activatedByAgent fires again,
+    // which only happens if turn 2 actually deactivated the session first
+    // (activateCueShown reset), otherwise the cue stays one-shot-suppressed.
+    const out3 = await chatMessage(hooks, sid, "ok let's continue", "elicify-vertex-agent")
+    expect(cuePushed(out3)).toBe(true)
+  })
+
+  it("survives an intervening default-agent turn without losing the original non-default activator", async () => {
+    // Found by adversarial re-review of the fix above: `activatedAgentBySession`
+    // used to be overwritten on EVERY qualifying turn, including ordinary
+    // default-agent turns (activatedByAgent). A session activated by trigger
+    // under "build", followed by one ordinary turn under the configured
+    // default agent, had its recorded activator silently clobbered from
+    // "build" to the default -- so "build" reappearing afterward looked like
+    // a switch to a genuinely different agent and incorrectly deactivated.
+    // This reproduces exactly that 3-turn interleaving.
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "c14-interleaved-default-turn"
+
+    // Turn 1: trigger text activates under non-default agent "build".
+    const out1 = await chatMessage(hooks, sid, "/elicify-vertex\n\ndo something", "build")
+    expect(cuePushed(out1)).toBe(true)
+
+    // Turn 2: an ordinary turn under the configured DEFAULT agent. This
+    // satisfies `activatedByAgent`, so it re-enters the activation branch --
+    // the bug was that doing so overwrote the recorded activator away from
+    // "build".
+    await chatMessage(hooks, sid, "an ordinary default-agent turn in between", "elicify-vertex-agent")
+
+    // Turn 3: back to "build", no trigger text -- the session's true,
+    // never-abandoned activator reappearing. Must not deactivate.
+    const out3 = await chatMessage(hooks, sid, "continuing under build, no trigger text", "build")
+    expect(cuePushed(out3)).toBe(false)
+
+    // Turn 4: trigger text again. If turn 3 had deactivated the session,
+    // activateCueShown would have reset and the cue would reappear here.
+    const out4 = await chatMessage(hooks, sid, "/elicify-vertex\n\ndo something else", "build")
+    expect(cuePushed(out4)).toBe(false)
   })
 })
 
@@ -880,6 +1132,15 @@ describe("verify:ambiguous-exit", () => {
 
     expect(out.output).not.toMatch(/verification-receipt/)
     expect(showToast.mock.calls.map((c) => c[0].body.message).join("\n")).toMatch(/exit code is not reliable/)
+
+    // C-2 (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md): `visibility.notify` only
+    // reaches `client.tui.showToast`, a human-operator-only channel -- the
+    // model never reads it. The diagnostic must ALSO land in the tool's own
+    // output, the channel the model actually reads as its tool result.
+    expect(out.output).toMatch(/\[vertex:verify-ambiguous\]/)
+    expect(out.output).toMatch(/exit code is not reliable/)
+    // Must never be mistaken for an actual minted receipt id.
+    expect(out.output).not.toMatch(/\[vertex:verification-receipt\]/)
   })
 
   it("does not warn for a clean standalone verifier, which still mints a receipt", async () => {
@@ -896,6 +1157,43 @@ describe("verify:ambiguous-exit", () => {
 
     expect(out.output).toMatch(/\[vertex:verification-receipt\]/)
     expect(showToast.mock.calls.map((c) => c[0].body.message).join("\n")).not.toMatch(/not reliable/)
+  })
+})
+
+// ===========================================================================
+// receipt:scope-unverifiable — a verifier PASSED, but the worktree was too
+// large to fingerprint, so no citable receipt was issued. Same C-2 defect as
+// verify:ambiguous-exit above: `visibility.notify` is a human-only channel.
+// ===========================================================================
+
+describe("receipt:scope-unverifiable", () => {
+  it("appends a model-facing diagnostic to toolOutput.output when the worktree can't be fingerprinted (C-2)", async () => {
+    const showToast = vi.fn(async (_o: { body: { message: string } }) => ({ data: true, error: undefined }))
+    const client = makeStubClient()
+    ;(client as unknown as { tui: unknown }).tui = { showToast }
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "scope-too-big"
+
+    await activate(hooks, sid, "implement the production database migration")
+    // A file too large to hash makes fingerprintWorktree(workDir).complete
+    // false -- mirrors tests/v2/fingerprint.test.ts's own trigger for this
+    // exact condition (RECEIPT_SCOPE_MAX_FILE_BYTES is 4MB).
+    writeFileSync(join(workDir, "big.bin"), Buffer.alloc(5 * 1024 * 1024, 1))
+    await toolAfter(hooks, sid, "edit", { filePath: join(workDir, "src/service.ts") }, "updated")
+
+    const out = { title: "bash", output: "1 passed in 0.02s", metadata: { exit: 0 } }
+    await hooks["tool.execute.after"]!(
+      { tool: "bash", sessionID: sid, callID: "su1", args: { command: "npx vitest run" } } as never,
+      out as never,
+    )
+
+    // Human channel unchanged.
+    expect(showToast.mock.calls.map((c) => c[0].body.message).join("\n")).toMatch(/too large to fingerprint/)
+    // NEW model-facing channel -- the fix this test exists to prove.
+    expect(out.output).toMatch(/\[vertex:scope-unverifiable\]/)
+    expect(out.output).toMatch(/too large to fingerprint/)
+    // Must never resemble an actual minted receipt id.
+    expect(out.output).not.toMatch(/\[vertex:verification-receipt\]/)
   })
 })
 
@@ -1188,6 +1486,138 @@ describe("the plugin's persisted state is protected from the model", () => {
 })
 
 // ===========================================================================
+// C-7 (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md, design in
+// docs/SUBAGENT-INJECTION-DRAFT.md): every `task` tool call gets the shared
+// subagent discipline injected into its prompt, instead of depending on the
+// parent hand-writing it into each delegation.
+// ===========================================================================
+
+describe("C-7: task tool calls get the subagent discipline injected", () => {
+  it("injects the preamble into args.prompt in place, returns without throwing, and skips the write-protection check entirely", async () => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "task-inject"
+    await activate(hooks, sid, "implement the production database migration")
+
+    // `filePath` targets the protected state dir -- this exact shape THROWS
+    // for a WRITE_TOOL_NAMES tool (see "the plugin's persisted state is
+    // protected from the model" above). Including it here on a `task` call
+    // proves `tool.execute.before` returns unconditionally from the new
+    // branch, before any write-protection logic runs at all -- not merely
+    // that "task" happens to be absent from WRITE_TOOL_NAMES today.
+    const toolOutput = {
+      args: {
+        description: "fix the flaky test",
+        prompt: "delegate: fix the flaky test",
+        subagent_type: "general-purpose",
+        filePath: ".opencode/elicify-vertex/receipts.json",
+      },
+    }
+
+    await expect(
+      hooks["tool.execute.before"]!({ tool: "task", sessionID: sid, callID: "t1" } as never, toolOutput as never),
+    ).resolves.toBeUndefined()
+
+    // Same object reference, mutated in place -- not a new args object.
+    expect(toolOutput.args.prompt).toContain("You are executing one bounded unit of work")
+    expect(toolOutput.args.prompt).toContain("delegate: fix the flaky test")
+  })
+
+  it("leaves args.prompt untouched (and still does not throw) when prompt is missing", async () => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "task-no-prompt"
+    await activate(hooks, sid, "implement the production database migration")
+
+    const toolOutput = { args: { description: "no prompt field", subagent_type: "general-purpose" } }
+    await expect(
+      hooks["tool.execute.before"]!({ tool: "task", sessionID: sid, callID: "t2" } as never, toolOutput as never),
+    ).resolves.toBeUndefined()
+    expect(toolOutput.args).toEqual({ description: "no prompt field", subagent_type: "general-purpose" })
+  })
+
+  // C-10 (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md): the "second subagent
+  // trigger site" C-7's own notes named (the `@agent` mention / command
+  // path, e.g. @mentioning a mode:"subagent" agent, or a slash command
+  // configured with `subtask: true`) turns out NOT to be a separate plugin
+  // hook surface at all -- confirmed via a live opencode 1.18.8 host probe
+  // (sidecar logging plugin + a SubtaskPartInput sent directly through
+  // session.prompt): the host resolves that message-part type into a real
+  // internal `task` TOOL CALL before dispatch, landing in THIS SAME
+  // `tool.execute.before` branch with `tool: "task"` and
+  // `args: {prompt, description, subagent_type, command}` -- an extra
+  // `command` key beyond what a model-initiated task call ever includes
+  // (verified: neither test above includes it). The probe's child-session
+  // DB read (not the subagent's own report) showed the injected preamble
+  // reaching the spawned session byte for byte, exactly like a model-issued
+  // task call. This test pins that exact args shape so a future change that
+  // narrowed the injection branch to only args without a `command` key
+  // would fail loudly here instead of silently reopening C-10.
+  it("still injects when args carry the extra `command` key a host-synthesized (subtask-derived) task call has", async () => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "task-inject-subtask-shape"
+    await activate(hooks, sid, "implement the production database migration")
+
+    const toolOutput = {
+      args: {
+        description: "c10 probe",
+        prompt: "ORIGINAL-UNMUTATED-PROMPT-TEXT-12345",
+        subagent_type: "c10-probe-subagent",
+        command: "some-command-name",
+      },
+    }
+
+    await expect(
+      hooks["tool.execute.before"]!({ tool: "task", sessionID: sid, callID: "t3" } as never, toolOutput as never),
+    ).resolves.toBeUndefined()
+
+    expect(toolOutput.args.prompt).toContain("You are executing one bounded unit of work")
+    expect(toolOutput.args.prompt).toContain("ORIGINAL-UNMUTATED-PROMPT-TEXT-12345")
+    expect(toolOutput.args.command).toBe("some-command-name") // untouched
+  })
+})
+
+// ===========================================================================
+// Security review finding: `injectSubagentPreamble`'s boolean return value
+// was discarded at the plugin.ts call site. It only returns `false` when
+// `args.prompt` isn't a string -- today that never happens (the `task`
+// schema requires it), but if that schema ever changes shape, the whole
+// injection mechanism would silently stop working with zero signal anywhere.
+// `plugin.ts` now logs `subagent:injection-skipped` on that no-op path and
+// stays quiet on the (only currently reachable) success path.
+// ===========================================================================
+
+describe("subagent injection no-op is now observable", () => {
+  it("logs subagent:injection-skipped when args.prompt is not a string", async () => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "task-inject-skip-log"
+    await activate(hooks, sid, "implement the production database migration")
+
+    const toolOutput = { args: { description: "no prompt field", subagent_type: "general-purpose" } }
+    await hooks["tool.execute.before"]!({ tool: "task", sessionID: sid, callID: "skip1" } as never, toolOutput as never)
+
+    const events = readEvents().filter((e) => e.event_type === "subagent:injection-skipped" && e.session_id === sid)
+    expect(events.length).toBeGreaterThan(0)
+    expect(events[events.length - 1].payload.reason).toBe("args.prompt is not a string")
+  })
+
+  it("does NOT log subagent:injection-skipped when args.prompt is a string", async () => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "task-inject-skip-quiet"
+    await activate(hooks, sid, "implement the production database migration")
+
+    const toolOutput = { args: { description: "fix it", prompt: "delegate: fix it", subagent_type: "general-purpose" } }
+    await hooks["tool.execute.before"]!({ tool: "task", sessionID: sid, callID: "skip2" } as never, toolOutput as never)
+
+    const events = readEvents().filter((e) => e.event_type === "subagent:injection-skipped" && e.session_id === sid)
+    expect(events).toHaveLength(0)
+  })
+})
+
+// ===========================================================================
 // A verifier that relates to NO work must not answer a criterion.
 //
 // With no plan and no changed paths, `prescribed` is null, so every
@@ -1245,5 +1675,66 @@ describe("a verifier unrelated to any work does not evidence criteria", () => {
       out as never,
     )
     expect(out.output, "a real verifier after a real edit still mints").toMatch(/verification-receipt/)
+  })
+})
+
+// ===========================================================================
+// fetchJudgeTranscriptFields (gate.ts) wired through the REAL plugin here too
+// — the fuller property-based coverage (last-assistant-not-last-user, turn
+// window, both response shapes) lives in tests/v2/integration-judge.test.ts;
+// this confirms the same `messagesImpl` override on THIS file's own stub
+// client is genuinely wired end to end, not dead code added but never
+// exercised.
+// ===========================================================================
+
+describe("fetchJudgeTranscriptFields: messagesImpl override wired through this file's stub client", () => {
+  it("lastResponse resolves to the parent's last assistant message, fetched via the messagesImpl override", async () => {
+    process.env.VERTEX_JUDGE = "1"
+    const transcript = [
+      { info: { id: "m1", role: "user" }, parts: [{ type: "text", text: "please finish" }] },
+      { info: { id: "m2", role: "assistant" }, parts: [{ type: "text", text: "final assistant answer for the judge to see" }] },
+    ]
+    const client = makeStubClient({
+      promptText: (agent) => (agent === "vertex-judge" ? '{"fit":"pass","summary":"ok","gaps":[]}' : '{"multiStory":false}'),
+      messagesImpl: async () => ({ data: transcript, error: undefined }),
+    })
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "plugin-judge-transcript-session"
+
+    // "fix a typo in the readme" matches TRIVIAL_ASK_RE, skipping the intake
+    // classification subturn (see tests/v2/integration-judge.test.ts's
+    // identical setup helper for the same reasoning).
+    await activate(hooks, sid, "fix a typo in the readme", { providerID: "minimax", id: "MiniMax-M3" })
+
+    const planRaw = await hooks.tool!.elicify_vertex_plan_create!.execute!(
+      { stories: [{ text: "the only story", acceptanceItems: ["criterion one"], scopeGlobs: [], verifiers: ["npx vitest run"] }] } as never,
+      { sessionID: sid } as never,
+    )
+    const plan = JSON.parse(planRaw as string) as { stories: Array<{ id: string; acceptanceItems: Array<{ id: string }> }> }
+    const storyId = plan.stories[0].id
+    const itemId = plan.stories[0].acceptanceItems[0].id
+
+    await toolAfter(hooks, sid, "edit", { filePath: "src/foo.ts" }, "updated")
+    const toolOutput = { title: "bash", output: "20 passed", metadata: { exit: 0 } }
+    await hooks["tool.execute.after"]!(
+      { tool: "bash", sessionID: sid, callID: "bash-1", args: { command: "npx vitest run" } } as never,
+      toolOutput as never,
+    )
+    const receiptMatch = toolOutput.output.match(/\[vertex:verification-receipt\] (\S+)/)
+    expect(receiptMatch).not.toBeNull()
+
+    await hooks.tool!.elicify_vertex_plan_checkpoint!.execute!(
+      { storyId, status: "complete", items: [{ id: itemId, receiptId: receiptMatch![1] }] } as never,
+      { sessionID: sid } as never,
+    )
+
+    await idle(hooks, sid)
+
+    const judgeCall = client.session.prompt.mock.calls
+      .map((c) => c[0] as { body?: { agent?: string; parts?: Array<{ text?: string }> } })
+      .find((c) => c.body?.agent === "vertex-judge")
+    expect(judgeCall, "the judge subturn must have been invoked").toBeDefined()
+    const payload = JSON.parse(judgeCall!.body!.parts![0]!.text!) as { lastResponse?: string }
+    expect(payload.lastResponse).toBe("final assistant answer for the judge to see")
   })
 })

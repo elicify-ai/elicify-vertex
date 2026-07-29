@@ -88,6 +88,35 @@ describe("redactSecrets", () => {
     expect(redacted).not.toContain("eyJhbGci")
   })
 
+  // C-8 (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md): the SENSITIVE_ASSIGNMENT_LABEL
+  // patterns used to accept a bare run of whitespace as the "assignment"
+  // between a sensitive-sounding word and its value, so ordinary prose
+  // containing a label word — with no `:`/`=` in sight — was swallowed whole.
+  // Both sentences below are the exact reproductions from the audit doc.
+  it.each([
+    "I made sure no secrets leaked into the log output.",
+    "The token refresh logic is now fixed and covered by a test.",
+  ])("C-8: does not redact ordinary prose with no assignment separator: %s", (input) => {
+    expect(redactSecrets(input)).toBe(input)
+  })
+
+  it("C-8 backstop: an unlabeled high-entropy secret with no ':'/'=' anywhere near it is still flagged by judge.ts's entropy scan (tightening the label pattern did not quietly open a gap)", () => {
+    // redactSecrets itself has no entropy rule — it only matches named
+    // patterns (SECRET_PATTERNS). This test proves the *combination* still
+    // holds: a genuine secret phrased without any assignment separator does
+    // not survive redactSecrets AND fall through with nothing else catching
+    // it, because src/v2/judge.ts's tripsEntropyScan (Shannon entropy, order-
+    // independent of any label match) is the dedicated backstop for exactly
+    // this shape. Reproduced here via the same mechanism judge.ts itself uses
+    // (redactSecrets unchanged-ness is not what catches this — entropy is);
+    // see tests/v2/judge.test.ts for the full buildJudgePayload-level proof.
+    const unlabeledSecret = "the password is hunter2xyzabcQ9mK3pL7vN2wR8tY5"
+    // redactSecrets alone does NOT touch this (no ':'/'=' after "password",
+    // and the value itself matches no dedicated SECRET_PATTERNS entry either)
+    // — demonstrating exactly why the entropy backstop must exist.
+    expect(redactSecrets(unlabeledSecret)).toBe(unlabeledSecret)
+  })
+
   it("recursively redacts sensitive object keys, nested strings, arrays, and cycles", () => {
     const circular: Record<string, unknown> = {
       password: "plain-value",
@@ -111,6 +140,26 @@ describe("redactSecrets", () => {
     })
     expect(redacted.values).toEqual(["token=[REDACTED]", "safe"])
     expect(redacted.self).toBe("[REDACTED:CIRCULAR]")
+  })
+
+  // C-15 (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md): a hex-run secret backstop
+  // was tried directly in SECRET_PATTERNS (shared by redactForDisk) and
+  // reverted — it corrupted VerificationReceipt's bare-hex `signature`
+  // (HMAC-SHA256 digest) and `scope.worktreeDigest` fields on every disk
+  // write via goals.ts's atomicWriteJson(redactForDisk(...)), breaking
+  // verifyReceiptSignature for anything persisted afterward. The fix landed
+  // in src/v2/judge.ts instead, scoped to the judge payload's free-form
+  // prose/line fields only. This test pins the regression: redactForDisk
+  // must never alter a receipt-shaped object's signature/digest fields.
+  it("C-15 regression guard: redactForDisk leaves a receipt-shaped object's bare-hex signature and worktree digest byte-identical", () => {
+    const receipt = {
+      id: "vrf_d99423c88f3e4f8faad287a61c7624a",
+      sessionID: "ses_abc123",
+      signature: "a1b2c3d4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e9f",
+      scope: { storyId: "S1", worktreeDigest: "f9e8d7c6b5a4938271605f4e3d2c1b0a9f8e7d6c5b4a3928170615243536475" },
+    }
+    const redacted = redactForDisk(receipt)
+    expect(redacted).toEqual(receipt)
   })
 })
 

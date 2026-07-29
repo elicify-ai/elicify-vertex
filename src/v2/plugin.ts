@@ -69,6 +69,7 @@ import {
   resetTurnState,
   type V2SessionState,
 } from "./wiring/state.js"
+import { injectSubagentPreamble } from "./wiring/subagentInjection.js"
 import { buildPlanTools } from "./wiring/tools.js"
 
 export interface ElicifyVertexV2Options {
@@ -226,15 +227,6 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
   }
   const activateCommandName = opts.activeSkillTrigger.replace(/^\//, "")
 
-  const workspaceRoot = (() => {
-    try {
-      return resolveGoalWorkspaceRoot([input.worktree, input.directory, process.cwd()])
-    } catch {
-      return process.cwd()
-    }
-  })()
-  const stateDir = `${workspaceRoot}/${PLUGIN_STATE_DIR}`
-
   // -- Shared long-lived components -----------------------------------------
   const states = new Map<string, V2SessionState>()
   const getContext = (sessionID: string | undefined) => {
@@ -242,6 +234,32 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
     return { model: state?.modelId ?? null, profile: state?.profile ?? ("standard" as Profile) }
   }
   const logger = createSharedV2Logger(getContext)
+
+  // C-3 (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md): v1's GoalStore constructor
+  // checked writability and threw (src/goals.ts:1133) when it found no
+  // writable project root; v2 catches that same throw here and falls back to
+  // process.cwd() SILENTLY. Deliberately NOT restoring the hard throw --
+  // crashing plugin init on an unwritable root has a much bigger blast
+  // radius than writing harness state to process.cwd() would, so the
+  // fallback stays. What v2 actually dropped was observability: log the
+  // fallback so a session that lands on the wrong directory is at least
+  // visible instead of silently invisible. No sessionID is attached -- this
+  // runs once at plugin construction, before any session exists.
+  const workspaceRoot = (() => {
+    const candidates = [input.worktree, input.directory, process.cwd()]
+    try {
+      return resolveGoalWorkspaceRoot(candidates)
+    } catch (err) {
+      const fallback = process.cwd()
+      logger("workspace:unwritable-fallback", {
+        candidates,
+        fallback,
+        error: err instanceof Error ? err.message : String(err),
+      })
+      return fallback
+    }
+  })()
+  const stateDir = `${workspaceRoot}/${PLUGIN_STATE_DIR}`
 
   const phaseEngine = new PhaseEngine(logger)
   const pinStore = new PinStore({ stateDir, logger })
@@ -284,6 +302,18 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
   // at the next chat.message turn boundary. Also not part of V2SessionState
   // for the same reason.
   const storyCompletionPending = new Map<string, StoryV2>()
+  // C-14 (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md): the `agent` field that
+  // actually activated each session -- undefined when activation came from
+  // trigger text/command with no agent, or the literal agent value when it
+  // came via `activatedByAgent`/trigger/command WITH an agent attached (e.g.
+  // "build"). Needed so `chat.message`'s deactivation branch can tell "the
+  // session's own established agent said hi again" (not a deactivation
+  // signal) apart from "the user switched to a genuinely different agent"
+  // (a real deactivation signal) -- see that branch below for the full
+  // mechanism this fixes. Same plugin-local-map pattern as
+  // commandActivatedSessions/lastVerifierOutputBySession above; not part of
+  // V2SessionState for the same reason (wiring/state.ts not owned here).
+  const activatedAgentBySession = new Map<string, string | undefined>()
 
   const isSelf = (sessionID: string | undefined): boolean =>
     !!sessionID && selfCreated.isSelfCreated(sessionID, selfCreatedGuard.resolveParent)
@@ -482,6 +512,27 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       if (activatedByAgent || activatedByTrigger || activatedByCommand) {
         const wasClose = phaseEngine.getPhase(sid) === "close"
         state.active = true
+        // C-14: record which agent (if any) activated this turn, so a LATER
+        // message carrying that same agent again is recognised as "business
+        // as usual" rather than misread as a switch-away. Trigger/command
+        // activation is agent-independent by design (that's the whole point
+        // of having those two routes alongside activatedByAgent) — a session
+        // activated via `/elicify-vertex` while running under a non-default
+        // agent (e.g. "build") must not self-deactivate the moment that same
+        // agent reappears on the very next turn, which it always will.
+        //
+        // Set ONCE per activation streak, not on every qualifying turn: a
+        // session activated by trigger under "build" that later gets an
+        // ordinary default-agent turn (activatedByAgent) must not have its
+        // recorded activator overwritten to the default agent — that would
+        // make "build" look like a switch-away the next time it reappears.
+        // Found by adversarial re-review of the first C-14 fix, reproduced
+        // with a 3-turn interleaving the original two-agent tests didn't
+        // cover. Paired with the `.delete()` on genuine deactivation below,
+        // so a later real re-activation still records fresh.
+        if (!activatedAgentBySession.has(sid)) {
+          activatedAgentBySession.set(sid, msgInput.agent)
+        }
         phaseEngine.onUserMessage(sid)
         composer.newTurn(sid)
         resetTurnState(state)
@@ -549,9 +600,29 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
             text: `\n${cue}`,
           } as never)
         }
-      } else if (msgInput.agent !== undefined && msgInput.agent !== opts.activeAgent) {
+      } else if (
+        msgInput.agent !== undefined &&
+        msgInput.agent !== opts.activeAgent &&
+        // C-14 (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md): without this third
+        // condition, a session activated by trigger text/command while
+        // running under a non-default agent (e.g. "build") deactivated
+        // itself on its own very next ordinary turn -- that turn's message
+        // necessarily carries the SAME "build" agent again, which read as a
+        // switch-away even though nothing changed. Confirmed on a real host,
+        // not just a direct hook probe (see tests/v2/plugin.integration.test.ts's
+        // "C-14" describe block for both directions). Only a message whose
+        // agent differs from BOTH the configured default AND whatever agent
+        // this session itself activated under is treated as a genuine
+        // switch to an unrelated agent.
+        msgInput.agent !== activatedAgentBySession.get(sid)
+      ) {
         state.active = false
         state.activateCueShown = false
+        // Paired with the "set once per streak" guard above: clearing the
+        // recorded activator on a genuine deactivation is what lets the NEXT
+        // real activation record fresh, instead of the once-per-streak guard
+        // mistaking a stale entry from a prior streak for "already recorded".
+        activatedAgentBySession.delete(sid)
       }
     },
 
@@ -574,6 +645,38 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
     async "tool.execute.before"(toolInput, toolOutput) {
       const sid = toolInput.sessionID
       if (isSelf(sid)) return
+
+      // C-7 (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md, design in
+      // docs/SUBAGENT-INJECTION-DRAFT.md): every `task` tool call gets the
+      // shared subagent discipline prepended to its prompt, instead of
+      // depending on the parent remembering to hand-write it into each
+      // delegation. Must go BEFORE the `WRITE_TOOL_NAMES` gate below --
+      // "task" is not a write tool, so that gate would otherwise skip right
+      // past this branch. Inject and return immediately; the write-protection
+      // logic below does not apply to a `task` call. No `isSelf` re-check
+      // needed here: the judge and intake subturns are created directly via
+      // `runSubturn` (`client.session.create` + `client.session.prompt`),
+      // never through the `task` tool, so they never reach this branch.
+      if (toolInput.tool === "task") {
+        const args = (toolOutput?.args ?? {}) as Record<string, unknown>
+        const injected = injectSubagentPreamble(args)
+        // `injectSubagentPreamble` returns `false` (no-op, defensively) when
+        // `args.prompt` isn't a string -- today that never happens (the
+        // `task` schema requires `prompt: string`), but the return value was
+        // previously discarded outright, so if the schema ever changes shape
+        // the whole injection mechanism would silently stop working with no
+        // signal anywhere. Log only the no-op case -- the success path stays
+        // as quiet as it already was.
+        if (!injected) {
+          logger("subagent:injection-skipped", {
+            sessionID: sid,
+            callID: toolInput.callID,
+            reason: "args.prompt is not a string",
+            promptType: typeof args.prompt,
+          })
+        }
+        return
+      }
       if (!WRITE_TOOL_NAMES.has(toolInput.tool)) return
 
       const state = states.get(sid)
@@ -673,14 +776,23 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
         // had this shape, and the agent's own prompt models `;`-chaining, so
         // the model learns it by example.
         if (verification.outcome === "ambiguous" && exitCode === 0) {
+          const ambiguousExitMessage =
+            `"${command.slice(0, 80)}" looks like a verifier but its exit code is not reliable ` +
+            `(usually ';' chaining) — no receipt minted. Run the verifier as a standalone command.`
           void visibility.notify("health", {
             sessionID: sid,
             family: "verify:ambiguous-exit",
-            message:
-              `"${command.slice(0, 80)}" looks like a verifier but its exit code is not reliable ` +
-              `(usually ';' chaining) — no receipt minted. Run the verifier as a standalone command.`,
+            message: ambiguousExitMessage,
             variant: "warning",
           })
+          // C-2 (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md): `visibility.notify`
+          // only reaches `client.tui.showToast`, a human-operator channel --
+          // the model never reads it. Append the same diagnostic to the
+          // tool's own output, mirroring the successful receipt-mint branch
+          // below (`[vertex:verification-receipt] <id>`), but with a prefix
+          // that can never be mistaken for a real receipt id.
+          const diagnosticText = `[vertex:verify-ambiguous] ${ambiguousExitMessage}`
+          toolOutput.output = `${out}${out && !out.endsWith("\n") ? "\n" : ""}${diagnosticText}`
           logger("verify:ambiguous-exit", { sessionID: sid, command })
         }
 
@@ -807,15 +919,23 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
           // file/byte ceiling no story could be closed by a receipt at all, and
           // the only route left was a waiver. Say so plainly instead.
           if (receipt.scope && receipt.scope.complete === false) {
+            const scopeUnverifiableMessage =
+              `verifier passed, but this worktree is too large to fingerprint ` +
+              `(${receipt.scope.fileCount} files), so no citable receipt was issued. ` +
+              `Checkpoint with a waiver, or narrow the workspace.`
             void visibility.notify("health", {
               sessionID: sid,
               family: "receipt:scope-unverifiable",
-              message:
-                `verifier passed, but this worktree is too large to fingerprint ` +
-                `(${receipt.scope.fileCount} files), so no citable receipt was issued. ` +
-                `Checkpoint with a waiver, or narrow the workspace.`,
+              message: scopeUnverifiableMessage,
               variant: "warning",
             })
+            // C-2 (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md): same fix as
+            // verify:ambiguous-exit above -- append to the tool's own output
+            // so the model (not just the human toast) sees why a passing
+            // verifier minted nothing citable. Distinct prefix so this can
+            // never be mistaken for `[vertex:verification-receipt] <id>`.
+            const diagnosticText = `[vertex:scope-unverifiable] ${scopeUnverifiableMessage}`
+            toolOutput.output = `${out}${out && !out.endsWith("\n") ? "\n" : ""}${diagnosticText}`
             logger("receipt:scope-unverifiable", { sessionID: sid, command, fileCount: receipt.scope.fileCount })
           } else {
             const receiptText = `[vertex:verification-receipt] ${receipt.id}`

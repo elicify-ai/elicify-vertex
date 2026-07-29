@@ -483,6 +483,53 @@ export function buildPlanTools(deps: PlanToolsDeps) {
     },
   })
 
+  const reopenTool = tool({
+    description:
+      "Reopen a blocked or failed story in the elicify-vertex v2 plan so work on it can resume. Use this ONLY " +
+      "after whatever actually caused the block or failure has been resolved (e.g. a missing dependency now " +
+      "exists, a design question got answered, an external blocker cleared) — never as a way to bypass a " +
+      "legitimate block or dodge unmet acceptance criteria. Reopening clears the story's acceptance-item " +
+      "evidence, so it must be re-proven via elicify_vertex_plan_checkpoint before the story can complete again. " +
+      "The story becomes the active story immediately if no other story is currently active, or rejoins the " +
+      "queue as pending (to be picked up by normal successor-promotion) if another story is already active. " +
+      "Fails if storyId is unknown or the story's current status is not 'blocked' or 'failed'.",
+    args: {
+      storyId: tool.schema.string().min(1),
+      reason: tool.schema.string().min(1),
+    },
+    async execute(args, context) {
+      storyEngine.reopenStory(context.sessionID, args.storyId, { reason: args.reason })
+      const plan = storyEngine.getPlan(context.sessionID)
+      const story = plan?.stories.find((candidate) => candidate.id === args.storyId) ?? null
+      // C-12: reopenStory resets StoryEngine's own status/evidence but has no
+      // knowledge of PhaseEngine (a deliberately separate module -- see
+      // story.ts's header). Without this, a story whose phase reached
+      // "close" before it blocked stays "close" after reopening -- and
+      // onMutation is a documented no-op from "close" (no table arc), so it
+      // cannot fix this; the gate-continuation exclusion on phase resets
+      // (plugin.ts) means the completion judge may then never re-trigger for
+      // this story even once it's genuinely re-completed. onStoryAdvance
+      // (T8) is the one phase transition that unconditionally forces the
+      // target back to "execute" regardless of its prior phase -- reused
+      // here as "resume this story now" rather than its usual "advance to
+      // the next story" meaning; fromStoryId is purely informational (see
+      // its own doc comment: "void fromStoryId"), so passing the same id
+      // for both is correct, not a workaround.
+      if (story?.status === "active") phaseEngine.onStoryAdvance(context.sessionID, args.storyId, args.storyId)
+      return JSON.stringify(
+        {
+          storyId: args.storyId,
+          newStatus: story?.status ?? null,
+          becameActive: story?.status === "active",
+          story,
+          plan,
+        },
+        null,
+        2,
+      )
+    },
+  })
+
   const statusTool = tool({
     description: "Read the elicify-vertex v2 story-contract plan for the current session (null if none).",
     args: {},
@@ -510,6 +557,7 @@ export function buildPlanTools(deps: PlanToolsDeps) {
     elicify_vertex_plan_checkpoint: checkpointTool,
     elicify_vertex_plan_status: statusTool,
     elicify_vertex_plan_clear: clearTool,
+    elicify_vertex_plan_reopen: reopenTool,
   }
 }
 

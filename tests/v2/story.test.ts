@@ -174,6 +174,25 @@ describe("story_schema_v2_validation (test 12, FR-017)", () => {
     expect(() => se.createPlan("s1", [])).toThrow(/at least one story/)
   })
 
+  // Manual UAT finding: a real model, given wiring/tools.ts's
+  // `scopeGlobs: tool.schema.array(...).optional().default([])`, naturally
+  // omits the field entirely -- and the host does not reliably apply the
+  // schema's `.default([])` for an omitted optional arg, so `undefined`
+  // reached here, not `[]`. Every other test in this file goes through the
+  // `story()` helper above, which always fills both fields -- exactly why
+  // 1292 passing tests never caught a crash a real model hit on ordinary use.
+  // Construct the args by hand, bypassing the helper, to reproduce the real
+  // shape.
+  it("does not throw when scopeGlobs/verifiers are omitted entirely, not just empty (real-model UAT crash)", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+
+    const plan = se.createPlan("s1", [{ text: "investigate the flaky nightly CI job", acceptanceItems: ["root cause found"] }])
+
+    expect(plan.stories[0].scopeGlobs).toEqual([])
+    expect(plan.stories[0].verifiers).toEqual([])
+  })
+
   it("persists to disk and survives a simulated restart (fresh StoryEngine instance)", () => {
     const stateDir = temporaryRoot()
     const { engine: se } = engine(stateDir)
@@ -674,6 +693,349 @@ describe("checkpoint evidence validation — Dataset (6 rows) + test 12/15", () 
     const stateDir = temporaryRoot()
     const { engine: se } = engine(stateDir)
     expect(() => se.checkpoint("no-plan", "S1", "complete", {})).toThrow(/no story plan/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// reopenStory — fixes docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md C-6: a plan
+// containing a blocked/failed story previously had no path back to
+// "pending"/"active" and could never reach all-"complete".
+// ---------------------------------------------------------------------------
+
+describe("reopenStory (C-6 fix: blocked/failed stories can be reopened)", () => {
+  it("a blocked story can be reopened and completed again with fresh evidence", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [story({ acceptanceItems: ["A1"] })])
+    const storyId = plan.stories[0].id
+
+    se.checkpoint("s1", storyId, "blocked", {})
+    expect(se.getPlan("s1")!.stories[0].status).toBe("blocked")
+
+    se.reopenStory("s1", storyId, { reason: "dependency unblocked" })
+    expect(se.getPlan("s1")!.stories[0].status).toBe("active")
+
+    se.attachEvidence("s1", storyId, "A1", { receiptId: "vrf_fresh" })
+    expect(() =>
+      se.checkpoint("s1", storyId, "complete", { isValidReceipt: (id) => id === "vrf_fresh" }),
+    ).not.toThrow()
+    expect(se.getPlan("s1")!.stories[0].status).toBe("complete")
+  })
+
+  it("a failed story likewise can be reopened and completed again with fresh evidence", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [story({ acceptanceItems: ["A1"] })])
+    const storyId = plan.stories[0].id
+
+    se.checkpoint("s1", storyId, "failed", {})
+    expect(se.getPlan("s1")!.stories[0].status).toBe("failed")
+
+    se.reopenStory("s1", storyId, { reason: "retrying after fix" })
+    expect(se.getPlan("s1")!.stories[0].status).toBe("active")
+
+    se.attachEvidence("s1", storyId, "A1", { waiver: true, sourceMessageId: "msg_user_9" })
+    expect(() => se.checkpoint("s1", storyId, "complete", {})).not.toThrow()
+    expect(se.getPlan("s1")!.stories[0].status).toBe("complete")
+  })
+
+  it("clears previously-attached evidence on reopen so a stale receipt cannot silently satisfy the next completion", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [story({ acceptanceItems: ["A1"] })])
+    const storyId = plan.stories[0].id
+    se.attachEvidence("s1", storyId, "A1", { receiptId: "vrf_stale" })
+    se.checkpoint("s1", storyId, "blocked", {})
+
+    se.reopenStory("s1", storyId, { reason: "retry" })
+    expect(se.getPlan("s1")!.stories[0].acceptanceItems[0].evidence).toBeNull()
+
+    // Completing now without attaching fresh evidence must fail exactly like
+    // a brand-new story would — checkpoint("complete")'s own validation,
+    // untouched by this fix, runs in full.
+    expect(() => se.checkpoint("s1", storyId, "complete", { isValidReceipt: () => true })).toThrow(/A1/)
+  })
+
+  it("throws when reopening a story whose status is not blocked/failed", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [story()])
+    const storyId = plan.stories[0].id // active, not blocked/failed
+    expect(() => se.reopenStory("s1", storyId, { reason: "x" })).toThrow(/status is active/)
+  })
+
+  it("throws on an unknown session or story", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    se.createPlan("s1", [story()])
+    expect(() => se.reopenStory("unknown-session", "S1", { reason: "x" })).toThrow(/no story plan/)
+    expect(() => se.reopenStory("s1", "S99", { reason: "x" })).toThrow(/unknown story/)
+  })
+
+  it("records an amendment naming the previous status and logs story:reopened", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se, logger } = engine(stateDir)
+    const plan = se.createPlan("s1", [story()])
+    const storyId = plan.stories[0].id
+    se.checkpoint("s1", storyId, "failed", {})
+
+    se.reopenStory("s1", storyId, { reason: "root cause fixed" })
+
+    const after = se.getPlan("s1")!.stories[0]
+    expect(after.amendments).toHaveLength(1)
+    expect(after.amendments[0].reason).toMatch(/reopened from failed/)
+    expect(after.amendments[0].reason).toMatch(/root cause fixed/)
+    expect(logger).toHaveBeenCalledWith("story:reopened", {
+      sessionID: "s1",
+      storyId,
+      previousStatus: "failed",
+      newStatus: "active",
+    })
+  })
+
+  it("reopening a story that is NOT the currently-active one returns it to pending, rejoining the queue behind the story that IS active (does not preempt it)", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [
+      story({ text: "S1", acceptanceItems: ["A1"] }),
+      story({ text: "S2", acceptanceItems: ["A1"] }),
+      story({ text: "S3", acceptanceItems: ["A1"] }),
+      story({ text: "S4", acceptanceItems: ["A1"] }),
+      story({ text: "S5", acceptanceItems: ["A1"] }),
+    ])
+    const [s1, s2, s3, s4, s5] = plan.stories.map((s) => s.id)
+
+    // Directly block S2 while it is still "pending" (out of order), before
+    // S1 completes.
+    se.checkpoint("s1", s2, "blocked", {})
+    expect(se.getPlan("s1")!.stories.find((s) => s.id === s2)!.status).toBe("blocked")
+
+    // Complete S1: successor-promotion skips the now-blocked S2 (no longer
+    // "pending") and activates S3 instead.
+    se.attachEvidence("s1", s1, "A1", { receiptId: "vrf_1" })
+    se.checkpoint("s1", s1, "complete", { isValidReceipt: () => true })
+    expect(se.getActiveStory("s1")!.id).toBe(s3)
+
+    // Reopen S2 — S3 is currently active, so S2 must NOT preempt it.
+    se.reopenStory("s1", s2, { reason: "unblocked" })
+
+    const after = se.getPlan("s1")!
+    const byId = (id: string) => after.stories.find((s) => s.id === id)!
+    expect(byId(s2).status).toBe("pending") // rejoined the queue, did not preempt S3
+    expect(byId(s2).startedAt).toBeUndefined()
+    expect(byId(s3).status).toBe("active") // untouched, still in flight
+    expect(byId(s4).status).toBe("pending")
+    expect(byId(s5).status).toBe("pending")
+
+    // Confirm it really rejoined at its original array position: when S3
+    // completes next, S2 — not S4 — is the one successor-promotion activates.
+    se.attachEvidence("s1", s3, "A1", { receiptId: "vrf_3" })
+    se.checkpoint("s1", s3, "complete", { isValidReceipt: () => true })
+    expect(se.getActiveStory("s1")!.id).toBe(s2)
+  })
+
+  it("reopening the story that WAS active when it blocked/failed reactivates it directly, since no other story is active", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [
+      story({ text: "S1", acceptanceItems: ["A1"] }),
+      story({ text: "S2", acceptanceItems: ["A1"] }),
+    ])
+    const [s1, s2] = plan.stories.map((s) => s.id)
+
+    se.attachEvidence("s1", s1, "A1", { receiptId: "vrf_1" })
+    se.checkpoint("s1", s1, "complete", { isValidReceipt: () => true })
+    expect(se.getActiveStory("s1")!.id).toBe(s2) // promoted, active
+
+    // Block S2 while it IS the active story — checkpoint's successor
+    // promotion only fires on a "complete" outcome, so nothing is promoted
+    // and the plan is left with zero active stories.
+    se.checkpoint("s1", s2, "blocked", {})
+    expect(se.getActiveStory("s1")).toBeNull()
+
+    const before = Date.now()
+    se.reopenStory("s1", s2, { reason: "resuming" })
+    const after = Date.now()
+
+    const reopened = se.getPlan("s1")!.stories.find((s) => s.id === s2)!
+    expect(reopened.status).toBe("active")
+    expect(typeof reopened.startedAt).toBe("string")
+    const startedMs = Date.parse(reopened.startedAt!)
+    expect(startedMs).toBeGreaterThanOrEqual(before)
+    expect(startedMs).toBeLessThanOrEqual(after)
+    expect(se.getActiveStory("s1")!.id).toBe(s2)
+  })
+
+  it("persists the reopened state across a restart (fresh StoryEngine instance)", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [story()])
+    const storyId = plan.stories[0].id
+    se.checkpoint("s1", storyId, "blocked", {})
+    se.reopenStory("s1", storyId, { reason: "retry" })
+
+    const restarted = new StoryEngine({ stateDir, logger: vi.fn() })
+    const reopened = restarted.getPlan("s1")!.stories[0]
+    expect(reopened.status).toBe("active")
+    expect(reopened.amendments).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// C-11 fix (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md): checkpoint's successor-
+// promotion is a first-"pending"-match scan, not strict index order, and
+// blocked/failed carries no active-story requirement — so an out-of-order
+// blocked/failed story can be silently skipped by promotion while a LATER
+// story, including the plan's final one, marches on to "complete" without
+// it ever being resolved. Reproduces the exact scenario from the audit doc
+// and proves the fix: completing the final story now REJECTS while an
+// earlier story remains unresolved, and the plan can still legitimately
+// reach all-"complete" once that earlier story is reopened and recompleted.
+// ---------------------------------------------------------------------------
+
+describe("checkpoint requires every story complete before the FINAL story can complete (C-11 fix)", () => {
+  it("reproduces the audit scenario: S2 blocked out of order, S1 completes, promotion skips to S3 (final) — completing S3 now throws instead of silently 'finishing' the plan", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [
+      story({ text: "S1", acceptanceItems: ["A1"] }),
+      story({ text: "S2", acceptanceItems: ["A1"] }),
+      story({ text: "S3 final", acceptanceItems: ["A1"] }),
+    ])
+    const [s1, s2, s3] = plan.stories.map((s) => s.id)
+    expect(plan.finalStoryId).toBe(s3)
+
+    // Story 2 checkpointed directly to "blocked" while still "pending" —
+    // out of order, nothing in `checkpoint` prevents this for blocked/failed.
+    se.checkpoint("s1", s2, "blocked", {})
+    expect(se.getPlan("s1")!.stories.find((s) => s.id === s2)!.status).toBe("blocked")
+
+    // Story 1 completes and triggers promotion. `find` skips S2 (blocked,
+    // not pending) and promotes S3 instead — the pre-existing, unchanged
+    // (and separately tested) skip-ahead behavior.
+    se.attachEvidence("s1", s1, "A1", { receiptId: "vrf_1" })
+    se.checkpoint("s1", s1, "complete", { isValidReceipt: () => true })
+    expect(se.getActiveStory("s1")!.id).toBe(s3)
+
+    // Before the C-11 fix, this next call SUCCEEDED: S3 (final) completed
+    // with S2 left permanently "blocked" — the plan looked all-done to any
+    // caller that (like wiring/gate.ts's appendJudgeCloseOut) trusts
+    // finalStory.status === "complete", even though it demonstrably wasn't.
+    se.attachEvidence("s1", s3, "A1", { receiptId: "vrf_3" })
+    expect(() => se.checkpoint("s1", s3, "complete", { isValidReceipt: () => true })).toThrow(
+      /final story.*S2:blocked|S2:blocked.*final story/s,
+    )
+
+    // Proof the gap is actually closed, not just that nothing crashed: the
+    // plan is NOT stuck with a false "done" signal — S3 is still "active"
+    // (the rejected checkpoint mutated nothing) and S2 is still "blocked".
+    const afterRejectedComplete = se.getPlan("s1")!
+    expect(afterRejectedComplete.stories.find((s) => s.id === s3)!.status).toBe("active")
+    expect(afterRejectedComplete.stories.find((s) => s.id === s2)!.status).toBe("blocked")
+    expect(afterRejectedComplete.stories.every((s) => s.status === "complete")).toBe(false)
+
+    // Recovery: free the active slot (re-block the final story — "blocked"
+    // carries no active-story requirement, same as the original out-of-order
+    // block), reopen S2 (no story is active now, so it resumes directly),
+    // complete it, then reopen and recomplete S3.
+    se.checkpoint("s1", s3, "blocked", {})
+    expect(se.getActiveStory("s1")).toBeNull()
+
+    se.reopenStory("s1", s2, { reason: "root cause identified and resolved" })
+    expect(se.getActiveStory("s1")!.id).toBe(s2)
+    se.attachEvidence("s1", s2, "A1", { receiptId: "vrf_2_fresh" })
+    se.checkpoint("s1", s2, "complete", { isValidReceipt: () => true })
+    expect(se.getPlan("s1")!.stories.find((s) => s.id === s2)!.status).toBe("complete")
+
+    se.reopenStory("s1", s3, { reason: "resuming final story" })
+    expect(se.getActiveStory("s1")!.id).toBe(s3)
+    se.attachEvidence("s1", s3, "A1", { receiptId: "vrf_3_fresh" })
+    expect(() =>
+      se.checkpoint("s1", s3, "complete", { isValidReceipt: (id) => id === "vrf_3_fresh" }),
+    ).not.toThrow()
+
+    // The plan genuinely reaches all-complete once every story really is.
+    const finalPlan = se.getPlan("s1")!
+    expect(finalPlan.stories.every((s) => s.status === "complete")).toBe(true)
+  })
+
+  it("does NOT block a non-final story from completing while an earlier story sits blocked/failed — the skip-ahead recovery shape stays intact", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [
+      story({ text: "S1", acceptanceItems: ["A1"] }),
+      story({ text: "S2", acceptanceItems: ["A1"] }),
+      story({ text: "S3", acceptanceItems: ["A1"] }),
+      story({ text: "S4 final", acceptanceItems: ["A1"] }),
+    ])
+    const [s1, s2, s3] = plan.stories.map((s) => s.id)
+
+    se.checkpoint("s1", s2, "blocked", {}) // out of order, S2 still "pending" at this point
+    se.attachEvidence("s1", s1, "A1", { receiptId: "vrf_1" })
+    se.checkpoint("s1", s1, "complete", { isValidReceipt: () => true })
+    expect(se.getActiveStory("s1")!.id).toBe(s3) // promotion skipped S2, as before
+
+    // S3 is NOT the final story (S4 is) — completing it must still work even
+    // though S2 remains blocked. Only the FINAL story's completion is gated.
+    se.attachEvidence("s1", s3, "A1", { receiptId: "vrf_3" })
+    expect(() => se.checkpoint("s1", s3, "complete", { isValidReceipt: () => true })).not.toThrow()
+    expect(se.getPlan("s1")!.stories.find((s) => s.id === s3)!.status).toBe("complete")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// End-to-end scenario: C-6's exact failure mode — a plan whose FINAL story
+// is blocked previously could never reach all-"complete". It now can, via
+// reopenStory.
+// ---------------------------------------------------------------------------
+
+describe("reopenStory end-to-end: a plan whose FINAL story is blocked can now reach all-complete (C-6's exact failure mode)", () => {
+  it("a 3-story plan whose final story is blocked while active is stuck (pre-fix symptom reproduced), then reaches all-complete once reopened", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [
+      story({ text: "S1", acceptanceItems: ["A1"] }),
+      story({ text: "S2", acceptanceItems: ["A1"] }),
+      story({ text: "S3 final", acceptanceItems: ["A1"] }),
+    ])
+    const [s1, s2, s3] = plan.stories.map((s) => s.id)
+    expect(plan.finalStoryId).toBe(s3)
+
+    se.attachEvidence("s1", s1, "A1", { receiptId: "vrf_1" })
+    se.checkpoint("s1", s1, "complete", { isValidReceipt: () => true })
+    se.attachEvidence("s1", s2, "A1", { receiptId: "vrf_2" })
+    se.checkpoint("s1", s2, "complete", { isValidReceipt: () => true })
+    expect(se.getActiveStory("s1")!.id).toBe(s3)
+
+    // The final story hits a blocker while it is the active story.
+    se.checkpoint("s1", s3, "blocked", {})
+
+    // Pre-fix symptom, reproduced: the plan is now permanently stuck — no
+    // story is active, and (before this fix) there was no way for the final
+    // story to ever become "complete" again. Exactly
+    // docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md C-6.
+    expect(se.getActiveStory("s1")).toBeNull()
+    const stuckPlan = se.getPlan("s1")!
+    expect(stuckPlan.stories.every((s) => s.status === "complete")).toBe(false)
+    expect(stuckPlan.stories.find((s) => s.id === s3)!.status).toBe("blocked")
+
+    // Reopen the final story — the fix under test.
+    se.reopenStory("s1", s3, { reason: "blocker resolved" })
+    expect(se.getActiveStory("s1")!.id).toBe(s3)
+
+    // checkpoint("complete")'s own validation is untouched by this fix: the
+    // reopened final story still needs a fresh OBSERVED receipt (FR-020) —
+    // its pre-block evidence was cleared by the reopen.
+    expect(() => se.checkpoint("s1", s3, "complete", { isValidReceipt: () => true })).toThrow(/no evidence/)
+    se.attachEvidence("s1", s3, "A1", { receiptId: "vrf_3_fresh" })
+    expect(() =>
+      se.checkpoint("s1", s3, "complete", { isValidReceipt: (id) => id === "vrf_3_fresh" }),
+    ).not.toThrow()
+
+    // The plan can now reach all-complete — the exact thing C-6 said was
+    // impossible.
+    const finalPlan = se.getPlan("s1")!
+    expect(finalPlan.stories.every((s) => s.status === "complete")).toBe(true)
   })
 })
 

@@ -342,6 +342,57 @@ describe("handleSessionIdle — stage-1 plan-completion gate", () => {
     expect(texts[0]).toContain("No story is active")
   })
 
+  // Sign-off finding: reopenStory/elicify_vertex_plan_reopen (C-6) exist, but
+  // nothing told the model about them at the exact moment the harness itself
+  // detects the plan is stuck on a blocked/failed story -- the one place C-2's
+  // own rationale ("the model reads tool output, not toasts") says this kind
+  // of guidance actually has to land.
+  it("names elicify_vertex_plan_reopen when the plan is stalled on a blocked/failed story", async () => {
+    const h = harness()
+    const sid = "s1"
+    quietSession(h, sid)
+    h.storyEngine.createPlan(sid, [
+      { text: "Blocked story", acceptanceItems: ["cannot be done"], scopeGlobs: [], verifiers: [] },
+      { text: "Trailing story", acceptanceItems: ["never started"], scopeGlobs: [], verifiers: [] },
+    ])
+    h.storyEngine.checkpoint(sid, "S1", "blocked", { isValidReceipt: () => true })
+
+    await handleSessionIdle(h.ctx, sid)
+
+    const texts = planTexts(h.prompt)
+    expect(texts).toHaveLength(1)
+    expect(texts[0]).toContain("elicify_vertex_plan_reopen")
+    expect(texts[0]).toContain("S1")
+  })
+
+  it("does NOT mention elicify_vertex_plan_reopen when no story is active but none is blocked/failed either", async () => {
+    const h = harness()
+    const sid = "s1"
+    quietSession(h, sid)
+    // No createPlan call at all -> getActiveStory is null with an EMPTY
+    // incomplete list is impossible (handleIncompletePlan wouldn't fire), so
+    // exercise the "stalled, but for a different reason" shape instead: a
+    // plan whose only story is still pending (never activated), never
+    // blocked/failed. Confirms the reopen mention is conditional, not blanket.
+    h.storyEngine.createPlan(sid, [
+      { text: "Only story", acceptanceItems: ["not started"], scopeGlobs: [], verifiers: [] },
+    ])
+    h.storyEngine.checkpoint(sid, "S1", "blocked", { isValidReceipt: () => true })
+    // Reopen it back to pending isn't reachable with a single-story plan
+    // (reopen always makes it active when nothing else is active) -- so
+    // assert the discriminating negative directly against the finding
+    // function instead of contorting a plan into an artificial state.
+    const { incompletePlanFinding } = await import("../../src/v2/wiring/findings.js")
+    const pending = h.storyEngine.getPlan(sid)!.stories[0]
+    const finding = incompletePlanFinding({
+      instanceId: "x",
+      totalStories: 1,
+      incomplete: [{ ...pending, status: "pending" }],
+      activeStory: null,
+    })
+    expect(finding.prescription).not.toContain("elicify_vertex_plan_reopen")
+  })
+
   it("AC-5: an off-arm holdout session is not blocked by the plan branch, and the rest of the tree still runs", async () => {
     const savedHoldout = process.env.VERTEX_HOLDOUT
     const savedData = process.env.VERTEX_DATA

@@ -385,7 +385,11 @@ console.log("\nG. Goals engine + receipts")
   )
   const plan = JSON.parse(done)
   assert("G2-plan-complete", plan.status === "complete", plan.status)
-  assert("G2-goals-on-disk", existsSync(join(worktree, ".elicify-vertex/goals.json")))
+  // PLUGIN_STATE_DIR (src/goals.ts) is ".opencode/elicify-vertex" — state was
+  // relocated out of ".elicify-vertex" in an earlier commit; this assertion's
+  // path was never updated to match, so it failed deterministically on every
+  // run regardless of plugin behavior. Found during this session's re-UAT.
+  assert("G2-goals-on-disk", existsSync(join(worktree, ".opencode/elicify-vertex/goals.json")))
 
   // stale receipt after edit
   clearLogs()
@@ -1038,6 +1042,143 @@ console.log("\nS. V2 anomaly + elevate (test 34: uat_v2_anomaly_and_elevate)")
     injElevate.includes("this is the moment to finish well"),
     injElevate.slice(0, 320),
   )
+}
+
+// ===== T. V2 round-2 fixes (C-11 final-story gate, C-14 activation) =====
+// Host-faithful confirmation of two round-2 fixes (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md)
+// against the real compiled dist/v2/plugin.js — independent of, and in addition
+// to, the mutation-verified unit/integration tests in tests/v2/*.test.ts.
+console.log("\nT. V2 round-2 fixes (C-11 final-story gate, C-14 activation interleaving)")
+{
+  // T1 — C-11: an earlier story blocked WHILE STILL PENDING (blocked/failed
+  // carry no active-story requirement, unlike complete) gets silently
+  // skipped by successor-promotion's first-pending-match scan — a LATER
+  // story can be promoted straight to the FINAL slot. The final story's
+  // completion must still be rejected until the skipped-over story is
+  // resolved (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md's exact C-11 repro).
+  clearLogs()
+  const t1UserMsgId = "uat-t1-user-confirm-msg"
+  const { hooks } = await loadV2Plugin({
+    messages: async () => ({ data: [{ info: { id: t1UserMsgId, role: "user" } }] }),
+  })
+  const sid = "uat-t1-c11-final-gate"
+  const ctx = { sessionID: sid, worktree: worktreeV2, directory: worktreeV2 }
+  await activate(hooks, sid, "implement the migration, its rollback path, and the docs")
+  const created = JSON.parse(
+    await hooks.tool.elicify_vertex_plan_create.execute(
+      {
+        stories: [
+          { text: "S1: write the migration", acceptanceItems: ["migration runs"], scopeGlobs: [], verifiers: [] },
+          { text: "S2: write the rollback", acceptanceItems: ["rollback runs"], scopeGlobs: [], verifiers: [] },
+          { text: "S3: document the change", acceptanceItems: ["docs updated"], scopeGlobs: [], verifiers: [] },
+        ],
+      },
+      ctx,
+    ),
+  )
+  const [s1, s2, s3] = created.stories
+  // S2 blocks directly while still "pending" (S1, not S2, is active) — the
+  // exact out-of-order shape blocked/failed's lack of an active-story
+  // requirement allows.
+  await hooks.tool.elicify_vertex_plan_checkpoint.execute({ storyId: s2.id, status: "blocked", items: [] }, ctx)
+  // S1 completes normally; successor-promotion's first-pending scan skips
+  // the now-blocked S2 and promotes S3 (the final story) directly.
+  const afterS1 = JSON.parse(
+    await hooks.tool.elicify_vertex_plan_checkpoint.execute(
+      { storyId: s1.id, status: "complete", items: [{ id: s1.acceptanceItems[0].id, waiverSourceMessageId: t1UserMsgId }] },
+      ctx,
+    ),
+  )
+  assert(
+    "T1-promotion-skips-blocked-story-to-final",
+    afterS1.stories.find((s) => s.id === s3.id)?.status === "active",
+    JSON.stringify(afterS1.stories.map((s) => [s.id, s.status])),
+  )
+  // S3 (the final story) attempts to complete while S2 sits blocked, skipped.
+  let rejected = false
+  let rejectMsg = ""
+  try {
+    await hooks.tool.elicify_vertex_plan_checkpoint.execute(
+      { storyId: s3.id, status: "complete", items: [{ id: s3.acceptanceItems[0].id, waiverSourceMessageId: t1UserMsgId }] },
+      ctx,
+    )
+  } catch (e) {
+    rejected = true
+    rejectMsg = String(e.message || e)
+  }
+  assert("T1-final-story-blocked-by-skipped-predecessor", rejected && /S2|blocked/i.test(rejectMsg), rejectMsg)
+
+  // Resolve S2. `reopenStory` rejoins S2 as "pending" (S3 is currently
+  // active), NOT "active" -- it can only become active once the currently-
+  // active story closes, but S3 (final) can never close via "complete" while
+  // S2 is unresolved (the C-11 gate just proved above). The recovery path is
+  // to block S3 too first (blocked/failed transitions clear "active" without
+  // requiring promotion), which frees the active slot for S2's reopen.
+  await hooks.tool.elicify_vertex_plan_reopen.execute({ storyId: s2.id, reason: "unblocked for uat" }, ctx)
+  let s2StillPending = false
+  try {
+    await hooks.tool.elicify_vertex_plan_checkpoint.execute(
+      { storyId: s2.id, status: "complete", items: [{ id: s2.acceptanceItems[0].id, waiverSourceMessageId: t1UserMsgId }] },
+      ctx,
+    )
+  } catch (e) {
+    s2StillPending = /not the plan's current active story/.test(String(e.message || e))
+  }
+  assert("T1-reopened-story-rejoins-as-pending-not-active", s2StillPending, "S2 should rejoin as pending while S3 is active")
+
+  // S2 is now "pending", not "blocked"/"failed" -- reopenTool would reject a
+  // second reopen attempt outright. `checkpoint`'s blocked/failed branch has
+  // NO active-story or prior-status gate at all (unlike "complete"), so a
+  // pending story CAN be checkpointed straight to "blocked" -- a legitimate,
+  // ungated transition that exists purely to make it reopen-eligible again.
+  // Chaining these two already-existing primitives (checkpoint-to-blocked,
+  // then reopen) is the only path back to "active" once a story has been
+  // displaced to "pending" while its would-be active slot is occupied by a
+  // story that itself later blocks instead of completing -- non-obvious,
+  // found only by tracing checkpoint's exact branch structure, but genuinely
+  // supported by the code as written; not a defect to fix here (evidence
+  // integrity holds throughout -- the cost is operational friction, not
+  // correctness), just an interaction worth documenting.
+  await hooks.tool.elicify_vertex_plan_checkpoint.execute({ storyId: s3.id, status: "blocked", items: [] }, ctx)
+  await hooks.tool.elicify_vertex_plan_checkpoint.execute({ storyId: s2.id, status: "blocked", items: [] }, ctx)
+  await hooks.tool.elicify_vertex_plan_reopen.execute({ storyId: s2.id, reason: "retry now that S3 vacated active" }, ctx)
+  await hooks.tool.elicify_vertex_plan_checkpoint.execute(
+    { storyId: s2.id, status: "complete", items: [{ id: s2.acceptanceItems[0].id, waiverSourceMessageId: t1UserMsgId }] },
+    ctx,
+  )
+  await hooks.tool.elicify_vertex_plan_reopen.execute({ storyId: s3.id, reason: "resume now that S2 is complete" }, ctx)
+  const finalDone = JSON.parse(
+    await hooks.tool.elicify_vertex_plan_checkpoint.execute(
+      { storyId: s3.id, status: "complete", items: [{ id: s3.acceptanceItems[0].id, waiverSourceMessageId: t1UserMsgId }] },
+      ctx,
+    ),
+  )
+  assert(
+    "T1-final-story-completes-once-predecessor-resolved",
+    finalDone.stories.find((s) => s.id === s3.id)?.status === "complete",
+    JSON.stringify(finalDone.stories.map((s) => [s.id, s.status])),
+  )
+
+  // T2 — C-14: a session activated by trigger text under a non-default agent
+  // survives an intervening ordinary turn under the configured DEFAULT agent
+  // without losing its recorded activator (the interleaving bug found by
+  // adversarial re-review of the first C-14 fix).
+  clearLogs()
+  const { hooks: hooksT2 } = await loadV2Plugin()
+  const sidT2 = "uat-t2-c14-interleave"
+  const CUE = "[vertex] harness on"
+  async function chatMessage(text, agent) {
+    const output = { message: { id: `msg-${sidT2}-${Math.random().toString(36).slice(2)}` }, parts: [{ type: "text", text }] }
+    await hooksT2["chat.message"]({ sessionID: sidT2, agent }, output)
+    return output.parts.some((p) => p && p.type === "text" && typeof p.text === "string" && p.text.includes(CUE))
+  }
+  const cue1 = await chatMessage("/elicify-vertex\n\ndo something", "build")
+  assert("T2-trigger-activates-under-non-default-agent", cue1, "cue expected on turn 1")
+  await chatMessage("an ordinary default-agent turn in between", "elicify-vertex-agent")
+  const cue3 = await chatMessage("continuing under build, no trigger text", "build")
+  assert("T2-non-default-agent-reappears-no-deactivate", cue3 === false, "no cue expected — session must still be active")
+  const cue4 = await chatMessage("/elicify-vertex\n\ndo something else", "build")
+  assert("T2-no-recue-proves-activation-survived", cue4 === false, "no cue expected — re-trigger would only re-fire if deactivated")
 }
 
 // ===== Summary =====
