@@ -70,7 +70,7 @@ import {
   type V2SessionState,
 } from "./wiring/state.js"
 import { injectSubagentPreamble } from "./wiring/subagentInjection.js"
-import { buildPlanTools } from "./wiring/tools.js"
+import { buildPlanTools, readStarConsent, writeStarConsent } from "./wiring/tools.js"
 import { DelegationTracker } from "./wiring/watchdog.js"
 
 export interface ElicifyVertexV2Options {
@@ -312,6 +312,11 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
   // at the next chat.message turn boundary. Also not part of V2SessionState
   // for the same reason.
   const storyCompletionPending = new Map<string, StoryV2>()
+  // One-time "star on GitHub" ask: sessions flagged here get a single
+  // system-transform directive telling the model to ask via the question tool.
+  // Machine-wide once-ness is gated by the consent file (written "prompted" the
+  // first time the ask is armed), so this fires for exactly one session ever.
+  const starPromptPending = new Set<string>()
   // C-14 (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md): the `agent` field that
   // actually activated each session -- undefined when activation came from
   // trigger text/command with no agent, or the literal agent value when it
@@ -547,6 +552,14 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
         phaseEngine.onUserMessage(sid)
         composer.newTurn(sid)
         resetTurnState(state)
+        // Arm the one-time GitHub-star ask the first time this machine sees
+        // an activated session (consent file absent). Writing "prompted" now
+        // makes the machine-wide once-ness durable across restarts; the
+        // directive itself is injected once via the next system.transform.
+        if (readStarConsent() === null) {
+          writeStarConsent("prompted")
+          starPromptPending.add(sid)
+        }
         // Redesign point 9: a real user message re-arms the delegation
         // tracker — a `task` whose `tool.execute.after` the host dropped (or
         // an inconsistent before/after callID) would otherwise leave a stale
@@ -1114,6 +1127,21 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       if (resolution.unknown) logger("dosing:unknown-model", { sessionID: sid, rawModelId: resolution.rawModelId })
 
       const findings: Finding[] = []
+
+      // One-time GitHub-star ask (armed at activation when the machine's
+      // consent file was absent). Injected ONCE as a system directive, then
+      // cleared. The model asks via the `question` tool and, on yes, calls
+      // `elicify_vertex_star` (which runs `gh` hidden). No bash involved.
+      if (starPromptPending.delete(sid)) {
+        sysOutput.system = [
+          ...sysOutput.system,
+          "One-time ask (do this once, now, then never again): use the `question` tool to ask the user " +
+            "\"Would you like to star elicify-ai/elicify-vertex on GitHub? It's free, open source, and starring " +
+            "helps other developers discover it.\" with options \"Yes, star it\" / \"No thanks\". " +
+            "If they choose yes, call the `elicify_vertex_star` tool — it performs the star itself; do NOT run " +
+            "gh or any bash command. If no, do nothing. This is asked exactly once; never raise starring again.",
+        ]
+      }
 
       if (state.needsCriteriaReinject) {
         findings.push(

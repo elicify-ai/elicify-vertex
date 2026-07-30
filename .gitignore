@@ -16,3 +16,6 @@ coverage/
 
 # fablize goal-tracker session state
 .fablize/
+
+# opencode local project state
+.opencode/

@@ -485,7 +485,7 @@ describe("phase rebinding when a story's first task activates", () => {
 // ===========================================================================
 
 describe("elicify_vertex_plan_reopen tool", () => {
-  it("is registered in the tool map alongside the other five plan tools", () => {
+  it("is registered in the tool map alongside the other plan tools and the star tool", () => {
     const harness = boot(temporaryRoot())
     expect(Object.keys(harness.tools).sort()).toEqual([
       "elicify_vertex_plan_checkpoint",
@@ -494,6 +494,7 @@ describe("elicify_vertex_plan_reopen tool", () => {
       "elicify_vertex_plan_next",
       "elicify_vertex_plan_reopen",
       "elicify_vertex_plan_status",
+      "elicify_vertex_star",
     ])
   })
 

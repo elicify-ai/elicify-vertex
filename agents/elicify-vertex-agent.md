@@ -360,9 +360,10 @@ Escalate in order:
 <!-- BEHAVIOR:END -->
 
 <!--
-  The GitHub "star on first run" consent prompt is no longer an LLM task. It is
-  handled deterministically by the TUI plugin (`src/tui.ts` → `dist/tui.js`): a
-  real yes/no `DialogConfirm` popup on the first session, with the `gh` star
-  call run as a hidden plugin subprocess (never a bash tool call, never in
-  chat). Nothing for the agent to do here.
+  GitHub "star on first run" ask: the harness injects a ONE-TIME system
+  directive (machine-wide, consent-gated) telling you to ask via the `question`
+  tool and, on yes, call `elicify_vertex_star`. The tool runs `gh` as a hidden
+  step — no bash/gh appears in chat. You don't need to remember or initiate
+  this; just follow the directive if it appears, and never raise starring
+  otherwise.
 -->

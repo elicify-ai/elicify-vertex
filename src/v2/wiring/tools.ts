@@ -24,6 +24,11 @@
  * path (`PinStore`, `tool.execute.after`'s auto-attach), which never went
  * through this file.
  */
+import { execFileSync } from "node:child_process"
+import { existsSync, readFileSync, writeFileSync } from "node:fs"
+import { homedir } from "node:os"
+import { join } from "node:path"
+
 import { tool } from "@opencode-ai/plugin"
 import type { PhaseEngine } from "../phase.js"
 import type { PinStore } from "../pin.js"
@@ -44,6 +49,70 @@ export interface PlanToolsDeps {
   phaseEngine: PhaseEngine
   /** Runs when a plan is successfully created, so wiring can clear `multiStoryPending`. */
   onPlanCreated: (sessionID: string) => void
+}
+
+// ---------------------------------------------------------------------------
+// One-time "star on GitHub" consent + tool (deterministic trigger, LLM popup,
+// hidden execution).
+//
+// The ask is a real yes/no via the model's `question` tool (the only popup
+// opencode exposes). The harness fires that ask ONCE per machine (consent file
+// gates it — see plugin.ts), not from the model's memory. The actual `gh` star
+// call runs as this plugin's OWN subprocess inside the tool below — never a
+// bash tool call — so the command and its output never appear in the chat; the
+// model only sees a clean tool result. `GH_TOKEN` is stripped so the user's own
+// `gh auth login` is used.
+// ---------------------------------------------------------------------------
+
+export const STAR_REPO = "elicify-ai/elicify-vertex"
+
+/** The opencode config root, matching `scripts/register-commands.mjs`. */
+function opencodeConfigRoot(): string {
+  const xdg = process.env.XDG_CONFIG_HOME
+  return xdg ? join(xdg, "opencode") : join(homedir(), ".config", "opencode")
+}
+
+/** Machine-wide consent marker for the star ask. Absent = never asked. */
+export function starConsentPath(): string {
+  return join(opencodeConfigRoot(), ".elicify-vertex-consent")
+}
+
+/** Read the consent marker. `null` = no file (never asked). */
+export function readStarConsent(): string | null {
+  try {
+    const path = starConsentPath()
+    return existsSync(path) ? readFileSync(path, "utf8").trim() || null : null
+  } catch {
+    return null
+  }
+}
+
+/** Star the repo as a hidden subprocess. Best-effort: returns false on any
+ *  failure (no `gh`, not authed, offline) — the caller records consent so the
+ *  user is never re-asked by a transient failure. */
+export function starRepoHidden(): boolean {
+  const env = { ...process.env }
+  delete env.GH_TOKEN
+  delete env.GITHUB_TOKEN
+  try {
+    execFileSync("gh", ["api", "--method", "PUT", `/user/starred/${STAR_REPO}`], {
+      env,
+      stdio: "ignore",
+      timeout: 15_000,
+    })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Write the consent marker (mode 0600). */
+export function writeStarConsent(value: "prompted" | "yes"): void {
+  try {
+    writeFileSync(starConsentPath(), value, { mode: 0o600 })
+  } catch {
+    // Non-fatal: worst case the user is asked again next run.
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +472,24 @@ export function buildPlanTools(deps: PlanToolsDeps) {
     },
   })
 
+  // One-time star tool: the model calls this ONLY after the user agrees via
+  // the `question` tool. It runs `gh` as a hidden subprocess and records
+  // consent, so no bash/gh ever appears in the chat. Idempotent: a second call
+  // (consent already "yes") is a no-op.
+  const starTool = tool({
+    description:
+      "Star the elicify-vertex GitHub repo. Call this ONLY once, after the user agreed to star via the question tool. " +
+      "It performs the star itself — do NOT run gh or any bash command yourself. Returns {starred, already}.",
+    args: {},
+    async execute() {
+      const prior = readStarConsent()
+      if (prior === "yes") return JSON.stringify({ starred: true, already: true })
+      const ok = starRepoHidden()
+      writeStarConsent("yes")
+      return JSON.stringify({ starred: ok, already: false })
+    },
+  })
+
   return {
     elicify_vertex_plan_create: createTool,
     elicify_vertex_plan_next: nextTool,
@@ -410,6 +497,7 @@ export function buildPlanTools(deps: PlanToolsDeps) {
     elicify_vertex_plan_status: statusTool,
     elicify_vertex_plan_clear: clearTool,
     elicify_vertex_plan_reopen: reopenTool,
+    elicify_vertex_star: starTool,
   }
 }
 

@@ -93,18 +93,14 @@ function main() {
     return
   }
 
-  // Ensure plugin entries are listed. Two are needed because opencode plugin
-  // modules are EITHER server (`{ server }`) OR tui (`{ tui }`), never both:
-  //   - PKG                 → the server plugin (verification harness), main entry
-  //   - PKG + "/dist/tui.js" → the TUI plugin (deterministic star-on-GitHub popup;
-  //                            see src/tui.ts). Only loads in the interactive TUI.
+  // Ensure the server plugin is listed. (A TUI plugin for the deterministic
+  // star prompt lives in src/tui.ts but is NOT registered here: on current
+  // opencode the `plugin` array is server-only — a `{ tui }` module is
+  // rejected with "must default export an object with server()". It stays
+  // dormant until the host exposes a TUI-plugin registration path.)
   if (!Array.isArray(config.plugin)) config.plugin = []
   if (!config.plugin.includes(PKG)) {
     config.plugin.push(PKG)
-  }
-  const tuiEntry = `${PKG}/dist/tui.js`
-  if (!config.plugin.includes(tuiEntry)) {
-    config.plugin.push(tuiEntry)
   }
 
   // Always (re)register the elicify-vertex commands. These are this package's
