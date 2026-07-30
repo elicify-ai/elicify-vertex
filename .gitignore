@@ -13,3 +13,6 @@ coverage/
 **/oc-uat-runs/
 *.uat-out
 *.uat-err
+
+# fablize goal-tracker session state
+.fablize/

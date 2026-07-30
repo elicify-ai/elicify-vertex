@@ -29,12 +29,14 @@ OPENCODE_JSON="$CONFIG_ROOT/opencode.json"
 FORCE="${SKILL_FORCE:-0}"
 
 # --- helper ---------------------------------------------------------------
+# Always overwrite: these are this package's OWN files (the agent definition
+# and skill, derived from the repo source). An upgrade that changes them MUST
+# propagate to the installed copy — the previous "skip if exists unless
+# SKILL_FORCE=1" rule left stale agent definitions in place after a redesign.
+# (SKILL_FORCE is now a no-op, retained for backward compatibility of the env
+# var.) User customizations belong in a differently-named file.
 copy_file() {
   local src="$1" dest="$2"
-  if [[ -f "$dest" ]] && [[ "$FORCE" != "1" ]]; then
-    say "  ✓ $dest (already exists)"
-    return 0
-  fi
   mkdir -p "$(dirname "$dest")"
   cp "$src" "$dest"
   say "  ✓ $dest"

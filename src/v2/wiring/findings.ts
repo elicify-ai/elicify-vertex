@@ -146,7 +146,7 @@ export function planProposalFinding(instanceId: string): Finding {
     observation: "The task describes multiple distinct, separately-completable outcomes.",
     diagnosis: "Multi-story scope was detected at intake.",
     prescription:
-      "Propose a story-by-story split: for each story, state its text and 2-3 acceptance items. After the user confirms the split, call elicify_vertex_plan_create with that breakdown (text, acceptanceItems, and optionally scopeGlobs/verifiers per story).",
+      "Propose a story-by-story split: for each story, state its text, 2-3 acceptance items, and the one or more TASKS it decomposes into (each a unit of work; optionally declare dependsOn naming other task or story ids so parallel waves can be computed from the dependency graph). After the user confirms the split, call elicify_vertex_plan_create with that breakdown (text, acceptanceItems, tasks, and optionally scopeGlobs/verifiers per story).",
     instanceId,
   }
 }
@@ -180,44 +180,62 @@ export function storyCompletionFinding(opts: { instanceId: string; nextStory: St
     observation: "The active story's bound verifier just passed, but it is not the plan's final story.",
     diagnosis:
       "An intermediate story going green does not elevate a multi-story plan (US-7) — completion is scoped per story, not session-wide.",
-    prescription: `Checkpoint this story as complete (elicify_vertex_plan_checkpoint, with evidence for every acceptance item), then move on to story ${nextStory.id}: ${nextStory.text}.`,
+    prescription: `Checkpoint the tasks you just finished for this story (elicify_vertex_plan_checkpoint with each taskId) — the story auto-completes when all its tasks are done, then the completion judge audits it at the next idle. The next wave of tasks activates automatically once no task remains active; ${nextStory.id} follows: ${nextStory.text}.`,
     instanceId,
   }
 }
 
 /**
- * What the ACTIVE story needs before it can be checkpointed complete —
- * AC-2's "for the active story what evidence would close it (its declared
- * verifiers, and which acceptance items lack evidence)".
- *
- * Three item states are worded distinctly on purpose: a story with no
- * acceptance items at all is a different (and more common than it should
- * be) failure from one whose items are merely unevidenced, and a story
- * whose items are ALL evidenced needs a checkpoint call, not another
- * verifier run. Saying "run the verifier" in that last case would be the
- * generic "keep going" the requirement explicitly rejects.
+ * What the ACTIVE story needs before it can be claimed complete — AC-2's
+ * "for the active story what would close it". HANDOVER.md redesign (points
+ * 1/4/8): there are no per-item evidence citations anymore, so this no
+ * longer enumerates "items lacking evidence" (a citation-counting
+ * exercise). What closes a story now is a checkpoint CLAIM that survives
+ * the completion judge's independent audit — so the prescription names the
+ * story's verifiers (run standalone, so their exit codes are reliable) and,
+ * when the judge has already failed this story once, the exact items and
+ * notes from that audit, verbatim. Naming the judge's own words back is
+ * what makes the continuation constructive ("S2 not delivered — A3, A4
+ * still missing") instead of a generic "keep going".
  */
 function activeStoryPrescription(story: StoryV2): string {
-  const unevidenced = story.acceptanceItems.filter((item) => !item.evidence)
+  const judgeNote =
+    story.judge && !story.judge.pass
+      ? `The completion judge's last audit of ${story.id} FAILED — "${story.judge.summary}". ` +
+        `Items it found unmet: ${listWithOverflow(
+          story.judge.items.filter((i) => !i.met).map((i) => `${i.itemId} (${i.note})`),
+          MAX_LISTED_ITEMS,
+        )}. Fix exactly those before claiming again. `
+      : ""
+
+  // 2026-07-30 task/DAG redesign: the atomic unit is the TASK. A story is
+  // back-compat granularity for THIS roster; the work the model actually
+  // dispatches and checkpoints is one subagent per active task, so name the
+  // story's active tasks (id + text) up front — these are what to resume.
+  const activeTasks = story.tasks.filter((t) => t.status === "active")
+  const tasksClause = activeTasks.length > 0
+    ? `Active tasks on ${story.id}: ${listWithOverflow(
+        activeTasks.map((t) => `${t.id} ("${quote(t.text)}")`),
+        MAX_LISTED_ITEMS,
+      )}. `
+    : `${story.id} has no task currently active — call elicify_vertex_plan_next for the active tasks. `
 
   const itemsClause =
     story.acceptanceItems.length === 0
-      ? `${story.id} declares no acceptance items, so nothing can evidence it — amend it to declare what "done" means before checkpointing.`
-      : unevidenced.length === 0
-        ? `Every acceptance item on ${story.id} already carries evidence, so it is ready to checkpoint.`
-        : `Acceptance items on ${story.id} still lacking evidence: ${listWithOverflow(
-            unevidenced.map((item) => `${item.id}: "${quote(item.text)}"`),
-            MAX_LISTED_ITEMS,
-          )}.`
+      ? `${story.id} declares no acceptance items, so there is nothing for the judge to audit — amend it to declare what "done" means before checkpointing.`
+      : `Acceptance items the judge will audit on ${story.id}: ${listWithOverflow(
+          story.acceptanceItems.map((item) => `${item.id}: "${quote(item.text)}"`),
+          MAX_LISTED_ITEMS,
+        )}.`
 
   const verifierClause = story.verifiers.length
-    ? `Evidence that would close ${story.id}: run ${story.verifiers.join(" && ")} and cite its observed result.`
+    ? `Before checkpointing tasks complete, run ${story.verifiers.join(" && ")} as standalone commands (never ';'-chained or piped — that hides the real exit code) and read their output.`
     : `${story.id} declares no verifiers, so nothing narrower is bound to it — run ${GENERIC_VERIFIER_CATEGORIES}, or amend ${story.id} to declare the verifier you intend to use.`
 
   return (
-    `Resume story ${story.id} — "${quote(story.text)}". ${itemsClause} ${verifierClause} ` +
-    `Then call elicify_vertex_plan_checkpoint for ${story.id} with evidence for every acceptance item, and continue with the next story. ` +
-    `If a story genuinely no longer applies, checkpoint it blocked or failed with a reason rather than leaving it silently open.`
+    `Resume story ${story.id} — "${quote(story.text)}". ${judgeNote}${tasksClause}${itemsClause} ${verifierClause} ` +
+    `Checkpoint each task as it finishes (elicify_vertex_plan_checkpoint with the taskId) — ${story.id} auto-completes when all its tasks are done, then the completion judge independently audits it at the next idle. ` +
+    `If a task genuinely cannot proceed, checkpoint it blocked or failed with a reason rather than leaving it silently open.`
   )
 }
 
@@ -243,12 +261,25 @@ export function incompletePlanFinding(opts: {
   instanceId: string
   totalStories: number
   incomplete: readonly StoryV2[]
-  activeStory: StoryV2 | null
+  activeStories: readonly StoryV2[]
 }): Finding {
-  const { instanceId, totalStories, incomplete, activeStory } = opts
+  const { instanceId, totalStories, incomplete, activeStories } = opts
 
+  // Point 8: name, per story, WHAT is missing — when the judge already
+  // audited the story and failed it, its own unmet-item ids ride in the
+  // roster ("S2 (judge: A3, A4 unmet)") so the model sees the specific
+  // deficit, not just an open status.
   const roster = listWithOverflow(
-    incomplete.map((story) => `${story.id} (${story.status}): "${quote(story.text)}"`),
+    incomplete.map((story) => {
+      const judgeDetail =
+        story.judge && !story.judge.pass
+          ? `, judge: ${listWithOverflow(
+              story.judge.items.filter((i) => !i.met).map((i) => i.itemId),
+              MAX_LISTED_ITEMS,
+            )} unmet`
+          : ""
+      return `${story.id} (${story.status}${judgeDetail}): "${quote(story.text)}"`
+    }),
     MAX_LISTED_STORIES,
   )
 
@@ -257,23 +288,27 @@ export function incompletePlanFinding(opts: {
     `${totalStories === 1 ? "story is" : "stories are"} still open — ${roster}.`
 
   const diagnosis =
-    "Idle was reached with an open story contract. Deterministic completion checks run before the completion " +
-    "judge, so nothing has assessed this session as done — the plan itself already says it is not."
+    "Idle was reached with an open story contract. A story closes only when its completion claim survives the " +
+    "completion judge's independent audit — the plan itself already says these stories are not there."
 
   const stalledOnBlocked = incomplete.filter((story) => story.status === "blocked" || story.status === "failed")
 
-  const prescription = activeStory
-    ? activeStoryPrescription(activeStory)
-    : `No story is active, so nothing can be checkpointed complete and the plan has stalled with ${incomplete
-        .map((story) => story.id)
-        .join(", ")} unresolved. ${
-        stalledOnBlocked.length > 0
-          ? `${stalledOnBlocked.map((story) => story.id).join(", ")} ${
-              stalledOnBlocked.length === 1 ? "is" : "are"
-            } blocked/failed with no active successor -- once whatever caused that is resolved, call ` +
-            `elicify_vertex_plan_reopen to resume it. `
-          : ""
-      }State plainly that the plan is stalled and what is needed to resume it, rather than ending the turn as if it were finished.`
+  const prescription =
+    activeStories.length > 0
+      ? activeStories
+          .slice(0, MAX_LISTED_STORIES)
+          .map((story) => activeStoryPrescription(story))
+          .join(" ")
+      : `No story is active, so nothing can be checkpointed and the plan has stalled with ${incomplete
+          .map((story) => story.id)
+          .join(", ")} unresolved. ${
+          stalledOnBlocked.length > 0
+            ? `${stalledOnBlocked.map((story) => story.id).join(", ")} ${
+                stalledOnBlocked.length === 1 ? "is" : "are"
+              } blocked/failed with no active successor -- once whatever caused that is resolved, call ` +
+              `elicify_vertex_plan_reopen to resume it. `
+            : ""
+        }State plainly that the plan is stalled and what is needed to resume it, rather than ending the turn as if it were finished.`
 
   return {
     family: "plan-incomplete",

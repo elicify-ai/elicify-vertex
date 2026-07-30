@@ -17,13 +17,14 @@
  * the model calling `elicify_vertex_plan_*` tools directly, driven by the
  * harness's own directives, not by a human typing a slash command.
  *
- * WHY THE ACTIVATE TEMPLATE IS DERIVED, NOT WRITTEN HERE. The config hook only
- * ever adds a command with `??=`, so it never overwrites one already on disk —
- * which means whatever THIS script writes is what the user actually sees, for
- * good, through every later upgrade. This file used to carry its own
- * four-sentence summary while `ACTIVATE_TEMPLATE` carried the full contract,
- * so installing the plugin silently pinned the weaker of the two. Deriving both
- * from the agent file's BEHAVIOR block removes the copy that could drift.
+ * WHY THE ACTIVATE TEMPLATE IS DERIVED, NOT WRITTEN HERE. Both this script
+ * and the v2 config hook (`applyV2Config`) derive their templates from the
+ * agent file's BEHAVIOR block and always (re)write them — so an upgrade that
+ * changes the contract propagates to the installed config rather than leaving
+ * a stale template behind. This file used to carry its own four-sentence
+ * summary while `ACTIVATE_TEMPLATE` carried the full contract, so installing
+ * the plugin silently pinned the weaker of the two. Deriving both from the
+ * same source removes the copy that could drift.
  */
 
 import { readFileSync, writeFileSync } from "node:fs"
@@ -92,18 +93,30 @@ function main() {
     return
   }
 
-  // Ensure plugin is listed
+  // Ensure plugin entries are listed. Two are needed because opencode plugin
+  // modules are EITHER server (`{ server }`) OR tui (`{ tui }`), never both:
+  //   - PKG                 → the server plugin (verification harness), main entry
+  //   - PKG + "/dist/tui.js" → the TUI plugin (deterministic star-on-GitHub popup;
+  //                            see src/tui.ts). Only loads in the interactive TUI.
   if (!Array.isArray(config.plugin)) config.plugin = []
   if (!config.plugin.includes(PKG)) {
     config.plugin.push(PKG)
   }
+  const tuiEntry = `${PKG}/dist/tui.js`
+  if (!config.plugin.includes(tuiEntry)) {
+    config.plugin.push(tuiEntry)
+  }
 
-  // Ensure commands are registered (don't override user-defined commands)
+  // Always (re)register the elicify-vertex commands. These are this package's
+  // OWN command templates, derived from the agent file's BEHAVIOR block — an
+  // upgrade that changes the contract MUST propagate to the installed config,
+  // otherwise the persisted template goes stale and `??=` lets the old one win
+  // forever (the exact bug that left the pre-redesign `/elicify-vertex` text
+  // in place after the completion-model redesign). User customizations belong
+  // under a different command name, not by overwriting elicify-vertex's own.
   config.command = config.command ?? {}
   for (const [name, cmd] of Object.entries(commands)) {
-    if (!config.command[name]) {
-      config.command[name] = cmd
-    }
+    config.command[name] = cmd
   }
 
   writeFileSync(OPENCODE_JSON, JSON.stringify(config, null, 2) + "\n", "utf8")

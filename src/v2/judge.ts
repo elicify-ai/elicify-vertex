@@ -1,5 +1,18 @@
 /**
- * Vertex 2 — Tier-3 judge as an in-loop subturn (US-9, FR-030/FR-030a/FR-031/FR-032).
+ * Vertex 2 — Tier-3 judge as an in-loop subturn (US-9, FR-030/FR-030a/FR-031/FR-032;
+ * redesigned per HANDOVER.md points 2-4, user decision 2026-07-29).
+ *
+ * The judge is now the SOLE ARBITER of story/plan completion (point 2), run
+ * at session.idle over stories that CLAIMED complete. It is no longer a
+ * zero-tool evidence-summarizer: it gets read-only tools (read/grep/glob/
+ * list/bash, point 3 — `subturn.ts`'s `JUDGE_PROBE_POLICY`) so it can
+ * independently re-run a story's declared verifiers rather than trusting
+ * the transcript, and it answers with STRUCTURED per-acceptance-item
+ * verdicts (point 4 — `{stories: [{storyId, pass, summary, items:
+ * [{itemId, met, note}]}]}`) instead of the old prose `{fit, summary,
+ * gaps}`. The motivating evidence: a real 894-message field session ended
+ * 5/5 stories blocked with genuinely-completed work the harness could not
+ * credit, and the zero-tool judge never fired to rescue it.
  *
  * Two responsibilities, kept in one module because they share the same
  * "evidence only, fail open" posture:
@@ -41,7 +54,7 @@
  */
 
 import { redactSecrets } from "../redaction.js"
-import { probeCapabilityBounded, runSubturn, type SelfCreatedSessions } from "./subturn.js"
+import { JUDGE_PROBE_POLICY, probeCapabilityBounded, runSubturn, type SelfCreatedSessions } from "./subturn.js"
 import type { EventLogger, OpencodeClient } from "./types.js"
 
 // ---------------------------------------------------------------------------
@@ -67,6 +80,13 @@ import type { EventLogger, OpencodeClient } from "./types.js"
  * `appendJudgeCloseOut`, which fetches them via `client.session.messages`
  * and passes them into `buildJudgePayload` alongside the existing three raw
  * fields). Same absent-when-emptied rule applies.
+ *
+ * HANDOVER.md point 4 adds a sixth field, `plan`: a rendered plan digest
+ * (stories, statuses, acceptance items, declared verifiers) supplied by the
+ * caller, so the judge audits against the plan's own claims rather than a
+ * flattened criteria list. Same pipeline as `recentTranscript`
+ * (scan-then-truncate via `scanProseField`), with its own 4000-char cap
+ * (`JUDGE_PLAN_FIELD_CHAR_CAP`).
  */
 export interface JudgePayload {
   criteria?: string[]
@@ -74,6 +94,7 @@ export interface JudgePayload {
   verifierSummaries?: string[]
   lastResponse?: string
   recentTranscript?: string
+  plan?: string
 }
 
 interface RawJudgePayload {
@@ -88,6 +109,10 @@ interface RawJudgePayload {
   /** Bounded recent-turn window (both roles), compact `role: text` per line,
    * already formatted by the caller. Empty string when unavailable. */
   recentTranscript: string
+  /** Rendered plan digest (HANDOVER.md point 4): stories, statuses,
+   * acceptance items and declared verifiers, formatted by the caller.
+   * Empty string when no plan is available. */
+  plan: string
 }
 
 /**
@@ -121,6 +146,15 @@ const JUDGE_PAYLOAD_FIELD_CHAR_CAP = 2000
  * without touching the other four fields' cap.
  */
 const JUDGE_TRANSCRIPT_FIELD_CHAR_CAP = 4000
+
+/**
+ * HANDOVER.md point 4: the `plan` field's cap, set to the same 4000 chars
+ * as `recentTranscript` — a plan digest carries multiple stories' worth of
+ * acceptance items and verifier commands, the same "several turns of
+ * nuance" sizing argument as the transcript window. Kept as its own named
+ * constant so it can be tuned without touching the other caps.
+ */
+const JUDGE_PLAN_FIELD_CHAR_CAP = 4000
 
 /**
  * C-9 follow-up, cost regression (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md):
@@ -318,7 +352,7 @@ function scanUnits(units: string[]): { kept: string[]; anyDropped: boolean } {
   return { kept, anyDropped: toDrop.size > 0 }
 }
 
-type JudgeFieldName = "criteria" | "verifierSummaries" | "diffSummary" | "lastResponse" | "recentTranscript"
+type JudgeFieldName = "criteria" | "verifierSummaries" | "diffSummary" | "lastResponse" | "recentTranscript" | "plan"
 
 /**
  * C-9 fix (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md — "boundary-truncation
@@ -488,12 +522,13 @@ function scanDiffSummaryField(rawDiff: string, logger: EventLogger): string | un
  * `RawJudgePayload` and in `JudgePayload`, so this takes a `string` in and
  * rejoins surviving lines with `\n` on the way out instead of returning the
  * array. `cap` is threaded through (not hardcoded) so the same function
- * serves `lastResponse` (`JUDGE_PAYLOAD_FIELD_CHAR_CAP`) and
- * `recentTranscript` (`JUDGE_TRANSCRIPT_FIELD_CHAR_CAP`).
+ * serves `lastResponse` (`JUDGE_PAYLOAD_FIELD_CHAR_CAP`), `recentTranscript`
+ * (`JUDGE_TRANSCRIPT_FIELD_CHAR_CAP`) and `plan`
+ * (`JUDGE_PLAN_FIELD_CHAR_CAP`, HANDOVER.md point 4).
  */
 function scanProseField(
   text: string,
-  field: "lastResponse" | "recentTranscript",
+  field: "lastResponse" | "recentTranscript" | "plan",
   logger: EventLogger,
   cap: number,
 ): string | undefined {
@@ -550,6 +585,9 @@ export function buildJudgePayload(raw: RawJudgePayload, logger: EventLogger): Ju
   const recentTranscript = scanProseField(raw.recentTranscript, "recentTranscript", logger, JUDGE_TRANSCRIPT_FIELD_CHAR_CAP)
   if (recentTranscript !== undefined) payload.recentTranscript = recentTranscript
 
+  const plan = scanProseField(raw.plan, "plan", logger, JUDGE_PLAN_FIELD_CHAR_CAP)
+  if (plan !== undefined) payload.plan = plan
+
   return payload
 }
 
@@ -558,29 +596,38 @@ export function buildJudgePayload(raw: RawJudgePayload, logger: EventLogger): Ju
 // ---------------------------------------------------------------------------
 
 /**
- * `docs/JUDGE-PROMPT.md` §4: one entry per criterion or aspect the judge
- * doubts. Each gap must name what is wrong (`issue`), what in the payload
- * shows it (`evidence`), and what would close it (`fix`) — specific enough
- * that another agent could act on it without asking the judge to clarify.
+ * HANDOVER.md point 4 (user decision, 2026-07-29): one verdict per
+ * acceptance item of a story. `note` says what the judge observed or what
+ * is specifically missing — the actionable detail the old prose
+ * `fit/summary/gaps` shape could not carry per item.
  */
-export interface JudgeGap {
-  issue: string
-  evidence: string
-  fix: string
+export interface JudgeItemVerdict {
+  itemId: string
+  met: boolean
+  note: string
+}
+
+/** One entry per story the judge was asked to audit. `pass` requires every
+ * listed item `met === true` (enforced by `isJudgeVerdictShape`, not just
+ * documented here). */
+export interface JudgeStoryVerdict {
+  storyId: string
+  pass: boolean
+  summary: string
+  items: JudgeItemVerdict[]
 }
 
 /**
- * `docs/JUDGE-PROMPT.md` §4 redesign, superseding the old `{fit, notes}`
- * shape: `notes` (a one-or-two-sentence blob) could not carry "here is
- * everything wrong and what would fix each one." `summary` keeps the
- * one-sentence overall assessment; `gaps` is the actual to-do list, empty
- * when `fit` is `"pass"` (enforced by `isJudgeVerdictShape` below, not just
- * documented here).
+ * HANDOVER.md point 4, superseding the `{fit, summary, gaps}` shape (itself
+ * a `docs/JUDGE-PROMPT.md` §4 redesign of the original `{fit, notes}`):
+ * structured per-story, per-acceptance-item feedback. The judge is the sole
+ * arbiter of completion (point 2), so its output must name exactly which
+ * criteria are met and which are not — a one-sentence `summary` plus a
+ * free-form gaps list was not machine-checkable enough to drive
+ * continuations ("story S2 not delivered — A3, A4 still missing").
  */
 export interface JudgeVerdict {
-  fit: "pass" | "concern"
-  summary: string
-  gaps: JudgeGap[]
+  stories: JudgeStoryVerdict[]
 }
 
 type ModelRef = { providerID: string; modelID: string }
@@ -602,7 +649,8 @@ type ModelRef = { providerID: string; modelID: string }
  *    the deny map could not be (re)built after a successful probe, for a
  *    reason other than the shared budget expiring).
  *  - `"malformed"` — the subturn returned text that is not valid JSON, or
- *    valid JSON that does not match `{fit: "pass"|"concern", notes: string}`.
+ *    valid JSON that does not match the `{stories: [...]}` verdict shape
+ *    (`isJudgeVerdictShape`).
  * This lets wave-3 wiring log `judge:unsupported` / `judge:unavailable` /
  * `judge:malformed` with the right label without re-deriving it from a
  * bare-null result. `runJudge` also calls the injected `logger` itself for
@@ -646,11 +694,20 @@ const JUDGE_AGENT_NAME = "vertex-judge"
  * indistinguishable from a broken feature (a 30s budget would have passed
  * the first run and failed the second). 90s is ~2x the slowest observation.
  *
+ * The 90s figure above was calibrated for the ZERO-TOOL judge (a single
+ * model round-trip). HANDOVER.md point 3 makes the judge tool-using: it now
+ * re-runs a story's declared verifier commands itself over multiple steps
+ * (maxSteps 12), and in the field session that motivated the redesign the
+ * equivalent verifier runs (`make check`, targeted re-tests) took MINUTES,
+ * not seconds — a 90s budget would convert the redesign's core capability
+ * into a guaranteed `judge:unavailable` timeout. The default is therefore
+ * raised to 300s.
+ *
  * Erring generous is the right asymmetry here: the judge runs at idle and
- * is advisory/non-gating, so an over-long budget costs only latency on an
- * already-idle session, while an over-short one silently removes the
- * feature. */
-const DEFAULT_JUDGE_TOTAL_BUDGET_MS = 90_000
+ * remains fail-open (a timeout degrades to "no verdict", never a blocked
+ * turn), so an over-long budget costs only latency on an already-idle
+ * session, while an over-short one silently removes the feature. */
+const DEFAULT_JUDGE_TOTAL_BUDGET_MS = 300_000
 
 function resolveJudgeBudgetMs(): number {
   const raw = Number(process.env.VERTEX_JUDGE_BUDGET_MS)
@@ -660,29 +717,34 @@ function resolveJudgeBudgetMs(): number {
 export const JUDGE_TOTAL_BUDGET_MS = resolveJudgeBudgetMs()
 
 /**
- * `docs/JUDGE-PROMPT.md` §4 (verdict redesign) merged with §5 (input
- * redesign) into one coherent prompt, per the task brief ("write ONE
- * coherent system prompt covering both, don't just concatenate two drafts
- * awkwardly") rather than two prompts stitched together:
- *  - §4's body (judgment framing, output shape, `gaps`/`fit` rules,
- *    zero-tool constraints) is used close to verbatim.
- *  - §5's one-clause addition ("You will also receive the parent agent's own
- *    last response and a short recent transcript...") is folded into the
- *    same first paragraph that already describes what the judge receives,
- *    immediately after naming the structured fields — rather than appended
- *    as an afterthought — so "what you're given" reads as one list (criteria/
- *    diff/verifier evidence, PLUS the parent's own words) before the prompt
- *    moves on to "how to judge it" and "how to answer."
+ * HANDOVER.md points 2-4 (user decision, 2026-07-29), superseding the
+ * `docs/JUDGE-PROMPT.md` §4/§5 prompt: the judge is now an independent
+ * completion AUDITOR with read-only tools, not a zero-tool evidence
+ * summarizer. Three load-bearing instructions, each tied to a field-session
+ * failure:
+ *  - verify, don't trust (points 2/3): the 894-message session's claims
+ *    were real but the harness credited none of them; the judge must read
+ *    the referenced files and re-run declared verifiers itself. Verifiers
+ *    must be run as STANDALONE bash commands — never `;`-chained or piped —
+ *    because the field session's deterministic gate correctly refused 19
+ *    piped/chained invocations whose exit codes were unreliable.
+ *  - modify nothing (point 3's boundary): no write/edit capability exists,
+ *    and bash is for verifiers and read-only inspection only.
+ *  - structured per-item output (point 4): one story entry per audited
+ *    story, one item entry per acceptance item, pass requires every item
+ *    met — machine-checkable enough to drive per-story continuations.
  */
 const JUDGE_SYSTEM_PROMPT = [
-  "You are an automated fit-for-purpose judge for a coding assistant's completed task.",
-  "You will be given pinned acceptance criteria, a diff summary, and verifier output summaries as a JSON object.",
-  "You will also receive the parent agent's own last response and a short recent transcript.",
-  "Use these to catch overclaiming, hedging, or reasoning gaps the structured evidence alone would not show — but the structured criteria, diff, and verifier evidence remain the primary basis for \"fit\".",
-  "Use your own judgment — decide whether the evidence actually supports each criterion being met, not just superficially present.",
-  'Respond with exactly one JSON object and nothing else, matching this shape: {"fit": "pass" | "concern", "summary": "<one sentence>", "gaps": [{"issue": "...", "evidence": "...", "fix": "..."}]}.',
-  'If fit is "pass", gaps must be an empty array. If fit is "concern", list every criterion or aspect that is missing, inconsistent, or unverified — each gap must name what is wrong and what would close it, specific enough that another agent could act on it without asking you to clarify.',
-  "Do not ask questions, do not request tool access, and do not output anything other than the JSON object.",
+  "You are an independent completion auditor for a coding plan whose stories have been claimed complete.",
+  "You receive a plan digest (stories, their acceptance items, and the verifier commands each story declares), a diff summary, verifier output summaries, and the parent agent's last response plus a short recent transcript, as a JSON object.",
+  "Do not trust the transcript or the parent's claims — verify them yourself with your read-only tools (read, grep, glob, list, bash).",
+  "Read the files a claim references before crediting it.",
+  'Where a story declares verifiers, re-run them with bash when that is feasible within your budget: run each verifier as a standalone command, never chained with ";" and never piped, so its exit code is reliable.',
+  "You must not modify anything: you have no write or edit capability, and bash is for running verifiers and read-only inspection only.",
+  'Respond with exactly one JSON object and nothing else, matching this shape: {"stories": [{"storyId": "S1", "pass": true|false, "summary": "...", "items": [{"itemId": "A1", "met": true|false, "note": "..."}]}]}.',
+  "Emit one story entry per story you were asked to audit, and one item entry per acceptance item of that story.",
+  "An item's note says what you observed or what is missing. A story's pass is true only when every one of its items is met.",
+  "Do not ask questions and do not output anything other than the JSON object.",
 ].join(" ")
 
 /**
@@ -751,39 +813,50 @@ export function parseJudgeResponse(text: string): unknown {
   return undefined
 }
 
-function isJudgeGapShape(value: unknown): value is JudgeGap {
+function isJudgeItemVerdictShape(value: unknown): value is JudgeItemVerdict {
   if (typeof value !== "object" || value === null) return false
-  const g = value as Record<string, unknown>
-  return typeof g.issue === "string" && typeof g.evidence === "string" && typeof g.fix === "string"
+  const item = value as Record<string, unknown>
+  return (
+    typeof item.itemId === "string" &&
+    item.itemId.trim().length > 0 &&
+    typeof item.met === "boolean" &&
+    typeof item.note === "string"
+  )
 }
 
 /**
- * §4 redesign shape check. Deliberately stricter than the old `{fit, notes}`
- * check in two ways, both load-bearing:
- *  - `summary`/`gaps` are now required, so an old-shape `{fit, notes}` reply
- *    (a real possibility if a stale prompt cache or a non-compliant model
- *    ever emits it) is rejected as malformed rather than silently accepted
- *    as if `notes` were still the contract — there is no field-name aliasing
- *    or best-effort fallback to the old shape.
- *  - every element of `gaps` must itself match `{issue, evidence, fix}`
- *    (`isJudgeGapShape`) — a `gaps` array of the wrong per-item shape (e.g.
- *    bare strings) is rejected, not coerced.
- *  - `fit: "pass"` REQUIRES `gaps` to be empty (task brief: "when fit ===
- *    'pass', gaps must be empty — enforce that"). `fit: "concern"` only
- *    requires `gaps` to be a valid (possibly empty) array of well-shaped
- *    items — the prompt asks the model to list every doubted aspect, but a
- *    concern verdict with zero gaps is a prompt-compliance question for the
- *    model, not a shape violation this function should reject; judgment call
- *    per the task brief ("you don't need to hard-require non-emptiness").
+ * HANDOVER.md point 4 shape check. Stricter than the `{fit, summary, gaps}`
+ * check it replaces, in ways that are all load-bearing:
+ *  - `stories` must be a NON-EMPTY array — the judge is the sole arbiter of
+ *    completion (point 2), so an empty audit is never a valid verdict.
+ *  - every story needs a non-blank `storyId`, a boolean `pass`, a string
+ *    `summary`, and an `items` array of `{itemId (non-blank), met
+ *    (boolean), note (string)}` — a wrong per-item shape is rejected, not
+ *    coerced, exactly as the old `isJudgeGapShape` rule worked.
+ *  - `pass: true` REQUIRES every listed item `met === true`: a pass with an
+ *    unmet item is malformed, not a prompt-compliance question — this is
+ *    the machine-checkable invariant continuations rely on.
+ *  - the superseded `{fit, summary, gaps}` shape (and the older
+ *    `{fit, notes}`) has no `stories` key, so both are rejected as
+ *    malformed rather than silently accepted — no field-name aliasing or
+ *    best-effort fallback to either old shape.
+ *  - unknown extra keys (on the verdict, a story, or an item) are
+ *    tolerated: models add commentary fields; only the contract keys are
+ *    validated.
  */
 function isJudgeVerdictShape(value: unknown): value is JudgeVerdict {
   if (typeof value !== "object" || value === null) return false
   const v = value as Record<string, unknown>
-  if (v.fit !== "pass" && v.fit !== "concern") return false
-  if (typeof v.summary !== "string") return false
-  if (!Array.isArray(v.gaps)) return false
-  if (!v.gaps.every(isJudgeGapShape)) return false
-  if (v.fit === "pass" && v.gaps.length !== 0) return false
+  if (!Array.isArray(v.stories) || v.stories.length === 0) return false
+  for (const story of v.stories) {
+    if (typeof story !== "object" || story === null) return false
+    const s = story as Record<string, unknown>
+    if (typeof s.storyId !== "string" || s.storyId.trim().length === 0) return false
+    if (typeof s.pass !== "boolean") return false
+    if (typeof s.summary !== "string") return false
+    if (!Array.isArray(s.items) || !s.items.every(isJudgeItemVerdictShape)) return false
+    if (s.pass === true && !(s.items as JudgeItemVerdict[]).every((item) => item.met === true)) return false
+  }
   return true
 }
 
@@ -797,14 +870,19 @@ function isJudgeVerdictShape(value: unknown): value is JudgeVerdict {
  *    block this function indefinitely — violating FR-030's literal
  *    "`Promise.race` 5s total including the retry." The probe + deny-map
  *    build now count against the same 5s total as the subturn attempt(s).
- * 1. Runs `subturn.ts`'s `probeCapabilityBounded` (probe, then deny-map
- *    build, raced together against the remaining budget) — a failure
- *    returns immediately with zero `session.create`/`session.prompt` calls
+ * 1. Runs `subturn.ts`'s `probeCapabilityBounded` (probe, then tool-map
+ *    build, raced together against the remaining budget) WITH
+ *    `JUDGE_PROBE_POLICY` (HANDOVER.md point 3): the probe verifies the
+ *    registered judge agent has no capability beyond read/grep/glob/list/
+ *    bash (with edit/write/webfetch/task provably denied), and the
+ *    resulting allow-aware map from `buildToolPolicyMap` — not a pure deny
+ *    map — is what the subturn's `tools` field receives. A failure returns
+ *    immediately with zero `session.create`/`session.prompt` calls
  *    (`runSubturn` is never reached). A probe failure OR a timeout both log
  *    `judge:unsupported` once (a probe that cannot be confirmed in time is
- *    treated identically to one actively refused); a deny-map-build failure
+ *    treated identically to one actively refused); a tool-map-build failure
  *    (non-timeout) logs `judge:unavailable`, unchanged from before this fix.
- *    This module does not receive a pre-cached deny map from the caller
+ *    This module does not receive a pre-cached tool map from the caller
  *    (the contracted signature has no slot for one) — it re-derives it on
  *    every call. See the "deny map caching" note in the final report for
  *    the trade-off this implies.
@@ -813,11 +891,12 @@ function isJudgeVerdictShape(value: unknown): value is JudgeVerdict {
  *    timed out, or otherwise `{ok: false}`), retries once with
  *    `sessionModel`. Every attempt draws from the SAME `JUDGE_TOTAL_BUDGET_MS`
  *    clock started in step 0 — each attempt's `timeoutMs` is whatever is
- *    left of the 5s total, not a fresh budget per attempt.
+ *    left of the total, not a fresh budget per attempt.
  * 3. A successful subturn's response text is parsed as JSON and checked
- *    against `{fit, summary, gaps}` (`isJudgeVerdictShape`); anything else —
- *    including the now-superseded `{fit, notes}` shape — is `"malformed"`,
- *    not thrown.
+ *    against the `{stories: [...]}` shape (`isJudgeVerdictShape`, HANDOVER.md
+ *    point 4); anything else — including BOTH superseded shapes
+ *    (`{fit, summary, gaps}` and `{fit, notes}`) — is `"malformed"`, not
+ *    thrown.
  */
 export async function runJudge(
   client: OpencodeClient,
@@ -834,19 +913,19 @@ export async function runJudge(
 
   const start = Date.now()
 
-  const probeResult = await probeCapabilityBounded(client, JUDGE_AGENT_NAME, JUDGE_TOTAL_BUDGET_MS)
+  const probeResult = await probeCapabilityBounded(client, JUDGE_AGENT_NAME, JUDGE_TOTAL_BUDGET_MS, JUDGE_PROBE_POLICY)
   if (!probeResult.ok) {
     if (probeResult.cause === "deny-map") {
-      logger("judge:unavailable", { reason: `deny map unavailable: ${probeResult.reason}` })
+      logger("judge:unavailable", { reason: `tool policy map unavailable: ${probeResult.reason}` })
       return { verdict: null, reason: "unavailable" }
     }
     // cause is "probe" or "timeout" — both fold to "unsupported" (fix #1:
-    // a probe/deny-map timeout is treated the same as an ordinary probe
+    // a probe/tool-map timeout is treated the same as an ordinary probe
     // refusal, matching the existing judge:unsupported log path).
     logger("judge:unsupported", { reason: probeResult.reason })
     return { verdict: null, reason: "unsupported" }
   }
-  const denyMap = probeResult.tools
+  const toolsMap = probeResult.tools
 
   const attempts: ModelRef[] = judgeModelOverride ? [judgeModelOverride, sessionModel] : [sessionModel]
   const parts = [{ type: "text" as const, text: JSON.stringify(payload) }]
@@ -865,7 +944,7 @@ export async function runJudge(
       model,
       system: JUDGE_SYSTEM_PROMPT,
       parts,
-      tools: denyMap,
+      tools: toolsMap,
       timeoutMs: remaining,
     })
     if (last.ok) break
@@ -883,7 +962,7 @@ export async function runJudge(
   }
 
   if (!isJudgeVerdictShape(parsed)) {
-    logger("judge:malformed", { reason: "response does not match {fit, summary, gaps} shape" })
+    logger("judge:malformed", { reason: "response does not match {stories: [{storyId, pass, summary, items}]} shape" })
     return { verdict: null, reason: "malformed" }
   }
 

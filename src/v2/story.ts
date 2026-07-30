@@ -24,13 +24,14 @@
  * to be usable at all):
  *
  *  - `attachEvidence` and `amendStory` are ADDED. The contract's `StoryV2`
- *    type carries `acceptanceItems[].evidence` and `amendments`, and
- *    `checkpoint`/`checkScope` read/describe them, but the §9 contract
- *    lists no method that ever WRITES either field. Without some write
- *    path, `checkpoint(complete)` could never succeed and `amendments`
- *    could never be non-empty. Both new methods mirror `pin.ts`'s
- *    `attachEvidence` shape/spirit as closely as the different schema
- *    allows.
+ *    type carries `acceptanceItems[].evidence` and `amendments`, but the
+ *    §9 contract lists no method that ever WRITES either field. Both
+ *    methods mirror `pin.ts`'s `attachEvidence` shape/spirit as closely as
+ *    the different schema allows. NOTE (HANDOVER.md redesign point 1):
+ *    `attachEvidence` is now a LEGACY write path — `checkpoint` no longer
+ *    reads or requires per-item evidence (see its doc comment), so nothing
+ *    new should call it; it stays only so pre-redesign plan.json files
+ *    with attached evidence still round-trip.
  *  - `checkScope` takes an additional optional third parameter
  *    (`opts?: { scopeGlobsMatchedZero?: boolean }`). The spec's edge case
  *    ("Story scope globs stop matching after a branch switch ... the
@@ -68,6 +69,36 @@
  *    pre-verified capability to skip the redundant `client.app.agents()`
  *    round trip.
  * ---------------------------------------------------------------------
+ * 2026-07-29 redesign (HANDOVER.md "Agreed redesign direction" points 1,
+ * 5, 6): `checkpoint` is now a bare completion CLAIM — the per-acceptance-
+ * item receipt/waiver citation (and `opts.isValidReceipt`) was removed
+ * after a real session showed the model fabricating plausible receipt ids
+ * 13 times in a row, then blocking every story rather than completing it.
+ * Verification moved OUT of this module to an independent completion judge
+ * (runs at session.idle with real tools), whose per-story verdicts arrive
+ * here via `applyJudgeVerdicts` and can REVERT an over-claimed story back
+ * to "active".
+ *
+ * 2026-07-30 redesign (task/DAG completion model, supersedes the wave
+ * model above): the atomic execution unit is now the TASK, not the story.
+ * Each story MUST decompose into ≥1 `Task`; the model declares each task's
+ * `dependsOn` (other task ids, cross-story allowed) and an optional
+ * story-level `dependsOn` (other story ids — every task in this story
+ * then depends on every task of those predecessors). The engine COMPUTES
+ * parallel waves from that dependency DAG as topological levels
+ * (longest-path layering: `level(t) = 0` if no deps, else
+ * `1 + max(level(dep))`). All level-0 tasks start `"active"` at once;
+ * `checkpoint` operates on a TASK id and, whenever no task remains active
+ * anywhere, promotes every pending task at the next-lowest pending level
+ * to active. Story status becomes DERIVED from its tasks (stored, but
+ * never input): all tasks complete → complete; any active → active; else
+ * failed/blocked/pending by the worst terminal task. The old stored
+ * `StoryV2.wave` field and `waveOf` helper are GONE — waves are computed,
+ * never stored or input, so a reader never has to trust a stale number.
+ * The C-11 final-story guard is now naturally enforced by the DAG (a
+ * final story that depends on its siblings cannot have all tasks complete
+ * until those siblings are done), so no redundant guard is kept.
+ * ---------------------------------------------------------------------
  */
 
 import { randomUUID } from "node:crypto"
@@ -100,7 +131,68 @@ export const fsIO = {
 export interface AcceptanceItem {
   id: string
   text: string
+  /**
+   * DEPRECATED (HANDOVER.md redesign point 1): per-item receipt/waiver
+   * citations are no longer required, read, or reset by anything in this
+   * module — `checkpoint` is now a bare claim and the completion judge
+   * (via `applyJudgeVerdicts`) is the sole arbiter of whether the claim
+   * was real. The field stays in the type, and the validators keep
+   * accepting it, because plan.json files written before the redesign
+   * carry it and must still load. Nothing here writes it anymore;
+   * `attachEvidence` survives only as a legacy path for those old plans.
+   */
   evidence: { receiptId: string } | { waiver: true; sourceMessageId: string; signature?: string } | null
+}
+
+/** HANDOVER.md redesign point 5: the completion judge's per-acceptance-item
+ * note — which criteria are met, which aren't, and what's specifically
+ * missing — so wiring can render per-story detail ("S2 not delivered — A3,
+ * A4 still missing") instead of a generic nudge. */
+export interface JudgeItemNote {
+  itemId: string
+  met: boolean
+  note: string
+}
+
+/** The latest completion-judge audit stamped onto a story by
+ * `applyJudgeVerdicts`. Stamps are history, not state: a story carries its
+ * most recent verdict even after a later status change, so wiring can
+ * always say WHY a story is where it is. */
+export interface StoryJudgeStamp {
+  pass: boolean
+  summary: string
+  items: JudgeItemNote[]
+  judgedAt: string
+}
+
+/**
+ * 2026-07-30 task/DAG redesign: the ATOMIC execution unit. A story is a
+ * container for one or more tasks; fan-out reads tasks (one subagent per
+ * active task), and `checkpoint` operates on a task id. `id` is GLOBALLY
+ * unique within the plan, auto-assigned by the engine as `${storyId}.T${n}`
+ * (e.g. "S1.T2") so the model can predict the ids and reference them in
+ * other tasks' `dependsOn` before the plan is even created. `dependsOn`
+ * names other TASK ids (cross-story allowed); it may also name a STORY id,
+ * which the engine expands to "depends on every task of that story".
+ */
+export type TaskStatus = "pending" | "active" | "complete" | "blocked" | "failed"
+
+export interface Task {
+  id: string
+  text: string
+  /** Other TASK ids (cross-story allowed) and/or STORY ids. The engine
+   * expands any story id to all of that story's task ids when building the
+   * dependency DAG. Empty array = no deps → level 0 → active at create. */
+  dependsOn: string[]
+  status: TaskStatus
+  /** ISO-8601 set the moment this task transitions to `"active"` (at
+   * createPlan for level-0 tasks, at checkpoint's level-promotion
+   * afterwards, at judge-revert, and at reopen). Optional so a task.json
+   * written before activation still validates. */
+  startedAt?: string
+  /** ISO-8601 set on every `checkpoint(..., "complete", ...)`; cleared on
+   * any non-complete outcome, judge revert, or reopen. */
+  completedAt?: string
 }
 
 export interface StoryV2 {
@@ -120,24 +212,55 @@ export interface StoryV2 {
    * `status: "complete" | "failed" | "blocked"`. Those two cannot both be
    * literally true: a `checkpoint(..., "failed", ...)` call has to store
    * that status somewhere. `"failed"` is added here to make the two
-   * internally consistent, matching v1's `StoryStatus` precedent
-   * (`src/goals.ts`: `"pending" | "in_progress" | "complete" | "failed" |
-   * "blocked"`), which already treats `"failed"` and `"blocked"` as
-   * distinct terminal states.
+   * internally consistent, matching v1's `StoryStatus` precedent.
+   *
+   * 2026-07-30: story status is now DERIVED from its tasks (and stored):
+   * all tasks complete → complete; any task active → active; else the
+   * worst terminal task (failed beats blocked) or pending. It is recomputed
+   * by `recomputeStoryStatuses` after every checkpoint / judge verdict /
+   * reopen, never input by the caller.
    */
   status: "pending" | "active" | "complete" | "blocked" | "failed"
   /**
    * ADDED — wave-4 cross-file dependency (`wiring/tools.ts`'s FR-020
    * "time-valid receipt" check: a receipt observed BEFORE the story started
    * shouldn't count as evidence for it). ISO-8601 timestamp set the moment
-   * this story's status transitions to `"active"` — in `createPlan` for the
-   * first story, and in `checkpoint`'s successor-promotion for every story
-   * promoted afterward. Deliberately OPTIONAL so a `plan.json` written
-   * before this field existed still validates on load (`isStoryV2` accepts
-   * it absent); a missing `startedAt` means "unknown, don't enforce the
-   * time bound" to any consumer, not an error.
+   * this story's status transitions to `"active"` (when its first task
+   * activates). Deliberately OPTIONAL so a `plan.json` written before this
+   * field existed still validates on load (`isStoryV2` accepts it absent).
    */
   startedAt?: string
+  /**
+   * ADDED (HANDOVER.md redesign point 1): ISO-8601 timestamp set when the
+   * story becomes `"complete"` (all its tasks complete). Cleared when a
+   * judge verdict reverts the story to `"active"` (or when a task is
+   * checkpointed to a non-complete status / reopened).
+   */
+  completedAt?: string
+  /**
+   * ADDED (HANDOVER.md redesign points 1/5): the latest completion-judge
+   * audit of this story. Written only by `applyJudgeVerdicts`.
+   */
+  judge?: StoryJudgeStamp
+  /**
+   * ADDED (2026-07-30 task/DAG redesign): the atomic execution units this
+   * story decomposes into. REQUIRED (≥1) — a story with no tasks is a
+   * model error; decomposition is the whole point of the redesign. The
+   * engine assigns each task's `id` (`${storyId}.T${n}`) and initial
+   * `status` ("pending"); the model supplies `text` and optional
+   * `dependsOn` only.
+   */
+  tasks: Task[]
+  /**
+   * ADDED (2026-07-30 task/DAG redesign): STORY-level dependency — references
+   * other STORY ids. Semantics: every task in THIS story implicitly depends
+   * on every task of the named predecessor stories (the story cannot start
+   * until those stories are fully done). The engine bakes these into the
+   * task DAG as edges, so topological-level promotion honours them
+   * automatically. Default `[]`; optional on disk so a plan.json written
+   * before this field existed still loads (treated as `[]`).
+   */
+  dependsOn: string[]
 }
 
 export interface PlanV2 {
@@ -171,8 +294,48 @@ function isAcceptanceItem(value: unknown): value is AcceptanceItem {
 
 const STORY_STATUSES = new Set(["pending", "active", "complete", "blocked", "failed"])
 
+/** 2026-07-30: the task status union, kept in its own set so `isTask` can
+ * validate a task's `status` independently of the story-level union (they
+ * happen to share the same five values today, but the model's vocabulary
+ * for a task is its own contract). */
+const TASK_STATUSES = new Set(["pending", "active", "complete", "blocked", "failed"])
+
 function isAmendment(value: unknown): value is { reason: string; ts: string } {
   return isRecord(value) && typeof value.reason === "string" && typeof value.ts === "string"
+}
+
+function isJudgeItemNote(value: unknown): value is JudgeItemNote {
+  return (
+    isRecord(value) &&
+    typeof value.itemId === "string" &&
+    typeof value.met === "boolean" &&
+    typeof value.note === "string"
+  )
+}
+
+function isStoryJudgeStamp(value: unknown): value is StoryJudgeStamp {
+  if (!isRecord(value)) return false
+  if (typeof value.pass !== "boolean") return false
+  if (typeof value.summary !== "string") return false
+  if (!Array.isArray(value.items) || !value.items.every(isJudgeItemNote)) return false
+  if (typeof value.judgedAt !== "string") return false
+  return true
+}
+
+/** 2026-07-30 task validator: a Task needs a non-blank id and text, a string[]
+ * `dependsOn`, a valid `status`, and (when present) string `startedAt`/
+ * `completedAt`. `dependsOn` is REQUIRED as an array (the engine always
+ * writes it; an old task without it is malformed, and there are no old
+ * tasks — tasks ship with this redesign). */
+function isTask(value: unknown): value is Task {
+  if (!isRecord(value)) return false
+  if (typeof value.id !== "string" || value.id.trim() === "") return false
+  if (typeof value.text !== "string" || value.text.trim() === "") return false
+  if (!isStringArray(value.dependsOn)) return false
+  if (typeof value.status !== "string" || !TASK_STATUSES.has(value.status)) return false
+  if (value.startedAt !== undefined && typeof value.startedAt !== "string") return false
+  if (value.completedAt !== undefined && typeof value.completedAt !== "string") return false
+  return true
 }
 
 function isStoryV2(value: unknown): value is StoryV2 {
@@ -185,10 +348,20 @@ function isStoryV2(value: unknown): value is StoryV2 {
   if (!isStringArray(value.rejectedAlternatives)) return false
   if (!Array.isArray(value.amendments) || !value.amendments.every(isAmendment)) return false
   if (typeof value.status !== "string" || !STORY_STATUSES.has(value.status)) return false
-  // `startedAt` is optional (added after the original schema shipped): a
-  // plan.json written before this field existed has no key at all here,
-  // which must still validate — only reject it when PRESENT but non-string.
+  // 2026-07-30: `tasks` is REQUIRED (non-empty, all valid). A plan written
+  // before this redesign has no tasks and is rejected on load — that is the
+  // intended hard cutover (this IS the redesign).
+  if (!Array.isArray(value.tasks) || value.tasks.length === 0 || !value.tasks.every(isTask)) return false
+  // `dependsOn` (story-level) is optional on disk for back-compat with
+  // plans that predate the field; treat absent as []. Reject only a
+  // PRESENT-but-wrong-shaped value.
+  if (value.dependsOn !== undefined && !isStringArray(value.dependsOn)) return false
+  // `startedAt` / `completedAt` / `judge` are likewise optional — old plans
+  // lack them and must still load; reject only a PRESENT-but-wrong-shaped
+  // value.
   if (value.startedAt !== undefined && typeof value.startedAt !== "string") return false
+  if (value.completedAt !== undefined && typeof value.completedAt !== "string") return false
+  if (value.judge !== undefined && !isStoryJudgeStamp(value.judge)) return false
   return true
 }
 
@@ -367,9 +540,35 @@ export class StoryEngine {
     return { proposalText: lines.join("\n") }
   }
 
+  /**
+   * 2026-07-30 task/DAG redesign. Each confirmed story MUST decompose into
+   * ≥1 task; the engine assigns each task a globally-unique id
+   * (`${storyId}.T${n}`) and initial `status: "pending"`. It then validates
+   * that every `dependsOn` (task- or story-level) resolves to a real story
+   * or task (a dangling id is a model error — throw naming the id BEFORE
+   * any disk write), computes topological levels over the task DAG
+   * (longest-path layering; a cycle throws `plan dependency cycle: ...`
+   * naming the cycle), and activates every level-0 task (with
+   * `startedAt = now`). Story statuses are derived from their tasks.
+   *
+   * Story ids are deterministic (`S1..Sn` in order) and task ids are
+   * deterministic (`S{i}.T{j}`), so the MODEL can compute the ids before
+   * create runs and reference them in other tasks' `dependsOn`. A
+   * story-level `dependsOn` names OTHER STORY ids and is expanded by the
+   * engine to "every task in this story depends on every task of the
+   * named predecessors" — the DAG then enforces it for free, which is why
+   * the old C-11 final-story guard is no longer needed.
+   */
   createPlan(
     sessionID: string,
-    confirmed: Array<{ text: string; acceptanceItems: string[]; scopeGlobs?: string[]; verifiers?: string[] }>,
+    confirmed: Array<{
+      text: string
+      acceptanceItems: string[]
+      tasks: Array<{ text: string; dependsOn?: string[] }>
+      scopeGlobs?: string[]
+      verifiers?: string[]
+      dependsOn?: string[]
+    }>,
   ): PlanV2 {
     this.archiveV1IfPresent()
     if (confirmed.length === 0) throw new Error("a story plan requires at least one story")
@@ -377,7 +576,21 @@ export class StoryEngine {
     const now = new Date().toISOString()
     const stories: StoryV2[] = confirmed.map((input, index) => {
       const storyId = `S${index + 1}`
-      const status: StoryV2["status"] = index === 0 ? "active" : "pending"
+      if (!Array.isArray(input.tasks) || input.tasks.length === 0) {
+        throw new Error(`stories[${index}].tasks must contain at least one task`)
+      }
+      const tasks: Task[] = input.tasks.map((taskInput, taskIndex) => {
+        const rawDeps = Array.isArray(taskInput.dependsOn) ? taskInput.dependsOn : []
+        if (!rawDeps.every((dep) => typeof dep === "string")) {
+          throw new Error(`stories[${index}].tasks[${taskIndex}].dependsOn must be an array of strings`)
+        }
+        return {
+          id: `${storyId}.T${taskIndex + 1}`,
+          text: requireNonBlank(taskInput.text, `stories[${index}].tasks[${taskIndex}].text`),
+          dependsOn: [...rawDeps],
+          status: "pending",
+        }
+      })
       return {
         id: storyId,
         text: requireNonBlank(input.text, `stories[${index}].text`),
@@ -387,21 +600,26 @@ export class StoryEngine {
           evidence: null,
         })),
         // UAT finding: the host does not reliably apply the tool schema's
-        // `.default([])` for an omitted optional array arg -- a real model
-        // that simply leaves scopeGlobs/verifiers out (which "optional"
-        // invites) reaches here with `undefined`, not `[]`, despite what
-        // wiring/tools.ts's zod schema and this method's own TS signature
-        // both claim. Defend at the point of use rather than trust the
+        // `.default([])` for an omitted optional array arg — a real model
+        // that simply leaves scopeGlobs/verifiers out reaches here with
+        // `undefined`. Defend at the point of use rather than trust the
         // caller's type.
         scopeGlobs: [...(input.scopeGlobs ?? [])],
         verifiers: [...(input.verifiers ?? [])],
         assumptions: [],
         rejectedAlternatives: [],
         amendments: [],
-        status,
-        // Set only for the story that becomes active at creation — pending
-        // stories have no `startedAt` until `checkpoint` promotes them.
-        ...(status === "active" ? { startedAt: now } : {}),
+        // Story-level deps default to [] and are baked into the task DAG by
+        // buildGraph. Stored explicitly so the on-disk plan is self-describing.
+        dependsOn: [...(input.dependsOn ?? [])],
+        status: "pending",
+        tasks,
+      }
+    })
+
+    stories.forEach((story, index) => {
+      if (story.acceptanceItems.length === 0) {
+        throw new Error(`stories[${index}].acceptanceItems must contain at least one item`)
       }
     })
 
@@ -411,10 +629,34 @@ export class StoryEngine {
       finalStoryId: stories[stories.length - 1].id,
       createdAt: now,
     }
+
+    // Validate deps resolve + task ids are globally unique BEFORE computing
+    // levels (and before any disk write) — a dangling reference or a
+    // duplicate task id is a model error, not a corrupt plan.
+    this.validateDepsResolve(plan)
+    // Compute topological levels; throws `plan dependency cycle: ...` on a
+    // cycle, again before any disk write (byte-for-byte-unchanged invariant).
+    const levels = this.computeLevels(plan)
+
+    // All level-0 tasks (no story/task deps) start ACTIVE at once — that IS
+    // wave 0, the parallel fan-out the model reads via getActiveTasks.
+    for (const story of plan.stories) {
+      for (const task of story.tasks) {
+        if (levels.get(task.id) === 0) {
+          task.status = "active"
+          task.startedAt = now
+        }
+      }
+    }
+    // Derive (and store) every story's status from its now-active/pending
+    // tasks. activationTs keeps a newly-active story's startedAt consistent
+    // with the tasks that activated it.
+    this.recomputeStoryStatuses(plan, { activationTs: now })
+
     if (!isPlanV2(plan)) throw new Error("internal error: constructed plan failed schema validation")
 
     // Archive an existing plan before replacing it. `createPlan` used to
-    // overwrite unconditionally while `clearPlan` archived -- so a second
+    // overwrite unconditionally while `clearPlan` archived — so a second
     // `elicify_vertex_plan_create` call silently discarded the user's stories,
     // their acceptance items AND their attached evidence, with no log and
     // nothing to recover. Losing a contract is exactly as bad as losing the
@@ -439,22 +681,50 @@ export class StoryEngine {
     return this.plans.get(sessionID) ?? null
   }
 
-  getActiveStory(sessionID: string): StoryV2 | null {
+  /**
+   * 2026-07-30: the primary fan-out read — ALL tasks with `status: "active"`
+   * across every story, in stable order (story-array order, then task-array
+   * order within a story). This is what `elicify_vertex_plan_next` returns
+   * and what the model dispatches one `task`-tool subagent against per
+   * element.
+   */
+  getActiveTasks(sessionID: string): Task[] {
     const plan = this.getPlan(sessionID)
-    if (!plan) return null
-    return plan.stories.find((story) => story.status === "active") ?? null
+    if (!plan) return []
+    const out: Task[] = []
+    for (const story of plan.stories) {
+      for (const task of story.tasks) {
+        if (task.status === "active") out.push(task)
+      }
+    }
+    return out
+  }
+
+  /**
+   * 2026-07-30: stories that have ≥1 ACTIVE task — the back-compat read for
+   * callers (gate.ts/findings.ts/plugin.ts) that still reason at story
+   * granularity. A story with all tasks pending has none active and reads
+   * as not-active here even before its first task is promoted.
+   */
+  getActiveStories(sessionID: string): StoryV2[] {
+    const plan = this.getPlan(sessionID)
+    if (!plan) return []
+    return plan.stories.filter((story) => story.tasks.some((task) => task.status === "active"))
+  }
+
+  /** Back-compat for singular callers: the FIRST story with an active task,
+   * or null. Kept so pre-task callers (plugin.ts/gate.ts) keep compiling. */
+  getActiveStory(sessionID: string): StoryV2 | null {
+    return this.getActiveStories(sessionID)[0] ?? null
   }
 
   /**
    * ADDED — not in the §9 contract's method list (see header comment).
-   * Attaches (or clears, when `evidence` is `null`) an acceptance item's
-   * evidence pointer and persists immediately — `StoryEngine` exposes no
-   * separate public `persist()` the way `PinStore` does, so there is no
-   * other way for a caller to flush the change to disk. (`pin.ts`'s own
-   * `attachEvidence` also auto-persists now — wave-4 fix — so both
-   * modules' `attachEvidence` share the same "every mutation leaves memory
-   * and disk consistent" contract.) Unknown session/story/item ids are
-   * no-ops, never throw (mirrors `pin.ts`'s convention).
+   * LEGACY (HANDOVER.md redesign point 1): per-item evidence citations are
+   * no longer part of the completion contract — `checkpoint` never reads
+   * this field and the completion judge supersedes it. This method remains
+   * only so pre-redesign plans with attached evidence still round-trip
+   * through memory and disk; new wiring should not call it.
    */
   attachEvidence(sessionID: string, storyId: string, itemId: string, evidence: AcceptanceItem["evidence"]): void {
     const plan = this.getPlan(sessionID)
@@ -471,9 +741,7 @@ export class StoryEngine {
    * ADDED — not in the §9 contract's method list (see header comment).
    * Records a scope amendment (the "amend" arm of `checkScope`'s
    * fold/amend/revert offer) and optionally updates `scopeGlobs`/
-   * `verifiers`. Throws on an unknown session/story (an amendment against
-   * a story that does not exist is a caller bug, unlike a missing-evidence
-   * read which is expected to be a common no-op).
+   * `verifiers`. Throws on an unknown session/story.
    */
   amendStory(sessionID: string, storyId: string, opts: { reason: string; scopeGlobs?: string[]; verifiers?: string[] }): void {
     const plan = this.getPlan(sessionID)
@@ -489,119 +757,67 @@ export class StoryEngine {
   }
 
   /**
-   * ADDED — not in the §9 contract's method list (see header comment).
-   * Fixes `docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md` C-6: `"active"` was
-   * previously assigned only at `createPlan` index 0 and by
-   * `checkpoint("complete")`'s successor-promotion, so a story that reached
-   * `"blocked"`/`"failed"` had NO path back to `"pending"`/`"active"` —
-   * the plan could never reach all-`"complete"`, and the idle gate's
-   * `handleIncompletePlan` (`wiring/gate.ts`) nudged forever (or, past its
-   * warn cap, just left the plan permanently unable to close out — the
-   * final-story judge close-out requires `finalStory.status === "complete"`,
-   * which a stuck blocked/failed story can never satisfy).
+   * 2026-07-30 task/DAG redesign. Reopens a story by re-activating its
+   * not-complete tasks per the DAG level rule: a task whose effective deps
+   * are ALL `"complete"` goes `"active"` (fresh `startedAt`); otherwise it
+   * goes `"pending"` and waits for `checkpoint`'s level-promotion to
+   * activate it once its predecessors finish. Complete tasks are LEFT
+   * complete (re-audit only re-does the work the judge flunked — but see
+   * `applyJudgeVerdicts`, which is what re-opens complete tasks after a
+   * failed verdict; `reopenStory` is the model-facing resume path for a
+   * blocked/failed story).
    *
-   * DESIGN CHOICE — a dedicated method, not a new `checkpoint()` status
-   * value (option (a) from the fix's brief, rejected): `checkpoint`'s
-   * `"complete"` branch is already a single dense piece of logic
-   * (active-story gate, per-item evidence validation, the final-story
-   * "observed receipt" rule, successor promotion) whose docblock promises
-   * "a thrown error leaves the plan file byte-for-byte unchanged" — and
-   * this fix's own requirement is that COMPLETING a reopened story must
-   * run that exact validation IN FULL, every time, no exceptions. Folding
-   * "unblock" into the same `status` union `checkpoint` accepts would mean
-   * special-casing a fundamentally different transition (resuming work,
-   * not finishing it) inside that method, which is exactly the kind of
-   * future edit that could accidentally let a reopen skip evidence
-   * validation. A separate method — mirroring `attachEvidence` /
-   * `amendStory` immediately above, this file's other ADDED (not-in-§9)
-   * methods — keeps `checkpoint`'s `"complete"` path completely untouched
-   * by this fix, provable by the fact that none of `checkpoint`'s own code
-   * changed. It also leaves `checkpoint`'s `status` parameter type
-   * (`"complete" | "failed" | "blocked"`) exactly as `wiring/tools.ts`'s
-   * `checkpointTool` arg schema (`tool.schema.enum([...])`) already mirrors
-   * it — out of scope for this fix, so left alone.
+   * The old "only a blocked/failed story may be reopened" precondition is
+   * GONE: `reopenStory` now also targets a story whose status a failed
+   * judge verdict already reverted to `"active"` (the model resumes it), or
+   * any story the model genuinely wants to resume. It simply re-activates
+   * the story's not-complete tasks per the DAG rule and recomputes status.
    *
-   * TARGET STATUS — grounded in this file's actual concurrency model, not
-   * assumed: `getActiveStory`, `checkpoint`'s active-story gate, and
-   * `wiring/tools.ts`'s `elicify_vertex_plan_next` tool ("Return THE active
-   * story", singular, "work only THAT story until checkpointed") all treat
-   * exactly one story as `"active"` at a time. There is no multi-active
-   * "wave" concept at the `StoryEngine` data-model level — the
-   * `<planning_in_waves>` / `<fan_out_agents>` system-prompt text in
-   * `wiring/config.ts` is guidance for how the MODEL organizes its OWN
-   * sub-agent dispatch while working a single story, not a second
-   * concurrency axis this engine implements or needs to preserve here. So
-   * reopening can only ever leave the plan with AT MOST one active story:
-   *  - If the plan currently has NO active story at all — which is exactly
-   *    what happens when the story being reopened was itself `"active"`
-   *    when it got blocked/failed, since `checkpoint` sets status without
-   *    promoting a successor on a non-`"complete"` outcome — the reopened
-   *    story becomes `"active"` immediately, with a fresh `startedAt`. This
-   *    is the direct resume-where-it-stalled case, including this fix's
-   *    headline scenario: the FINAL story blocked while active, with
-   *    nothing after it in the plan to ever promote it.
-   *  - If another story is CURRENTLY `"active"` (e.g. story 2 was blocked
-   *    directly while still `"pending"`, out of order, and normal
-   *    successor-promotion later activated story 3 without ever seeing
-   *    story 2 as `"pending"`), the reopened story becomes `"pending"`
-   *    instead and simply rejoins the queue at its original array
-   *    position — `checkpoint`'s existing successor-promotion
-   *    (`plan.stories.find(status === "pending")`, first array match)
-   *    already picks it up in due course with no changes needed there.
-   *    This never disrupts in-flight work on whichever story is currently
-   *    active, consistent with the single-active-story invariant above.
-   *
-   * Acceptance-item evidence is reset to `null` on every reopened story
-   * (mirrors a brand-new story's initial state in `createPlan`): the story
-   * is being reopened precisely because it did NOT reach `"complete"`
-   * cleanly, so whatever evidence was attached before the block/failure
-   * must be re-proven — not silently reused — the next time
-   * `checkpoint(..., "complete", ...)` is attempted. This is the mechanism
-   * that satisfies the fix's "must not skip acceptance-evidence
-   * requirements" bar: `checkpoint`'s own unmodified "no evidence" branch
-   * now rejects the reopened story exactly as it would a brand-new one,
-   * until fresh evidence is attached. The story's text/scope/verifiers and
-   * its `amendments` history are left untouched — only completion state
-   * resets; the reopen itself is additionally recorded as an amendment for
-   * audit purposes.
-   *
-   * Throws (never a silent no-op — reopening a story the caller
-   * misidentified must not be swallowed) on an unknown session/story, or
-   * when the story's CURRENT status is not `"blocked"`/`"failed"` —
-   * reopening is only ever a valid transition FROM one of those two
-   * terminal-but-not-complete states.
+   * `completedAt` (task and story) is cleared for re-activated tasks; the
+   * reopen itself is recorded as a story amendment for audit. Acceptance-
+   * item `evidence` is deliberately NOT reset (deprecated, superseded by
+   * `StoryV2.judge`). Throws on an unknown session/story; never a silent
+   * no-op.
    */
   reopenStory(sessionID: string, storyId: string, opts: { reason: string }): void {
     const plan = this.getPlan(sessionID)
     if (!plan) throw new Error(`no story plan for session ${sessionID}`)
     const story = plan.stories.find((candidate) => candidate.id === storyId)
     if (!story) throw new Error(`unknown story: ${storyId}`)
-    if (story.status !== "blocked" && story.status !== "failed") {
-      throw new Error(
-        `cannot reopen story ${storyId}: status is ${story.status}, only a 'blocked' or 'failed' story can be reopened`,
-      )
-    }
 
     const reason = requireNonBlank(opts.reason, "reopen reason")
     const previousStatus = story.status
-    const hasActiveStory = plan.stories.some((candidate) => candidate.status === "active")
+    const graph = this.buildGraph(plan)
+    const now = new Date().toISOString()
 
-    for (const item of story.acceptanceItems) item.evidence = null
-
-    if (hasActiveStory) {
-      // Another story is already in flight — rejoin the queue rather than
-      // preempting it. Successor-promotion (checkpoint's "complete" branch)
-      // will pick this story up, in array order, once the active one closes.
-      story.status = "pending"
-      story.startedAt = undefined
-    } else {
-      // Nothing else is active — this was the story stalling the whole
-      // plan, so resume it directly.
-      story.status = "active"
-      story.startedAt = new Date().toISOString()
+    for (const task of story.tasks) {
+      // Complete tasks stay complete — re-audit re-opens them via
+      // applyJudgeVerdicts, not here.
+      if (task.status === "complete") continue
+      const deps = graph.deps.get(task.id) ?? new Set<string>()
+      let allDepsComplete = true
+      for (const depId of deps) {
+        if (this.taskStatus(plan, depId) !== "complete") {
+          allDepsComplete = false
+          break
+        }
+      }
+      if (allDepsComplete) {
+        task.status = "active"
+        task.startedAt = now
+        task.completedAt = undefined
+      } else {
+        // A predecessor task/story is still incomplete — rejoin the queue
+        // and let checkpoint's level-promotion activate it in order.
+        task.status = "pending"
+        task.startedAt = undefined
+        task.completedAt = undefined
+      }
     }
 
-    story.amendments.push({ reason: `reopened from ${previousStatus}: ${reason}`, ts: new Date().toISOString() })
+    story.completedAt = undefined
+    story.amendments.push({ reason: `reopened from ${previousStatus}: ${reason}`, ts: now })
+    this.recomputeStoryStatuses(plan, { activationTs: now })
     this.logger("story:reopened", { sessionID, storyId, previousStatus, newStatus: story.status })
     this.persistPlan(sessionID)
   }
@@ -610,24 +826,20 @@ export class StoryEngine {
 
   /**
    * Returns a scope-drift finding-shaped object when `mutatedPath` falls
-   * outside the active story's `scopeGlobs`, or `null` when it is in scope
-   * (including the "no scope declared" case — an empty `scopeGlobs` array
-   * is read as "no constraint", not "matches nothing"). At most one per
-   * turn is the composer's job (FR-004 cap table), not this method's — it
-   * always returns a finding when out of scope and lets the caller decide
-   * whether to render it.
+   * outside EVERY active-task story's `scopeGlobs`, or `null` when it is
+   * in scope. 2026-07-30: "active story" now means a story with ≥1 ACTIVE
+   * TASK (the unit of work in flight); with several such stories active at
+   * once, a mutation is in scope when it matches ANY of their globs. An
+   * active-task story with empty `scopeGlobs` imposes no constraint — but
+   * does NOT whitelist: if at least one active-task story declares globs,
+   * the path must match one of those stories' globs. `null` is also
+   * returned when no task is active, or when every active-task story has
+   * empty globs.
    *
-   * `opts.scopeGlobsMatchedZero` (see header comment for why this
-   * parameter exists beyond the two-argument contract signature): when
-   * `true`, the recommended `offer` is `"amend"` first (the spec's
-   * branch-switch/typo edge case — folding or reverting a mutation against
-   * globs that match nothing in the worktree makes no sense, the globs
-   * themselves are what's wrong). Otherwise the recommended `offer` is
-   * `"fold"` (judgment call: the least-disruptive default for an ordinary
-   * single-mutation drift). `offer` is a single recommended action, not
-   * the full menu — the composer/wiring renders fold/amend/revert as the
-   * full set of choices in the directive text regardless of which one is
-   * recommended here.
+   * `opts.scopeGlobsMatchedZero`: when `true`, the recommended `offer` is
+   * `"amend"` first (the branch-switch/typo edge case — folding/reverting
+   * against globs that match nothing in the worktree makes no sense).
+   * Otherwise the recommended `offer` is `"fold"`.
    */
   checkScope(
     sessionID: string,
@@ -635,11 +847,12 @@ export class StoryEngine {
     opts?: { scopeGlobsMatchedZero?: boolean },
   ): { family: "scope-watchdog"; offer: "fold" | "amend" | "revert"; scopeGlobsMatchedZero: boolean } | null {
     this.archiveV1IfPresent()
-    const story = this.getActiveStory(sessionID)
-    if (!story) return null
-    if (story.scopeGlobs.length === 0) return null
+    const activeTaskStories = this.getActiveStories(sessionID)
+    if (activeTaskStories.length === 0) return null
+    const scoped = activeTaskStories.filter((story) => story.scopeGlobs.length > 0)
+    if (scoped.length === 0) return null
 
-    const inScope = story.scopeGlobs.some((glob) => matchesGlob(mutatedPath, glob))
+    const inScope = scoped.some((story) => story.scopeGlobs.some((glob) => matchesGlob(mutatedPath, glob)))
     if (inScope) return null
 
     const scopeGlobsMatchedZero = opts?.scopeGlobsMatchedZero ?? false
@@ -650,226 +863,434 @@ export class StoryEngine {
     }
   }
 
-  // -- FR-019/FR-020: checkpoint --------------------------------------------
+  // -- FR-019/FR-020: checkpoint (TASK-level) ------------------------------
 
   /**
-   * FR-019/FR-020: throws (naming the specific acceptance item id) when
-   * `status === "complete"` and any acceptance item lacks evidence.
+   * 2026-07-30 task/DAG redesign: checkpoint operates on a TASK id (the
+   * atomic unit). It is still a CLAIM, not a proof — the completion judge
+   * audits stories at session.idle. What is enforced here, all structural,
+   * all BEFORE any mutation (a thrown error still leaves the plan file
+   * byte-for-byte unchanged):
+   *  - `"complete"` requires the task to currently be `"active"` —
+   *    completing a pending/blocked task would skip the DAG's activation
+   *    bookkeeping; the error names the task and the currently active ids.
+   *  - `"blocked"`/`"failed"` carry no active-task requirement (mirrors
+   *    the old story-level rule), and an optional `opts.reason` is appended
+   *    to the parent STORY's amendments (`"blocked: <reason>"` /
+   *    `"failed: <reason>"`) so the judge and wiring can see WHY.
    *
-   * Also throws (naming both the requested and the actual active story id)
-   * when `status === "complete"` and `storyId` is not the plan's CURRENT
-   * active story — completing a non-active story directly would silently
-   * strand the plan, since successor-promotion below only fires off of
-   * `wasActive`. This check runs before evidence validation.
-   *
-   * Also throws (naming every unresolved story and its status) when
-   * `status === "complete"`, `storyId` is the plan's `finalStoryId`, and any
-   * OTHER story is not `"complete"` — C-11 fix (`docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md`):
-   * successor-promotion's first-`"pending"`-match scan can skip an earlier
-   * story that was checkpointed `blocked`/`failed` directly while still
-   * `"pending"` (out of order — `blocked`/`failed` carry no active-story
-   * requirement), letting a later story, including this one, reach
-   * `"complete"` while that earlier story is never resolved. This check is
-   * scoped to the final story only; a non-final story completing while an
-   * earlier one sits blocked/failed is the intended skip-ahead/rejoin-queue
-   * shape `reopenStory` documents and this stays untouched.
-   *
-   * Evidence-shape enforcement performed HERE (structural only — see the
-   * module header's "waiver-provenance boundary" note repeated below):
-   *  - `{ receiptId }`: the id must be non-blank. For the plan's
-   *    `finalStoryId`, `opts.isValidReceipt` is MANDATORY in effect — if
-   *    omitted, the receipt cannot be proven "observed" and the checkpoint
-   *    is rejected (FR-020: "the final verification story MUST require an
-   *    OBSERVED ... receipt"). For any other story, `opts.isValidReceipt`
-   *    is consulted only if the caller supplied it (defense in depth) —
-   *    FR-019's bar for non-final stories is merely "an evidence pointer
-   *    exists", the "observed" requirement is FR-020's, and FR-020 is
-   *    explicitly scoped to "the final verification story".
-   *  - `{ waiver: true, sourceMessageId }`: valid only STRUCTURALLY here
-   *    (`sourceMessageId` is a non-empty string). Whether that message id
-   *    actually names a real user-authored chat message — as opposed to,
-   *    e.g., a string the model invented inside its own tool-call
-   *    arguments — is NOT decided in this module, because this module has
-   *    no access to the message stream. See the module header and this
-   *    wave's final report for the exact boundary: wiring MUST NOT call
-   *    `attachEvidence` with a waiver whose `sourceMessageId` it has not
-   *    independently traced to a real `role: "user"` message. A
-   *    model-issued waiver that wiring correctly refuses to attach simply
-   *    leaves that item's `evidence` at `null`, which this method already
-   *    rejects via the "no evidence" branch below (Dataset row 6).
-   *
-   * On success, the story's status is set. When a NON-final story
-   * transitions to `"complete"`, the next `"pending"` story (in array
-   * order) is promoted to `"active"` — the contract exposes no separate
-   * `next()`-style method, so `checkpoint` is the only place this
-   * transition can happen.
-   *
-   * Nothing is persisted (or mutated in memory) until every item has been
-   * validated, so a thrown error leaves the plan file byte-for-byte
-   * unchanged (BDD: "Checkpoint rejected when a criterion lacks evidence").
+   * After the task's status is set: the parent story is recomputed (if all
+   * its tasks are now `"complete"`, the story auto-completes with
+   * `completedAt` stamped); then, if NO task remains `"active"` ANYWHERE,
+   * every pending task at the next-lowest pending topological level is
+   * promoted to `"active"` at once (fresh `startedAt`), and the affected
+   * stories are recomputed to `"active"`. Story `dependsOn` are baked into
+   * the DAG levels, so promotion by level honours them automatically — no
+   * separate C-11 final-story guard is needed (a final story that depends
+   * on its siblings cannot have all tasks complete until they are).
    */
   checkpoint(
     sessionID: string,
-    storyId: string,
+    taskId: string,
     status: "complete" | "failed" | "blocked",
-    opts: { isValidReceipt?: (receiptId: string) => boolean },
+    opts?: { reason?: string },
   ): void {
     this.archiveV1IfPresent()
     const plan = this.getPlan(sessionID)
     if (!plan) throw new Error(`no story plan for session ${sessionID}`)
-    const story = plan.stories.find((candidate) => candidate.id === storyId)
-    if (!story) throw new Error(`unknown story: ${storyId}`)
+
+    let targetTask: Task | undefined
+    let targetStory: StoryV2 | undefined
+    for (const story of plan.stories) {
+      const task = story.tasks.find((candidate) => candidate.id === taskId)
+      if (task) {
+        targetTask = task
+        targetStory = story
+        break
+      }
+    }
+    if (!targetTask || !targetStory) throw new Error(`unknown task: ${taskId}`)
 
     if (status === "complete") {
-      // Successor-promotion below is gated on `wasActive` — completing a
-      // story that is NOT the plan's current active story (e.g. a
-      // "pending" one, completed directly out of order) would silently
-      // strand the plan: the real active story stays active forever,
-      // nothing downstream ever gets promoted, and the story just marked
-      // "complete" sits there having skipped the queue. Reject it up front,
-      // naming both ids so the caller can see exactly what went wrong.
-      const currentActive = plan.stories.find((candidate) => candidate.status === "active")
-      if (!currentActive || currentActive.id !== storyId) {
+      // Completing a non-active task would silently strand the DAG's
+      // activation bookkeeping — the task would skip its level's activation
+      // while real active tasks stay active elsewhere.
+      if (targetTask.status !== "active") {
+        const activeIds = this.activeTaskIds(plan)
         throw new Error(
-          `cannot complete story ${storyId}: it is not the plan's current active story ` +
-            `(active story is ${currentActive ? currentActive.id : "none"})`,
+          `cannot complete task ${taskId}: it is not active ` +
+            `(currently active: ${activeIds.length > 0 ? activeIds.join(", ") : "none"})`,
         )
-      }
-
-      const isFinal = storyId === plan.finalStoryId
-
-      // C-11 fix (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md): successor-promotion
-      // below (`plan.stories.find((s) => s.status === "pending")`) is a
-      // first-match scan, not strict index order — deliberately so, since
-      // `reopenStory`'s documented "rejoins the queue at its original array
-      // position" recovery path depends on exactly this scan finding an
-      // earlier, since-reopened story before a later one. That same scan
-      // means an EARLIER story checkpointed `blocked`/`failed` directly
-      // while still `"pending"` (out of order — `blocked`/`failed` carry no
-      // active-story requirement, unlike `"complete"` above) gets silently
-      // skipped: a LATER story is promoted in its place and can march all
-      // the way to `"complete"` — including, eventually, THIS plan's final
-      // story — while the earlier one sits stuck, unresolved, forever,
-      // unless something calls `elicify_vertex_plan_reopen` on it (nothing
-      // does so automatically). `wiring/gate.ts`'s `appendJudgeCloseOut`
-      // treats `finalStory.status === "complete"` as "the plan is done"
-      // once its own nudge cap is exhausted, so leaving that possible would
-      // let the plan look finished while a real story never was. Reject the
-      // FINAL story's completion here unless every OTHER story is already
-      // `"complete"` — this is deliberately NOT extended to non-final
-      // stories: a later, non-final story completing while an earlier one
-      // sits blocked/failed IS the intended, tested shape (see
-      // `reopenStory`'s "rejoins the queue" case above) — only the plan's
-      // own "is everything really done" signal needs to be trustworthy.
-      if (isFinal) {
-        const unresolved = plan.stories.filter(
-          (candidate) => candidate.id !== storyId && candidate.status !== "complete",
-        )
-        if (unresolved.length > 0) {
-          const openList = unresolved.map((candidate) => `${candidate.id}:${candidate.status}`).join(", ")
-          throw new Error(
-            `cannot complete story ${storyId}: it is the plan's final story, but ` +
-              `${unresolved.length} other ${unresolved.length === 1 ? "story is" : "stories are"} not complete ` +
-              `(${openList}) — resolve and complete every story before the final one can close the plan`,
-          )
-        }
-      }
-
-      for (const item of story.acceptanceItems) {
-        if (!item.evidence) {
-          throw new Error(`cannot complete story ${storyId}: acceptance item ${item.id} has no evidence`)
-        }
-        if ("receiptId" in item.evidence) {
-          const receiptId = item.evidence.receiptId
-          if (!receiptId || !receiptId.trim()) {
-            throw new Error(`cannot complete story ${storyId}: acceptance item ${item.id} has a blank receipt id`)
-          }
-          if (isFinal) {
-            const observed = opts.isValidReceipt ? opts.isValidReceipt(receiptId) : false
-            if (!observed) {
-              throw new Error(
-                `cannot complete story ${storyId}: acceptance item ${item.id}'s receipt ${receiptId} is not an observed receipt`,
-              )
-            }
-          } else if (opts.isValidReceipt && !opts.isValidReceipt(receiptId)) {
-            throw new Error(
-              `cannot complete story ${storyId}: acceptance item ${item.id}'s receipt ${receiptId} is not an observed receipt`,
-            )
-          }
-        } else {
-          if (item.evidence.waiver !== true || typeof item.evidence.sourceMessageId !== "string" || !item.evidence.sourceMessageId.trim()) {
-            throw new Error(`cannot complete story ${storyId}: acceptance item ${item.id} has a malformed waiver`)
-          }
-        }
       }
     }
 
-    const wasActive = story.status === "active"
-    story.status = status
-    // C-16 fix (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md): promote the next
-    // pending story whenever the active slot vacates, regardless of WHY --
-    // complete, blocked, OR failed -- not just "complete". Before this fix,
-    // blocking/failing the active story left the plan with zero active
-    // stories and no automatic recovery: if an EARLIER story had separately
-    // been reopened and rejoined the queue as "pending" (`reopenStory`'s
-    // "another story is already active" branch), it could never be promoted
-    // back to active once the story occupying the active slot also
-    // blocked/failed instead of completing -- nothing ran this same
-    // first-pending-match scan for those two transitions. Symmetric with the
-    // "complete" case in every other respect (same selection: first
-    // "pending" story in array order); does not change `reopenStory`'s own
-    // no-preemption guarantee -- a reopened story still only jumps straight
-    // to "active" when NOTHING is active, exactly as before.
-    if (wasActive) {
-      const next = plan.stories.find((candidate) => candidate.status === "pending")
-      if (next) {
-        next.status = "active"
-        next.startedAt = new Date().toISOString()
+    // --- All validation passed; mutate. ---
+    targetTask.status = status
+    if (status === "complete") {
+      targetTask.completedAt = new Date().toISOString()
+    } else {
+      // A non-complete outcome withdraws any earlier completion claim.
+      targetTask.completedAt = undefined
+      if (opts?.reason) {
+        targetStory.amendments.push({ reason: `${status}: ${opts.reason}`, ts: new Date().toISOString() })
+      }
+    }
+
+    // Recompute the affected story (the checkpointed task's parent) so a
+    // story whose last task just completed reads "complete" immediately.
+    this.recomputeStoryStatuses(plan)
+
+    // Level-promotion (the task analog of the old wave-promotion): whenever
+    // NO task remains active anywhere — for any reason (complete / blocked
+    // / failed) — activate every pending task at the next-lowest pending
+    // topological level. All such tasks are independent by construction
+    // (same level), so activating them together IS the parallel wave.
+    if (!this.anyActiveTask(plan)) {
+      const activationTs = this.promoteNextLevel(plan)
+      if (activationTs !== null) {
+        this.recomputeStoryStatuses(plan, { activationTs })
       }
     }
 
     this.persistPlan(sessionID)
   }
 
+  /**
+   * HANDOVER.md redesign points 1/5 (+ 2026-07-30 task re-open): the
+   * completion judge is the sole arbiter of whether a checkpoint's claim
+   * was real. It hands its per-story verdicts here; this method stamps
+   * each one onto its story (`StoryV2.judge`) and enforces the verdict:
+   *  - pass on a `"complete"` story: confirmed — status untouched, id in
+   *    `passed`.
+   *  - fail on a `"complete"` story: REVERT. The story goes back to
+   *    `"active"` (fresh `startedAt`, `completedAt` cleared) AND its
+   *    `"complete"` tasks are re-opened to `"active"` (fresh task
+   *    `startedAt`, task `completedAt` cleared) — re-audit requires
+   *    re-doing the work, so the claim's evidence is withdrawn; id in
+   *    `reverted`.
+   *  - any verdict on a non-`"complete"` story: the stamp is recorded
+   *    (still useful audit information) but nothing transitions.
+   * Unknown story ids are collected into `unknown` and NEVER throw. Persists
+   * once at the end and logs `story:judge-audit`. Throws only when the
+   * session has no plan at all.
+   */
+  applyJudgeVerdicts(
+    sessionID: string,
+    verdicts: Array<{ storyId: string; pass: boolean; summary: string; items: JudgeItemNote[] }>,
+  ): { reverted: string[]; passed: string[]; unknown: string[] } {
+    const plan = this.getPlan(sessionID)
+    if (!plan) throw new Error(`no story plan for session ${sessionID}`)
+
+    const reverted: string[] = []
+    const passed: string[] = []
+    const unknown: string[] = []
+    const judgedAt = new Date().toISOString()
+
+    for (const verdict of verdicts) {
+      const story = plan.stories.find((candidate) => candidate.id === verdict.storyId)
+      if (!story) {
+        unknown.push(verdict.storyId)
+        continue
+      }
+      // Copy the items defensively — the stamp becomes part of the
+      // persisted plan and must not alias the judge module's array.
+      story.judge = {
+        pass: verdict.pass,
+        summary: verdict.summary,
+        items: verdict.items.map((item) => ({ ...item })),
+        judgedAt,
+      }
+      if (verdict.pass && story.status === "complete") {
+        passed.push(story.id)
+      } else if (!verdict.pass && story.status === "complete") {
+        // 2026-07-30: re-open the story's complete TASKS too — re-audit
+        // requires re-doing the work, so a reverted claim withdraws the
+        // task-level completion as well as the story-level one.
+        story.status = "active"
+        story.startedAt = judgedAt
+        story.completedAt = undefined
+        for (const task of story.tasks) {
+          if (task.status === "complete") {
+            task.status = "active"
+            task.startedAt = judgedAt
+            task.completedAt = undefined
+          }
+        }
+        reverted.push(story.id)
+      }
+    }
+
+    this.persistPlan(sessionID)
+    this.logger("story:judge-audit", { sessionID, passed, reverted, unknown })
+    return { reverted, passed, unknown }
+  }
+
+  // -- DAG / level machinery (2026-07-30) ----------------------------------
+
+  /**
+   * Validates that every `dependsOn` (task- and story-level) resolves to a
+   * real story id or task id, and that task ids are globally unique across
+   * the plan. Throws (naming the dangling id / duplicate) BEFORE any disk
+   * write. A dep may name a STORY (expanded by `buildGraph` to all of that
+   * story's tasks) or a TASK — both are accepted so the model can express
+   * either granularity.
+   */
+  private validateDepsResolve(plan: PlanV2): void {
+    const storyIds = new Set(plan.stories.map((story) => story.id))
+    const taskIds = new Set<string>()
+    const seenTaskIds = new Set<string>()
+    for (const story of plan.stories) {
+      for (const task of story.tasks) {
+        taskIds.add(task.id)
+        if (seenTaskIds.has(task.id)) {
+          throw new Error(`duplicate task id: ${task.id} (task ids must be globally unique within the plan)`)
+        }
+        seenTaskIds.add(task.id)
+      }
+    }
+    plan.stories.forEach((story, storyIndex) => {
+      const storyDeps = story.dependsOn ?? []
+      storyDeps.forEach((dep) => {
+        if (!storyIds.has(dep) && !taskIds.has(dep)) {
+          throw new Error(`stories[${storyIndex}].dependsOn references unknown story or task: ${dep}`)
+        }
+      })
+      story.tasks.forEach((task, taskIndex) => {
+        task.dependsOn.forEach((dep) => {
+          if (!storyIds.has(dep) && !taskIds.has(dep)) {
+            throw new Error(`stories[${storyIndex}].tasks[${taskIndex}].dependsOn references unknown story or task: ${dep}`)
+          }
+        })
+      })
+    })
+  }
+
+  /**
+   * Builds the effective task-dependency graph: for each task, the set of
+   * TASK ids it depends on, with story-level `dependsOn` and any story-id
+   * references in a task's `dependsOn` expanded to that story's task ids.
+   * Iteration order is deterministic (story-array, then task-array, then
+   * array order within each `dependsOn`), so cycle-error messages and level
+   * tie-breaking are stable across runs.
+   */
+  private buildGraph(plan: PlanV2): {
+    deps: Map<string, Set<string>>
+    taskOf: Map<string, { task: Task; storyId: string }>
+  } {
+    const tasksByStory = new Map<string, Task[]>()
+    const taskOf = new Map<string, { task: Task; storyId: string }>()
+    for (const story of plan.stories) {
+      tasksByStory.set(story.id, story.tasks)
+      for (const task of story.tasks) {
+        taskOf.set(task.id, { task, storyId: story.id })
+      }
+    }
+    const resolveDep = (dep: string): string[] => {
+      // A task id reference is a single edge; a story id reference expands
+      // to every task of that story. Both are validated to resolve already.
+      if (taskOf.has(dep)) return [dep]
+      const tasks = tasksByStory.get(dep)
+      return tasks ? tasks.map((task) => task.id) : []
+    }
+
+    const deps = new Map<string, Set<string>>()
+    for (const story of plan.stories) {
+      const storyDepEdges: string[] = []
+      for (const dep of story.dependsOn ?? []) {
+        storyDepEdges.push(...resolveDep(dep))
+      }
+      for (const task of story.tasks) {
+        const edges = new Set<string>()
+        for (const dep of task.dependsOn) {
+          for (const resolved of resolveDep(dep)) edges.add(resolved)
+        }
+        // Story-level deps apply to EVERY task in this story.
+        for (const resolved of storyDepEdges) edges.add(resolved)
+        deps.set(task.id, edges)
+      }
+    }
+    return { deps, taskOf }
+  }
+
+  /** Look up a task's status by id across all stories (undefined if unknown). */
+  private taskStatus(plan: PlanV2, taskId: string): TaskStatus | undefined {
+    for (const story of plan.stories) {
+      const task = story.tasks.find((candidate) => candidate.id === taskId)
+      if (task) return task.status
+    }
+    return undefined
+  }
+
+  /**
+   * Longest-path layering over the task DAG: `level(t) = 0` if no deps,
+   * else `1 + max(level(dep))`. Tasks at the same level are independent —
+   * that level IS a wave. Detects cycles via DFS colouring and throws
+   * `plan dependency cycle: A -> B -> ... -> A` naming the cycle. The plan
+   * is cycle-free by construction after `createPlan`'s validation, so this
+   * only throws when a caller hands in an inconsistent plan (defensive).
+   */
+  private computeLevels(plan: PlanV2): Map<string, number> {
+    const { deps } = this.buildGraph(plan)
+    const levels = new Map<string, number>()
+    const WHITE = 0,
+      GRAY = 1,
+      BLACK = 2
+    const color = new Map<string, number>()
+    const stack: string[] = []
+
+    const visit = (id: string): number => {
+      const c = color.get(id) ?? WHITE
+      if (c === BLACK) return levels.get(id)!
+      if (c === GRAY) {
+        // Revisited a node on the current DFS path — extract the cycle.
+        const start = stack.indexOf(id)
+        const cycle = stack.slice(start).concat(id)
+        throw new Error(`plan dependency cycle: ${cycle.join(" -> ")}`)
+      }
+      color.set(id, GRAY)
+      stack.push(id)
+      let max = -1
+      for (const dep of deps.get(id) ?? []) {
+        const depLevel = visit(dep)
+        if (depLevel > max) max = depLevel
+      }
+      stack.pop()
+      const level = max + 1
+      levels.set(id, level)
+      color.set(id, BLACK)
+      return level
+    }
+
+    for (const story of plan.stories) {
+      for (const task of story.tasks) visit(task.id)
+    }
+    return levels
+  }
+
+  // -- Story-status derivation + promotion (2026-07-30) --------------------
+
+  /**
+   * Derives a story's status from its tasks:
+   *  - all tasks `"complete"`           → `"complete"`
+   *  - any task `"active"`              → `"active"`
+   *  - any task `"failed"`              → `"failed"`
+   *  - any task `"blocked"`             → `"blocked"`
+   *  - otherwise (complete + pending)   → `"pending"` (waiting on deps)
+   * The order is deliberate: a story still in flight (an active task) is
+   * "active" even if a sibling task already failed; only when nothing is
+   * active does the worst terminal task win.
+   */
+  private deriveStoryStatus(story: StoryV2): StoryV2["status"] {
+    const tasks = story.tasks
+    if (tasks.length === 0) return "pending" // defensive — validators forbid empty tasks
+    if (tasks.every((task) => task.status === "complete")) return "complete"
+    if (tasks.some((task) => task.status === "active")) return "active"
+    if (tasks.some((task) => task.status === "failed")) return "failed"
+    if (tasks.some((task) => task.status === "blocked")) return "blocked"
+    return "pending"
+  }
+
+  /**
+   * Recomputes and stores EVERY story's derived status, managing the
+   * story-level `startedAt`/`completedAt` timestamps consistently:
+   *  - newly-active (prev !== active → active): `startedAt = activationTs ?? now`
+   *  - pending: `startedAt = undefined`
+   *  - newly-complete (prev !== complete → complete): `completedAt = now`
+   *  - non-complete: `completedAt = undefined`
+   * Called after every checkpoint / promotion / reopen. Idempotent for
+   * stories whose status did not change (their timestamps are untouched).
+   */
+  private recomputeStoryStatuses(plan: PlanV2, opts: { activationTs?: string } = {}): void {
+    const now = new Date().toISOString()
+    for (const story of plan.stories) {
+      const prev = story.status
+      const next = this.deriveStoryStatus(story)
+      if (next === "active" && prev !== "active") {
+        story.startedAt = opts.activationTs ?? now
+      } else if (next === "pending") {
+        story.startedAt = undefined
+      }
+      if (next === "complete" && prev !== "complete") {
+        story.completedAt = now
+      } else if (next !== "complete") {
+        story.completedAt = undefined
+      }
+      story.status = next
+    }
+  }
+
+  private anyActiveTask(plan: PlanV2): boolean {
+    for (const story of plan.stories) {
+      for (const task of story.tasks) {
+        if (task.status === "active") return true
+      }
+    }
+    return false
+  }
+
+  private activeTaskIds(plan: PlanV2): string[] {
+    const out: string[] = []
+    for (const story of plan.stories) {
+      for (const task of story.tasks) {
+        if (task.status === "active") out.push(task.id)
+      }
+    }
+    return out
+  }
+
+  /**
+   * Promotes the next wave: the minimum pending topological level. Sets
+   * every pending task at that level to `"active"` with a shared fresh
+   * `startedAt`, and returns that timestamp so the caller can feed it to
+   * `recomputeStoryStatuses` (keeping the newly-active stories' startedAt
+   * consistent with their tasks'). Returns `null` when no pending task
+   * remains (plan exhausted). No-op-safe: callers only invoke this when
+   * `anyActiveTask` is already false.
+   */
+  private promoteNextLevel(plan: PlanV2): string | null {
+    // Activation is DEPENDENCY-COMPLETION-based, not raw-topological-level-based:
+    // a pending task activates only when EVERY task it depends on (its own
+    // task deps PLUS the implicit edges from its story's `dependsOn`) is
+    // `"complete"`. Topological levels are still computed at `createPlan` for
+    // cycle detection, but activation cannot use raw levels: if a level-0 task
+    // is BLOCKED (not pending, not complete), level-based promotion would scan
+    // past it and wrongly activate its level-1 dependents — letting a story
+    // reach `"complete"` while a dependency it relied on is unresolved. The
+    // completion check is what carries the C-11 invariant ("the plan's
+    // 'everything is done' signal must be trustworthy") into the task/DAG
+    // model: a dependent task stays `"pending"` until its blocker is reopened
+    // and completed, so the plan stalls visibly instead of false-completing.
+    const { deps, taskOf } = this.buildGraph(plan)
+    const ready: Task[] = []
+    for (const [taskId, depIds] of deps) {
+      const entry = taskOf.get(taskId)
+      if (!entry || entry.task.status !== "pending") continue
+      let allDepsComplete = true
+      for (const depId of depIds) {
+        if (this.taskStatus(plan, depId) !== "complete") {
+          allDepsComplete = false
+          break
+        }
+      }
+      if (allDepsComplete) ready.push(entry.task)
+    }
+    if (ready.length === 0) return null
+    const ts = new Date().toISOString()
+    for (const task of ready) {
+      task.status = "active"
+      task.startedAt = ts
+    }
+    return ts
+  }
+
   // -- Plan clear (human-facing escape hatch) --------------------------------
 
   /**
    * Reversibly archives (never deletes) the session's current plan entry —
-   * the human-facing escape hatch for abandoning/resetting a plan (invoked
-   * via `/elicify-vertex-plan-clear` or a direct natural-language request,
-   * never proactively offered by the composer/findings system). Mirrors
-   * `archiveV1IfPresent`'s never-destroy convention, adapted for a single
-   * entry inside the shared multi-session `plan.json` file rather than a
-   * whole-file migration: the plan is serialized to its own file under
-   * `archive/`, then the session's key is dropped from `plan.json` (leaving
-   * every other session's entry untouched). Returns `false` (no-op) when
-   * the session has no plan to clear.
+   * the human-facing escape hatch for abandoning/resetting a plan. Mirrors
+   * `archiveV1IfPresent`'s never-destroy convention. Returns `false`
+   * (no-op) when the session has no plan to clear.
    */
-  /** Write a plan to `archive/plan.<session>.<ts>.json`. Shared by
-   * `clearPlan` and by `createPlan`'s replace path — a plan discarded by a
-   * second create is exactly as unrecoverable as one that was cleared. */
-  private archivePlan(sessionID: string, plan: PlanV2): void {
-    try {
-      fsIO.mkdirSync(this.archiveDir, { recursive: true, mode: 0o700 })
-      const timestamp = new Date().toISOString().replace(/[:.]/g, "-")
-      let archivePath = join(this.archiveDir, `plan.${sessionID}.${timestamp}.json`)
-      let suffix = 0
-      while (fsIO.existsSync(archivePath)) {
-        suffix += 1
-        archivePath = join(this.archiveDir, `plan.${sessionID}.${timestamp}-${suffix}.json`)
-      }
-      fsIO.writeFileSync(archivePath, `${JSON.stringify(redactForDisk(plan), null, 2)}\n`, {
-        encoding: "utf8",
-        flag: "wx",
-        mode: 0o600,
-      })
-    } catch (error) {
-      // Best-effort: failing to keep a copy must not block the caller, but it
-      // must not be silent either.
-      this.logger("plan:archive-failed", { sessionID, reason: (error as Error).message })
-    }
-  }
-
   clearPlan(sessionID: string): boolean {
     const plan = this.getPlan(sessionID)
     if (!plan) return false
@@ -899,6 +1320,31 @@ export class StoryEngine {
     return true
   }
 
+  /** Write a plan to `archive/plan.<session>.<ts>.json`. Shared by
+   * `clearPlan` and by `createPlan`'s replace path — a plan discarded by a
+   * second create is exactly as unrecoverable as one that was cleared. */
+  private archivePlan(sessionID: string, plan: PlanV2): void {
+    try {
+      fsIO.mkdirSync(this.archiveDir, { recursive: true, mode: 0o700 })
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-")
+      let archivePath = join(this.archiveDir, `plan.${sessionID}.${timestamp}.json`)
+      let suffix = 0
+      while (fsIO.existsSync(archivePath)) {
+        suffix += 1
+        archivePath = join(this.archiveDir, `plan.${sessionID}.${timestamp}-${suffix}.json`)
+      }
+      fsIO.writeFileSync(archivePath, `${JSON.stringify(redactForDisk(plan), null, 2)}\n`, {
+        encoding: "utf8",
+        flag: "wx",
+        mode: 0o600,
+      })
+    } catch (error) {
+      // Best-effort: failing to keep a copy must not block the caller, but it
+      // must not be silent either.
+      this.logger("plan:archive-failed", { sessionID, reason: (error as Error).message })
+    }
+  }
+
   // -- Persistence -----------------------------------------------------------
 
   private hydrateFromDisk(sessionID: string): void {
@@ -918,6 +1364,16 @@ export class StoryEngine {
     if (!isRecord(parsed)) return
     const entry = parsed[sessionID]
     if (!isPlanV2(entry)) return
+    // Back-compat coercion: a story-level `dependsOn` is OPTIONAL on disk
+    // (plans written before the 2026-07-30 task/DAG redesign predate the
+    // field and must still load). The in-memory type requires it, so fill
+    // the absent case to [] at the disk boundary — the one place a
+    // pre-redesign shape can reach memory. (Task `dependsOn` is NOT coerced:
+    // tasks ship with this redesign, so an absent task dependsOn is a
+    // malformed task and already rejected by isTask above.)
+    for (const story of entry.stories) {
+      if (story.dependsOn === undefined) story.dependsOn = []
+    }
     this.plans.set(sessionID, entry)
   }
 

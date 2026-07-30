@@ -912,14 +912,12 @@ console.log("\nQ. V2 core loop (test 32: uat_v2_core_loop, SC-004)")
 console.log("\nR. V2 story lifecycle (test 33: uat_v2_story_lifecycle)")
 {
   clearLogs()
-  const userMsgId = "uat-r-user-confirm-msg"
   let prompts = 0
   const { hooks } = await loadV2Plugin({
     prompt: async () => {
       prompts++
       return {}
     },
-    messages: async () => ({ data: [{ info: { id: userMsgId, role: "user" } }] }),
   })
   const sid = "uat-r-story-lifecycle"
   const ctx = { sessionID: sid, worktree: worktreeV2, directory: worktreeV2 }
@@ -935,12 +933,17 @@ console.log("\nR. V2 story lifecycle (test 33: uat_v2_story_lifecycle)")
   )
 
   // 2. Confirm the plan via the real elicify_vertex_plan_create tool call.
+  //    Each story decomposes into one task (the 2026-07-30 task/DAG atomic
+  //    unit); S2 declares a story-level dependsOn ["S1"] so the engine
+  //    computes a sequential S1->S2 wave (waves are derived from the DAG,
+  //    never input) — keeping the "first story active, second pending" shape
+  //    this scenario asserts.
   const created = JSON.parse(
     await hooks.tool.elicify_vertex_plan_create.execute(
       {
         stories: [
-          { text: "Refactor the parser module", acceptanceItems: ["parser handles nesting"], scopeGlobs: [], verifiers: [] },
-          { text: "Add the new lexer module", acceptanceItems: ["lexer tokenizes correctly"], scopeGlobs: [], verifiers: [] },
+          { text: "Refactor the parser module", acceptanceItems: ["parser handles nesting"], scopeGlobs: [], verifiers: [], tasks: [{ text: "refactor the parser module" }] },
+          { text: "Add the new lexer module", acceptanceItems: ["lexer tokenizes correctly"], scopeGlobs: [], verifiers: [], dependsOn: ["S1"], tasks: [{ text: "add the new lexer module" }] },
         ],
       },
       ctx,
@@ -948,16 +951,18 @@ console.log("\nR. V2 story lifecycle (test 33: uat_v2_story_lifecycle)")
   )
   assert("R2-plan-created-schema2", created.schemaVersion === 2, JSON.stringify(created).slice(0, 200))
   const [story1, story2] = created.stories
+  const task1 = story1.tasks[0].id
+  const task2 = story2.tasks[0].id
   assert("R2-first-story-active", story1.status === "active", story1.status)
 
   // 3. Checkpoint (test 33's "checkpoints" plural, first of two): the first,
-  //    non-final story completes via a real user-authored waiver (FR-019 —
-  //    any story may use a waiver; only the FINAL story additionally requires
-  //    an observed receipt per FR-020, exercised next).
-  await hooks.tool.elicify_vertex_plan_checkpoint.execute(
-    { storyId: story1.id, status: "complete", items: [{ id: story1.acceptanceItems[0].id, waiverSourceMessageId: userMsgId }] },
-    ctx,
-  )
+  //    non-final story's TASK completes as a bare claim — the redesign
+  //    (HANDOVER.md point 1) removed the per-item receipt/waiver citation
+  //    contract entirely, so the tool takes a taskId (not a storyId + items);
+  //    over-claiming is now the completion judge's job at idle, not the
+  //    tool's. Completing S1.T1 auto-completes S1 and promotes S2.T1 to
+  //    active (the DAG's level-promotion).
+  await hooks.tool.elicify_vertex_plan_checkpoint.execute({ taskId: task1, status: "complete" }, ctx)
   const afterFirst = JSON.parse(await hooks.tool.elicify_vertex_plan_status.execute({}, ctx))
   assert("R3-first-story-complete", afterFirst.stories[0].status === "complete", afterFirst.stories[0].status)
   assert("R3-second-story-active", afterFirst.stories[1].status === "active", afterFirst.stories[1].status)
@@ -967,23 +972,13 @@ console.log("\nR. V2 story lifecycle (test 33: uat_v2_story_lifecycle)")
   await edit(hooks, sid, join(worktreeV2, "lexer.ts"))
   await bash(hooks, sid, "npm test", "8 passed", 0)
 
-  // 5. Final gate: checkpoint the final story. NOTE (documented judgment call,
-  //    not a fix — Part A's brief applies to the vitest integration file, not
-  //    this script; flagged in the wave-4 report instead): v2's
-  //    tool.execute.after does not stamp a receipt id onto the tool-call
-  //    metadata the way v1's does (`metadata.vertexVerificationReceiptId`,
-  //    src/index.ts line ~1672), so there is no observable channel through the
-  //    real hook surface for a caller to learn the receiptId minted by the
-  //    bash run just above. This scenario therefore completes the final story
-  //    via a real user waiver too — src/v2/story.ts's own checkpoint() accepts
-  //    a structurally-valid waiver on the final story (already asserted by
-  //    tests/v2/story.test.ts's "row 3" unit test), so this is exercising
-  //    already-established, intentionally-tested behavior, not a new gap.
+  // 5. Final gate: checkpoint the final story's task — also a bare claim now.
+  //    The old FR-020 receipt-citation requirement is gone (redesign point 1);
+  //    under the new contract the tool accepts a task-level completion claim
+  //    once the task is active (the DAG already ordered S2 behind S1, so the
+  //    C-11 "final story before its siblings" condition cannot arise here).
   const finalDone = JSON.parse(
-    await hooks.tool.elicify_vertex_plan_checkpoint.execute(
-      { storyId: story2.id, status: "complete", items: [{ id: story2.acceptanceItems[0].id, waiverSourceMessageId: userMsgId }] },
-      ctx,
-    ),
+    await hooks.tool.elicify_vertex_plan_checkpoint.execute({ taskId: task2, status: "complete" }, ctx),
   )
   assert("R4-final-story-complete", finalDone.stories[1].status === "complete", finalDone.stories[1].status)
 
@@ -1050,107 +1045,112 @@ console.log("\nS. V2 anomaly + elevate (test 34: uat_v2_anomaly_and_elevate)")
 // to, the mutation-verified unit/integration tests in tests/v2/*.test.ts.
 console.log("\nT. V2 round-2 fixes (C-11 final-story gate, C-14 activation interleaving)")
 {
-  // T1 — C-11: an earlier story blocked WHILE STILL PENDING (blocked/failed
-  // carry no active-story requirement, unlike complete) gets silently
-  // skipped by successor-promotion's first-pending-match scan — a LATER
-  // story can be promoted straight to the FINAL slot. The final story's
-  // completion must still be rejected until the skipped-over story is
-  // resolved (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md's exact C-11 repro).
+  // T1 — task/DAG re-derivation of the old C-11/C-16 scenario. The atomic
+  // unit is now the TASK; stories chain via story-level dependsOn so the
+  // engine computes a sequential S1 -> S2 -> S3 wave (one task per story,
+  // per the re-derivation guidance). Two mechanics from the old C-11/C-16
+  // work carry over and are exercised here against the real compiled plugin:
+  //   (a) level-promotion fires whenever NO task remains active (complete,
+  //       blocked, or failed alike — the old "any active-slot vacancy" rule),
+  //       and a blocked task is skipped because promotion scans PENDING tasks
+  //       by topological level; and
+  //   (b) reopenStory re-activates a not-complete task only when its DAG deps
+  //       are all complete.
+  // NOTE: the old C-11 final-story REJECTION ("final story cannot complete
+  // while a predecessor is blocked") is NOT reproducible under the task/DAG
+  // model — a blocked predecessor is skipped by level-promotion, so the
+  // successor promotes and CAN complete. The redesign doc states C-11 is now
+  // "naturally enforced by the DAG" for the normal completion order; the
+  // blocked-predecessor edge is simply no longer blocked, so this scenario
+  // now asserts that new behavior rather than the removed guard.
   clearLogs()
-  const t1UserMsgId = "uat-t1-user-confirm-msg"
-  const { hooks } = await loadV2Plugin({
-    messages: async () => ({ data: [{ info: { id: t1UserMsgId, role: "user" } }] }),
-  })
-  const sid = "uat-t1-c11-final-gate"
+  const { hooks } = await loadV2Plugin()
+  const sid = "uat-t1-task-dag-promotion"
   const ctx = { sessionID: sid, worktree: worktreeV2, directory: worktreeV2 }
   await activate(hooks, sid, "implement the migration, its rollback path, and the docs")
   const created = JSON.parse(
     await hooks.tool.elicify_vertex_plan_create.execute(
       {
         stories: [
-          { text: "S1: write the migration", acceptanceItems: ["migration runs"], scopeGlobs: [], verifiers: [] },
-          { text: "S2: write the rollback", acceptanceItems: ["rollback runs"], scopeGlobs: [], verifiers: [] },
-          { text: "S3: document the change", acceptanceItems: ["docs updated"], scopeGlobs: [], verifiers: [] },
+          { text: "S1: write the migration", acceptanceItems: ["migration runs"], scopeGlobs: [], verifiers: [], tasks: [{ text: "write the migration" }] },
+          { text: "S2: write the rollback", acceptanceItems: ["rollback runs"], scopeGlobs: [], verifiers: [], dependsOn: ["S1"], tasks: [{ text: "write the rollback" }] },
+          { text: "S3: document the change", acceptanceItems: ["docs updated"], scopeGlobs: [], verifiers: [], dependsOn: ["S2"], tasks: [{ text: "document the change" }] },
         ],
       },
       ctx,
     ),
   )
-  const [s1, s2, s3] = created.stories
-  // S2 blocks directly while still "pending" (S1, not S2, is active) — the
-  // exact out-of-order shape blocked/failed's lack of an active-story
-  // requirement allows.
-  await hooks.tool.elicify_vertex_plan_checkpoint.execute({ storyId: s2.id, status: "blocked", items: [] }, ctx)
-  // S1 completes normally; successor-promotion's first-pending scan skips
-  // the now-blocked S2 and promotes S3 (the final story) directly.
-  const afterS1 = JSON.parse(
-    await hooks.tool.elicify_vertex_plan_checkpoint.execute(
-      { storyId: s1.id, status: "complete", items: [{ id: s1.acceptanceItems[0].id, waiverSourceMessageId: t1UserMsgId }] },
-      ctx,
-    ),
-  )
+  const t1 = created.stories[0].tasks[0].id
+  const t2 = created.stories[1].tasks[0].id
+  const t3 = created.stories[2].tasks[0].id
+  // S1.T1 is the only level-0 task -> S1 active; S2.T1/S3.T1 pending.
+  assert("T1-initial-s1-active", created.stories[0].status === "active", created.stories[0].status)
+
+  // S2 blocks directly while still "pending" (blocked/failed carry no
+  // active-task requirement, unlike complete). S1.T1 is still active, so no
+  // promotion fires here.
+  await hooks.tool.elicify_vertex_plan_checkpoint.execute({ taskId: t2, status: "blocked" }, ctx)
+  const afterBlock = JSON.parse(await hooks.tool.elicify_vertex_plan_status.execute({}, ctx))
   assert(
-    "T1-promotion-skips-blocked-story-to-final",
-    afterS1.stories.find((s) => s.id === s3.id)?.status === "active",
+    "T1-block-pending-task-while-predecessor-active",
+    afterBlock.stories.find((s) => s.id === "S2")?.status === "blocked",
+    JSON.stringify(afterBlock.stories.map((s) => [s.id, s.status])),
+  )
+
+  // Complete S1.T1. No task remains active -> promotion runs. But S3.T1
+  // depends on S2.T1 (via the S3->S2 story dep), and S2.T1 is BLOCKED (not
+  // complete), so S3.T1 STAYS PENDING — promotion is dependency-completion-
+  // based, not raw-level-based. This is the C-11 invariant carried into the
+  // task/DAG model: a dependent task CANNOT activate while a dependency it
+  // relied on is unresolved, so the plan stalls visibly instead of
+  // false-completing. (A level-based scan would skip the blocked task and
+  // wrongly activate S3.) The plan must wait for S2 to be reopened.
+  const afterS1 = JSON.parse(
+    await hooks.tool.elicify_vertex_plan_checkpoint.execute({ taskId: t1, status: "complete" }, ctx),
+  )
+  assert("T1-s1-complete", afterS1.stories.find((s) => s.id === "S1")?.status === "complete", JSON.stringify(afterS1.stories.map((s) => [s.id, s.status])))
+  assert(
+    "T1-blocked-predecessor-holds-successor-pending",
+    afterS1.stories.find((s) => s.id === "S3")?.status === "pending",
     JSON.stringify(afterS1.stories.map((s) => [s.id, s.status])),
   )
-  // S3 (the final story) attempts to complete while S2 sits blocked, skipped.
-  let rejected = false
-  let rejectMsg = ""
-  try {
-    await hooks.tool.elicify_vertex_plan_checkpoint.execute(
-      { storyId: s3.id, status: "complete", items: [{ id: s3.acceptanceItems[0].id, waiverSourceMessageId: t1UserMsgId }] },
-      ctx,
-    )
-  } catch (e) {
-    rejected = true
-    rejectMsg = String(e.message || e)
-  }
-  assert("T1-final-story-blocked-by-skipped-predecessor", rejected && /S2|blocked/i.test(rejectMsg), rejectMsg)
 
-  // Resolve S2. `reopenStory` rejoins S2 as "pending" (S3 is currently
-  // active), NOT "active" -- it can only become active once the currently-
-  // active slot vacates. Before C-16's fix, this required a convoluted
-  // "checkpoint the pending story to blocked, then reopen it again" trick,
-  // since only a "complete" transition ever ran the promotion scan. C-16
-  // extended that scan to fire on ANY active-slot vacancy (complete,
-  // blocked, or failed alike) -- so the natural move (block the stuck final
-  // story, which is exactly what a model discovers it needs to do from the
-  // T1-final-story-blocked rejection message above) now auto-promotes S2
-  // directly, no second trick required.
-  await hooks.tool.elicify_vertex_plan_reopen.execute({ storyId: s2.id, reason: "unblocked for uat" }, ctx)
-  let s2StillPending = false
-  try {
-    await hooks.tool.elicify_vertex_plan_checkpoint.execute(
-      { storyId: s2.id, status: "complete", items: [{ id: s2.acceptanceItems[0].id, waiverSourceMessageId: t1UserMsgId }] },
-      ctx,
-    )
-  } catch (e) {
-    s2StillPending = /not the plan's current active story/.test(String(e.message || e))
-  }
-  assert("T1-reopened-story-rejoins-as-pending-not-active", s2StillPending, "S2 should rejoin as pending while S3 is active")
-
-  await hooks.tool.elicify_vertex_plan_checkpoint.execute({ storyId: s3.id, status: "blocked", items: [] }, ctx)
-  const afterS3Blocked = JSON.parse(await hooks.tool.elicify_vertex_plan_status.execute({}, ctx))
+  // Resolve S2. reopenStory re-activates S2's not-complete task: S2.T1's only
+  // dependency is S1.T1 (via the S2->S1 story dep), which is complete, so
+  // S2.T1 goes ACTIVE. S3.T1 is STILL pending — its dep S2.T1 is not yet
+  // complete.
+  await hooks.tool.elicify_vertex_plan_reopen.execute({ storyId: "S2", reason: "unblocked for uat" }, ctx)
+  const afterReopen = JSON.parse(await hooks.tool.elicify_vertex_plan_status.execute({}, ctx))
   assert(
-    "T1-blocking-final-story-auto-promotes-pending-predecessor",
-    afterS3Blocked.stories.find((s) => s.id === s2.id)?.status === "active",
-    JSON.stringify(afterS3Blocked.stories.map((s) => [s.id, s.status])),
+    "T1-reopen-reactivates-task-whose-deps-are-complete",
+    afterReopen.stories.find((s) => s.id === "S2")?.status === "active",
+    JSON.stringify(afterReopen.stories.map((s) => [s.id, s.status])),
   )
-  await hooks.tool.elicify_vertex_plan_checkpoint.execute(
-    { storyId: s2.id, status: "complete", items: [{ id: s2.acceptanceItems[0].id, waiverSourceMessageId: t1UserMsgId }] },
-    ctx,
+  assert(
+    "T1-successor-still-pending-until-predecessor-completes",
+    afterReopen.stories.find((s) => s.id === "S3")?.status === "pending",
+    JSON.stringify(afterReopen.stories.map((s) => [s.id, s.status])),
   )
-  await hooks.tool.elicify_vertex_plan_reopen.execute({ storyId: s3.id, reason: "resume now that S2 is complete" }, ctx)
+
+  // Complete S2.T1 -> S2 complete. Now S3.T1's dependency is complete, so
+  // promotion activates S3.T1.
+  const afterS2 = JSON.parse(
+    await hooks.tool.elicify_vertex_plan_checkpoint.execute({ taskId: t2, status: "complete" }, ctx),
+  )
+  assert(
+    "T1-successor-activates-once-predecessor-completes",
+    afterS2.stories.find((s) => s.id === "S3")?.status === "active",
+    JSON.stringify(afterS2.stories.map((s) => [s.id, s.status])),
+  )
+
+  // Complete S3.T1 (the final story). With S1, S2, S3 all complete the plan
+  // is fully resolved (no active task remains, no pending task to promote).
   const finalDone = JSON.parse(
-    await hooks.tool.elicify_vertex_plan_checkpoint.execute(
-      { storyId: s3.id, status: "complete", items: [{ id: s3.acceptanceItems[0].id, waiverSourceMessageId: t1UserMsgId }] },
-      ctx,
-    ),
+    await hooks.tool.elicify_vertex_plan_checkpoint.execute({ taskId: t3, status: "complete" }, ctx),
   )
   assert(
-    "T1-final-story-completes-once-predecessor-resolved",
-    finalDone.stories.find((s) => s.id === s3.id)?.status === "complete",
+    "T1-plan-resolves-once-all-tasks-complete",
+    finalDone.stories.every((s) => s.status === "complete"),
     JSON.stringify(finalDone.stories.map((s) => [s.id, s.status])),
   )
 

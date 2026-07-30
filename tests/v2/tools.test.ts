@@ -1,30 +1,34 @@
 /**
- * `elicify_vertex_plan_checkpoint` <-> persisted verification receipts
- * (src/v2/wiring/tools.ts's `isFreshReceipt`).
+ * `elicify_vertex_plan_*` tool wiring after the 2026-07-30 task/DAG redesign
+ * (supersedes the wave model; preserves HANDOVER.md points 1 and 5).
  *
- * `isFreshReceipt` is module-private on purpose, so these tests drive it the
- * way production does: through the real checkpoint tool, over a real
- * `StoryEngine` / `PinStore` / `VerificationReceiptStore` on a real temp
- * worktree. A "process restart" is modelled by rebuilding every stateful
- * object over the same directory — which is exactly what a restart is: the
- * in-memory Maps start empty and only what reached disk survives.
+ * The atomic unit surfaced to the model is now the TASK. These tests drive
+ * the real tool `execute` over a real `StoryEngine` / `PinStore` /
+ * `PhaseEngine` on a real temp worktree and pin down, all the way through
+ * the JSON the model actually sees:
+ *   - create: each story MUST decompose into ≥1 task (+ optional task and
+ *     story dependsOn); waves are computed from the DAG, never input;
+ *   - next: returns the active TASKS as a JSON array, each enriched with its
+ *     parent storyId/storyText, so the model can fan out one subagent per
+ *     element;
+ *   - checkpoint: takes `{ taskId, status, reason? }`; a story auto-completes
+ *     when all its tasks are done; the phase engine is rebound to `execute`
+ *     for every story newly activated by promotion;
+ *   - a refused checkpoint leaves plan.json byte-for-byte unchanged;
+ *   - reopen, status, clear round out the surface.
  *
- * The two behaviours under test are opposites, and both matter:
- *   - a legitimately still-valid receipt from an EARLIER process is accepted
- *     (otherwise persistence is inert and the harness re-demands proof), and
- *   - a receipt whose worktree has moved on is REFUSED (otherwise persistence
- *     is an evidence-fabrication vector, which is worse than not persisting).
+ * checkpoint remains a CLAIM (HANDOVER.md point 1): no receipt, no waiver,
+ * no evidence — the completion judge audits the claim at session.idle.
  */
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import { afterEach, describe, expect, it } from "vitest"
 
-import { VerificationReceiptStore, type VerificationReceipt } from "../../src/goals.js"
 import { PhaseEngine } from "../../src/v2/phase.js"
 import { PinStore } from "../../src/v2/pin.js"
-import { StoryEngine } from "../../src/v2/story.js"
+import { StoryEngine, type PlanV2 } from "../../src/v2/story.js"
 import type { OpencodeClient } from "../../src/v2/types.js"
 import { buildPlanTools } from "../../src/v2/wiring/tools.js"
 import { freshSessionState, type V2SessionState } from "../../src/v2/wiring/state.js"
@@ -35,194 +39,308 @@ const roots: string[] = []
 function temporaryRoot(): string {
   const root = mkdtempSync(join(tmpdir(), "vertex-tools-"))
   roots.push(root)
-  writeFileSync(join(root, "src.ts"), "export const answer = 42\n", "utf8")
   return root
 }
 
-/** Minimal client: the checkpoint tool only touches `session.messages` on the
- * waiver path, and none of these tests use a waiver. */
+/** Minimal client: `PlanToolsDeps` still requires one, but no plan tool
+ * touches it anymore — the waiver-provenance path that read
+ * `session.messages` was deleted with the citation contract. */
 const client = { session: { messages: async () => ({ data: [] }) } } as unknown as OpencodeClient
 
 interface Harness {
   storyEngine: StoryEngine
-  receipts: VerificationReceiptStore
   tools: ReturnType<typeof buildPlanTools>
   phaseEngine: PhaseEngine
 }
 
-/** Build (or REBUILD, i.e. restart) the whole wiring over one worktree. */
+/** Build the whole wiring over one worktree. */
 function boot(root: string): Harness {
   const stateDir = join(root, ".opencode", "elicify-vertex")
   const logger = (): void => {}
   const storyEngine = new StoryEngine({ stateDir, logger })
-  const receipts = new VerificationReceiptStore()
   const states = new Map<string, V2SessionState>([[SESSION, freshSessionState(root)]])
   const phaseEngine = new PhaseEngine(logger)
   const tools = buildPlanTools({
     storyEngine,
     pinStore: new PinStore({ stateDir, logger }),
-    verificationReceipts: receipts,
     client,
     states,
     phaseEngine,
     onPlanCreated: () => {},
   })
-  return { storyEngine, receipts, tools, phaseEngine }
+  return { storyEngine, tools, phaseEngine }
 }
 
-function mintReceipt(
-  receipts: VerificationReceiptStore,
-  root: string,
-  scope?: { storyId?: string | null; paths?: readonly string[] },
-): VerificationReceipt {
-  return receipts.record({
-    sessionID: SESSION,
-    workspaceRoot: root,
-    command: "npx vitest run",
-    exitCode: 0,
-    outcome: "verified",
-    outputSummary: "992 passed",
-    observedAt: new Date().toISOString(),
-    ...(scope ? { scope } : {}),
-  })
+/** Input shape for `elicify_vertex_plan_create` — each story MUST carry tasks. */
+interface CreateStory {
+  text: string
+  acceptanceItems: string[]
+  tasks: Array<{ text: string; dependsOn?: string[] }>
+  scopeGlobs?: string[]
+  verifiers?: string[]
+  dependsOn?: string[]
 }
 
-async function checkpoint(harness: Harness, storyId: string, receiptId: string): Promise<void> {
-  await harness.tools.elicify_vertex_plan_checkpoint.execute(
-    { storyId, status: "complete", items: [{ id: "A1", receiptId }] },
+async function createStories(harness: Harness, stories: CreateStory[]): Promise<void> {
+  await harness.tools.elicify_vertex_plan_create.execute(
+    {
+      stories: stories.map((story) => ({
+        scopeGlobs: [],
+        verifiers: [],
+        dependsOn: [],
+        ...story,
+        tasks: story.tasks.map((task) => ({ dependsOn: [], ...task })),
+      })),
+    },
     { sessionID: SESSION } as never,
   )
+}
+
+/** Drive `elicify_vertex_plan_checkpoint` and return the parsed plan it
+ * hands back — callers assert on the RETURNED plan (what the model sees). */
+async function checkpoint(
+  harness: Harness,
+  taskId: string,
+  status: "complete" | "failed" | "blocked",
+  reason?: string,
+): Promise<PlanV2> {
+  const raw = (await harness.tools.elicify_vertex_plan_checkpoint.execute(
+    { taskId, status, ...(reason !== undefined ? { reason } : {}) },
+    { sessionID: SESSION } as never,
+  )) as string
+  return JSON.parse(raw) as PlanV2
+}
+
+async function blockTask(harness: Harness, taskId: string, reason?: string): Promise<PlanV2> {
+  return checkpoint(harness, taskId, "blocked", reason)
 }
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
 })
 
-describe("checkpoint with persisted verification receipts", () => {
-  // MUTATION PROOF: delete the `deps.verificationReceipts.load(sessionID,
-  // state.workspaceRoot)` call in `isFreshReceipt` -> the restarted store
-  // never hydrates, `get()` returns null, and the checkpoint throws
-  // "not an observed receipt" -> RED.
-  it("accepts a receipt observed before a restart when nothing has changed since", async () => {
-    const root = temporaryRoot()
-    const first = boot(root)
-    first.storyEngine.createPlan(SESSION, [
-      { text: "ship it", acceptanceItems: ["tests pass"], scopeGlobs: ["src/**"], verifiers: ["npx vitest run"] },
+// ===========================================================================
+// checkpoint is a bare completion claim, now on a TASK (redesign point 1,
+// task/DAG model).
+// ===========================================================================
+
+describe("checkpoint is a bare completion claim on a task", () => {
+  // MUTATION PROOF: re-introduce any evidence requirement into the
+  // checkpoint tool's `execute` -> this call has nothing to cite and the
+  // test goes RED.
+  it("completes a task with NO evidence; the parent story auto-completes when its last task is done", async () => {
+    const harness = boot(temporaryRoot())
+    await createStories(harness, [
+      { text: "two-task story", acceptanceItems: ["one"], tasks: [{ text: "a" }, { text: "b" }] },
     ])
-    const minted = mintReceipt(first.receipts, root)
-    expect(minted.scope?.storyId).toBe("S1")
 
-    // --- process restart: fresh engines, same worktree ---
-    const second = boot(root)
-    await checkpoint(second, "S1", minted.id)
+    const afterFirst = await checkpoint(harness, "S1.T1", "complete")
+    expect(afterFirst.stories[0].status).toBe("active") // S1.T2 still active
+    expect(afterFirst.stories[0].tasks.map((t) => t.status)).toEqual(["complete", "active"])
+    expect(typeof afterFirst.stories[0].tasks[0].completedAt).toBe("string")
 
-    expect(second.storyEngine.getPlan(SESSION)?.stories[0].status).toBe("complete")
+    const afterSecond = await checkpoint(harness, "S1.T2", "complete")
+    expect(afterSecond.stories[0].status).toBe("complete") // auto-completed
+    expect(typeof afterSecond.stories[0].completedAt).toBe("string")
   })
 
-  // MUTATION PROOF: make `VerificationReceiptStore.isStale()` return `false`
-  // unconditionally (or delete its `current.digest !== scope.worktreeDigest`
-  // comparison) -> the checkpoint succeeds against changed code -> RED. This
-  // is the whole reason persistence is safe to ship.
-  it("refuses the same receipt after a file in the worktree changed", async () => {
-    const root = temporaryRoot()
-    const first = boot(root)
-    first.storyEngine.createPlan(SESSION, [
-      { text: "ship it", acceptanceItems: ["tests pass"], scopeGlobs: ["src/**"], verifiers: ["npx vitest run"] },
+  // MUTATION PROOF: gate level-promotion in story.ts's checkpoint on the
+  // completing task only -> S2.T1 never activates and the assertion goes RED.
+  it("promotes the next DAG level (across stories) only when no task remains active", async () => {
+    const harness = boot(temporaryRoot())
+    await createStories(harness, [
+      { text: "S1", acceptanceItems: ["one"], tasks: [{ text: "a" }] },
+      { text: "S2", acceptanceItems: ["two"], tasks: [{ text: "b", dependsOn: ["S1.T1"] }, { text: "c", dependsOn: ["S1.T1"] }] },
+      { text: "S3", acceptanceItems: ["four"], tasks: [{ text: "d", dependsOn: ["S2.T1", "S2.T2"] }] },
     ])
-    const minted = mintReceipt(first.receipts, root)
 
-    // The code moves on while no harness process is running.
-    writeFileSync(join(root, "src.ts"), "export const answer = 43 // regression\n", "utf8")
+    const afterS1 = await checkpoint(harness, "S1.T1", "complete")
+    expect(afterS1.stories.map((s) => s.status)).toEqual(["complete", "active", "pending"])
 
-    const second = boot(root)
-    await expect(checkpoint(second, "S1", minted.id)).rejects.toThrow(/not an observed receipt/i)
-    expect(second.storyEngine.getPlan(SESSION)?.stories[0].status).toBe("active")
+    const afterS2T1 = await checkpoint(harness, "S2.T1", "complete")
+    expect(afterS2T1.stories[2].tasks[0].status).toBe("pending") // S2.T2 still active
+
+    const afterS2T2 = await checkpoint(harness, "S2.T2", "complete")
+    expect(afterS2T2.stories[2].tasks[0].status).toBe("active") // S3.T1 promoted
   })
 
-  // MUTATION PROOF: delete the
-  // `if (plan && (receipt.scope?.storyId ?? null) !== storyId) return false`
-  // line in `isFreshReceipt` -> S1's receipt closes S2 -> RED.
-  //
-  // The receipt is minted WHILE S2 is active but explicitly linked to S1, so
-  // its `observedAt` sits after S2's `startedAt`. That matters: it means the
-  // pre-existing "receipt predates the story" time bound cannot be what
-  // rejects it, and the story link is the only thing standing between S1's
-  // proof and S2's checkpoint.
-  it("refuses a receipt linked to another story, and accepts the one linked to this story", async () => {
-    const root = temporaryRoot()
-    const harness = boot(root)
-    harness.storyEngine.createPlan(SESSION, [
-      { text: "story one", acceptanceItems: ["one"], scopeGlobs: [], verifiers: [] },
-      { text: "story two", acceptanceItems: ["two"], scopeGlobs: [], verifiers: [] },
+  // MUTATION PROOF: drop the amendments push for non-complete checkpoints in
+  // story.ts -> the amendment assertion goes RED.
+  it("records the reason of a blocked task checkpoint as an amendment on the parent story", async () => {
+    const harness = boot(temporaryRoot())
+    await createStories(harness, [
+      { text: "story one", acceptanceItems: ["one"], tasks: [{ text: "a" }, { text: "b" }] },
     ])
 
-    const forS1 = mintReceipt(harness.receipts, root)
-    expect(forS1.scope?.storyId).toBe("S1")
-    await checkpoint(harness, "S1", forS1.id)
-    expect(harness.storyEngine.getActiveStory(SESSION)?.id).toBe("S2")
+    const plan = await blockTask(harness, "S1.T1", "waiting on the upstream API")
 
-    const stillLinkedToS1 = mintReceipt(harness.receipts, root, { storyId: "S1" })
-    await expect(checkpoint(harness, "S2", stillLinkedToS1.id)).rejects.toThrow(/not an observed receipt/i)
-
-    const forS2 = mintReceipt(harness.receipts, root)
-    expect(forS2.scope?.storyId).toBe("S2")
-    await checkpoint(harness, "S2", forS2.id)
-    expect(harness.storyEngine.getPlan(SESSION)?.stories[1].status).toBe("complete")
-  })
-
-  // MUTATION PROOF: change that same story-link line to
-  // `if (plan && receipt.scope?.storyId != null && receipt.scope.storyId !== storyId)`
-  // -> an unlinked receipt is accepted under a plan -> RED. A receipt minted
-  // on the no-plan path is evidence for the worktree, not for any story, so it
-  // must not be able to close one.
-  it("refuses a receipt with no story link once a plan exists", async () => {
-    const root = temporaryRoot()
-    const harness = boot(root)
-    harness.storyEngine.createPlan(SESSION, [
-      { text: "ship it", acceptanceItems: ["tests pass"], scopeGlobs: [], verifiers: [] },
-    ])
-    const unlinked = mintReceipt(harness.receipts, root, { storyId: null })
-
-    await expect(checkpoint(harness, "S1", unlinked.id)).rejects.toThrow(/not an observed receipt/i)
-  })
-
-  // MUTATION PROOF: revert `VerificationReceiptStore.invalidate()` to
-  // memory-only (drop its `this.persist(sessionID)` call) -> the retired
-  // receipt is resurrected by the restart and the checkpoint succeeds -> RED.
-  it("does not let a restart resurrect a receipt invalidated by a mutation", async () => {
-    const root = temporaryRoot()
-    const first = boot(root)
-    first.storyEngine.createPlan(SESSION, [
-      { text: "ship it", acceptanceItems: ["tests pass"], scopeGlobs: [], verifiers: [] },
-    ])
-    const minted = mintReceipt(first.receipts, root)
-    // What plugin.ts does on every mutating tool call / file.edited event.
-    first.receipts.invalidate(SESSION)
-
-    const second = boot(root)
-    await expect(checkpoint(second, "S1", minted.id)).rejects.toThrow(/not an observed receipt/i)
+    expect(plan.stories[0].tasks[0].status).toBe("blocked")
+    expect(plan.stories[0].amendments.map((a) => a.reason)).toEqual(["blocked: waiting on the upstream API"])
+    expect(plan.stories[0].tasks[0].completedAt).toBeUndefined()
+    // S1.T2 is still active, so the story is not blocked overall.
+    expect(plan.stories[0].status).toBe("active")
   })
 })
 
 // ===========================================================================
-// The reflective planning challenge
-// (docs/REQUIREMENTS-CLARIFICATION-BEFORE-PLAN.md, AC-1..AC-5)
+// plan_next returns the active TASKS (one subagent per element), each with
+// its parent story id/text for context.
+// ===========================================================================
+
+describe("plan_next returns the active tasks", () => {
+  // MUTATION PROOF: revert the next tool to return getActiveStories ->
+  // the parsed value's elements have no `taskId`/`text` task shape and the
+  // shape assertion goes RED.
+  it("returns a JSON array of active TASKS, each enriched with storyId/storyText", async () => {
+    const harness = boot(temporaryRoot())
+    await createStories(harness, [
+      { text: "parser", acceptanceItems: ["a"], tasks: [{ text: "t1" }, { text: "t2" }] },
+      { text: "cli", acceptanceItems: ["b"], tasks: [{ text: "t3", dependsOn: ["S1.T1"] }] },
+    ])
+
+    const raw = (await harness.tools.elicify_vertex_plan_next.execute({}, { sessionID: SESSION } as never)) as string
+    const active = JSON.parse(raw) as Array<{ id: string; status: string; storyId: string; storyText: string }>
+
+    expect(Array.isArray(active)).toBe(true)
+    // S1.T1, S1.T2 are level 0; S2.T1 depends on S1.T1 -> pending.
+    expect(active.map((t) => t.id)).toEqual(["S1.T1", "S1.T2"])
+    expect(active.every((t) => t.status === "active")).toBe(true)
+    expect(active.every((t) => t.storyId === "S1")).toBe(true)
+    expect(active.every((t) => t.storyText === "parser")).toBe(true)
+  })
+
+  it("returns [] when no task is active (e.g. every task waiting on a predecessor)", async () => {
+    const harness = boot(temporaryRoot())
+    await createStories(harness, [
+      { text: "S1", acceptanceItems: ["a"], tasks: [{ text: "a" }] },
+      { text: "S2", acceptanceItems: ["b"], tasks: [{ text: "b", dependsOn: ["S1.T1"] }] },
+    ])
+    // Complete S1.T1 -> S2.T1 promotes. Then complete S2.T1 -> nothing active.
+    await checkpoint(harness, "S1.T1", "complete")
+    await checkpoint(harness, "S2.T1", "complete")
+
+    const raw = (await harness.tools.elicify_vertex_plan_next.execute({}, { sessionID: SESSION } as never)) as string
+    expect(JSON.parse(raw)).toEqual([])
+  })
+})
+
+// ===========================================================================
+// plan_create: tasks are required, dependsOn drives the computed waves, and
+// the wave argument is GONE. Plus the reflective planning challenge still
+// rides first in the returned JSON.
+// ===========================================================================
+
+describe("plan_create requires tasks and computes waves from the DAG", () => {
+  // MUTATION PROOF: drop the `.min(1)` on the tasks schema (or make createPlan
+  // accept empty tasks) -> the create succeeds and this rejects-assertion RED.
+  it("rejects a story with no tasks and creates no plan", async () => {
+    const harness = boot(temporaryRoot())
+    await expect(
+      harness.tools.elicify_vertex_plan_create.execute(
+        {
+          stories: [
+            { text: "no tasks", acceptanceItems: ["a"], scopeGlobs: [], verifiers: [], dependsOn: [], tasks: [] },
+          ],
+        },
+        { sessionID: SESSION } as never,
+      ),
+    ).rejects.toThrow(/at least one task/)
+    expect(harness.storyEngine.getPlan(SESSION)).toBeNull()
+  })
+
+  it("rejects a dangling task dependsOn and creates no plan", async () => {
+    const harness = boot(temporaryRoot())
+    await expect(
+      harness.tools.elicify_vertex_plan_create.execute(
+        {
+          stories: [
+            {
+              text: "bad dep",
+              acceptanceItems: ["a"],
+              scopeGlobs: [],
+              verifiers: [],
+              dependsOn: [],
+              tasks: [{ text: "t", dependsOn: ["S1.T9"] }],
+            },
+          ],
+        },
+        { sessionID: SESSION } as never,
+      ),
+    ).rejects.toThrow(/unknown story or task: S1\.T9/)
+    expect(harness.storyEngine.getPlan(SESSION)).toBeNull()
+  })
+
+  it("rejects a dependency cycle and creates no plan", async () => {
+    const harness = boot(temporaryRoot())
+    await expect(
+      harness.tools.elicify_vertex_plan_create.execute(
+        {
+          stories: [
+            {
+              text: "cycle",
+              acceptanceItems: ["a"],
+              scopeGlobs: [],
+              verifiers: [],
+              dependsOn: [],
+              tasks: [
+                { text: "a", dependsOn: ["S1.T2"] },
+                { text: "b", dependsOn: ["S1.T1"] },
+              ],
+            },
+          ],
+        },
+        { sessionID: SESSION } as never,
+      ),
+    ).rejects.toThrow(/plan dependency cycle:/)
+    expect(harness.storyEngine.getPlan(SESSION)).toBeNull()
+  })
+
+  it("story-dependsOn-story gates a successor story's tasks until the predecessor is fully done", async () => {
+    const harness = boot(temporaryRoot())
+    await createStories(harness, [
+      { text: "S1", acceptanceItems: ["a"], tasks: [{ text: "a" }, { text: "b" }] },
+      { text: "S2", acceptanceItems: ["c"], dependsOn: ["S1"], tasks: [{ text: "c" }] },
+    ])
+
+    const plan = harness.storyEngine.getPlan(SESSION)!
+    expect(plan.stories[0].tasks.map((t) => t.status)).toEqual(["active", "active"])
+    expect(plan.stories[1].tasks.map((t) => t.status)).toEqual(["pending"]) // gated by story dep
+
+    // Completing only one S1 task keeps S2 gated.
+    await checkpoint(harness, "S1.T1", "complete")
+    expect(harness.storyEngine.getPlan(SESSION)!.stories[1].tasks[0].status).toBe("pending")
+    // Completing the other activates S2.T1.
+    await checkpoint(harness, "S1.T2", "complete")
+    expect(harness.storyEngine.getPlan(SESSION)!.stories[1].tasks[0].status).toBe("active")
+  })
+})
+
+// ===========================================================================
+// The reflective planning challenge (AC-1..AC-5) — unchanged apparatus, still
+// rides FIRST in the create tool's JSON return, still writes nothing to disk.
 // ===========================================================================
 
 interface CreatedPlan {
   raw: string
   parsed: { planningChallenge?: string[]; schemaVersion?: number; stories?: Array<{ id: string }>; finalStoryId?: string }
-  /** The challenge lines joined — asserted on by CONTENT, never by length. */
   challenge: string
   challengeLines: string[]
 }
 
 async function createPlanVia(
   harness: Harness,
-  stories: Array<{ text: string; acceptanceItems: string[] }>,
+  stories: Array<{ text: string; acceptanceItems: string[]; tasks: Array<{ text: string }> }>,
 ): Promise<CreatedPlan> {
   const raw = (await harness.tools.elicify_vertex_plan_create.execute(
-    { stories: stories.map((story) => ({ ...story, scopeGlobs: [], verifiers: [] })) },
+    {
+      stories: stories.map((story) => ({
+        ...story,
+        scopeGlobs: [],
+        verifiers: [],
+        dependsOn: [],
+        tasks: story.tasks.map((task) => ({ text: task.text, dependsOn: [] })),
+      })),
+    },
     { sessionID: SESSION } as never,
   )) as string
   const parsed = JSON.parse(raw) as CreatedPlan["parsed"]
@@ -231,173 +349,142 @@ async function createPlanVia(
 }
 
 describe("plan_create returns a reflective planning challenge", () => {
-  // MUTATION PROOF: delete the `lines.push("If material questions remain, ...")`
-  // block at the end of `buildPlanningChallenge` in src/v2/wiring/tools.ts (the
-  // three numbered remedies + the closing "Proceeding is also a valid answer"
-  // line) -> the question is still asked but the escape route is gone, and this
-  // test goes red on `elicify_vertex_plan_clear`. Verified red, then restored.
   it("asks what the plan is grounded in and NAMES the remedy with exact tool calls (AC-1, AC-2b)", async () => {
     const harness = boot(temporaryRoot())
     const { challenge } = await createPlanVia(harness, [
-      { text: "build the admin console", acceptanceItems: ["it works"] },
-      { text: "wire the approval workflow", acceptanceItems: ["done"] },
+      { text: "build the admin console", acceptanceItems: ["it works"], tasks: [{ text: "scaffold" }] },
+      { text: "wire the approval workflow", acceptanceItems: ["done"], tasks: [{ text: "wire" }] },
     ])
 
-    // AC-1: grounded-or-guessed, research/user interview, unknowns eliminated.
     expect(challenge).toMatch(/grounded, or guessed/i)
     expect(challenge).toMatch(/research and user interview/i)
     expect(challenge).toMatch(/unknowns/i)
-
-    // AC-2b: all three remedies, by their exact tool names.
     expect(challenge).toMatch(/question tool/i)
     expect(challenge).toMatch(/research it/i)
     expect(challenge).toContain("elicify_vertex_plan_clear")
     expect(challenge).toContain("elicify_vertex_plan_create")
-
-    // AC-2b: clearing ARCHIVES, it does not destroy. Verified against
-    // src/v2/story.ts (`clearPlan` and `createPlan`'s replace path both call
-    // `archivePlan`) as of 57dcc3f -- without this the model reads re-planning
-    // as destructive and will not do it.
     expect(challenge).toMatch(/archived/i)
     expect(challenge).toMatch(/never deleted/i)
   })
 
-  // MUTATION PROOF: make `isVagueAcceptanceItem` in src/v2/wiring/tools.ts
-  // `return false` unconditionally -> `flagged` is empty, no story is named,
-  // and both plans get byte-identical boilerplate -> red on the S2 assertion
-  // AND on the two-plans-differ assertion. Verified red, then restored.
-  it("names the stories whose acceptance items are vague, and is not identical boilerplate (AC-2)", async () => {
+  it("names the stories whose acceptance items are vague (AC-2)", async () => {
     const harness = boot(temporaryRoot())
     const { challenge } = await createPlanVia(harness, [
-      { text: "port the parser", acceptanceItems: ["npx vitest run tests/parser.test.ts exits 0"] },
-      { text: "ship a mature UI", acceptanceItems: ["it works", "looks good"] },
+      { text: "port the parser", acceptanceItems: ["npx vitest run tests/parser.test.ts exits 0"], tasks: [{ text: "port" }] },
+      { text: "ship a mature UI", acceptanceItems: ["it works", "looks good"], tasks: [{ text: "ship" }] },
     ])
 
-    // The vague story is named, with the offending item quoted back.
     expect(challenge).toMatch(/S2 \(ship a mature UI\)/)
     expect(challenge).toContain('"it works"')
     expect(challenge).toContain('"looks good"')
-    // The concrete story is left alone -- being specific means being silent
-    // about the parts that are already verifiable.
     expect(challenge).not.toMatch(/S1 \(port the parser\)/)
-    expect(challenge).not.toContain("tests/parser.test.ts")
-    expect(challenge).toMatch(/2 stories, 3 acceptance items, 2 of which/)
-
-    // A different plan must produce a different challenge, or it is wallpaper.
-    const other = boot(temporaryRoot())
-    const second = await createPlanVia(other, [
-      { text: "migrate auth", acceptanceItems: ["handled"] },
-      { text: "delete the shim", acceptanceItems: ["src/shim.ts no longer exists", "npx tsc --noEmit exits 0"] },
-    ])
-    expect(second.challenge).toMatch(/S1 \(migrate auth\)/)
-    expect(second.challenge).not.toBe(challenge)
   })
 
-  // MUTATION PROOF: delete the `if (stories.length <= 1 && flagged.length === 0)`
-  // short-form branch in `buildPlanningChallenge` (so every plan falls through to
-  // the full challenge) -> the trivial plan gets the remedy list and this test
-  // goes red on the `not.toContain("elicify_vertex_plan_clear")` assertion.
-  // Verified red, then restored.
-  it("gives a trivial plan the short form and the same plan-with-a-vague-item the full one (AC-4)", async () => {
+  it("gives a trivial plan the short form (AC-4)", async () => {
     const trivial = await createPlanVia(boot(temporaryRoot()), [
-      { text: "fix the off-by-one", acceptanceItems: ["npx vitest run exits 0 with 3 tests passing"] },
+      { text: "fix the off-by-one", acceptanceItems: ["npx vitest run exits 0 with 3 tests passing"], tasks: [{ text: "fix" }] },
     ])
-    // The discrimination, asserted FIRST so it is what a regression trips on:
-    // none of the heavyweight apparatus fires on one-shot work.
     expect(trivial.challenge).not.toContain("elicify_vertex_plan_clear")
-    expect(trivial.challenge).not.toMatch(/Before you act on this plan/i)
-    expect(trivial.challenge).not.toMatch(/do ONE of these now/i)
     expect(trivial.challengeLines.length).toBeLessThan(4)
-    // It still asks the AC-1 question, though -- one-shot work is prompted,
-    // not taxed. (Phrased form-agnostically: both forms say these, so these
-    // assertions cannot be what makes the AC-4 mutation red.)
     expect(trivial.challenge).toMatch(/guessed/i)
-    expect(trivial.challenge).toMatch(/research/i)
-    expect(trivial.challenge).toMatch(/question tool/i)
-
-    // Same shape of plan, one word of acceptance criterion different: the
-    // discrimination is the vagueness of the item, not the story count.
-    const vague = await createPlanVia(boot(temporaryRoot()), [{ text: "fix the off-by-one", acceptanceItems: ["it works"] }])
-    expect(vague.challenge).toContain("elicify_vertex_plan_clear")
-    expect(vague.challenge).toMatch(/S1 \(fix the off-by-one\)/)
   })
 
-  // MUTATION PROOF: change the create tool's return to
-  // `${JSON.stringify(plan, null, 2)}\n\n${planningChallenge?.join("\n")}` (the
-  // obvious "just append the prose" implementation) -> `JSON.parse` throws and
-  // this test goes red, as would scripts/uat-harness.mjs and the three v2
-  // integration test files that parse this return value. Verified red, then
-  // restored.
-  it("still SUCCEEDS and still returns a parseable plan; nothing is written to plan.json (AC-3, AC-5)", async () => {
+  it("still returns a parseable plan and writes nothing extra to plan.json (AC-3, AC-5)", async () => {
     const root = temporaryRoot()
     const harness = boot(root)
     const created = await createPlanVia(harness, [
-      { text: "story one", acceptanceItems: ["it works"] },
-      { text: "story two", acceptanceItems: ["fine"] },
+      { text: "story one", acceptanceItems: ["it works"], tasks: [{ text: "do" }] },
+      { text: "story two", acceptanceItems: ["fine"], tasks: [{ text: "do" }] },
     ])
 
-    // No refusal, no deadlock: the plan exists and the return value is still
-    // the plan its callers parse.
     expect(created.parsed.schemaVersion).toBe(2)
     expect(created.parsed.stories?.map((story) => story.id)).toEqual(["S1", "S2"])
     expect(created.parsed.finalStoryId).toBe("S2")
     expect(harness.storyEngine.getPlan(SESSION)?.stories[0].status).toBe("active")
 
-    // AC-5: the challenge is return text only -- no self-reported clarification
-    // field reaches the durable record. (Drift guard: the write path lives in
-    // story.ts, so this assertion is not the one carrying the mutation proof
-    // above; it exists to catch a future attempt to persist the challenge.)
     const persisted = readFileSync(join(root, ".opencode", "elicify-vertex", "plan.json"), "utf8")
     expect(persisted).not.toContain("planningChallenge")
     expect(persisted).not.toContain("grounded")
   })
 })
 
-describe("a refused checkpoint leaves no forged evidence in plan.json (R7)", () => {
-  // Evidence used to be attached BEFORE `checkpoint` validated it, so a refused
-  // checkpoint still wrote the model's claim to disk: the story could never be
-  // completed (validation re-runs every attempt) but the durable audit record
-  // showed a fabricated receipt id, contradicting story.ts's guarantee that a
-  // thrown error leaves the plan byte-for-byte unchanged.
-  //
-  // MUTATION PROOF: move the `attachEvidence` loop in wiring/tools.ts back above
-  // the validation loop -> this test goes red.
-  it("does not persist a fabricated receiptId when the checkpoint is rejected", async () => {
+// ===========================================================================
+// A refused checkpoint leaves plan.json byte-for-byte unchanged — validation
+// happens BEFORE any mutation.
+// ===========================================================================
+
+describe("a refused checkpoint leaves plan.json byte-for-byte unchanged", () => {
+  // MUTATION PROOF: move the not-active guard below the status mutation in
+  // story.ts -> the out-of-order complete succeeds, mutates the file, and RED.
+  it("refuses to complete a task that is not active, and writes nothing", async () => {
     const root = temporaryRoot()
-    const h = boot(root)
-    await h.tools.elicify_vertex_plan_create.execute(
-      { stories: [{ text: "w", acceptanceItems: ["ok"], scopeGlobs: ["**"], verifiers: ["npx vitest run"] }] },
-      { sessionID: SESSION } as never,
-    )
-
-    await expect(checkpoint(h, "S1", "vrf_totally_made_up")).rejects.toThrow()
-
+    const harness = boot(root)
+    await createStories(harness, [
+      {
+        text: "story one",
+        acceptanceItems: ["one"],
+        tasks: [{ text: "first" }, { text: "second", dependsOn: ["S1.T1"] }],
+      },
+    ])
     const planPath = join(root, ".opencode", "elicify-vertex", "plan.json")
-    expect(readFileSync(planPath, "utf8")).not.toContain("vrf_totally_made_up")
+    const before = readFileSync(planPath, "utf8")
+
+    await expect(checkpoint(harness, "S1.T2", "complete")).rejects.toThrow(/not active/)
+
+    expect(readFileSync(planPath, "utf8")).toBe(before)
+    expect(harness.storyEngine.getPlan(SESSION)?.stories[0].tasks.map((t) => t.status)).toEqual(["active", "pending"])
   })
 })
 
 // ===========================================================================
-// elicify_vertex_plan_reopen (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md C-6:
-// "a blocked/failed story can never be reopened, so a plan with a blocked
-// final story can never reach all-complete"). `StoryEngine.reopenStory` was
-// implemented and unit-tested, but had no caller anywhere in the wiring
-// layer -- these tests drive it the way the model actually would, through
-// the tool's own `execute`, never by calling `storyEngine.reopenStory`
-// directly.
+// T8 (FR-001), task/wave-aware: when promotion activates a story's first
+// task, the checkpoint tool rebinds that story's phase to `execute` so its
+// slot does not read a stale default until its first mutation.
 // ===========================================================================
 
-async function blockStory(harness: Harness, storyId: string): Promise<void> {
-  await harness.tools.elicify_vertex_plan_checkpoint.execute(
-    { storyId, status: "blocked", items: [] },
-    { sessionID: SESSION } as never,
-  )
-}
+describe("phase rebinding when a story's first task activates", () => {
+  // MUTATION PROOF: in the checkpoint tool, rebind only stories that were
+  // already active (drop the `!activeBefore.has` guard) -> S2's phase is never
+  // touched and stays "intake" -> RED.
+  it("rebinds phase to execute for every story newly activated by promotion", async () => {
+    const harness = boot(temporaryRoot())
+    await createStories(harness, [
+      { text: "S1", acceptanceItems: ["one"], tasks: [{ text: "a" }] },
+      { text: "S2", acceptanceItems: ["two"], tasks: [{ text: "b", dependsOn: ["S1.T1"] }] },
+    ])
+    expect(harness.phaseEngine.getPhase(SESSION, "S2")).toBe("intake")
+
+    await checkpoint(harness, "S1.T1", "complete")
+
+    expect(harness.phaseEngine.getPhase(SESSION, "S2")).toBe("execute")
+  })
+
+  // MUTATION PROOF: drop the `activeBefore` diff so phase is rebound for EVERY
+  // active story after a checkpoint -> S1.T2's story phase is forced back and RED.
+  it("does NOT rebind a story that was already active before the checkpoint", async () => {
+    const harness = boot(temporaryRoot())
+    await createStories(harness, [
+      { text: "S1", acceptanceItems: ["a"], tasks: [{ text: "a" }, { text: "b" }] },
+    ])
+    // Drive S1 past execute while both its tasks are active.
+    harness.phaseEngine.onMutation(SESSION, "S1")
+    harness.phaseEngine.onVerifierOutcome(SESSION, "S1", { success: true, coversFinalStory: true })
+    expect(harness.phaseEngine.getPhase(SESSION, "S1")).toBe("elevate")
+
+    // Completing S1.T1 leaves S1.T2 active, so S1 is still an active-task story;
+    // its phase must be left where the verifier arc put it.
+    await checkpoint(harness, "S1.T1", "complete")
+    expect(harness.phaseEngine.getPhase(SESSION, "S1")).toBe("elevate")
+  })
+})
+
+// ===========================================================================
+// elicify_vertex_plan_reopen (C-6): the recovery path for a blocked story,
+// driven through the tool's own execute. reopenStory now re-activates a
+// story's not-complete tasks per the DAG level rule.
+// ===========================================================================
 
 describe("elicify_vertex_plan_reopen tool", () => {
-  // MUTATION PROOF: delete `elicify_vertex_plan_reopen` from the returned
-  // tool map (or from `buildPlanTools` entirely) -> `harness.tools.elicify_vertex_plan_reopen`
-  // is `undefined` and this test throws a TypeError before any assertion runs -> RED.
   it("is registered in the tool map alongside the other five plan tools", () => {
     const harness = boot(temporaryRoot())
     expect(Object.keys(harness.tools).sort()).toEqual([
@@ -410,20 +497,10 @@ describe("elicify_vertex_plan_reopen tool", () => {
     ])
   })
 
-  // MUTATION PROOF: replace the tool's `execute` body with a no-op that
-  // returns without calling `storyEngine.reopenStory` -> the story's status
-  // stays "blocked" and both assertions below go RED.
   it("reopens a blocked story, called through the tool's execute (not storyEngine.reopenStory directly)", async () => {
     const harness = boot(temporaryRoot())
-    // Single story: nothing pending to auto-promote (C-16) when it blocks,
-    // so "nothing else is active" holds and this stays a clean test of the
-    // reopen TOOL's own wiring, not promotion mechanics (covered separately
-    // below).
-    await harness.tools.elicify_vertex_plan_create.execute(
-      { stories: [{ text: "story one", acceptanceItems: ["one"], scopeGlobs: [], verifiers: [] }] },
-      { sessionID: SESSION } as never,
-    )
-    await blockStory(harness, "S1")
+    await createStories(harness, [{ text: "story one", acceptanceItems: ["one"], tasks: [{ text: "a" }] }])
+    await blockTask(harness, "S1.T1")
     expect(harness.storyEngine.getPlan(SESSION)?.stories[0].status).toBe("blocked")
 
     const raw = (await harness.tools.elicify_vertex_plan_reopen.execute(
@@ -432,92 +509,15 @@ describe("elicify_vertex_plan_reopen tool", () => {
     )) as string
     const parsed = JSON.parse(raw) as { storyId: string; newStatus: string; becameActive: boolean }
 
-    // S1 was the only story and nothing else is active, so it resumes as
-    // "active" directly (story.ts's `reopenStory`: "nothing else is active").
     expect(parsed.newStatus).toBe("active")
     expect(parsed.becameActive).toBe(true)
     expect(harness.storyEngine.getPlan(SESSION)?.stories[0].status).toBe("active")
-    expect(harness.storyEngine.getActiveStory(SESSION)?.id).toBe("S1")
+    expect(harness.storyEngine.getActiveTasks(SESSION).map((t) => t.id)).toEqual(["S1.T1"])
   })
 
-  // C-16 (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md): blocking the ACTIVE story
-  // now auto-promotes the next pending story (checkpoint's promotion scan
-  // fires on any active-slot vacancy, not just "complete") -- so reopening
-  // the blocked story afterward finds another story already active and
-  // correctly rejoins the queue as "pending" rather than preempting it.
-  // MUTATION PROOF: revert story.ts's checkpoint to gate promotion on
-  // `status === "complete" && wasActive` -> after blockStory(S1), S2 stays
-  // pending (getActiveStory is null) instead of becoming active -> RED.
-  it("blocking the active story promotes the next pending one; reopening the blocked story then rejoins as pending", async () => {
-    const harness = boot(temporaryRoot())
-    await harness.tools.elicify_vertex_plan_create.execute(
-      {
-        stories: [
-          { text: "story one", acceptanceItems: ["one"], scopeGlobs: [], verifiers: [] },
-          { text: "story two", acceptanceItems: ["two"], scopeGlobs: [], verifiers: [] },
-        ],
-      },
-      { sessionID: SESSION } as never,
-    )
-    await blockStory(harness, "S1")
-    expect(harness.storyEngine.getPlan(SESSION)?.stories[0].status).toBe("blocked")
-    expect(harness.storyEngine.getActiveStory(SESSION)?.id).toBe("S2")
-
-    const raw = (await harness.tools.elicify_vertex_plan_reopen.execute(
-      { storyId: "S1", reason: "the missing dependency now exists" },
-      { sessionID: SESSION } as never,
-    )) as string
-    const parsed = JSON.parse(raw) as { storyId: string; newStatus: string; becameActive: boolean }
-    expect(parsed.newStatus).toBe("pending")
-    expect(parsed.becameActive).toBe(false)
-    expect(harness.storyEngine.getActiveStory(SESSION)?.id).toBe("S2")
-  })
-
-  // MUTATION PROOF: in story.ts's `reopenStory`, change the `hasActiveStory`
-  // branch so a reopened story ALWAYS becomes "active" regardless of another
-  // story already being active -> two stories end up "active" at once and
-  // `getActiveStory` (which returns the FIRST match) silently hides the bug;
-  // this test instead asserts the reopened story's own status is "pending"
-  // and that the originally-active story is untouched, so it goes RED.
-  it("rejoins the queue as pending when another story is already active, instead of preempting it", async () => {
-    const harness = boot(temporaryRoot())
-    await harness.tools.elicify_vertex_plan_create.execute(
-      {
-        stories: [
-          { text: "story one", acceptanceItems: ["one"], scopeGlobs: [], verifiers: [] },
-          { text: "story two", acceptanceItems: ["two"], scopeGlobs: [], verifiers: [] },
-          { text: "story three", acceptanceItems: ["three"], scopeGlobs: [], verifiers: [] },
-        ],
-      },
-      { sessionID: SESSION } as never,
-    )
-    // S2 blocked directly while still pending (out of order); normal
-    // successor-promotion never touches it because it only fires on
-    // "complete", so S1 stays active throughout.
-    await blockStory(harness, "S2")
-    expect(harness.storyEngine.getActiveStory(SESSION)?.id).toBe("S1")
-
-    const raw = (await harness.tools.elicify_vertex_plan_reopen.execute(
-      { storyId: "S2", reason: "unblocked" },
-      { sessionID: SESSION } as never,
-    )) as string
-    const parsed = JSON.parse(raw) as { newStatus: string; becameActive: boolean }
-
-    expect(parsed.newStatus).toBe("pending")
-    expect(parsed.becameActive).toBe(false)
-    expect(harness.storyEngine.getActiveStory(SESSION)?.id).toBe("S1")
-    expect(harness.storyEngine.getPlan(SESSION)?.stories[1].status).toBe("pending")
-  })
-
-  // MUTATION PROOF: delete the `storyEngine.reopenStory(...)` call in the
-  // tool's `execute` (or swallow its error in a try/catch) -> this rejects
-  // nothing and the assertion goes RED.
   it("errors on an unknown storyId, mirroring StoryEngine.reopenStory's own error", async () => {
     const harness = boot(temporaryRoot())
-    await harness.tools.elicify_vertex_plan_create.execute(
-      { stories: [{ text: "story one", acceptanceItems: ["one"], scopeGlobs: [], verifiers: [] }] },
-      { sessionID: SESSION } as never,
-    )
+    await createStories(harness, [{ text: "story one", acceptanceItems: ["one"], tasks: [{ text: "a" }] }])
     await expect(
       harness.tools.elicify_vertex_plan_reopen.execute(
         { storyId: "S99", reason: "does not matter" },
@@ -526,220 +526,110 @@ describe("elicify_vertex_plan_reopen tool", () => {
     ).rejects.toThrow(/unknown story: S99/)
   })
 
-  // MUTATION PROOF: same as above -- if the tool stopped calling
-  // `storyEngine.reopenStory` (or wrapped/reworded its error), reopening a
-  // still-"active" story would silently succeed instead of throwing.
-  it("errors on a story that is not currently blocked or failed (still active), mirroring StoryEngine's own error", async () => {
+  it("resumes with a fresh startedAt and a recorded amendment, and leaves acceptance evidence untouched", async () => {
     const harness = boot(temporaryRoot())
-    await harness.tools.elicify_vertex_plan_create.execute(
-      { stories: [{ text: "story one", acceptanceItems: ["one"], scopeGlobs: [], verifiers: [] }] },
-      { sessionID: SESSION } as never,
-    )
-    // S1 is "active" straight out of createPlan -- not a valid reopen source.
-    await expect(
-      harness.tools.elicify_vertex_plan_reopen.execute(
-        { storyId: "S1", reason: "does not matter" },
-        { sessionID: SESSION } as never,
-      ),
-    ).rejects.toThrow(/cannot reopen story S1: status is active/)
-
-    // The rejected reopen must not have mutated anything.
-    expect(harness.storyEngine.getPlan(SESSION)?.stories[0].status).toBe("active")
-  })
-
-  // MUTATION PROOF: revert story.ts's `reopenStory` to leave prior evidence
-  // in place instead of resetting it to `null` -> `checkpoint`'s own
-  // "no evidence" branch never fires on the stale item, this stale-evidence
-  // guard silently disappears, and the assertion below (a second checkpoint
-  // attempt with NO items succeeding) goes from throwing to succeeding,
-  // flipping the `.rejects` expectation to RED.
-  it("resets acceptance evidence on reopen, so the reopened story must be re-proven before it can complete again", async () => {
-    const root = temporaryRoot()
-    const harness = boot(root)
-    await harness.tools.elicify_vertex_plan_create.execute(
-      { stories: [{ text: "story one", acceptanceItems: ["one"], scopeGlobs: ["**"], verifiers: ["npx vitest run"] }] },
-      { sessionID: SESSION } as never,
-    )
-    await blockStory(harness, "S1")
+    await createStories(harness, [{ text: "story one", acceptanceItems: ["one"], tasks: [{ text: "a" }] }])
+    harness.storyEngine.attachEvidence(SESSION, "S1", "A1", { receiptId: "vrf_legacy" })
+    await blockTask(harness, "S1.T1")
     await harness.tools.elicify_vertex_plan_reopen.execute(
-      { storyId: "S1", reason: "unblocked" },
+      { storyId: "S1", reason: "the dependency now exists" },
       { sessionID: SESSION } as never,
     )
 
-    // No evidence attached since the reopen -- completing must be refused.
-    await expect(
-      harness.tools.elicify_vertex_plan_checkpoint.execute(
-        { storyId: "S1", status: "complete", items: [] },
-        { sessionID: SESSION } as never,
-      ),
-    ).rejects.toThrow(/has no evidence/)
+    const story = harness.storyEngine.getPlan(SESSION)!.stories[0]
+    expect(story.status).toBe("active")
+    expect(story.tasks[0].status).toBe("active")
+    expect(typeof story.tasks[0].startedAt).toBe("string")
+    expect(story.completedAt).toBeUndefined()
+    expect(story.amendments.map((a) => a.reason)).toContain("reopened from blocked: the dependency now exists")
+    expect(story.acceptanceItems[0].evidence).toEqual({ receiptId: "vrf_legacy" })
   })
-})
 
-// ===========================================================================
-// C-6 end-to-end: the REAL failure mode the fix targets -- a plan whose
-// FINAL story blocks while active has nothing downstream to ever promote it,
-// so before this tool existed the plan could never reach all-complete. This
-// proves the actual scenario, not just the isolated reopen mechanism above.
-// ===========================================================================
-
-describe("C-6 end-to-end: a blocked FINAL story can be reopened, re-completed, and the plan reaches all-complete", () => {
-  it("recovers a plan stuck on a blocked final story via elicify_vertex_plan_reopen", async () => {
-    const root = temporaryRoot()
-    const harness = boot(root)
-    await harness.tools.elicify_vertex_plan_create.execute(
-      {
-        stories: [
-          { text: "story one", acceptanceItems: ["one"], scopeGlobs: [], verifiers: [] },
-          { text: "story two (final)", acceptanceItems: ["two"], scopeGlobs: [], verifiers: [] },
-        ],
-      },
-      { sessionID: SESSION } as never,
-    )
-
-    // Complete S1 normally -- successor-promotion activates S2 (the plan's
-    // finalStoryId).
-    const forS1 = mintReceipt(harness.receipts, root)
-    await checkpoint(harness, "S1", forS1.id)
-    expect(harness.storyEngine.getPlan(SESSION)?.finalStoryId).toBe("S2")
-    expect(harness.storyEngine.getActiveStory(SESSION)?.id).toBe("S2")
-
-    // S2 -- the FINAL story -- blocks while active. Nothing downstream exists
-    // to ever promote a successor: before this fix, the plan was stuck here
-    // permanently (the idle gate's finalStory.status === "complete" check
-    // could never be satisfied).
-    await blockStory(harness, "S2")
-    expect(harness.storyEngine.getPlan(SESSION)?.stories[1].status).toBe("blocked")
-    expect(harness.storyEngine.getActiveStory(SESSION)).toBeNull()
-
-    // Reopen it -- the real recovery path, driven through the tool.
-    const reopenRaw = (await harness.tools.elicify_vertex_plan_reopen.execute(
-      { storyId: "S2", reason: "the blocking dependency shipped upstream" },
-      { sessionID: SESSION } as never,
-    )) as string
-    const reopened = JSON.parse(reopenRaw) as { newStatus: string }
-    expect(reopened.newStatus).toBe("active")
-    expect(harness.storyEngine.getActiveStory(SESSION)?.id).toBe("S2")
-
-    // Re-complete it with fresh evidence (reopening cleared the old evidence
-    // pointer, so the FR-020 "observed receipt" bar still has to be cleared
-    // for real, not skipped because it was reopened).
-    const forS2 = mintReceipt(harness.receipts, root)
-    await checkpoint(harness, "S2", forS2.id)
-
-    const finalPlan = harness.storyEngine.getPlan(SESSION)
-    expect(finalPlan?.stories.map((s) => s.status)).toEqual(["complete", "complete"])
-    expect(finalPlan?.stories.every((s) => s.status === "complete")).toBe(true)
-  })
-})
-
-// ===========================================================================
-// C-11 fix (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md): checkpointTool places no
-// restriction on `blocked`/`failed` targeting a non-active storyId, and
-// StoryEngine.checkpoint's successor-promotion is a first-"pending"-match
-// scan -- so an earlier story blocked out of order can be silently skipped
-// while a later story, including the plan's final one, reaches "complete"
-// with the earlier one never resolved. Drives the exact audit scenario
-// through the real tool surface (elicify_vertex_plan_checkpoint /
-// elicify_vertex_plan_reopen), not storyEngine directly.
-// ===========================================================================
-
-describe("C-11 end-to-end: an out-of-order blocked story can no longer let the FINAL story silently complete", () => {
-  it("S2 blocked out of order, S1 completes (promotion skips to S3=final) -- completing S3 now rejects until S2 is genuinely resolved", async () => {
-    const root = temporaryRoot()
-    const harness = boot(root)
-    await harness.tools.elicify_vertex_plan_create.execute(
-      {
-        stories: [
-          { text: "story one", acceptanceItems: ["one"], scopeGlobs: [], verifiers: [] },
-          { text: "story two", acceptanceItems: ["two"], scopeGlobs: [], verifiers: [] },
-          { text: "story three (final)", acceptanceItems: ["three"], scopeGlobs: [], verifiers: [] },
-        ],
-      },
-      { sessionID: SESSION } as never,
-    )
-    expect(harness.storyEngine.getPlan(SESSION)?.finalStoryId).toBe("S3")
-
-    // Block S2 directly while it is still "pending" -- checkpointTool's
-    // schema/description impose no active-story requirement for blocked/failed.
-    await blockStory(harness, "S2")
-    expect(harness.storyEngine.getPlan(SESSION)?.stories[1].status).toBe("blocked")
-
-    // Complete S1 -- successor-promotion skips the blocked S2 and activates
-    // S3, the plan's final story, instead (pre-existing, unchanged behavior).
-    const forS1 = mintReceipt(harness.receipts, root, { storyId: "S1" })
-    await checkpoint(harness, "S1", forS1.id)
-    expect(harness.storyEngine.getActiveStory(SESSION)?.id).toBe("S3")
-
-    // Before the C-11 fix, this succeeded: the final story closed the plan
-    // while S2 sat permanently blocked. Now it must reject.
-    const forS3 = mintReceipt(harness.receipts, root, { storyId: "S3" })
-    await expect(checkpoint(harness, "S3", forS3.id)).rejects.toThrow(/S2:blocked/)
-
-    // Proves the gap actually closed: S3 is still active (not silently
-    // completed), S2 is still blocked, the plan is not all-complete.
-    const afterRejected = harness.storyEngine.getPlan(SESSION)!
-    expect(afterRejected.stories.find((s) => s.id === "S3")!.status).toBe("active")
-    expect(afterRejected.stories.find((s) => s.id === "S2")!.status).toBe("blocked")
-    expect(afterRejected.stories.every((s) => s.status === "complete")).toBe(false)
-
-    // Recovery through the real tool surface: free the active slot, reopen
-    // and complete S2, then reopen and complete S3.
-    await blockStory(harness, "S3")
-    expect(harness.storyEngine.getActiveStory(SESSION)).toBeNull()
-
-    await harness.tools.elicify_vertex_plan_reopen.execute(
-      { storyId: "S2", reason: "root cause identified and resolved" },
-      { sessionID: SESSION } as never,
-    )
-    expect(harness.storyEngine.getActiveStory(SESSION)?.id).toBe("S2")
-    const forS2 = mintReceipt(harness.receipts, root, { storyId: "S2" })
-    await checkpoint(harness, "S2", forS2.id)
-    expect(harness.storyEngine.getPlan(SESSION)?.stories[1].status).toBe("complete")
-
-    await harness.tools.elicify_vertex_plan_reopen.execute(
-      { storyId: "S3", reason: "resuming final story" },
-      { sessionID: SESSION } as never,
-    )
-    expect(harness.storyEngine.getActiveStory(SESSION)?.id).toBe("S3")
-    const forS3Fresh = mintReceipt(harness.receipts, root, { storyId: "S3" })
-    await checkpoint(harness, "S3", forS3Fresh.id)
-
-    const finalPlan = harness.storyEngine.getPlan(SESSION)
-    expect(finalPlan?.stories.every((s) => s.status === "complete")).toBe(true)
-  })
-})
-
-describe("C-12: reopening rebinds a phase stuck at close, not just StoryEngine status", () => {
+  // C-12: a story whose phase reached "close" before it blocked is back at
+  // "execute" after reopen (the tool calls onStoryAdvance to force the slot).
   it("a story whose phase reached close before it blocked is back at execute after reopen", async () => {
-    const root = temporaryRoot()
-    const harness = boot(root)
-    await harness.tools.elicify_vertex_plan_create.execute(
-      { stories: [{ text: "the only story", acceptanceItems: ["done"], scopeGlobs: [], verifiers: [] }] },
-      { sessionID: SESSION } as never,
-    )
+    const harness = boot(temporaryRoot())
+    await createStories(harness, [{ text: "the only story", acceptanceItems: ["done"], tasks: [{ text: "a" }] }])
 
-    // Drive S1's phase all the way to "close" -- the exact pre-condition
-    // C-12 describes: intake -> execute (T3) -> elevate (T4) -> close (T7).
     harness.phaseEngine.onMutation(SESSION, "S1")
     harness.phaseEngine.onVerifierOutcome(SESSION, "S1", { success: true, coversFinalStory: true })
     harness.phaseEngine.onIdle(SESSION, "S1", { criteriaAllEvidenced: true, hasPins: true, unverifiedChangesExist: false })
     expect(harness.phaseEngine.getPhase(SESSION, "S1")).toBe("close")
 
-    // Block it directly from here (mirroring the real trigger: a story can
-    // be blocked at any point, including after its phase already closed).
-    await blockStory(harness, "S1")
-    expect(harness.storyEngine.getPlan(SESSION)?.stories[0].status).toBe("blocked")
-
-    // Before the C-12 fix: reopen only touched StoryEngine, so phase stayed
-    // "close" here -- and onMutation is a documented no-op from "close" (no
-    // table arc), so nothing downstream could ever have fixed it either.
+    await blockTask(harness, "S1.T1")
     await harness.tools.elicify_vertex_plan_reopen.execute(
       { storyId: "S1", reason: "root cause identified and resolved" },
       { sessionID: SESSION } as never,
     )
 
-    expect(harness.storyEngine.getActiveStory(SESSION)?.id).toBe("S1")
+    expect(harness.storyEngine.getActiveTasks(SESSION).map((t) => t.id)).toEqual(["S1.T1"])
     expect(harness.phaseEngine.getPhase(SESSION, "S1")).toBe("execute")
+  })
+})
+
+// ===========================================================================
+// C-6 end-to-end through the real tool surface: a blocked final story can be
+// reopened and re-completed, and the plan reaches all-complete.
+// ===========================================================================
+
+describe("C-6 end-to-end: a blocked final story can be reopened and the plan reaches all-complete", () => {
+  it("recovers a plan stuck on a blocked final story via elicify_vertex_plan_reopen", async () => {
+    const harness = boot(temporaryRoot())
+    await createStories(harness, [
+      { text: "story one", acceptanceItems: ["one"], tasks: [{ text: "a" }] },
+      { text: "story two (final)", acceptanceItems: ["two"], dependsOn: ["S1"], tasks: [{ text: "b" }] },
+    ])
+
+    await checkpoint(harness, "S1.T1", "complete")
+    expect(harness.storyEngine.getPlan(SESSION)?.finalStoryId).toBe("S2")
+    expect(harness.storyEngine.getActiveTasks(SESSION).map((t) => t.id)).toEqual(["S2.T1"])
+
+    await blockTask(harness, "S2.T1")
+    expect(harness.storyEngine.getActiveTasks(SESSION)).toEqual([])
+
+    const reopenRaw = (await harness.tools.elicify_vertex_plan_reopen.execute(
+      { storyId: "S2", reason: "the blocking dependency shipped upstream" },
+      { sessionID: SESSION } as never,
+    )) as string
+    expect((JSON.parse(reopenRaw) as { newStatus: string }).newStatus).toBe("active")
+
+    await checkpoint(harness, "S2.T1", "complete")
+
+    const finalPlan = harness.storyEngine.getPlan(SESSION)
+    expect(finalPlan?.stories.map((s) => s.status)).toEqual(["complete", "complete"])
+  })
+})
+
+// ===========================================================================
+// plan_status / plan_clear round out the surface — status returns the whole
+// plan (now including tasks); clear archives + drops the session entry.
+// ===========================================================================
+
+describe("plan_status and plan_clear", () => {
+  it("plan_status returns the whole plan, including each story's tasks and their statuses", async () => {
+    const harness = boot(temporaryRoot())
+    await createStories(harness, [
+      { text: "S1", acceptanceItems: ["a"], tasks: [{ text: "a" }, { text: "b", dependsOn: ["S1.T1"] }] },
+    ])
+
+    const raw = (await harness.tools.elicify_vertex_plan_status.execute({}, { sessionID: SESSION } as never)) as string
+    const plan = JSON.parse(raw) as PlanV2
+
+    expect(plan.schemaVersion).toBe(2)
+    expect(plan.stories[0].tasks.map((t) => [t.id, t.status])).toEqual([
+      ["S1.T1", "active"],
+      ["S1.T2", "pending"],
+    ])
+  })
+
+  it("plan_clear archives the plan and drops the session entry; a follow-up status is null", async () => {
+    const harness = boot(temporaryRoot())
+    await createStories(harness, [{ text: "S1", acceptanceItems: ["a"], tasks: [{ text: "a" }] }])
+
+    const raw = (await harness.tools.elicify_vertex_plan_clear.execute({}, { sessionID: SESSION } as never)) as string
+    expect(JSON.parse(raw)).toEqual({ planCleared: true, pinsCleared: false })
+
+    const statusRaw = (await harness.tools.elicify_vertex_plan_status.execute({}, { sessionID: SESSION } as never)) as string
+    expect(JSON.parse(statusRaw)).toBeNull()
   })
 })

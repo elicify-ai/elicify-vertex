@@ -48,8 +48,11 @@ function denyAllAgent(name: string): Agent {
     name,
     mode: "subagent",
     builtIn: false,
-    permission: { edit: "deny", bash: { "*": "deny" }, webfetch: "deny" },
-    tools: { bash: false, edit: false, write: false, webfetch: false, read: false, "*": false },
+    // Deny the UNION of both probe policies so the same stub satisfies the
+    // intake default policy (edit/bash/webfetch) AND the judge's
+    // JUDGE_PROBE_POLICY (edit/write/webfetch/task) — see src/v2/subturn.ts.
+    permission: { edit: "deny", write: "deny", bash: { "*": "deny" }, webfetch: "deny", task: "deny" },
+    tools: { bash: false, edit: false, write: false, webfetch: false, read: false, task: false, "*": false },
     options: {},
   } as Agent
 }
@@ -378,7 +381,18 @@ describe("verification receipt surfaced to the model (v1 parity fix)", () => {
     expect((toolOutput.metadata as Record<string, unknown>).vertexVerificationReceiptId).toBeUndefined()
   })
 
-  it("a receipt surfaced via tool output round-trips as a valid checkpoint receiptId", async () => {
+  it("a passing verifier still mints a receipt, and a task-level completion claim completes the story with no citation (task-model equivalent of receipt round-trip)", async () => {
+    // REWRITTEN for the 2026-07-30 task/DAG redesign. The original test asserted
+    // that a receipt surfaced by tool.execute.after "round-trips as a valid
+    // checkpoint receiptId" — i.e. the OLD elicify_vertex_plan_checkpoint
+    // validated per-item receipt/waiver citations (FR-020) and accepted that
+    // id. That citation apparatus is GONE: a checkpoint is now a bare CLAIM on
+    // a TASK id, and the completion judge (at idle) is the sole arbiter of
+    // whether the claim holds. The receipt is still minted by
+    // tool.execute.after's unchanged verification-recognition path, so the
+    // coverage preserved here is its task-model equivalent: the verifier
+    // still surfaces a receipt, AND a task-level claim completes the story
+    // WITHOUT quoting any receipt/waiver (the judge audits it later).
     const client = makeStubClient()
     const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
     const sid = "receipt-checkpoint-session"
@@ -386,28 +400,25 @@ describe("verification receipt surfaced to the model (v1 parity fix)", () => {
     await activate(hooks, sid, "refactor the auth database migration end to end")
     await toolAfter(hooks, sid, "edit", { filePath: "src/foo.ts" }, "updated")
 
-    // Plan must exist (and the story must have started) BEFORE the
-    // verifying command runs — isFreshReceipt (tools.ts) correctly rejects a
-    // receipt observed earlier than the story's own startedAt (FR-020: a
-    // receipt must not predate the story it's evidence for).
     const plan = await hooks.tool!.elicify_vertex_plan_create!.execute!(
-      { stories: [{ text: "do it", acceptanceItems: ["A1"], scopeGlobs: [], verifiers: [] }] } as never,
+      { stories: [{ text: "do it", acceptanceItems: ["A1"], scopeGlobs: [], verifiers: [], tasks: [{ text: "do the work" }] }] } as never,
       { sessionID: sid } as never,
     )
-    const storyId = JSON.parse(plan as string).stories[0].id
-    const itemId = JSON.parse(plan as string).stories[0].acceptanceItems[0].id
+    const taskId = (JSON.parse(plan as string) as { stories: Array<{ tasks: Array<{ id: string }> }> }).stories[0].tasks[0].id
 
     const toolOutput = { title: "bash", output: "20 passed", metadata: { exit: 0 } }
     await hooks["tool.execute.after"]!(
       { tool: "bash", sessionID: sid, callID: "bash-1", args: { command: "npx vitest run" } } as never,
       toolOutput as never,
     )
+    // The receipt is still minted and surfaced (verification-recognition path unchanged).
     const match = toolOutput.output.match(/\[vertex:verification-receipt\] (\S+)/)
     expect(match).not.toBeNull()
-    const receiptId = match![1]
 
+    // A task-level completion claim completes the story with NO receipt/waiver
+    // citation — the redesign removed that contract entirely.
     const checkpointResult = await hooks.tool!.elicify_vertex_plan_checkpoint!.execute!(
-      { storyId, status: "complete", items: [{ id: itemId, receiptId }] } as never,
+      { taskId, status: "complete" } as never,
       { sessionID: sid } as never,
     )
     const checkpointed = JSON.parse(checkpointResult as string)
@@ -783,7 +794,7 @@ describe("D1 regression: a covering verifier mints a receipt", () => {
     await hooks.tool!.elicify_vertex_plan_create!.execute!(
       {
         stories: [
-          { text: "do the work", acceptanceItems: ["it works"], scopeGlobs: ["internal/**"], verifiers },
+          { text: "do the work", acceptanceItems: ["it works"], scopeGlobs: ["internal/**"], verifiers, tasks: [{ text: "do the work" }] },
         ],
       } as never,
       { sessionID: sid } as never,
@@ -1006,7 +1017,7 @@ describe("post-review fixes", () => {
 
   async function planWith(hooks: Hooks, sid: string, verifiers: string[]) {
     await hooks.tool!.elicify_vertex_plan_create!.execute!(
-      { stories: [{ text: "w", acceptanceItems: ["ok"], scopeGlobs: ["internal/**"], verifiers }] } as never,
+      { stories: [{ text: "w", acceptanceItems: ["ok"], scopeGlobs: ["internal/**"], verifiers, tasks: [{ text: "do the work" }] }] } as never,
       { sessionID: sid } as never,
     )
   }
@@ -1385,18 +1396,23 @@ describe("file.edited is a deliberate no-op; tool.execute.after carries attribut
 })
 describe("persisted receipts survive a restart and are visible to the gate", () => {
   it("hydrates a receipt minted by a previous plugin instance", async () => {
+    // REWRITTEN for the 2026-07-30 task/DAG redesign. The original test proved a
+    // receipt minted by plugin instance A was still accepted by instance B's
+    // elicify_vertex_plan_checkpoint after a restart (the OLD checkpoint
+    // validated receipt citations). A checkpoint is now a bare CLAIM on a TASK
+    // id and no longer reads receipts at all — so "visible to the gate via
+    // checkpoint citation" is gone. What survives (and is still asserted here)
+    // is the persistence/hydration path itself: the receipt is minted by
+    // instance A's tool.execute.after and the hydrated store is observable
+    // after a restart, while the task-level claim completes the story with no
+    // citation (the completion judge, not the checkpoint, audits claims).
     const clientA = makeStubClient()
     const hooksA = await ElicifyVertexPluginV2(pluginInput(clientA), undefined)
     const sid = "restart-session"
 
     await activate(hooksA, sid, "implement the production database migration")
-    // The plan must exist BEFORE the verifier runs: a receipt is linked to the
-    // story that was active when it was observed, and a receipt earned before
-    // the story existed must not complete it. That linkage is the feature, not
-    // an obstacle -- an earlier draft of this test got the order wrong and was
-    // correctly refused twice over (null story link, and observedAt < startedAt).
     await hooksA.tool!.elicify_vertex_plan_create!.execute!(
-      { stories: [{ text: "w", acceptanceItems: ["ok"], scopeGlobs: ["**"], verifiers: ["go test ./..."] }] } as never,
+      { stories: [{ text: "w", acceptanceItems: ["ok"], scopeGlobs: ["**"], verifiers: ["go test ./..."], tasks: [{ text: "do the work" }] }] } as never,
       { sessionID: sid } as never,
     )
     const out = { title: "bash", output: "ok  pkg  0.01s", metadata: { exit: 0 } }
@@ -1412,11 +1428,14 @@ describe("persisted receipts survive a restart and are visible to the gate", () 
     const hooksB = await ElicifyVertexPluginV2(pluginInput(clientB), undefined)
     await activate(hooksB, sid, "implement the production database migration")
 
+    // The task-level claim completes the story after the restart — no receipt
+    // citation is needed or accepted (the receipt store still hydrates; it is
+    // simply no longer the checkpoint's concern).
     const res = await hooksB.tool!.elicify_vertex_plan_checkpoint!.execute!(
-      { storyId: "S1", status: "complete", receiptId, items: [{ id: "A1", receiptId }] } as never,
+      { taskId: "S1.T1", status: "complete" } as never,
       { sessionID: sid } as never,
     )
-    expect(JSON.stringify(res)).not.toMatch(/not an observed receipt/i)
+    expect((JSON.parse(res as string) as { stories: Array<{ status: string }> }).stories[0].status).toBe("complete")
   })
 })
 
@@ -1695,7 +1714,10 @@ describe("fetchJudgeTranscriptFields: messagesImpl override wired through this f
       { info: { id: "m2", role: "assistant" }, parts: [{ type: "text", text: "final assistant answer for the judge to see" }] },
     ]
     const client = makeStubClient({
-      promptText: (agent) => (agent === "vertex-judge" ? '{"fit":"pass","summary":"ok","gaps":[]}' : '{"multiStory":false}'),
+      promptText: (agent) =>
+        agent === "vertex-judge"
+          ? '{"stories":[{"storyId":"S1","pass":true,"summary":"ok","items":[{"itemId":"A1","met":true,"note":"observed"}]}]}'
+          : '{"multiStory":false}',
       messagesImpl: async () => ({ data: transcript, error: undefined }),
     })
     const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
@@ -1707,12 +1729,11 @@ describe("fetchJudgeTranscriptFields: messagesImpl override wired through this f
     await activate(hooks, sid, "fix a typo in the readme", { providerID: "minimax", id: "MiniMax-M3" })
 
     const planRaw = await hooks.tool!.elicify_vertex_plan_create!.execute!(
-      { stories: [{ text: "the only story", acceptanceItems: ["criterion one"], scopeGlobs: [], verifiers: ["npx vitest run"] }] } as never,
+      { stories: [{ text: "the only story", acceptanceItems: ["criterion one"], scopeGlobs: [], verifiers: ["npx vitest run"], tasks: [{ text: "do the only story" }] }] } as never,
       { sessionID: sid } as never,
     )
-    const plan = JSON.parse(planRaw as string) as { stories: Array<{ id: string; acceptanceItems: Array<{ id: string }> }> }
-    const storyId = plan.stories[0].id
-    const itemId = plan.stories[0].acceptanceItems[0].id
+    const plan = JSON.parse(planRaw as string) as { stories: Array<{ tasks: Array<{ id: string }> }> }
+    const taskId = plan.stories[0].tasks[0].id
 
     await toolAfter(hooks, sid, "edit", { filePath: "src/foo.ts" }, "updated")
     const toolOutput = { title: "bash", output: "20 passed", metadata: { exit: 0 } }
@@ -1723,8 +1744,10 @@ describe("fetchJudgeTranscriptFields: messagesImpl override wired through this f
     const receiptMatch = toolOutput.output.match(/\[vertex:verification-receipt\] (\S+)/)
     expect(receiptMatch).not.toBeNull()
 
+    // Task-level completion claim (the receipt is still minted above by the
+    // unchanged verification path; the checkpoint no longer cites it).
     await hooks.tool!.elicify_vertex_plan_checkpoint!.execute!(
-      { storyId, status: "complete", items: [{ id: itemId, receiptId: receiptMatch![1] }] } as never,
+      { taskId, status: "complete" } as never,
       { sessionID: sid } as never,
     )
 

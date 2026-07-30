@@ -30,13 +30,41 @@ vi.mock("../../src/v2/subturn.js", async (importOriginal) => {
 })
 
 import { buildJudgePayload, JUDGE_TOTAL_BUDGET_MS, runJudge, parseJudgeResponse } from "../../src/v2/judge.js"
-import { probeCapabilityBounded, runSubturn, SelfCreatedSessions } from "../../src/v2/subturn.js"
+import { JUDGE_PROBE_POLICY, probeCapabilityBounded, runSubturn, SelfCreatedSessions } from "../../src/v2/subturn.js"
 import type { OpencodeClient } from "../../src/v2/types.js"
 
 const mockProbeCapabilityBounded = vi.mocked(probeCapabilityBounded)
 const mockRunSubturn = vi.mocked(runSubturn)
 
-const DENY_MAP = { bash: false, edit: false, webfetch: false, "*": false }
+// HANDOVER.md point 3: the judge's tool map is no longer a pure deny map —
+// the read-only tools (read/grep/glob/list/bash) resolve true, everything
+// else false. runJudge must thread whatever the (mocked) bounded probe
+// returns straight into the subturn's `tools` field.
+const JUDGE_TOOLS_MAP = {
+  read: true,
+  grep: true,
+  glob: true,
+  list: true,
+  bash: true,
+  edit: false,
+  write: false,
+  webfetch: false,
+  task: false,
+  "*": false,
+}
+
+// HANDOVER.md point 4 verdict shape: one story entry, one item entry per
+// acceptance item; pass requires every item met.
+const PASS_VERDICT = {
+  stories: [
+    {
+      storyId: "S1",
+      pass: true,
+      summary: "all items observed",
+      items: [{ itemId: "A1", met: true, note: "verifier re-run passed" }],
+    },
+  ],
+}
 
 function makeClient(): OpencodeClient {
   return {
@@ -48,8 +76,8 @@ function makeClient(): OpencodeClient {
 
 beforeEach(() => {
   vi.clearAllMocks()
-  mockProbeCapabilityBounded.mockResolvedValue({ ok: true, tools: DENY_MAP })
-  mockRunSubturn.mockResolvedValue({ ok: true, text: '{"fit":"pass","summary":"looks fine","gaps":[]}' })
+  mockProbeCapabilityBounded.mockResolvedValue({ ok: true, tools: JUDGE_TOOLS_MAP })
+  mockRunSubturn.mockResolvedValue({ ok: true, text: JSON.stringify(PASS_VERDICT) })
 })
 
 // ===========================================================================
@@ -65,7 +93,7 @@ describe("buildJudgePayload", () => {
       diffSummary: ["@@ -1,2 +1,2 @@", "-const sorted = input", "+const sorted = input.sort()"].join("\n"),
       verifierSummaries: ["3 passed, 0 failed"],
       lastResponse: "",
-      recentTranscript: "",
+      recentTranscript: "", plan: "",
     }
     const payload = buildJudgePayload(raw, logger)
     expect(payload).toEqual({
@@ -89,13 +117,13 @@ describe("buildJudgePayload", () => {
       diffSummary: "@@ -1,1 +1,1 @@\n+ordinary line",
       verifierSummaries: ["verifier ok"],
       lastResponse: "",
-      recentTranscript: "",
+      recentTranscript: "", plan: "",
     }
     const payload = buildJudgePayload(raw, logger)
     expect(JSON.stringify(payload)).not.toContain("NARRATIVE_CANARY")
     expect(
       Object.keys(payload).every((k) =>
-        ["criteria", "diffSummary", "verifierSummaries", "lastResponse", "recentTranscript"].includes(k),
+        ["criteria", "diffSummary", "verifierSummaries", "lastResponse", "recentTranscript", "plan"].includes(k),
       ),
     ).toBe(true)
   })
@@ -109,7 +137,7 @@ describe("buildJudgePayload", () => {
       diffSummary: [cleanHunk, secretHunk].join("\n"),
       verifierSummaries: [],
       lastResponse: "",
-      recentTranscript: "",
+      recentTranscript: "", plan: "",
     }
     const payload = buildJudgePayload(raw, logger)
     expect(payload.diffSummary).toBe(cleanHunk)
@@ -135,7 +163,7 @@ describe("buildJudgePayload", () => {
       '+const key = "sk-live-abc123',
       'def456ghi789jklmno"',
     ].join("\n")
-    const raw = { criteria: [], diffSummary: hunkWithSplitSecret, verifierSummaries: [], lastResponse: "", recentTranscript: "" }
+    const raw = { criteria: [], diffSummary: hunkWithSplitSecret, verifierSummaries: [], lastResponse: "", recentTranscript: "", plan: "" }
     const payload = buildJudgePayload(raw, logger)
     expect(payload.diffSummary).toBeUndefined()
     expect(logger).toHaveBeenCalledWith("judge:field-dropped", { field: "diffSummary" })
@@ -149,7 +177,7 @@ describe("buildJudgePayload", () => {
       diffSummary: "",
       verifierSummaries: [`build hash ${hexToken} recorded`, "5 passed, 0 failed"],
       lastResponse: "",
-      recentTranscript: "",
+      recentTranscript: "", plan: "",
     }
     const payload = buildJudgePayload(raw, logger)
     expect(payload.verifierSummaries).toEqual(["5 passed, 0 failed"])
@@ -168,7 +196,7 @@ describe("buildJudgePayload", () => {
       diffSummary: "",
       verifierSummaries: [line1, line2, "2 passed, 0 failed"],
       lastResponse: "",
-      recentTranscript: "",
+      recentTranscript: "", plan: "",
     }
     const payload = buildJudgePayload(raw, logger)
     expect(payload.verifierSummaries).toEqual(["2 passed, 0 failed"])
@@ -188,7 +216,7 @@ describe("buildJudgePayload", () => {
       diffSummary: "",
       verifierSummaries: [],
       lastResponse: "",
-      recentTranscript: "",
+      recentTranscript: "", plan: "",
     }
     const payload = buildJudgePayload(raw, logger)
     expect(payload.criteria).toBeUndefined()
@@ -198,7 +226,7 @@ describe("buildJudgePayload", () => {
   it("row 8 / test 39: an oversized clean verifier summary is truncated to the field cap after scanning (C-9: scan-then-truncate)", () => {
     const logger = vi.fn()
     const longClean = "ok ".repeat(1334) // ~4002 chars, well past the 2000-char field cap, no secrets
-    const raw = { criteria: [], diffSummary: "", verifierSummaries: [longClean], lastResponse: "", recentTranscript: "" }
+    const raw = { criteria: [], diffSummary: "", verifierSummaries: [longClean], lastResponse: "", recentTranscript: "", plan: "" }
     const payload = buildJudgePayload(raw, logger)
     expect(payload.verifierSummaries).toBeDefined()
     const survivingLength = payload.verifierSummaries!.join("\n").length
@@ -235,7 +263,7 @@ describe("buildJudgePayload", () => {
       diffSummary: "",
       verifierSummaries: [secretPastOldBoundary],
       lastResponse: "",
-      recentTranscript: "",
+      recentTranscript: "", plan: "",
     }
     const payload2 = buildJudgePayload(raw2, logger)
     expect(payload2.verifierSummaries).toBeUndefined()
@@ -251,7 +279,7 @@ describe("buildJudgePayload", () => {
       diffSummary: "",
       verifierSummaries: ["short summary"],
       lastResponse: "",
-      recentTranscript: "",
+      recentTranscript: "", plan: "",
     }
     buildJudgePayload(raw, logger)
     expect(logger).not.toHaveBeenCalled()
@@ -268,7 +296,7 @@ describe("buildJudgePayload", () => {
     // nothing left to truncate, so judge:field-truncated no longer fires
     // for this case at all.
     const secretText = 'const key = "sk-live-abc123def456ghi789jkl012mno345pqr" ' + "x".repeat(3000)
-    const raw = { criteria: [], diffSummary: "", verifierSummaries: [secretText], lastResponse: "", recentTranscript: "" }
+    const raw = { criteria: [], diffSummary: "", verifierSummaries: [secretText], lastResponse: "", recentTranscript: "", plan: "" }
     const payload = buildJudgePayload(raw, logger)
     expect(payload.verifierSummaries).toBeUndefined()
     expect(logger).toHaveBeenCalledTimes(1)
@@ -289,7 +317,7 @@ describe("buildJudgePayload", () => {
       diffSummary: "",
       verifierSummaries: [secretLine, longCleanLine],
       lastResponse: "",
-      recentTranscript: "",
+      recentTranscript: "", plan: "",
     }
     const payload = buildJudgePayload(raw, logger)
     expect(payload.verifierSummaries).toBeDefined()
@@ -323,7 +351,7 @@ describe("buildJudgePayload", () => {
     const text = filler + jwt
     expect(text.length).toBe(CAP + 1)
 
-    const raw = { criteria: [], diffSummary: "", verifierSummaries: [text], lastResponse: "", recentTranscript: "" }
+    const raw = { criteria: [], diffSummary: "", verifierSummaries: [text], lastResponse: "", recentTranscript: "", plan: "" }
     const payload = buildJudgePayload(raw, logger)
 
     // Redact-then-truncate: the scan sees the WHOLE field — including
@@ -351,6 +379,7 @@ describe("buildJudgePayload", () => {
       verifierSummaries: [],
       lastResponse: "",
       recentTranscript: `assistant: here is the raw value ${highEntropyToken} for reference`,
+      plan: "",
     }
     const payload = buildJudgePayload(raw, logger)
     expect(payload.recentTranscript).toBeUndefined()
@@ -369,7 +398,7 @@ describe("buildJudgePayload", () => {
       diffSummary: "",
       verifierSummaries: [],
       lastResponse: "our client secret ends up being 8f3ac9d2e1b74c0aa9f2d8e7c1b3a4f6",
-      recentTranscript: "",
+      recentTranscript: "", plan: "",
     }
     const payload = buildJudgePayload(raw, logger)
     expect(payload.lastResponse).toBeUndefined()
@@ -388,7 +417,7 @@ describe("buildJudgePayload", () => {
       diffSummary: "",
       verifierSummaries: [`fixed in commit ${fullSha}`],
       lastResponse: "",
-      recentTranscript: "",
+      recentTranscript: "", plan: "",
     }
     const payload = buildJudgePayload(raw, logger)
     expect(payload.verifierSummaries).toBeUndefined()
@@ -403,7 +432,7 @@ describe("buildJudgePayload", () => {
     // attempt here would need to distinguish this from ordinary prose, which
     // risks reopening C-8's false-positive problem.
     const text = "she pasted the password hunter2CorrectHorseBatteryStaple99 in the chat by mistake"
-    const raw = { criteria: [], diffSummary: "", verifierSummaries: [], lastResponse: text, recentTranscript: "" }
+    const raw = { criteria: [], diffSummary: "", verifierSummaries: [], lastResponse: text, recentTranscript: "", plan: "" }
     const payload = buildJudgePayload(raw, logger)
     expect(payload.lastResponse).toBe(text)
     expect(logger).not.toHaveBeenCalled()
@@ -415,7 +444,7 @@ describe("buildJudgePayload", () => {
     // realistic evidence field, so a field this large is treated as
     // pathological and dropped whole rather than paying the full scan cost.
     const oversized = "x".repeat(100_001)
-    const raw = { criteria: [], diffSummary: "", verifierSummaries: [], lastResponse: oversized, recentTranscript: "" }
+    const raw = { criteria: [], diffSummary: "", verifierSummaries: [], lastResponse: oversized, recentTranscript: "", plan: "" }
     const payload = buildJudgePayload(raw, logger)
     expect(payload.lastResponse).toBeUndefined()
     expect(logger).toHaveBeenCalledWith("judge:field-oversized", {
@@ -434,7 +463,7 @@ describe("buildJudgePayload", () => {
       diffSummary: "",
       verifierSummaries: [`analysis: ${prose} completed cleanly`],
       lastResponse: "",
-      recentTranscript: "",
+      recentTranscript: "", plan: "",
     }
     const payload = buildJudgePayload(raw, logger)
     expect(payload.verifierSummaries).toEqual([`analysis: ${prose} completed cleanly`])
@@ -444,7 +473,7 @@ describe("buildJudgePayload", () => {
   it("empty raw fields are omitted (not present as empty array/string) without logging field-dropped", () => {
     const logger = vi.fn()
     const payload = buildJudgePayload(
-      { criteria: [], diffSummary: "", verifierSummaries: [], lastResponse: "", recentTranscript: "" },
+      { criteria: [], diffSummary: "", verifierSummaries: [], lastResponse: "", recentTranscript: "", plan: "" },
       logger,
     )
     expect(payload).toEqual({})
@@ -458,7 +487,7 @@ describe("buildJudgePayload", () => {
       diffSummary: "",
       verifierSummaries: [],
       lastResponse: "",
-      recentTranscript: "",
+      recentTranscript: "", plan: "",
     }
     const payload = buildJudgePayload(raw, logger)
     expect(payload.criteria).toEqual(["clean criterion one", "clean criterion two"])
@@ -481,6 +510,7 @@ describe("buildJudgePayload", () => {
       verifierSummaries: [],
       lastResponse: "All acceptance criteria are covered by the new tests.",
       recentTranscript: "user: please finish this\nassistant: done, tests pass",
+      plan: "",
     }
     const payload = buildJudgePayload(raw, logger)
     expect(payload.lastResponse).toBe(raw.lastResponse)
@@ -496,7 +526,7 @@ describe("buildJudgePayload", () => {
       diffSummary: "",
       verifierSummaries: [],
       lastResponse: `I finished the task. Here is the key I used: ${secret}`,
-      recentTranscript: "",
+      recentTranscript: "", plan: "",
     }
     const payload = buildJudgePayload(raw, logger)
     expect(payload.lastResponse).toBeUndefined()
@@ -516,6 +546,7 @@ describe("buildJudgePayload", () => {
       // field is emptied by the scan — the direct analogue of row 4's
       // "token split across a hunk boundary -> whole diffSummary dropped".
       recentTranscript: `assistant: the key I used is ${secret}, all set`,
+      plan: "",
     }
     const payload = buildJudgePayload(raw, logger)
     expect(payload.recentTranscript).toBeUndefined()
@@ -532,6 +563,7 @@ describe("buildJudgePayload", () => {
       verifierSummaries: [],
       lastResponse: "",
       recentTranscript: `user: go ahead\nassistant: using ${secret} now\nassistant: all tests pass`,
+      plan: "",
     }
     const payload = buildJudgePayload(raw, logger)
     expect(payload.recentTranscript).toBeDefined()
@@ -552,6 +584,7 @@ describe("buildJudgePayload", () => {
       verifierSummaries: [],
       lastResponse: "",
       recentTranscript: longClean,
+      plan: "",
     }
     const payload = buildJudgePayload(raw, logger)
     expect(payload.recentTranscript).toBeDefined()
@@ -571,7 +604,7 @@ describe("buildJudgePayload", () => {
       diffSummary: "",
       verifierSummaries: [],
       lastResponse: longClean,
-      recentTranscript: "",
+      recentTranscript: "", plan: "",
     }
     const payload = buildJudgePayload(raw, logger)
     expect(payload.lastResponse).toBeDefined()
@@ -586,11 +619,67 @@ describe("buildJudgePayload", () => {
   it("§5: empty lastResponse/recentTranscript are omitted, same as the other empty fields", () => {
     const logger = vi.fn()
     const payload = buildJudgePayload(
-      { criteria: [], diffSummary: "", verifierSummaries: [], lastResponse: "", recentTranscript: "" },
+      { criteria: [], diffSummary: "", verifierSummaries: [], lastResponse: "", recentTranscript: "", plan: "" },
       logger,
     )
     expect(payload).toEqual({})
     expect(logger).not.toHaveBeenCalled()
+  })
+
+  // =========================================================================
+  // HANDOVER.md point 4 — the `plan` field (rendered plan digest: stories,
+  // statuses, acceptance items, declared verifiers) goes through the SAME
+  // scan-then-truncate pipeline as recentTranscript, with its own 4000 cap.
+  // =========================================================================
+
+  it("point 4: a clean plan digest transmits unchanged", () => {
+    const logger = vi.fn()
+    const planDigest = [
+      "S1 [claimed-complete] Build the trace model",
+      "  A1: NormalizedTrace exists with fields X/Y/Z",
+      "  verifiers: make check",
+      "S2 [claimed-complete] Wire the CLI",
+      "  A1: cli --help exits 0",
+    ].join("\n")
+    const raw = { criteria: [], diffSummary: "", verifierSummaries: [], lastResponse: "", recentTranscript: "", plan: planDigest }
+    const payload = buildJudgePayload(raw, logger)
+    expect(payload.plan).toBe(planDigest)
+    expect(logger).not.toHaveBeenCalled()
+  })
+
+  it("point 4: a secret embedded in the plan field is dropped exactly like one embedded in recentTranscript", () => {
+    const logger = vi.fn()
+    const secret = "sk-live-abc123def456ghi789jkl012mno345pqr"
+    const raw = {
+      criteria: [],
+      diffSummary: "",
+      verifierSummaries: [],
+      lastResponse: "",
+      recentTranscript: "",
+      // Single line (no other lines to survive independently) so the whole
+      // field is emptied by the scan — the direct analogue of the §5
+      // recentTranscript single-line secret test.
+      plan: `S1 [claimed-complete] deploy — A1: service live with key ${secret}`,
+    }
+    const payload = buildJudgePayload(raw, logger)
+    expect(payload.plan).toBeUndefined()
+    expect(JSON.stringify(payload)).not.toContain(secret)
+    expect(logger).toHaveBeenCalledWith("judge:field-dropped", { field: "plan" })
+  })
+
+  it("point 4: an oversized clean plan is truncated to its own 4000-char cap (C-9 scan-then-truncate), not the 2000 field cap", () => {
+    const logger = vi.fn()
+    const longPlan = "story line ok\n".repeat(400) // 5600 chars, past 4000, no secrets
+    const raw = { criteria: [], diffSummary: "", verifierSummaries: [], lastResponse: "", recentTranscript: "", plan: longPlan }
+    const payload = buildJudgePayload(raw, logger)
+    expect(payload.plan).toBeDefined()
+    expect(payload.plan!.length).toBeLessThanOrEqual(4000)
+    expect(payload.plan!.length).toBeGreaterThan(2000) // proves the 2000 field cap was NOT applied
+    expect(logger).toHaveBeenCalledWith("judge:field-truncated", {
+      field: "plan",
+      originalLength: longPlan.length,
+      cap: 4000,
+    })
   })
 })
 
@@ -628,6 +717,7 @@ describe("judge:field-partial-drop", () => {
         "assistant: I made sure no secrets leaked into the log output.",
         "assistant: all tests pass",
       ].join("\n"),
+      plan: "",
     }
     const payload = buildJudgePayload(raw, logger)
     expect(payload.recentTranscript).toBe(raw.recentTranscript)
@@ -647,6 +737,7 @@ describe("judge:field-partial-drop", () => {
         `assistant: the key I used is ${secret}`,
         "assistant: all tests pass",
       ].join("\n"),
+      plan: "",
     }
     const payload = buildJudgePayload(raw, logger)
 
@@ -675,6 +766,7 @@ describe("judge:field-partial-drop", () => {
       verifierSummaries: ["all good"],
       lastResponse: "everything looks fine",
       recentTranscript: "user: go\nassistant: done, all clean",
+      plan: "",
     }
     const payload = buildJudgePayload(raw, logger)
     expect(payload.criteria).toEqual(raw.criteria)
@@ -692,7 +784,7 @@ describe("judge:field-partial-drop", () => {
       diffSummary: "",
       verifierSummaries: [],
       lastResponse: `the key I used is ${secret}`,
-      recentTranscript: "",
+      recentTranscript: "", plan: "",
     }
     const payload = buildJudgePayload(raw, logger)
     expect(payload.lastResponse).toBeUndefined()
@@ -708,18 +800,29 @@ describe("judge:field-partial-drop", () => {
 describe("runJudge", () => {
   const basePayload = { criteria: ["c1"], diffSummary: "@@ -1,1 +1,1 @@\n+ok", verifierSummaries: ["ok"] }
 
-  it('BDD "Judge verdict appended without gating the checkpoint": a configured judge stub returning {fit:"concern", summary, gaps} resolves cleanly', async () => {
-    const gaps = [
-      {
-        issue: "criterion 2 evidence is type-only",
-        evidence: "verifier summary only reports a typecheck, not a test run",
-        fix: "run the test suite and cite its output",
-      },
-    ]
-    mockRunSubturn.mockResolvedValue({
-      ok: true,
-      text: JSON.stringify({ fit: "concern", summary: "criterion 2 evidence is type-only", gaps }),
-    })
+  it('BDD "Judge verdict appended without gating the checkpoint": a configured judge stub returning a per-story/per-item verdict resolves cleanly', async () => {
+    // HANDOVER.md point 4: a failing story names exactly which acceptance
+    // items are unmet and why, per item — the detail continuations consume.
+    const verdict = {
+      stories: [
+        {
+          storyId: "S1",
+          pass: true,
+          summary: "model exists with the declared fields",
+          items: [{ itemId: "A1", met: true, note: "NormalizedTrace found in src/model.ts with X/Y/Z" }],
+        },
+        {
+          storyId: "S2",
+          pass: false,
+          summary: "one item unverified",
+          items: [
+            { itemId: "A1", met: true, note: "cli --help exits 0 (re-ran it myself)" },
+            { itemId: "A2", met: false, note: "declared verifier `make check` fails on test 37" },
+          ],
+        },
+      ],
+    }
+    mockRunSubturn.mockResolvedValue({ ok: true, text: JSON.stringify(verdict) })
     const client = makeClient()
     const logger = vi.fn()
     const result = await runJudge(
@@ -731,7 +834,7 @@ describe("runJudge", () => {
         payload: basePayload,
       },
     )
-    expect(result).toEqual({ verdict: { fit: "concern", summary: "criterion 2 evidence is type-only", gaps } })
+    expect(result).toEqual({ verdict })
     // No judge:* failure event on a clean success.
     expect(logger).not.toHaveBeenCalled()
   })
@@ -752,7 +855,9 @@ describe("runJudge", () => {
     expect(req.model).toEqual({ providerID: "minimax", modelID: "MiniMax-M3" })
     expect(req.agent).toBe("vertex-judge")
     expect(req.parentSessionID).toBe("session-123")
-    expect(req.tools).toEqual(DENY_MAP)
+    // HANDOVER.md point 3: the allow-aware tool map from the probe is
+    // threaded through verbatim as the subturn's `tools` field.
+    expect(req.tools).toEqual(JUDGE_TOOLS_MAP)
   })
 
   it('BDD "Configured judgeModel failure falls back to the session model": retry uses session model within the shared 5s budget', async () => {
@@ -761,7 +866,7 @@ describe("runJudge", () => {
         await new Promise((r) => setTimeout(r, 30)) // simulate real elapsed time before the failure
         return { ok: false, reason: "provider rejected the request" }
       })
-      .mockResolvedValueOnce({ ok: true, text: JSON.stringify({ fit: "pass", summary: "ok on retry", gaps: [] }) })
+      .mockResolvedValueOnce({ ok: true, text: JSON.stringify(PASS_VERDICT) })
 
     const client = makeClient()
     const result = await runJudge(
@@ -781,9 +886,9 @@ describe("runJudge", () => {
     expect(firstReq.model).toEqual({ providerID: "provider-x", modelID: "model-y" })
     expect(secondReq.model).toEqual({ providerID: "minimax", modelID: "MiniMax-M3" })
     // Shared budget: the retry's timeout is the *remaining* time, strictly
-    // less than a fresh JUDGE_TOTAL_BUDGET_MS — never 5s added per attempt.
+    // less than a fresh JUDGE_TOTAL_BUDGET_MS — never added per attempt.
     expect(secondReq.timeoutMs).toBeLessThan(JUDGE_TOTAL_BUDGET_MS)
-    expect(result).toEqual({ verdict: { fit: "pass", summary: "ok on retry", gaps: [] } })
+    expect(result).toEqual({ verdict: PASS_VERDICT })
   })
 
   // =========================================================================
@@ -807,13 +912,15 @@ describe("runJudge", () => {
       },
     )
     expect(mockProbeCapabilityBounded).toHaveBeenCalledTimes(1)
-    expect(mockProbeCapabilityBounded).toHaveBeenCalledWith(client, "vertex-judge", JUDGE_TOTAL_BUDGET_MS)
+    // HANDOVER.md point 3: the judge's probe runs with JUDGE_PROBE_POLICY —
+    // read/grep/glob/list/bash allowed, edit/write/webfetch/task must deny.
+    expect(mockProbeCapabilityBounded).toHaveBeenCalledWith(client, "vertex-judge", JUDGE_TOTAL_BUDGET_MS, JUDGE_PROBE_POLICY)
   })
 
   it("fix #1: real elapsed time spent in the probe/deny-map step reduces the subturn attempt's timeout — never a fresh 5s after the probe", async () => {
     mockProbeCapabilityBounded.mockImplementationOnce(async () => {
-      await new Promise((r) => setTimeout(r, 40)) // simulate real elapsed time during probe+deny-map
-      return { ok: true, tools: DENY_MAP }
+      await new Promise((r) => setTimeout(r, 40)) // simulate real elapsed time during probe+tool-map build
+      return { ok: true, tools: JUDGE_TOOLS_MAP }
     })
     const client = makeClient()
     await runJudge(
@@ -869,7 +976,7 @@ describe("runJudge", () => {
     try {
       mockProbeCapabilityBounded.mockImplementationOnce(async () => {
         vi.advanceTimersByTime(JUDGE_TOTAL_BUDGET_MS + 10)
-        return { ok: true, tools: DENY_MAP }
+        return { ok: true, tools: JUDGE_TOOLS_MAP }
       })
       const client = makeClient()
       const logger = vi.fn()
@@ -976,8 +1083,8 @@ describe("runJudge", () => {
     expect(logger).toHaveBeenCalledWith("judge:malformed", expect.objectContaining({ reason: expect.any(String) }))
   })
 
-  it('valid JSON with an invalid "fit" value (does not match the {fit, summary, gaps} shape) resolves to malformed', async () => {
-    mockRunSubturn.mockResolvedValue({ ok: true, text: JSON.stringify({ fit: "maybe", summary: "unsure", gaps: [] }) })
+  it("valid JSON that does not match the {stories: [...]} shape resolves to malformed", async () => {
+    mockRunSubturn.mockResolvedValue({ ok: true, text: JSON.stringify({ verdict: "maybe", confidence: 0.7 }) })
     const client = makeClient()
     const logger = vi.fn()
     const result = await runJudge(
@@ -993,33 +1100,18 @@ describe("runJudge", () => {
     expect(logger).toHaveBeenCalledWith("judge:malformed", expect.any(Object))
   })
 
-  it("valid JSON missing the summary/gaps fields resolves to malformed", async () => {
-    mockRunSubturn.mockResolvedValue({ ok: true, text: JSON.stringify({ fit: "pass" }) })
-    const client = makeClient()
-    const logger = vi.fn()
-    const result = await runJudge(
-      client,
-      { selfCreated: new SelfCreatedSessions(), logger },
-      {
-        parentSessionID: "parent-1",
-        sessionModel: { providerID: "minimax", modelID: "MiniMax-M3" },
-        payload: basePayload,
-      },
-    )
-    expect(result).toEqual({ verdict: null, reason: "malformed" })
-  })
-
   // =========================================================================
-  // §4 redesign — new schema shape enforcement. Required coverage per the
-  // task brief: (1) the superseded {fit, notes} shape must now be rejected,
-  // not silently accepted; (2) fit:"pass" with a non-empty gaps array must be
-  // rejected (a deliberate, tested validation choice, not an accident).
+  // HANDOVER.md point 4 — new verdict schema shape enforcement. Required
+  // coverage: (1) BOTH superseded shapes ({fit, summary, gaps} and the older
+  // {fit, notes}) must be rejected, not silently accepted; (2) pass:true with
+  // an unmet item must be rejected (the machine-checkable invariant
+  // continuations rely on); (3) unknown extra keys are tolerated.
   // =========================================================================
 
-  it('§4: an old-shape {fit, notes} reply (the shape this judge used to emit) is now rejected as malformed, not silently accepted', async () => {
+  it('point 4: the superseded {fit, summary, gaps} shape is now rejected as malformed, not silently accepted', async () => {
     mockRunSubturn.mockResolvedValue({
       ok: true,
-      text: JSON.stringify({ fit: "pass", notes: "looks fine" }),
+      text: JSON.stringify({ fit: "pass", summary: "looks fine", gaps: [] }),
     })
     const client = makeClient()
     const logger = vi.fn()
@@ -1039,20 +1131,60 @@ describe("runJudge", () => {
     )
   })
 
-  it('§4: fit:"pass" with a non-empty gaps array is rejected as malformed (pass requires gaps === [])', async () => {
+  it("point 4: the even-older {fit, notes} shape is also rejected as malformed", async () => {
+    mockRunSubturn.mockResolvedValue({
+      ok: true,
+      text: JSON.stringify({ fit: "pass", notes: "looks fine" }),
+    })
+    const client = makeClient()
+    const result = await runJudge(
+      client,
+      { selfCreated: new SelfCreatedSessions(), logger: vi.fn() },
+      {
+        parentSessionID: "parent-1",
+        sessionModel: { providerID: "minimax", modelID: "MiniMax-M3" },
+        payload: basePayload,
+      },
+    )
+    expect(result).toEqual({ verdict: null, reason: "malformed" })
+  })
+
+  it("point 4: an empty stories array is rejected as malformed (the judge is the sole arbiter — an empty audit is not a verdict)", async () => {
+    mockRunSubturn.mockResolvedValue({ ok: true, text: JSON.stringify({ stories: [] }) })
+    const client = makeClient()
+    const result = await runJudge(
+      client,
+      { selfCreated: new SelfCreatedSessions(), logger: vi.fn() },
+      {
+        parentSessionID: "parent-1",
+        sessionModel: { providerID: "minimax", modelID: "MiniMax-M3" },
+        payload: basePayload,
+      },
+    )
+    expect(result).toEqual({ verdict: null, reason: "malformed" })
+  })
+
+  it("point 4: pass:true with an unmet item is rejected as malformed (a pass requires every item met)", async () => {
     mockRunSubturn.mockResolvedValue({
       ok: true,
       text: JSON.stringify({
-        fit: "pass",
-        summary: "looks fine",
-        gaps: [{ issue: "leftover doubt", evidence: "some evidence", fix: "do the fix" }],
+        stories: [
+          {
+            storyId: "S1",
+            pass: true,
+            summary: "claimed pass despite a gap",
+            items: [
+              { itemId: "A1", met: true, note: "observed" },
+              { itemId: "A2", met: false, note: "verifier fails" },
+            ],
+          },
+        ],
       }),
     })
     const client = makeClient()
-    const logger = vi.fn()
     const result = await runJudge(
       client,
-      { selfCreated: new SelfCreatedSessions(), logger },
+      { selfCreated: new SelfCreatedSessions(), logger: vi.fn() },
       {
         parentSessionID: "parent-1",
         sessionModel: { providerID: "minimax", modelID: "MiniMax-M3" },
@@ -1062,15 +1194,60 @@ describe("runJudge", () => {
     expect(result).toEqual({ verdict: null, reason: "malformed" })
   })
 
-  it('§4: fit:"concern" with a well-shaped, non-empty gaps array is accepted', async () => {
-    const gaps = [
-      { issue: "criterion 2 unverified", evidence: "no verifier summary mentions it", fix: "run the verifier and cite the result" },
-      { issue: "diff touches an unrelated file", evidence: "diffSummary shows src/unrelated.ts", fix: "explain or revert the unrelated change" },
-    ]
+  it("point 4: a blank storyId or blank itemId is rejected as malformed", async () => {
+    for (const broken of [
+      { stories: [{ storyId: "  ", pass: false, summary: "s", items: [{ itemId: "A1", met: false, note: "n" }] }] },
+      { stories: [{ storyId: "S1", pass: false, summary: "s", items: [{ itemId: "", met: false, note: "n" }] }] },
+    ]) {
+      mockRunSubturn.mockResolvedValue({ ok: true, text: JSON.stringify(broken) })
+      const client = makeClient()
+      const result = await runJudge(
+        client,
+        { selfCreated: new SelfCreatedSessions(), logger: vi.fn() },
+        {
+          parentSessionID: "parent-1",
+          sessionModel: { providerID: "minimax", modelID: "MiniMax-M3" },
+          payload: basePayload,
+        },
+      )
+      expect(result).toEqual({ verdict: null, reason: "malformed" })
+    }
+  })
+
+  it("point 4: wrong-shaped items (missing met/note) are rejected as malformed", async () => {
     mockRunSubturn.mockResolvedValue({
       ok: true,
-      text: JSON.stringify({ fit: "concern", summary: "two open items", gaps }),
+      text: JSON.stringify({
+        stories: [{ storyId: "S1", pass: false, summary: "problems found", items: [{ itemId: "A1", note: "no met field" }] }],
+      }),
     })
+    const client = makeClient()
+    const result = await runJudge(
+      client,
+      { selfCreated: new SelfCreatedSessions(), logger: vi.fn() },
+      {
+        parentSessionID: "parent-1",
+        sessionModel: { providerID: "minimax", modelID: "MiniMax-M3" },
+        payload: basePayload,
+      },
+    )
+    expect(result).toEqual({ verdict: null, reason: "malformed" })
+  })
+
+  it("point 4: unknown extra keys on the verdict, a story, or an item are tolerated", async () => {
+    const verdict = {
+      stories: [
+        {
+          storyId: "S1",
+          pass: false,
+          summary: "one item missing",
+          confidence: "high", // extra key — tolerated
+          items: [{ itemId: "A1", met: false, note: "A1 still missing", severity: "blocking" }],
+        },
+      ],
+      auditedAt: "2026-07-29", // extra key — tolerated
+    }
+    mockRunSubturn.mockResolvedValue({ ok: true, text: JSON.stringify(verdict) })
     const client = makeClient()
     const logger = vi.fn()
     const result = await runJudge(
@@ -1082,46 +1259,8 @@ describe("runJudge", () => {
         payload: basePayload,
       },
     )
-    expect(result).toEqual({ verdict: { fit: "concern", summary: "two open items", gaps } })
+    expect(result).toEqual({ verdict })
     expect(logger).not.toHaveBeenCalled()
-  })
-
-  it('§4: fit:"concern" with an empty gaps array is accepted (non-emptiness is prompt guidance, not a shape requirement)', async () => {
-    mockRunSubturn.mockResolvedValue({
-      ok: true,
-      text: JSON.stringify({ fit: "concern", summary: "something feels off but I can't pin it down", gaps: [] }),
-    })
-    const client = makeClient()
-    const result = await runJudge(
-      client,
-      { selfCreated: new SelfCreatedSessions(), logger: vi.fn() },
-      {
-        parentSessionID: "parent-1",
-        sessionModel: { providerID: "minimax", modelID: "MiniMax-M3" },
-        payload: basePayload,
-      },
-    )
-    expect(result).toEqual({
-      verdict: { fit: "concern", summary: "something feels off but I can't pin it down", gaps: [] },
-    })
-  })
-
-  it("§4: a gaps array with wrong-shaped items (missing fields) is rejected as malformed", async () => {
-    mockRunSubturn.mockResolvedValue({
-      ok: true,
-      text: JSON.stringify({ fit: "concern", summary: "problems found", gaps: [{ issue: "only an issue, no evidence/fix" }] }),
-    })
-    const client = makeClient()
-    const result = await runJudge(
-      client,
-      { selfCreated: new SelfCreatedSessions(), logger: vi.fn() },
-      {
-        parentSessionID: "parent-1",
-        sessionModel: { providerID: "minimax", modelID: "MiniMax-M3" },
-        payload: basePayload,
-      },
-    )
-    expect(result).toEqual({ verdict: null, reason: "malformed" })
   })
 
   it("no judgeModelOverride means a single attempt only — no retry, no fallback logic exercised", async () => {
@@ -1168,13 +1307,13 @@ describe("runJudge", () => {
 //
 // A real judge run was discarded with `judge:malformed {reason:"response is
 // not valid JSON"}`: the plan had completed, the subturn had run, and the
-// verdict was thrown away because the model fenced its JSON. A zero-tool agent
+// verdict was thrown away because the model fenced its JSON. The judge agent
 // is told to return JSON and usually does, but "usually" is not a contract,
-// and each miss costs a full judge budget (up to 90s and a model call).
+// and each miss costs a full judge budget (up to 300s and a model call).
 // ===========================================================================
 
 describe("parseJudgeResponse", () => {
-  const verdict = { fit: "pass", notes: "tests cover the change" }
+  const verdict = { stories: [{ storyId: "S1", pass: true, summary: "tests cover the change", items: [{ itemId: "A1", met: true, note: "observed" }] }] }
 
   it("accepts bare JSON", () => {
     expect(parseJudgeResponse(JSON.stringify(verdict))).toEqual(verdict)
@@ -1190,7 +1329,7 @@ describe("parseJudgeResponse", () => {
   })
 
   it("handles braces inside string values", () => {
-    const tricky = { fit: "concern", notes: "saw a literal } and { in the diff" }
+    const tricky = { stories: [{ storyId: "S1", pass: false, summary: "saw a literal } and { in the diff", items: [] }] }
     expect(parseJudgeResponse(`prose ${JSON.stringify(tricky)} trailing`)).toEqual(tricky)
   })
 

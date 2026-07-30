@@ -18,6 +18,16 @@
  *    *constructed* (zero-tool registered agent + enumerated deny map) and
  *    then *verified* by reading the resolution back — the probe's refusal
  *    path is the control, not the deny map itself (spec Open Question 1).
+ *    HANDOVER.md point 3 (user decision, 2026-07-29): this zero-tool posture
+ *    is DELIBERATELY REVERSED for the judge only — `probeCapability` now
+ *    takes an optional `ProbePolicy` (an allowlist of tool names permitted
+ *    to resolve true, plus the permission keys that must still provably
+ *    deny), and `JUDGE_PROBE_POLICY` grants the judge read/grep/glob/list/
+ *    bash so it can independently re-run a story's declared verifiers (a
+ *    real 894-message field session ended 5/5 stories blocked with the
+ *    judge never able to rescue it). The intake subturn keeps the default
+ *    zero-tool policy unchanged; `buildDenyMap` is likewise untouched, with
+ *    `buildToolPolicyMap` added alongside it for allow-aware maps.
  *  - `probeCapabilityBounded` — CRITICAL fix (post-review): `probeCapability`
  *    and `buildDenyMap` are plain, un-timed `await`s on their own. Both
  *    `judge.ts`'s `runJudge` and `story.ts`'s `classifyMultiStory` issue
@@ -157,6 +167,36 @@ export interface CapabilityProbeResult {
 }
 
 /**
+ * HANDOVER.md point 3 (user decision, 2026-07-29): the probe's capability
+ * contract is now parameterized per agent. The DEFAULT (no policy supplied)
+ * reproduces the original FR-030b zero-tool behavior exactly — zero enabled
+ * tools, edit/bash/webfetch provably denied — so the intake subturn is
+ * unaffected. A supplied policy relaxes it in exactly two dimensions, both
+ * still verified by reading the host's resolution back (the probe remains
+ * the control of record; the maps are not).
+ */
+export interface ProbePolicy {
+  /** Tool names allowed to resolve true. Default [] (zero-tool, today's behavior). */
+  allowTools?: string[]
+  /** Permission keys that must be provably "deny". Default ["edit","bash","webfetch"] (today's behavior). */
+  denyPermissions?: string[]
+}
+
+/**
+ * The judge's policy under the HANDOVER.md point-3 reversal: read-only
+ * inspection tools (read/grep/glob/list) plus bash — bash so the judge can
+ * independently re-run a story's declared verifier commands rather than
+ * trusting the transcript (the field session's core failure: claims were
+ * real but unverifiable by the harness). Still hard-denied: edit and write
+ * (the judge must never modify the work it audits), webfetch (no network),
+ * and task (no sub-subagents — the judge is a leaf).
+ */
+export const JUDGE_PROBE_POLICY: ProbePolicy = {
+  allowTools: ["read", "grep", "glob", "list", "bash"],
+  denyPermissions: ["edit", "write", "webfetch", "task"],
+}
+
+/**
  * Builds the deny map from `client.tool.ids()` (`GET /experimental/tool/ids`,
  * `types.gen.d.ts:1705`/`1215` — returns `Array<string>`) plus a `"*": false`
  * wildcard entry for hosts that honour one. Called once at plugin
@@ -187,6 +227,34 @@ export async function buildDenyMap(client: OpencodeClient): Promise<Record<strin
   }
   denyMap["*"] = false
   return denyMap
+}
+
+/**
+ * HANDOVER.md point 3: the allow-aware counterpart of `buildDenyMap`, used
+ * for the judge's subturn `tools` field and registration. Every enumerated
+ * tool id maps to false EXCEPT the allowlisted names, which map to true;
+ * `"*": false` is kept so a host that honours the wildcard still denies
+ * anything un-enumerated. An allowlisted name the host did not enumerate is
+ * still named true (harmless on a host lacking that tool; keeps the map
+ * self-describing against `KNOWN_TOOL_NAMES`-style static maps). Same
+ * failure contract as `buildDenyMap`: enumeration failure propagates, never
+ * a silently partial map.
+ */
+export async function buildToolPolicyMap(client: OpencodeClient, allowTools: string[]): Promise<Record<string, boolean>> {
+  const ids = unwrap<string[]>(await client.tool.ids())
+  if (!Array.isArray(ids)) {
+    throw new Error("client.tool.ids() did not return an array")
+  }
+  const allow = new Set(allowTools)
+  const map: Record<string, boolean> = {}
+  for (const id of ids) {
+    map[id] = allow.has(id)
+  }
+  for (const name of allowTools) {
+    if (!(name in map)) map[name] = true
+  }
+  map["*"] = false
+  return map
 }
 
 const DENY_REQUIRED_PERMISSIONS = ["edit", "bash", "webfetch"] as const
@@ -269,21 +337,29 @@ function permissionDenied(permission: unknown, key: string): { denied: boolean; 
  * `permission` block, see `permissionDenied` above for its real live-host
  * shape) and requires:
  *  - the named agent exists,
- *  - it resolves ZERO tools to `true`,
- *  - `permission.edit`, `permission.bash`, and `permission.webfetch` are
- *    each provably denied per `permissionDenied` above.
+ *  - NO tool outside `policy.allowTools` resolves to `true` (default policy:
+ *    empty allowlist, i.e. the original "zero tools resolve to true" check).
+ *    Enabled ALLOWLISTED tools are fine, and their absence is NOT an error —
+ *    host differences (a build without `list`, say) degrade gracefully; the
+ *    probe guards against unexpected capability, not missing capability.
+ *  - every key in `policy.denyPermissions` (default edit/bash/webfetch) is
+ *    provably denied per `permissionDenied` above.
  *
- * Registers nothing itself. Any failure — agent absent, a tool resolving
- * `true`, a permission not provably `"deny"`, `client.app.agents()`
- * throwing, or the fields-style result carrying an `error` — returns
- * `{ ok: false, reason }` with a specific, non-generic reason string
- * (SC-017 / FR-030b: callers log this reason verbatim under
+ * Registers nothing itself. Any failure — agent absent, a non-allowlisted
+ * tool resolving `true`, a deny-permission not provably `"deny"`,
+ * `client.app.agents()` throwing, or the fields-style result carrying an
+ * `error` — returns `{ ok: false, reason }` with a specific, non-generic
+ * reason string (SC-017 / FR-030b: callers log this reason verbatim under
  * `judge:unsupported` / `intake:unsupported`).
  */
 export async function probeCapability(
   client: OpencodeClient,
   agentName: string,
+  policy?: ProbePolicy,
 ): Promise<CapabilityProbeResult> {
+  const allowTools = new Set(policy?.allowTools ?? [])
+  const denyPermissions = policy?.denyPermissions ?? DENY_REQUIRED_PERMISSIONS
+
   let agents: Agent[]
   try {
     agents = unwrap<Agent[]>(await client.app.agents())
@@ -303,11 +379,17 @@ export async function probeCapability(
   }
 
   const tools = agent.tools ?? {}
-  const enabledTool = Object.entries(tools).find(([, enabled]) => enabled === true)
+  const enabledTool = Object.entries(tools).find(([name, enabled]) => enabled === true && !allowTools.has(name))
   if (enabledTool) {
+    // Default-policy message preserved verbatim (intake's wording, and the
+    // string existing failure logs/tests match on); the allowlist variant
+    // names both the offending tool and the policy it violated.
     return {
       ok: false,
-      reason: `agent "${agentName}" resolves tool "${enabledTool[0]}" to true (expected zero enabled tools)`,
+      reason:
+        allowTools.size === 0
+          ? `agent "${agentName}" resolves tool "${enabledTool[0]}" to true (expected zero enabled tools)`
+          : `agent "${agentName}" resolves tool "${enabledTool[0]}" to true outside the allowlist [${[...allowTools].join(", ")}]`,
     }
   }
 
@@ -316,7 +398,7 @@ export async function probeCapability(
     return { ok: false, reason: `agent "${agentName}" has no resolved permission block` }
   }
 
-  for (const key of DENY_REQUIRED_PERMISSIONS) {
+  for (const key of denyPermissions) {
     const result = permissionDenied(permission, key)
     if (!result.denied) {
       return {
@@ -351,13 +433,16 @@ const CAPABILITY_PROBE_BOUNDED_TIMEOUT_MESSAGE = "vertex:capability-probe-timeou
  * remaining budget in, so elapsed probe/deny-map time is deducted from what
  * is left for the subturn attempt(s).
  *
- * Never rejects. Resolves `{ ok: true, tools }` (the `buildDenyMap` result)
- * on success, or `{ ok: false, cause, reason }` on failure:
+ * Never rejects. Resolves `{ ok: true, tools }` (the `buildDenyMap` result,
+ * or — when a `policy` is supplied (HANDOVER.md point 3) — the allow-aware
+ * `buildToolPolicyMap` result for that policy's allowlist) on success, or
+ * `{ ok: false, cause, reason }` on failure:
  *  - `cause: "probe"` — `probeCapability` returned `{ ok: false }` (or,
  *    defensively, threw — not documented to, but not assumed to hold
  *    forever either).
- *  - `cause: "deny-map"` — the probe passed but `buildDenyMap` threw/
- *    rejected (its own documented failure mode).
+ *  - `cause: "deny-map"` — the probe passed but the map build (`buildDenyMap`
+ *    / `buildToolPolicyMap`) threw/rejected (its own documented failure
+ *    mode).
  *  - `cause: "timeout"` — `budgetMs` elapsed before either step settled.
  *    Callers MUST treat this the same as `cause: "probe"` (e.g. judge.ts's
  *    `judge:unsupported` path) — a probe that cannot be confirmed in time is
@@ -367,11 +452,12 @@ export async function probeCapabilityBounded(
   client: OpencodeClient,
   agentName: string,
   budgetMs: number,
+  policy?: ProbePolicy,
 ): Promise<CapabilityProbeBoundedResult> {
   const work = (async (): Promise<CapabilityProbeBoundedResult> => {
     let probe: CapabilityProbeResult
     try {
-      probe = await probeCapability(client, agentName)
+      probe = await probeCapability(client, agentName, policy)
     } catch (err) {
       return { ok: false, cause: "probe", reason: `probeCapability threw: ${describeError(err)}` }
     }
@@ -379,7 +465,7 @@ export async function probeCapabilityBounded(
       return { ok: false, cause: "probe", reason: probe.reason ?? "capability probe failed" }
     }
     try {
-      const tools = await buildDenyMap(client)
+      const tools = policy ? await buildToolPolicyMap(client, policy.allowTools ?? []) : await buildDenyMap(client)
       return { ok: true, tools }
     } catch (err) {
       return { ok: false, cause: "deny-map", reason: describeError(err) }
@@ -417,7 +503,7 @@ export interface SubturnRequest {
   model?: { providerID: string; modelID: string }
   system: string
   parts: Array<{ type: "text"; text: string }>
-  /** The deny map from `buildDenyMap`. */
+  /** The tool map from `buildDenyMap` (zero-tool agents) or `buildToolPolicyMap` (judge, HANDOVER.md point 3). */
   tools: Record<string, boolean>
   /** Total budget for THIS attempt, including no further retry inside this call — the caller owns any retry-and-resubmit policy (FR-030a). */
   timeoutMs: number

@@ -2,7 +2,9 @@ import { describe, expect, it, vi } from "vitest"
 
 import {
   SelfCreatedSessions,
+  JUDGE_PROBE_POLICY,
   buildDenyMap,
+  buildToolPolicyMap,
   probeCapability,
   probeCapabilityBounded,
   runSubturn,
@@ -426,6 +428,184 @@ describe("probeCapabilityBounded", () => {
     const client = makeClient({ agents: [denyAllAgent("vertex-judge")] })
     const result = await probeCapabilityBounded(client, "vertex-judge", 5000)
     expect(result.ok).toBe(true)
+  })
+})
+
+// ===========================================================================
+// ProbePolicy / JUDGE_PROBE_POLICY / buildToolPolicyMap — HANDOVER.md point 3
+// (user decision, 2026-07-29): the judge's zero-tool posture is deliberately
+// reversed — read/grep/glob/list/bash allowed, edit/write/webfetch/task still
+// provably denied. The DEFAULT policy (no policy argument) must reproduce the
+// original zero-tool behavior exactly so intake is unaffected.
+// ===========================================================================
+
+/** The judge's resolved shape under config.ts's JUDGE_PERMISSION +
+ * buildJudgeToolsMap: allowlisted tools true, everything else false, with
+ * explicit deny rules for edit/write/webfetch/task. */
+function judgePolicyAgent(name: string, overrides: Partial<Agent> = {}): Agent {
+  return {
+    name,
+    mode: "subagent",
+    builtIn: false,
+    permission: { edit: "deny", write: "deny", webfetch: "deny", task: "deny" },
+    tools: {
+      read: true,
+      grep: true,
+      glob: true,
+      list: true,
+      bash: true,
+      edit: false,
+      write: false,
+      webfetch: false,
+      task: false,
+      "*": false,
+    },
+    options: {},
+    ...overrides,
+  } as Agent
+}
+
+describe("ProbePolicy (HANDOVER.md point 3)", () => {
+  it("default-policy equivalence: an explicit zero-tool policy behaves identically to no policy", async () => {
+    const client = makeClient({ agents: [denyAllAgent("vertex-intake")] })
+    const noPolicy = await probeCapability(client, "vertex-intake")
+    const explicitDefault = await probeCapability(client, "vertex-intake", {
+      allowTools: [],
+      denyPermissions: ["edit", "bash", "webfetch"],
+    })
+    expect(noPolicy).toEqual({ ok: true })
+    expect(explicitDefault).toEqual({ ok: true })
+
+    // And both reject the same violation with the same naming reason.
+    const violated = makeClient({ agents: [denyAllAgent("vertex-intake", { tools: { bash: true, edit: false } })] })
+    const noPolicyFail = await probeCapability(violated, "vertex-intake")
+    const explicitDefaultFail = await probeCapability(violated, "vertex-intake", { allowTools: [], denyPermissions: ["edit", "bash", "webfetch"] })
+    expect(noPolicyFail.ok).toBe(false)
+    expect(explicitDefaultFail).toEqual(noPolicyFail)
+  })
+
+  it("JUDGE_PROBE_POLICY: allowlisted tools resolving true is OK (their absence is also not an error)", async () => {
+    const client = makeClient({ agents: [judgePolicyAgent("vertex-judge")] })
+    const result = await probeCapability(client, "vertex-judge", JUDGE_PROBE_POLICY)
+    expect(result).toEqual({ ok: true })
+
+    // A host without `list` (missing capability, not unexpected capability)
+    // degrades gracefully — still ok.
+    const withoutList = judgePolicyAgent("vertex-judge")
+    delete (withoutList.tools as Record<string, boolean>).list
+    const client2 = makeClient({ agents: [withoutList] })
+    const result2 = await probeCapability(client2, "vertex-judge", JUDGE_PROBE_POLICY)
+    expect(result2).toEqual({ ok: true })
+  })
+
+  it("JUDGE_PROBE_POLICY: a NON-allowlisted tool resolving true fails with a naming reason", async () => {
+    const client = makeClient({
+      agents: [judgePolicyAgent("vertex-judge", { tools: { webfetch: true, read: true } })],
+    })
+    const result = await probeCapability(client, "vertex-judge", JUDGE_PROBE_POLICY)
+    expect(result.ok).toBe(false)
+    expect(result.reason).toMatch(/webfetch/)
+    expect(result.reason).toMatch(/outside the allowlist/)
+  })
+
+  it("JUDGE_PROBE_POLICY: each denyPermission key missing or not-deny fails with a naming reason", async () => {
+    // edit not deny
+    let client = makeClient({
+      agents: [judgePolicyAgent("vertex-judge", { permission: { edit: "ask", write: "deny", webfetch: "deny", task: "deny" } })],
+    })
+    let result = await probeCapability(client, "vertex-judge", JUDGE_PROBE_POLICY)
+    expect(result.ok).toBe(false)
+    expect(result.reason).toMatch(/permission\.edit/)
+
+    // write rule entirely absent (cannot confirm deny)
+    client = makeClient({
+      agents: [judgePolicyAgent("vertex-judge", { permission: { edit: "deny", webfetch: "deny", task: "deny" } })],
+    })
+    result = await probeCapability(client, "vertex-judge", JUDGE_PROBE_POLICY)
+    expect(result.ok).toBe(false)
+    expect(result.reason).toMatch(/permission\.write/)
+
+    // webfetch allowed
+    client = makeClient({
+      agents: [judgePolicyAgent("vertex-judge", { permission: { edit: "deny", write: "deny", webfetch: "allow", task: "deny" } })],
+    })
+    result = await probeCapability(client, "vertex-judge", JUDGE_PROBE_POLICY)
+    expect(result.ok).toBe(false)
+    expect(result.reason).toMatch(/permission\.webfetch/)
+
+    // task not deny (no sub-subagents — the judge is a leaf)
+    client = makeClient({
+      agents: [judgePolicyAgent("vertex-judge", { permission: { edit: "deny", write: "deny", webfetch: "deny", task: "allow" } })],
+    })
+    result = await probeCapability(client, "vertex-judge", JUDGE_PROBE_POLICY)
+    expect(result.ok).toBe(false)
+    expect(result.reason).toMatch(/permission\.task/)
+  })
+
+  it("buildToolPolicyMap: enumerated ids all false EXCEPT allowlisted names true, plus a wildcard false", async () => {
+    const client = makeClient() // TOOL_IDS = bash, edit, write, webfetch, read
+    const map = await buildToolPolicyMap(client, ["read", "bash"])
+    expect(map).toEqual({
+      bash: true,
+      read: true,
+      edit: false,
+      write: false,
+      webfetch: false,
+      "*": false,
+    })
+  })
+
+  it("buildToolPolicyMap: an allowlisted name the host did not enumerate is still named true (and JUDGE_PROBE_POLICY's full allowlist round-trips)", async () => {
+    const client = makeClient() // TOOL_IDS lacks grep/glob/list
+    const map = await buildToolPolicyMap(client, JUDGE_PROBE_POLICY.allowTools!)
+    expect(map.read).toBe(true)
+    expect(map.bash).toBe(true)
+    expect(map.grep).toBe(true)
+    expect(map.glob).toBe(true)
+    expect(map.list).toBe(true)
+    expect(map.edit).toBe(false)
+    expect(map["*"]).toBe(false)
+  })
+
+  it("buildToolPolicyMap: enumeration failure propagates, never a silently partial map", async () => {
+    const client = makeClient({
+      toolIdsImpl: async () => {
+        throw new Error("tool ids endpoint unavailable")
+      },
+    })
+    await expect(buildToolPolicyMap(client, ["read"])).rejects.toThrow(/tool ids endpoint unavailable/)
+  })
+
+  it("probeCapabilityBounded with a policy returns the allow-aware map (not a pure deny map)", async () => {
+    const client = makeClient({ agents: [judgePolicyAgent("vertex-judge")] })
+    const result = await probeCapabilityBounded(client, "vertex-judge", 5000, JUDGE_PROBE_POLICY)
+    expect(result).toEqual({
+      ok: true,
+      tools: {
+        bash: true,
+        read: true,
+        grep: true,
+        glob: true,
+        list: true,
+        edit: false,
+        write: false,
+        webfetch: false,
+        "*": false,
+      },
+    })
+  })
+
+  it("probeCapabilityBounded with a policy still refuses a non-allowlisted enabled tool before any map build", async () => {
+    const client = makeClient({
+      agents: [judgePolicyAgent("vertex-judge", { tools: { edit: true, read: true } })],
+    })
+    const result = await probeCapabilityBounded(client, "vertex-judge", 5000, JUDGE_PROBE_POLICY)
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.cause).toBe("probe")
+      expect(result.reason).toMatch(/edit/)
+    }
+    expect(client.tool.ids).not.toHaveBeenCalled()
   })
 })
 

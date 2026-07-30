@@ -12,7 +12,6 @@ import {
   TRIVIAL_ASK_RE,
   classifyMultiStory,
   classifyMultiStoryHeuristic,
-  type PlanV2,
 } from "../../src/v2/story.js"
 import { SelfCreatedSessions } from "../../src/v2/subturn.js"
 import type { OpencodeClient } from "../../src/v2/types.js"
@@ -39,15 +38,29 @@ function engine(stateDir: string, logger = vi.fn()): { engine: StoryEngine; logg
   return { engine: new StoryEngine({ stateDir, logger }), logger }
 }
 
-/** Minimal confirmed-story input builder for `createPlan`. */
+/**
+ * Minimal confirmed-story input builder for the 2026-07-30 task/DAG
+ * `createPlan`. A story MUST decompose into ≥1 task; the helper fills the
+ * common defaults (one no-dep task, one acceptance item, empty globs/
+ * verifiers) so each test overrides only what it cares about.
+ */
 function story(
-  overrides: Partial<{ text: string; acceptanceItems: string[]; scopeGlobs: string[]; verifiers: string[] }> = {},
+  overrides: Partial<{
+    text: string
+    acceptanceItems: string[]
+    tasks: Array<{ text: string; dependsOn?: string[] }>
+    scopeGlobs: string[]
+    verifiers: string[]
+    dependsOn: string[]
+  }> = {},
 ) {
   return {
     text: "do the thing",
     acceptanceItems: ["it works"],
+    tasks: [{ text: "implement it" }],
     scopeGlobs: [] as string[],
     verifiers: [] as string[],
+    dependsOn: [] as string[],
     ...overrides,
   }
 }
@@ -147,10 +160,11 @@ describe("story_v1_archival (test 13, FR-022)", () => {
 
 // ---------------------------------------------------------------------------
 // Test 12: story_schema_v2_validation — plan creation, schema, getters
+// (task/DAG model)
 // ---------------------------------------------------------------------------
 
 describe("story_schema_v2_validation (test 12, FR-017)", () => {
-  it("createPlan builds a schemaVersion:2 plan with the first story active and the rest pending", () => {
+  it("createPlan builds a schemaVersion:2 plan, assigns task ids S{n}.T{m}, and activates level-0 tasks", () => {
     const stateDir = temporaryRoot()
     const { engine: se } = engine(stateDir)
 
@@ -161,9 +175,15 @@ describe("story_schema_v2_validation (test 12, FR-017)", () => {
 
     expect(plan.schemaVersion).toBe(2)
     expect(plan.stories).toHaveLength(2)
-    expect(plan.stories[0].status).toBe("active")
-    expect(plan.stories[1].status).toBe("pending")
-    expect(plan.finalStoryId).toBe(plan.stories[1].id)
+    expect(plan.stories.map((s) => s.id)).toEqual(["S1", "S2"])
+    expect(plan.finalStoryId).toBe("S2")
+    // Each story decomposed into the declared task, with a deterministic id.
+    expect(plan.stories[0].tasks.map((t) => t.id)).toEqual(["S1.T1"])
+    expect(plan.stories[1].tasks.map((t) => t.id)).toEqual(["S2.T1"])
+    // No deps anywhere → both tasks are level 0 → both ACTIVE at create.
+    expect(plan.stories[0].tasks[0].status).toBe("active")
+    expect(plan.stories[1].tasks[0].status).toBe("active")
+    expect(plan.stories.map((s) => s.status)).toEqual(["active", "active"])
     expect(plan.stories[0].acceptanceItems[0].evidence).toBeNull()
     expect(typeof plan.createdAt).toBe("string")
   })
@@ -174,23 +194,32 @@ describe("story_schema_v2_validation (test 12, FR-017)", () => {
     expect(() => se.createPlan("s1", [])).toThrow(/at least one story/)
   })
 
-  // Manual UAT finding: a real model, given wiring/tools.ts's
-  // `scopeGlobs: tool.schema.array(...).optional().default([])`, naturally
-  // omits the field entirely -- and the host does not reliably apply the
-  // schema's `.default([])` for an omitted optional arg, so `undefined`
-  // reached here, not `[]`. Every other test in this file goes through the
-  // `story()` helper above, which always fills both fields -- exactly why
-  // 1292 passing tests never caught a crash a real model hit on ordinary use.
-  // Construct the args by hand, bypassing the helper, to reproduce the real
-  // shape.
-  it("does not throw when scopeGlobs/verifiers are omitted entirely, not just empty (real-model UAT crash)", () => {
+  it("rejects a story with no tasks (decomposition is mandatory)", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    expect(() => se.createPlan("s1", [{ text: "x", acceptanceItems: ["a"], tasks: [] }])).toThrow(/at least one task/)
+  })
+
+  it("rejects a story with no acceptanceItems", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    expect(() => se.createPlan("s1", [{ text: "x", acceptanceItems: [], tasks: [{ text: "t" }] }])).toThrow(
+      /at least one item/,
+    )
+  })
+
+  // Manual UAT finding preserved: the host does not reliably apply the tool
+  // schema's `.default([])` for an omitted optional array arg — a real model
+  // that leaves scopeGlobs/verifiers out reaches here with `undefined`.
+  it("does not throw when scopeGlobs/verifiers/dependsOn are omitted entirely (real-model UAT crash)", () => {
     const stateDir = temporaryRoot()
     const { engine: se } = engine(stateDir)
 
-    const plan = se.createPlan("s1", [{ text: "investigate the flaky nightly CI job", acceptanceItems: ["root cause found"] }])
+    const plan = se.createPlan("s1", [{ text: "investigate the flaky CI", acceptanceItems: ["root cause"], tasks: [{ text: "dig" }] }])
 
     expect(plan.stories[0].scopeGlobs).toEqual([])
     expect(plan.stories[0].verifiers).toEqual([])
+    expect(plan.stories[0].dependsOn).toEqual([])
   })
 
   it("persists to disk and survives a simulated restart (fresh StoryEngine instance)", () => {
@@ -200,13 +229,14 @@ describe("story_schema_v2_validation (test 12, FR-017)", () => {
 
     const restarted = new StoryEngine({ stateDir, logger: vi.fn() })
     expect(restarted.getPlan("s1")).toEqual(created)
-    expect(restarted.getActiveStory("s1")?.id).toBe(created.stories[0].id)
+    expect(restarted.getActiveTasks("s1")[0]?.id).toBe(created.stories[0].tasks[0].id)
   })
 
-  it("getPlan/getActiveStory return null for an unknown session, never throw", () => {
+  it("getPlan/getActiveTasks return null/[] for an unknown session, never throw", () => {
     const stateDir = temporaryRoot()
     const { engine: se } = engine(stateDir)
     expect(se.getPlan("unknown")).toBeNull()
+    expect(se.getActiveTasks("unknown")).toEqual([])
     expect(se.getActiveStory("unknown")).toBeNull()
   })
 
@@ -230,9 +260,8 @@ describe("story_schema_v2_validation (test 12, FR-017)", () => {
 
     expect(() => se.attachEvidence("unknown-session", storyId, "A1", { receiptId: "x" })).not.toThrow()
     expect(() => se.attachEvidence("s1", "unknown-story", "A1", { receiptId: "x" })).not.toThrow()
-    expect(() => se.attachEvidence("s1", storyId, "unknown-item", { receiptId: "x" })).not.toThrow()
+    expect(() => se.attachEvidence("s1", storyId, "unknown-items", { receiptId: "x" })).not.toThrow()
 
-    // Survives restart — proves the attachEvidence write was actually persisted.
     const restarted = new StoryEngine({ stateDir, logger: vi.fn() })
     expect(restarted.getPlan("s1")!.stories[0].acceptanceItems[0].evidence).toEqual({ receiptId: "vrf_1" })
   })
@@ -261,8 +290,8 @@ describe("story_schema_v2_validation (test 12, FR-017)", () => {
 })
 
 // ---------------------------------------------------------------------------
-// CRITICAL fix: a corrupt plan.json must not silently destroy other
-// sessions' data on the next write (persistPlan).
+// CRITICAL fix (preserved): a corrupt plan.json must not silently destroy
+// other sessions' data on the next write (persistPlan).
 // ---------------------------------------------------------------------------
 
 describe("story_disk_corrupt_on_write (CRITICAL fix, persistPlan)", () => {
@@ -275,8 +304,6 @@ describe("story_disk_corrupt_on_write (CRITICAL fix, persistPlan)", () => {
     const logger = vi.fn()
     const { engine: se } = engine(stateDir, logger)
 
-    // createPlan() -> persistPlan(): must NOT silently proceed from an empty
-    // base and overwrite session-other's (unreadable) plan with only s1's.
     expect(() => se.createPlan("s1", [story()])).toThrow(/corrupt/i)
 
     expect(readFileSync(planPath, "utf8")).toBe(corruptBytes) // byte-for-byte untouched
@@ -290,27 +317,20 @@ describe("story_disk_corrupt_on_write (CRITICAL fix, persistPlan)", () => {
     const stateDir = temporaryRoot()
     const { engine: se } = engine(stateDir)
     const plan = se.createPlan("s1", [story({ acceptanceItems: ["A1"] })])
-    const storyId = plan.stories[0].id
-    se.attachEvidence("s1", storyId, "A1", { receiptId: "vrf_1" })
+    const taskId = plan.stories[0].tasks[0].id
     const planPath = join(stateDir, "plan.json")
 
-    // Corrupt the file out from under the engine (simulating another
-    // process/session's write gone bad) and confirm checkpoint() fails
-    // loudly rather than clobbering it. `se` already holds s1 in memory
-    // from createPlan/attachEvidence above; persistPlan always re-reads the
-    // ON-DISK file fresh before writing, regardless of what's cached.
     const corruptBytes = "{ this is not json "
     writeFileSync(planPath, corruptBytes)
 
-    expect(() => se.checkpoint("s1", storyId, "complete", { isValidReceipt: () => true })).toThrow(/corrupt/i)
+    expect(() => se.checkpoint("s1", taskId, "complete")).toThrow(/corrupt/i)
     expect(readFileSync(planPath, "utf8")).toBe(corruptBytes) // still untouched
   })
 
-  it("(b) a schema-invalid-but-parseable plan.json still degrades gracefully (no regression): invalid entries are dropped, the write proceeds", () => {
+  it("(b) a schema-invalid-but-parseable plan.json still degrades gracefully (no regression)", () => {
     const stateDir = temporaryRoot()
     mkdirSync(stateDir, { recursive: true })
     const planPath = join(stateDir, "plan.json")
-    // Valid JSON, but "session-other"'s value fails isPlanV2 (stories is not an array).
     writeFileSync(planPath, JSON.stringify({ "session-other": { schemaVersion: 2, stories: "not an array" } }))
     const logger = vi.fn()
     const { engine: se } = engine(stateDir, logger)
@@ -320,146 +340,790 @@ describe("story_disk_corrupt_on_write (CRITICAL fix, persistPlan)", () => {
     expect(logger).not.toHaveBeenCalledWith("story:disk-corrupt", expect.anything())
     const onDisk = JSON.parse(readFileSync(planPath, "utf8")) as Record<string, unknown>
     expect(onDisk.s1).toBeDefined()
-    // The pre-existing schema-invalid entry is dropped (per-key filtering,
-    // unchanged behavior) rather than blocking this session's write.
     expect(onDisk["session-other"]).toBeUndefined()
   })
 })
 
-// ---------------------------------------------------------------------------
-// MINOR fix: checkpoint(complete) must require storyId to be the plan's
-// current active story, or successor-promotion can silently strand the plan.
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// 2026-07-30 task/DAG redesign: wave computation from the dependency DAG.
+// ===========================================================================
 
-describe("story_checkpoint_requires_active_story (MINOR fix)", () => {
-  it("throws, naming both the requested and the actual active story id, when completing a non-active (pending) story directly", () => {
+describe("DAG wave computation (2026-07-30 task/DAG redesign)", () => {
+  it("independent tasks (no deps) are ALL level 0 → all start ACTIVE at create, with startedAt", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const before = Date.now()
+    const plan = se.createPlan("s1", [
+      story({
+        text: "three independent tasks",
+        tasks: [{ text: "a" }, { text: "b" }, { text: "c" }],
+      }),
+    ])
+    const after = Date.now()
+
+    expect(plan.stories[0].tasks.map((t) => t.status)).toEqual(["active", "active", "active"])
+    for (const task of plan.stories[0].tasks) {
+      expect(typeof task.startedAt).toBe("string")
+      const ms = Date.parse(task.startedAt!)
+      expect(ms).toBeGreaterThanOrEqual(before)
+      expect(ms).toBeLessThanOrEqual(after)
+    }
+  })
+
+  it("a task that depends on another WAITS: dependent is pending while its predecessor is active", () => {
     const stateDir = temporaryRoot()
     const { engine: se } = engine(stateDir)
     const plan = se.createPlan("s1", [
-      story({ text: "story one", acceptanceItems: ["A1"] }),
-      story({ text: "story two", acceptanceItems: ["A1"] }),
+      story({
+        text: "pipeline",
+        tasks: [
+          { text: "first" },
+          { text: "second", dependsOn: ["S1.T1"] },
+        ],
+      }),
     ])
-    const firstId = plan.stories[0].id // active
-    const secondId = plan.stories[1].id // pending — not the active story
-    se.attachEvidence("s1", secondId, "A1", { receiptId: "vrf_1" })
 
-    expect(() => se.checkpoint("s1", secondId, "complete", { isValidReceipt: () => true })).toThrow(
-      new RegExp(secondId),
-    )
-    expect(() => se.checkpoint("s1", secondId, "complete", { isValidReceipt: () => true })).toThrow(
-      new RegExp(firstId),
-    )
-
-    // Nothing changed: first story is still active, second still pending —
-    // the plan was NOT silently stranded.
-    const after = se.getPlan("s1")!
-    expect(after.stories[0].status).toBe("active")
-    expect(after.stories[1].status).toBe("pending")
+    expect(plan.stories[0].tasks[0].status).toBe("active") // level 0
+    expect(plan.stories[0].tasks[1].status).toBe("pending") // level 1, depends on T1
+    expect(plan.stories[0].tasks[1].startedAt).toBeUndefined()
   })
 
-  it("still allows completing the actual active story (no false-positive rejection)", () => {
-    const stateDir = temporaryRoot()
-    const { engine: se } = engine(stateDir)
-    const plan = se.createPlan("s1", [story({ acceptanceItems: ["A1"] })])
-    const storyId = plan.stories[0].id
-    se.attachEvidence("s1", storyId, "A1", { receiptId: "vrf_1" })
-
-    expect(() => se.checkpoint("s1", storyId, "complete", { isValidReceipt: () => true })).not.toThrow()
-    expect(se.getPlan("s1")!.stories[0].status).toBe("complete")
-  })
-
-  it("does not gate 'failed'/'blocked' transitions on being the active story (only 'complete' is checked)", () => {
+  it("longest-path layering: a chain T1 -> T2 -> T3 places each at levels 0/1/2", () => {
     const stateDir = temporaryRoot()
     const { engine: se } = engine(stateDir)
     const plan = se.createPlan("s1", [
-      story({ text: "story one", acceptanceItems: ["A1"] }),
-      story({ text: "story two", acceptanceItems: ["A1"] }),
+      story({
+        text: "chain",
+        tasks: [
+          { text: "t1" },
+          { text: "t2", dependsOn: ["S1.T1"] },
+          { text: "t3", dependsOn: ["S1.T2"] },
+        ],
+      }),
     ])
-    const secondId = plan.stories[1].id // pending, not active
 
-    expect(() => se.checkpoint("s1", secondId, "blocked", {})).not.toThrow()
-    expect(se.getPlan("s1")!.stories[1].status).toBe("blocked")
+    // Only the level-0 task is active at create; the rest wait in order.
+    expect(plan.stories[0].tasks.map((t) => t.status)).toEqual(["active", "pending", "pending"])
+  })
+
+  it("a diamond (T1 -> {T2,T3} -> T4) fans out T2/T3 together once T1 is done", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [
+      story({
+        text: "diamond",
+        tasks: [
+          { text: "t1" },
+          { text: "t2", dependsOn: ["S1.T1"] },
+          { text: "t3", dependsOn: ["S1.T1"] },
+          { text: "t4", dependsOn: ["S1.T2", "S1.T3"] },
+        ],
+      }),
+    ])
+    const [t1, t2, t3, t4] = plan.stories[0].tasks
+
+    expect([t1.status, t2.status, t3.status, t4.status]).toEqual(["active", "pending", "pending", "pending"])
+
+    // Complete T1 → no active task remains → promote the next level (T2,T3).
+    se.checkpoint("s1", t1.id, "complete")
+    const after1 = se.getPlan("s1")!.stories[0].tasks
+    expect(after1.map((t) => t.status)).toEqual(["complete", "active", "active", "pending"])
+
+    // Complete T2 alone: T3 is still active, so T4 stays pending.
+    se.checkpoint("s1", t2.id, "complete")
+    const after2 = se.getPlan("s1")!.stories[0].tasks
+    expect(after2.map((t) => t.status)).toEqual(["complete", "complete", "active", "pending"])
+
+    // Complete T3 → no active → promote T4.
+    se.checkpoint("s1", t3.id, "complete")
+    const after3 = se.getPlan("s1")!.stories[0].tasks
+    expect(after3.map((t) => t.status)).toEqual(["complete", "complete", "complete", "active"])
+  })
+
+  it("getActiveTasks returns active tasks across stories in stable story-then-task order", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    se.createPlan("s1", [
+      story({ text: "s1", tasks: [{ text: "a" }, { text: "b" }] }),
+      story({ text: "s2", tasks: [{ text: "c" }] }),
+    ])
+
+    expect(se.getActiveTasks("s1").map((t) => t.id)).toEqual(["S1.T1", "S1.T2", "S2.T1"])
   })
 })
 
 // ---------------------------------------------------------------------------
-// MAJOR fix (supporting wiring/tools.ts's FR-020 time-valid-receipt check):
-// StoryV2.startedAt is set on activation and survives persist/load.
+// Cross-story task dependencies + story-dependsOn-story.
 // ---------------------------------------------------------------------------
 
-describe("story_started_at (MAJOR fix, wave-4 cross-file dependency)", () => {
-  it("is set to an ISO-8601 timestamp on the first story when the plan is created; pending stories have none yet", () => {
+describe("cross-story dependencies and story-dependsOn-story", () => {
+  it("a task in S2 depending on a task in S1 cannot activate until that task completes", () => {
     const stateDir = temporaryRoot()
     const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [
+      story({ text: "S1", tasks: [{ text: "t1" }] }),
+      story({ text: "S2", tasks: [{ text: "t1", dependsOn: ["S1.T1"] }] }),
+    ])
+    const s1t1 = plan.stories[0].tasks[0]
+    const s2t1 = plan.stories[1].tasks[0]
+
+    // S1.T1 is level 0 (active); S2.T1 is level 1 (pending) — S2 is pending.
+    expect(s1t1.status).toBe("active")
+    expect(s2t1.status).toBe("pending")
+    expect(plan.stories.map((s) => s.status)).toEqual(["active", "pending"])
+
+    se.checkpoint("s1", s1t1.id, "complete")
+    const after = se.getPlan("s1")!
+    expect(after.stories[0].tasks[0].status).toBe("complete")
+    expect(after.stories[1].tasks[0].status).toBe("active") // predecessor done → promoted
+    expect(after.stories.map((s) => s.status)).toEqual(["complete", "active"])
+  })
+
+  it("story-dependsOn-story: none of S2's tasks activate until every task of S1 is complete", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [
+      story({ text: "S1", tasks: [{ text: "a" }, { text: "b" }] }),
+      story({ text: "S2", dependsOn: ["S1"], tasks: [{ text: "c" }, { text: "d" }] }),
+    ])
+
+    // Both S1 tasks are level 0; all S2 tasks depend (via the story dep) on
+    // both S1 tasks → level 1 → pending.
+    expect(plan.stories[0].tasks.map((t) => t.status)).toEqual(["active", "active"])
+    expect(plan.stories[1].tasks.map((t) => t.status)).toEqual(["pending", "pending"])
+
+    // Complete only ONE of S1's tasks: S2 still waits (the other is active).
+    se.checkpoint("s1", plan.stories[0].tasks[0].id, "complete")
+    expect(se.getPlan("s1")!.stories[1].tasks.map((t) => t.status)).toEqual(["pending", "pending"])
+
+    // Now complete the other: no active task remains → S2's whole level (c,d) activates.
+    se.checkpoint("s1", plan.stories[0].tasks[1].id, "complete")
+    const after = se.getPlan("s1")!
+    expect(after.stories[0].status).toBe("complete")
+    expect(after.stories[1].tasks.map((t) => t.status)).toEqual(["active", "active"])
+    expect(after.stories[1].status).toBe("active")
+  })
+
+  it("a task-level dependsOn naming a STORY id expands to all of that story's tasks", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [
+      story({ text: "S1", tasks: [{ text: "a" }, { text: "b" }] }),
+      // S2.T1 depends on the whole story S1 by id.
+      story({ text: "S2", tasks: [{ text: "c", dependsOn: ["S1"] }] }),
+    ])
+
+    expect(plan.stories[1].tasks[0].status).toBe("pending")
+    se.checkpoint("s1", plan.stories[0].tasks[0].id, "complete")
+    expect(se.getPlan("s1")!.stories[1].tasks[0].status).toBe("pending") // S1.T2 still active
+    se.checkpoint("s1", plan.stories[0].tasks[1].id, "complete")
+    expect(se.getPlan("s1")!.stories[1].tasks[0].status).toBe("active") // all of S1 done
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Validation: cycle rejection + dangling-dep rejection (before any disk write).
+// ---------------------------------------------------------------------------
+
+describe("createPlan dependency validation", () => {
+  it("rejects a task-level cycle, naming the cycle, and writes no plan", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    expect(() =>
+      se.createPlan("s1", [
+        story({
+          text: "cycle",
+          tasks: [
+            { text: "a", dependsOn: ["S1.T2"] },
+            { text: "b", dependsOn: ["S1.T1"] },
+          ],
+        }),
+      ]),
+    ).toThrow(/plan dependency cycle:/)
+    expect(se.getPlan("s1")).toBeNull()
+    // byte-for-byte: no plan.json written.
+    expect(existsSync(join(stateDir, "plan.json"))).toBe(false)
+  })
+
+  it("rejects a cycle across stories (S1.T1 -> S2.T1 -> S1.T1)", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    expect(() =>
+      se.createPlan("s1", [
+        story({ text: "S1", tasks: [{ text: "a", dependsOn: ["S2.T1"] }] }),
+        story({ text: "S2", tasks: [{ text: "b", dependsOn: ["S1.T1"] }] }),
+      ]),
+    ).toThrow(/plan dependency cycle:/)
+  })
+
+  it("rejects a dangling task dependsOn (unknown id), naming the id", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    expect(() =>
+      se.createPlan("s1", [
+        story({ text: "S1", tasks: [{ text: "a", dependsOn: ["S1.T9"] }] }),
+      ]),
+    ).toThrow(/unknown story or task: S1\.T9/)
+    expect(se.getPlan("s1")).toBeNull()
+  })
+
+  it("rejects a dangling story dependsOn (unknown story id)", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    expect(() =>
+      se.createPlan("s1", [story({ text: "S1", dependsOn: ["S9"], tasks: [{ text: "a" }] })]),
+    ).toThrow(/unknown story or task: S9/)
+  })
+
+  it("rejects a duplicate task id is impossible by construction (auto-assigned), but two stories share no task ids", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [
+      story({ text: "S1", tasks: [{ text: "a" }, { text: "b" }] }),
+      story({ text: "S2", tasks: [{ text: "c" }] }),
+    ])
+    const ids = plan.stories.flatMap((s) => s.tasks.map((t) => t.id))
+    expect(new Set(ids).size).toBe(ids.length)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Task-level checkpoint: claim semantics, auto-complete, promotion.
+// ---------------------------------------------------------------------------
+
+describe("checkpoint operates on a TASK (2026-07-30)", () => {
+  it("completing a task with NO evidence succeeds (claim, not proof) and stamps task.completedAt", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [story({ tasks: [{ text: "a" }, { text: "b" }] })])
+    const t1 = plan.stories[0].tasks[0].id
+
     const before = Date.now()
-    const plan = se.createPlan("s1", [story(), story()])
+    se.checkpoint("s1", t1, "complete")
     const after = Date.now()
 
-    expect(plan.stories[0].status).toBe("active")
-    expect(typeof plan.stories[0].startedAt).toBe("string")
-    const startedMs = Date.parse(plan.stories[0].startedAt!)
-    expect(startedMs).toBeGreaterThanOrEqual(before)
-    expect(startedMs).toBeLessThanOrEqual(after)
-
-    expect(plan.stories[1].status).toBe("pending")
-    expect(plan.stories[1].startedAt).toBeUndefined()
+    const task = se.getPlan("s1")!.stories[0].tasks[0]
+    expect(task.status).toBe("complete")
+    expect(typeof task.completedAt).toBe("string")
+    const ms = Date.parse(task.completedAt!)
+    expect(ms).toBeGreaterThanOrEqual(before)
+    expect(ms).toBeLessThanOrEqual(after)
   })
 
-  it("is set on the successor story when checkpoint's successor-promotion activates it", () => {
+  it("a story AUTO-COMPLETES (with story.completedAt) when its LAST active task completes", () => {
     const stateDir = temporaryRoot()
     const { engine: se } = engine(stateDir)
-    const plan = se.createPlan("s1", [story({ acceptanceItems: ["A1"] }), story({ acceptanceItems: ["A1"] })])
-    const firstId = plan.stories[0].id
-    se.attachEvidence("s1", firstId, "A1", { receiptId: "vrf_1" })
+    const plan = se.createPlan("s1", [
+      story({
+        text: "two-task story",
+        tasks: [{ text: "a" }, { text: "b" }],
+      }),
+    ])
+    const [t1, t2] = plan.stories[0].tasks.map((t) => t.id)
 
-    expect(se.getPlan("s1")!.stories[1].startedAt).toBeUndefined()
-    se.checkpoint("s1", firstId, "complete", { isValidReceipt: () => true })
+    se.checkpoint("s1", t1, "complete")
+    let storyState = se.getPlan("s1")!.stories[0]
+    expect(storyState.status).toBe("active") // t2 still active
+    expect(storyState.completedAt).toBeUndefined()
 
+    se.checkpoint("s1", t2, "complete")
+    storyState = se.getPlan("s1")!.stories[0]
+    expect(storyState.status).toBe("complete")
+    expect(typeof storyState.completedAt).toBe("string")
+  })
+
+  it("promotes the next level (across stories) only when NO task remains active anywhere", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [
+      story({ text: "S1", tasks: [{ text: "a" }] }),
+      story({ text: "S2", tasks: [{ text: "b", dependsOn: ["S1.T1"] }, { text: "c", dependsOn: ["S1.T1"] }] }),
+      story({ text: "S3", tasks: [{ text: "d", dependsOn: ["S2.T1", "S2.T2"] }] }),
+    ])
+    const [s1t1] = plan.stories[0].tasks
+    const s2 = plan.stories[1].tasks
+    const s3 = plan.stories[2].tasks
+
+    // Complete S1.T1 → promote S2's whole level (b,c) together.
+    se.checkpoint("s1", s1t1.id, "complete")
+    expect(se.getPlan("s1")!.stories[1].tasks.map((t) => t.status)).toEqual(["active", "active"])
+    expect(se.getPlan("s1")!.stories[2].tasks[0].status).toBe("pending")
+
+    // Complete S2.T1 alone: S2.T2 still active → S3 NOT promoted.
+    se.checkpoint("s1", s2[0].id, "complete")
+    expect(se.getPlan("s1")!.stories[2].tasks[0].status).toBe("pending")
+
+    // Complete S2.T2 → no active → promote S3.T1.
+    se.checkpoint("s1", s2[1].id, "complete")
+    expect(se.getPlan("s1")!.stories[2].tasks[0].status).toBe("active")
+    expect(typeof se.getPlan("s1")!.stories[2].tasks[0].startedAt).toBe("string")
+  })
+
+  it("completing a non-active (pending) task throws, naming the task and the active ids", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [
+      story({
+        tasks: [
+          { text: "first" },
+          { text: "second", dependsOn: ["S1.T1"] },
+        ],
+      }),
+    ])
+    const pending = plan.stories[0].tasks[1].id
+
+    expect(() => se.checkpoint("s1", pending, "complete")).toThrow(new RegExp(pending))
+    expect(() => se.checkpoint("s1", pending, "complete")).toThrow(/not active/)
+    // Nothing changed.
     const after = se.getPlan("s1")!
-    expect(after.stories[1].status).toBe("active")
-    expect(typeof after.stories[1].startedAt).toBe("string")
+    expect(after.stories[0].tasks[0].status).toBe("active")
+    expect(after.stories[0].tasks[1].status).toBe("pending")
   })
 
-  it("survives a persist/load round-trip (fresh StoryEngine instance)", () => {
+  it("does NOT gate failed/blocked transitions on being an active task (only complete is checked)", () => {
     const stateDir = temporaryRoot()
     const { engine: se } = engine(stateDir)
-    const plan = se.createPlan("s1", [story()])
-    const startedAt = plan.stories[0].startedAt
-    expect(typeof startedAt).toBe("string")
+    const plan = se.createPlan("s1", [
+      story({
+        tasks: [
+          { text: "first" },
+          { text: "second", dependsOn: ["S1.T1"] },
+        ],
+      }),
+    ])
+    const pending = plan.stories[0].tasks[1].id
+
+    expect(() => se.checkpoint("s1", pending, "blocked")).not.toThrow()
+    expect(se.getPlan("s1")!.stories[0].tasks[1].status).toBe("blocked")
+  })
+
+  // C-11 invariant carried into the task/DAG model: a dependent task CANNOT
+  // activate while a dependency it relies on is blocked — promotion is
+  // dependency-COMPLETION-based, not raw-topological-level-based. A level
+  // scan would skip the blocked predecessor and wrongly activate the
+  // successor, letting a plan false-complete with an unresolved dependency.
+  it("a blocked dependency holds its dependent task pending until the dependency is reopened and completed", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [
+      story({ text: "predecessor", tasks: [{ text: "p" }] }),
+      story({ text: "successor", dependsOn: ["S1"], tasks: [{ text: "s" }] }),
+    ])
+    const p = plan.stories[0].tasks[0].id // S1.T1
+
+    // Block the active predecessor. No task remains active -> promotion runs,
+    // but S2.T1's dep (S1.T1) is not complete -> S2.T1 STAYS pending.
+    se.checkpoint("s1", p, "blocked", { reason: "upstream missing" })
+    const afterBlock = se.getPlan("s1")!
+    expect(afterBlock.stories[0].tasks[0].status).toBe("blocked")
+    expect(afterBlock.stories[1].tasks[0].status).toBe("pending") // NOT activated
+    expect(afterBlock.stories[1].status).toBe("pending")
+
+    // Reopen the predecessor -> its task re-activates (deps vacuously complete).
+    se.reopenStory("s1", "S1", { reason: "unblocked" })
+    expect(se.getPlan("s1")!.stories[0].tasks[0].status).toBe("active")
+
+    // Complete the predecessor -> now S2.T1's dep is complete -> promoted.
+    se.checkpoint("s1", p, "complete")
+    expect(se.getPlan("s1")!.stories[1].tasks[0].status).toBe("active")
+  })
+
+  it("blocked/failed with a reason record it on the parent STORY as an amendment", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [story({ tasks: [{ text: "a" }] })])
+    const t1 = plan.stories[0].tasks[0].id
+
+    se.checkpoint("s1", t1, "blocked", { reason: "verifier exits ambiguous" })
+    const blocked = se.getPlan("s1")!.stories[0]
+    expect(blocked.status).toBe("blocked")
+    expect(blocked.amendments.map((a) => a.reason)).toEqual(["blocked: verifier exits ambiguous"])
+    expect(blocked.tasks[0].completedAt).toBeUndefined()
+
+    // A non-complete outcome also clears any earlier task completion claim.
+    se.reopenStory("s1", "S1", { reason: "retry" })
+    se.checkpoint("s1", t1, "failed", { reason: "attempt blew up" })
+    expect(se.getPlan("s1")!.stories[0].amendments.some((a) => a.reason === "failed: attempt blew up")).toBe(true)
+  })
+
+  it("blocked/failed without a reason appends no amendment", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [story({ tasks: [{ text: "a" }] })])
+    se.checkpoint("s1", plan.stories[0].tasks[0].id, "blocked")
+    expect(se.getPlan("s1")!.stories[0].amendments).toHaveLength(0)
+  })
+
+  it("unknown task id throws, no plan for the session throws", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    se.createPlan("s1", [story()])
+    expect(() => se.checkpoint("s1", "S1.T9", "complete")).toThrow(/unknown task/)
+    expect(() => se.checkpoint("no-plan", "S1.T1", "complete")).toThrow(/no story plan/)
+  })
+
+  it("a rejected checkpoint leaves the plan file byte-for-byte unchanged (invariant)", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [
+      story({
+        tasks: [
+          { text: "first" },
+          { text: "second", dependsOn: ["S1.T1"] },
+        ],
+      }),
+    ])
+    const pending = plan.stories[0].tasks[1].id // pending → completing must throw
+    const beforeBytes = readFileSync(join(stateDir, "plan.json"))
+
+    expect(() => se.checkpoint("s1", pending, "complete")).toThrow()
+    expect(readFileSync(join(stateDir, "plan.json")).equals(beforeBytes)).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// applyJudgeVerdicts — a failed verdict reverts a complete story AND re-opens
+// its complete tasks (re-audit requires re-doing the work).
+// ---------------------------------------------------------------------------
+
+describe("applyJudgeVerdicts re-opens a reverted story's tasks (2026-07-30)", () => {
+  const items = [
+    { itemId: "A1", met: true, note: "verified via make check" },
+    { itemId: "A2", met: false, note: "no such export exists" },
+  ]
+
+  it("a passing verdict on a complete story keeps it complete and records the stamp", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se, logger } = engine(stateDir)
+    const plan = se.createPlan("s1", [story({ acceptanceItems: ["A1", "A2"], tasks: [{ text: "a" }] })])
+    const storyId = plan.stories[0].id
+    const taskId = plan.stories[0].tasks[0].id
+    se.checkpoint("s1", taskId, "complete")
+
+    const result = se.applyJudgeVerdicts("s1", [{ storyId, pass: true, summary: "all good", items }])
+
+    expect(result).toEqual({ reverted: [], passed: [storyId], unknown: [] })
+    const after = se.getPlan("s1")!.stories[0]
+    expect(after.status).toBe("complete")
+    expect(after.completedAt).toBeDefined()
+    expect(after.judge).toMatchObject({ pass: true, summary: "all good", items })
+    expect(typeof after.judge!.judgedAt).toBe("string")
+    expect(logger).toHaveBeenCalledWith("story:judge-audit", { sessionID: "s1", passed: [storyId], reverted: [], unknown: [] })
+  })
+
+  it("a failing verdict on a complete story REVERTS it: tasks re-opened to active, fresh startedAt, completedAt cleared", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [story({ acceptanceItems: ["A1", "A2"], tasks: [{ text: "a" }, { text: "b" }] })])
+    const storyId = plan.stories[0].id
+    const [t1, t2] = plan.stories[0].tasks.map((t) => t.id)
+    se.checkpoint("s1", t1, "complete")
+    se.checkpoint("s1", t2, "complete")
+    expect(se.getPlan("s1")!.stories[0].status).toBe("complete")
+
+    const before = Date.now()
+    const result = se.applyJudgeVerdicts("s1", [{ storyId, pass: false, summary: "A2 not delivered", items }])
+    const after = Date.now()
+
+    expect(result.reverted).toEqual([storyId])
+    const reverted = se.getPlan("s1")!.stories[0]
+    expect(reverted.status).toBe("active")
+    expect(reverted.completedAt).toBeUndefined()
+    // BOTH complete tasks were re-opened to active.
+    expect(reverted.tasks.map((t) => t.status)).toEqual(["active", "active"])
+    expect(reverted.tasks.every((t) => t.completedAt === undefined)).toBe(true)
+    expect(reverted.tasks.every((t) => typeof t.startedAt === "string")).toBe(true)
+    expect(reverted.tasks.every((t) => Date.parse(t.startedAt!) >= before && Date.parse(t.startedAt!) <= after)).toBe(true)
+    expect(reverted.judge).toMatchObject({ pass: false, summary: "A2 not delivered" })
+  })
+
+  it("a verdict on a non-complete story records the stamp but changes no status", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [
+      story({ text: "S1", tasks: [{ text: "a" }] }),
+      story({ text: "S2", tasks: [{ text: "b", dependsOn: ["S1.T1"] }] }),
+    ])
+    const [s1, s2] = plan.stories.map((s) => s.id)
+
+    const result = se.applyJudgeVerdicts("s1", [
+      { storyId: s1, pass: false, summary: "active story audited early", items: [] },
+      { storyId: s2, pass: true, summary: "pending story audited early", items: [] },
+    ])
+
+    expect(result).toEqual({ reverted: [], passed: [], unknown: [] })
+    const after = se.getPlan("s1")!
+    expect(after.stories[0].status).toBe("active")
+    expect(after.stories[0].judge).toMatchObject({ pass: false })
+    expect(after.stories[1].status).toBe("pending")
+    expect(after.stories[1].judge).toMatchObject({ pass: true })
+  })
+
+  it("unknown story ids are collected into `unknown` and never throw", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [story({ tasks: [{ text: "a" }] })])
+    const storyId = plan.stories[0].id
+    se.checkpoint("s1", plan.stories[0].tasks[0].id, "complete")
+
+    const result = se.applyJudgeVerdicts("s1", [
+      { storyId: "S99", pass: false, summary: "ghost", items: [] },
+      { storyId, pass: true, summary: "real", items: [] },
+    ])
+
+    expect(result).toEqual({ reverted: [], passed: [storyId], unknown: ["S99"] })
+  })
+
+  it("throws when the session has no plan", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    expect(() => se.applyJudgeVerdicts("no-plan", [])).toThrow(/no story plan/)
+  })
+
+  it("a reverted story's tasks can be recompleted and rejudged — the full claim/audit/reclaim cycle", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [story({ tasks: [{ text: "a" }] })])
+    const storyId = plan.stories[0].id
+    const taskId = plan.stories[0].tasks[0].id
+
+    se.checkpoint("s1", taskId, "complete")
+    se.applyJudgeVerdicts("s1", [{ storyId, pass: false, summary: "not real", items }])
+    expect(se.getPlan("s1")!.stories[0].status).toBe("active")
+
+    se.checkpoint("s1", taskId, "complete")
+    const result = se.applyJudgeVerdicts("s1", [{ storyId, pass: true, summary: "now real", items: [] }])
+    expect(result.passed).toEqual([storyId])
+    expect(se.getPlan("s1")!.stories[0].status).toBe("complete")
+    expect(se.getPlan("s1")!.stories[0].judge!.pass).toBe(true)
+  })
+
+  it("stamps and reversions survive a restart (fresh StoryEngine instance)", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [story({ acceptanceItems: ["A1", "A2"], tasks: [{ text: "a" }] })])
+    const storyId = plan.stories[0].id
+    se.checkpoint("s1", plan.stories[0].tasks[0].id, "complete")
+    se.applyJudgeVerdicts("s1", [{ storyId, pass: false, summary: "A2 missing", items }])
 
     const restarted = new StoryEngine({ stateDir, logger: vi.fn() })
-    expect(restarted.getPlan("s1")!.stories[0].startedAt).toBe(startedAt)
+    const reloaded = restarted.getPlan("s1")!.stories[0]
+    expect(reloaded.status).toBe("active")
+    expect(reloaded.completedAt).toBeUndefined()
+    expect(reloaded.tasks[0].status).toBe("active")
+    expect(reloaded.judge).toMatchObject({ pass: false, summary: "A2 missing", items })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// reopenStory (2026-07-30): re-activates a story's not-complete tasks per
+// the DAG level rule; no longer gated on blocked/failed only.
+// ---------------------------------------------------------------------------
+
+describe("reopenStory re-activates tasks per the DAG rule", () => {
+  it("reopens a blocked story's tasks: a no-dep task goes active (fresh startedAt)", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [story({ tasks: [{ text: "a" }] })])
+    const storyId = plan.stories[0].id
+    const taskId = plan.stories[0].tasks[0].id
+
+    se.checkpoint("s1", taskId, "blocked")
+    expect(se.getPlan("s1")!.stories[0].status).toBe("blocked")
+
+    const before = Date.now()
+    se.reopenStory("s1", storyId, { reason: "dependency unblocked" })
+    const after = Date.now()
+
+    const reopened = se.getPlan("s1")!.stories[0]
+    expect(reopened.status).toBe("active")
+    expect(reopened.tasks[0].status).toBe("active")
+    expect(reopened.tasks[0].completedAt).toBeUndefined()
+    expect(typeof reopened.tasks[0].startedAt).toBe("string")
+    const ms = Date.parse(reopened.tasks[0].startedAt!)
+    expect(ms).toBeGreaterThanOrEqual(before)
+    expect(ms).toBeLessThanOrEqual(after)
   })
 
-  it("a plan.json written before this field existed (no startedAt key at all) still validates on load — treated as unknown, not an error", () => {
+  it("reopens a story whose task depends on an incomplete predecessor: the task rejoins as pending", () => {
     const stateDir = temporaryRoot()
-    mkdirSync(stateDir, { recursive: true })
-    const legacyPlan = {
-      schemaVersion: 2,
-      stories: [
-        {
-          id: "S1",
-          text: "legacy story",
-          acceptanceItems: [],
-          scopeGlobs: [],
-          verifiers: [],
-          assumptions: [],
-          rejectedAlternatives: [],
-          amendments: [],
-          status: "active",
-          // no startedAt field at all — pre-dates the field's existence
-        },
-      ],
-      finalStoryId: "S1",
-      createdAt: new Date().toISOString(),
-    }
-    writeFileSync(join(stateDir, "plan.json"), JSON.stringify({ s1: legacyPlan }))
-
     const { engine: se } = engine(stateDir)
-    const plan = se.getPlan("s1")
+    const plan = se.createPlan("s1", [
+      story({ text: "S1", tasks: [{ text: "a" }] }),
+      story({ text: "S2", tasks: [{ text: "b", dependsOn: ["S1.T1"] }] }),
+    ])
+    const s2 = plan.stories[1]
 
-    expect(plan).not.toBeNull()
-    expect(plan!.stories[0].startedAt).toBeUndefined()
+    // S2.T1 starts pending (depends on S1.T1). Block it out of order, reopen.
+    se.checkpoint("s1", s2.tasks[0].id, "blocked")
+    expect(se.getPlan("s1")!.stories[1].tasks[0].status).toBe("blocked")
+
+    se.reopenStory("s1", s2.id, { reason: "retry" })
+    const reopened = se.getPlan("s1")!.stories[1]
+    // S1.T1 still active (not complete) → S2.T1 cannot activate → pending.
+    expect(reopened.tasks[0].status).toBe("pending")
+    expect(reopened.tasks[0].startedAt).toBeUndefined()
+    expect(reopened.status).toBe("pending")
+  })
+
+  it("reopen leaves complete tasks complete (re-audit re-opens those via applyJudgeVerdicts, not here)", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [
+      story({ tasks: [{ text: "a" }, { text: "b" }] }),
+    ])
+    const [t1, t2] = plan.stories[0].tasks.map((t) => t.id)
+
+    se.checkpoint("s1", t1, "complete")
+    se.checkpoint("s1", t2, "blocked") // story now mixed: complete + blocked
+    se.reopenStory("s1", "S1", { reason: "resume" })
+
+    const after = se.getPlan("s1")!.stories[0]
+    expect(after.tasks[0].status).toBe("complete") // untouched
+    expect(after.tasks[1].status).toBe("active") // deps (none) satisfied → active
+  })
+
+  it("records an amendment naming the previous status and logs story:reopened", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se, logger } = engine(stateDir)
+    const plan = se.createPlan("s1", [story({ tasks: [{ text: "a" }] })])
+    const storyId = plan.stories[0].id
+    se.checkpoint("s1", plan.stories[0].tasks[0].id, "failed")
+
+    se.reopenStory("s1", storyId, { reason: "root cause fixed" })
+
+    const after = se.getPlan("s1")!.stories[0]
+    expect(after.amendments[0].reason).toMatch(/reopened from failed/)
+    expect(after.amendments[0].reason).toMatch(/root cause fixed/)
+    expect(logger).toHaveBeenCalledWith("story:reopened", expect.objectContaining({ sessionID: "s1", storyId, previousStatus: "failed" }))
+  })
+
+  it("throws on an unknown session or story", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    se.createPlan("s1", [story()])
+    expect(() => se.reopenStory("unknown-session", "S1", { reason: "x" })).toThrow(/no story plan/)
+    expect(() => se.reopenStory("s1", "S99", { reason: "x" })).toThrow(/unknown story/)
+  })
+
+  it("does NOT reset acceptance-item evidence on reopen (deprecated field, judge stamps supersede it)", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [story({ acceptanceItems: ["A1"], tasks: [{ text: "a" }] })])
+    se.attachEvidence("s1", "S1", "A1", { receiptId: "vrf_legacy" })
+    se.checkpoint("s1", plan.stories[0].tasks[0].id, "blocked")
+    se.reopenStory("s1", "S1", { reason: "retry" })
+    expect(se.getPlan("s1")!.stories[0].acceptanceItems[0].evidence).toEqual({ receiptId: "vrf_legacy" })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// C-6 end-to-end (task model): a blocked final story can be reopened and the
+// plan still reaches all-complete. The DAG honours story dependsOn, so the
+// final story's tasks cannot complete until its siblings are done.
+// ---------------------------------------------------------------------------
+
+describe("C-6 end-to-end: a blocked final story can be reopened and the plan reaches all-complete", () => {
+  it("recovers a plan stuck on a blocked final story", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [
+      story({ text: "S1", tasks: [{ text: "a" }] }),
+      story({ text: "S2 final", dependsOn: ["S1"], tasks: [{ text: "b" }] }),
+    ])
+    const s1t1 = plan.stories[0].tasks[0].id
+    const s2t1 = plan.stories[1].tasks[0].id
+    expect(plan.finalStoryId).toBe("S2")
+
+    se.checkpoint("s1", s1t1, "complete")
+    expect(se.getActiveTasks("s1").map((t) => t.id)).toEqual([s2t1])
+
+    // The final story's task blocks while it is the only active task.
+    se.checkpoint("s1", s2t1, "blocked")
+    expect(se.getActiveTasks("s1")).toEqual([])
+    expect(se.getPlan("s1")!.stories.every((s) => s.status === "complete")).toBe(false)
+
+    se.reopenStory("s1", "S2", { reason: "blocker resolved" })
+    expect(se.getActiveTasks("s1").map((t) => t.id)).toEqual([s2t1])
+
+    se.checkpoint("s1", s2t1, "complete")
+    expect(se.getPlan("s1")!.stories.map((s) => s.status)).toEqual(["complete", "complete"])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// checkScope across MULTIPLE active-task stories.
+// ---------------------------------------------------------------------------
+
+describe("checkScope with multiple active-task stories", () => {
+  it("a mutation matching ANY active-task story's globs is in scope", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    se.createPlan("s1", [
+      story({ scopeGlobs: ["src/parser/**"], tasks: [{ text: "a" }] }),
+      story({ scopeGlobs: ["src/cli/**"], tasks: [{ text: "b" }] }),
+    ])
+
+    expect(se.checkScope("s1", "src/parser/lexer.ts")).toBeNull()
+    expect(se.checkScope("s1", "src/cli/main.ts")).toBeNull()
+  })
+
+  it("a mutation matching NO active-task story's globs is out of scope", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    se.createPlan("s1", [
+      story({ scopeGlobs: ["src/parser/**"], tasks: [{ text: "a" }] }),
+      story({ scopeGlobs: ["src/cli/**"], tasks: [{ text: "b" }] }),
+    ])
+
+    expect(se.checkScope("s1", "docs/readme.md")).toEqual({
+      family: "scope-watchdog",
+      offer: "fold",
+      scopeGlobsMatchedZero: false,
+    })
+  })
+
+  it("returns null when no task is active anywhere (e.g. a story whose tasks all wait on a predecessor)", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    se.createPlan("s1", [
+      story({ scopeGlobs: ["src/parser/**"], tasks: [{ text: "a" }] }),
+      // S2's only task depends on S1.T1 → pending → no active-task story for S2.
+      story({ scopeGlobs: ["src/cli/**"], tasks: [{ text: "b", dependsOn: ["S1.T1"] }] }),
+    ])
+
+    // S1 IS an active-task story, so its globs still apply; but a path
+    // matching only S2's globs is out of scope because S2 has no active task.
+    expect(se.checkScope("s1", "src/parser/lexer.ts")).toBeNull() // S1 active, matches
+    expect(se.checkScope("s1", "src/cli/main.ts")).not.toBeNull() // S2 NOT an active-task story
+  })
+
+  it("offers amend first when the caller reports the globs match zero files in the worktree", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    se.createPlan("s1", [story({ scopeGlobs: ["src/parsr/**"], tasks: [{ text: "a" }] })])
+
+    expect(se.checkScope("s1", "src/cli.ts", { scopeGlobsMatchedZero: true })).toEqual({
+      family: "scope-watchdog",
+      offer: "amend",
+      scopeGlobsMatchedZero: true,
+    })
+  })
+
+  it("returns null when every active-task story has empty globs", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    se.createPlan("s1", [
+      story({ scopeGlobs: [], tasks: [{ text: "a" }] }),
+      story({ scopeGlobs: [], tasks: [{ text: "b" }] }),
+    ])
+    expect(se.checkScope("s1", "anything.ts")).toBeNull()
+  })
+
+  it("returns null when there is no active task / no plan", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    expect(se.checkScope("no-plan-session", "src/cli.ts")).toBeNull()
   })
 })
 
@@ -503,13 +1167,9 @@ describe("clearPlan (human-facing escape hatch)", () => {
 
     expect(se.getPlan("s1")).toBeNull()
     expect(se.getPlan("s2")).not.toBeNull()
-
-    const onDisk = JSON.parse(readFileSync(join(stateDir, "plan.json"), "utf8"))
-    expect(onDisk.s1).toBeUndefined()
-    expect(onDisk.s2).toBeDefined()
   })
 
-  it("survives a fresh StoryEngine instance — the clear is durable, not just in-memory", () => {
+  it("survives a fresh StoryEngine instance — the clear is durable", () => {
     const stateDir = temporaryRoot()
     const { engine: se } = engine(stateDir)
     se.createPlan("s1", [story()])
@@ -520,522 +1180,233 @@ describe("clearPlan (human-facing escape hatch)", () => {
   })
 })
 
-// ---------------------------------------------------------------------------
-// Test 14: story_scope_watchdog_globs (FR-021)
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// A second `createPlan` must not silently discard the first plan.
+// ===========================================================================
 
-describe("story_scope_watchdog_globs (test 14, FR-021)", () => {
-  it("returns null for a mutation inside scope", () => {
-    const stateDir = temporaryRoot()
-    const { engine: se } = engine(stateDir)
-    se.createPlan("s1", [story({ scopeGlobs: ["src/parser/**"] })])
-
-    expect(se.checkScope("s1", "src/parser/lexer.ts")).toBeNull()
-  })
-
-  it("returns a scope-watchdog finding offering fold-first for an ordinary out-of-scope mutation", () => {
-    const stateDir = temporaryRoot()
-    const { engine: se } = engine(stateDir)
-    se.createPlan("s1", [story({ scopeGlobs: ["src/parser/**"] })])
-
-    const finding = se.checkScope("s1", "src/cli.ts")
-    expect(finding).toEqual({ family: "scope-watchdog", offer: "fold", scopeGlobsMatchedZero: false })
-  })
-
-  it("returns null when the active story declares no scope constraint (empty scopeGlobs)", () => {
-    const stateDir = temporaryRoot()
-    const { engine: se } = engine(stateDir)
-    se.createPlan("s1", [story({ scopeGlobs: [] })])
-    expect(se.checkScope("s1", "anything.ts")).toBeNull()
-  })
-
-  it("returns null when there is no active story", () => {
-    const stateDir = temporaryRoot()
-    const { engine: se } = engine(stateDir)
-    expect(se.checkScope("no-plan-session", "src/cli.ts")).toBeNull()
-  })
-
-  it("offers amend first when the caller reports the scope globs match zero files in the worktree (branch-switch/typo edge case)", () => {
-    const stateDir = temporaryRoot()
-    const { engine: se } = engine(stateDir)
-    se.createPlan("s1", [story({ scopeGlobs: ["src/parsr/**"] })]) // typo'd glob
-
-    const finding = se.checkScope("s1", "src/cli.ts", { scopeGlobsMatchedZero: true })
-    expect(finding).toEqual({ family: "scope-watchdog", offer: "amend", scopeGlobsMatchedZero: true })
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Test 12/15 + Dataset: Checkpoint evidence validation (6 rows)
-// ---------------------------------------------------------------------------
-
-describe("checkpoint evidence validation — Dataset (6 rows) + test 12/15", () => {
-  function planWithTwoStories(se: StoryEngine): PlanV2 {
-    return se.createPlan("s1", [
-      story({ text: "story one", acceptanceItems: ["A1", "A2"] }),
-      story({ text: "final story", acceptanceItems: ["A1"] }),
-    ])
-  }
-
-  it("row 1: both items receipted on the FINAL story, isValidReceipt true -> accepted, status complete", () => {
-    const stateDir = temporaryRoot()
-    const { engine: se } = engine(stateDir)
-    const plan = se.createPlan("s1", [story({ acceptanceItems: ["A1", "A2"] })]) // single story == final story
-    const storyId = plan.stories[0].id
-    se.attachEvidence("s1", storyId, "A1", { receiptId: "vrf_1" })
-    se.attachEvidence("s1", storyId, "A2", { receiptId: "vrf_2" })
-
-    expect(() =>
-      se.checkpoint("s1", storyId, "complete", { isValidReceipt: (id) => id === "vrf_1" || id === "vrf_2" }),
-    ).not.toThrow()
-    expect(se.getPlan("s1")!.stories[0].status).toBe("complete")
-  })
-
-  it("row 2: A1 receipted, A2 has no evidence -> throws naming A2, plan file unchanged", () => {
-    const stateDir = temporaryRoot()
-    const { engine: se } = engine(stateDir)
-    const plan = se.createPlan("s1", [story({ acceptanceItems: ["A1", "A2"] })])
-    const storyId = plan.stories[0].id
-    se.attachEvidence("s1", storyId, "A1", { receiptId: "vrf_1" })
-    const beforeBytes = readFileSync(join(stateDir, "plan.json"))
-
-    // isValidReceipt returns true for A1's receipt so A1 passes structurally
-    // (this single-story plan is also the final story) — isolating the
-    // failure to A2's missing evidence, per the dataset row's intent.
-    expect(() => se.checkpoint("s1", storyId, "complete", { isValidReceipt: () => true })).toThrow(/A2/)
-    expect(se.getPlan("s1")!.stories[0].status).toBe("active") // unchanged
-    expect(readFileSync(join(stateDir, "plan.json")).equals(beforeBytes)).toBe(true)
-  })
-
-  it("row 3: explicit user waiver recorded -> accepted", () => {
-    const stateDir = temporaryRoot()
-    const { engine: se } = engine(stateDir)
-    const plan = se.createPlan("s1", [story({ acceptanceItems: ["A1"] })])
-    const storyId = plan.stories[0].id
-    se.attachEvidence("s1", storyId, "A1", { waiver: true, sourceMessageId: "msg_user_42" })
-
-    expect(() => se.checkpoint("s1", storyId, "complete", {})).not.toThrow()
-    expect(se.getPlan("s1")!.stories[0].status).toBe("complete")
-  })
-
-  it("row 4: an invented receipt id on the FINAL story throws 'not observed' (v1 rule kept)", () => {
-    const stateDir = temporaryRoot()
-    const { engine: se } = engine(stateDir)
-    const plan = se.createPlan("s1", [story({ acceptanceItems: ["A1"] })]) // single story == final
-    const storyId = plan.stories[0].id
-    se.attachEvidence("s1", storyId, "A1", { receiptId: "vrf_invented" })
-
-    expect(() => se.checkpoint("s1", storyId, "complete", { isValidReceipt: () => false })).toThrow(
-      /not an observed receipt/,
-    )
-    // Also throws when no isValidReceipt is supplied at all for the final story — cannot prove "observed".
-    expect(() => se.checkpoint("s1", storyId, "complete", {})).toThrow(/not an observed receipt/)
-  })
-
-  it("row 5: no evidence at all, status=blocked -> accepted (evidence not required for a non-complete terminal status)", () => {
-    const stateDir = temporaryRoot()
-    const { engine: se } = engine(stateDir)
-    const plan = se.createPlan("s1", [story({ acceptanceItems: ["A1", "A2"] })])
-    const storyId = plan.stories[0].id
-
-    expect(() => se.checkpoint("s1", storyId, "blocked", {})).not.toThrow()
-    expect(se.getPlan("s1")!.stories[0].status).toBe("blocked")
-  })
-
-  it("row 6: a model-issued waiver (never attached because wiring refused it) is rejected — item still has no evidence", () => {
-    const stateDir = temporaryRoot()
-    const { engine: se } = engine(stateDir)
-    const plan = se.createPlan("s1", [story({ acceptanceItems: ["A1"] })])
-    const storyId = plan.stories[0].id
-
-    // Simulates correct wiring behavior: the model tried to author its own waiver
-    // inside a tool call's arguments (not a real chat message), wiring's
-    // provenance check refuses to call attachEvidence at all, so evidence stays
-    // null and checkpoint rejects it via the ordinary "no evidence" path — this
-    // module never sees the model's fabricated waiver object.
-    expect(() => se.checkpoint("s1", storyId, "complete", {})).toThrow(/A1/)
-  })
-
-  it("row 6b: story.ts's own structural floor rejects a malformed waiver even if a caller bypasses TypeScript and attaches one directly", () => {
-    const stateDir = temporaryRoot()
-    const { engine: se } = engine(stateDir)
-    const plan = se.createPlan("s1", [story({ acceptanceItems: ["A1"] })])
-    const storyId = plan.stories[0].id
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    se.attachEvidence("s1", storyId, "A1", { waiver: true, sourceMessageId: "" } as any)
-
-    expect(() => se.checkpoint("s1", storyId, "complete", {})).toThrow(/malformed waiver/)
-  })
-
-  it("non-final story: a receipted item is accepted with no isValidReceipt supplied (FR-019 only requires 'evidence exists', not 'observed')", () => {
-    const stateDir = temporaryRoot()
-    const { engine: se } = engine(stateDir)
-    const plan = planWithTwoStories(se)
-    const firstId = plan.stories[0].id
-    se.attachEvidence("s1", firstId, "A1", { receiptId: "vrf_unverified" })
-    se.attachEvidence("s1", firstId, "A2", { receiptId: "vrf_unverified_2" })
-
-    expect(() => se.checkpoint("s1", firstId, "complete", {})).not.toThrow()
-    // Completing the (non-final) first story promotes the second to active.
-    const after = se.getPlan("s1")!
-    expect(after.stories[0].status).toBe("complete")
-    expect(after.stories[1].status).toBe("active")
-  })
-
-  it("unknown story id throws", () => {
-    const stateDir = temporaryRoot()
-    const { engine: se } = engine(stateDir)
-    se.createPlan("s1", [story()])
-    expect(() => se.checkpoint("s1", "S99", "complete", {})).toThrow(/unknown story/)
-  })
-
-  it("no plan for the session throws", () => {
-    const stateDir = temporaryRoot()
-    const { engine: se } = engine(stateDir)
-    expect(() => se.checkpoint("no-plan", "S1", "complete", {})).toThrow(/no story plan/)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// reopenStory — fixes docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md C-6: a plan
-// containing a blocked/failed story previously had no path back to
-// "pending"/"active" and could never reach all-"complete".
-// ---------------------------------------------------------------------------
-
-describe("reopenStory (C-6 fix: blocked/failed stories can be reopened)", () => {
-  it("a blocked story can be reopened and completed again with fresh evidence", () => {
-    const stateDir = temporaryRoot()
-    const { engine: se } = engine(stateDir)
-    const plan = se.createPlan("s1", [story({ acceptanceItems: ["A1"] })])
-    const storyId = plan.stories[0].id
-
-    se.checkpoint("s1", storyId, "blocked", {})
-    expect(se.getPlan("s1")!.stories[0].status).toBe("blocked")
-
-    se.reopenStory("s1", storyId, { reason: "dependency unblocked" })
-    expect(se.getPlan("s1")!.stories[0].status).toBe("active")
-
-    se.attachEvidence("s1", storyId, "A1", { receiptId: "vrf_fresh" })
-    expect(() =>
-      se.checkpoint("s1", storyId, "complete", { isValidReceipt: (id) => id === "vrf_fresh" }),
-    ).not.toThrow()
-    expect(se.getPlan("s1")!.stories[0].status).toBe("complete")
-  })
-
-  it("a failed story likewise can be reopened and completed again with fresh evidence", () => {
-    const stateDir = temporaryRoot()
-    const { engine: se } = engine(stateDir)
-    const plan = se.createPlan("s1", [story({ acceptanceItems: ["A1"] })])
-    const storyId = plan.stories[0].id
-
-    se.checkpoint("s1", storyId, "failed", {})
-    expect(se.getPlan("s1")!.stories[0].status).toBe("failed")
-
-    se.reopenStory("s1", storyId, { reason: "retrying after fix" })
-    expect(se.getPlan("s1")!.stories[0].status).toBe("active")
-
-    se.attachEvidence("s1", storyId, "A1", { waiver: true, sourceMessageId: "msg_user_9" })
-    expect(() => se.checkpoint("s1", storyId, "complete", {})).not.toThrow()
-    expect(se.getPlan("s1")!.stories[0].status).toBe("complete")
-  })
-
-  it("clears previously-attached evidence on reopen so a stale receipt cannot silently satisfy the next completion", () => {
-    const stateDir = temporaryRoot()
-    const { engine: se } = engine(stateDir)
-    const plan = se.createPlan("s1", [story({ acceptanceItems: ["A1"] })])
-    const storyId = plan.stories[0].id
-    se.attachEvidence("s1", storyId, "A1", { receiptId: "vrf_stale" })
-    se.checkpoint("s1", storyId, "blocked", {})
-
-    se.reopenStory("s1", storyId, { reason: "retry" })
-    expect(se.getPlan("s1")!.stories[0].acceptanceItems[0].evidence).toBeNull()
-
-    // Completing now without attaching fresh evidence must fail exactly like
-    // a brand-new story would — checkpoint("complete")'s own validation,
-    // untouched by this fix, runs in full.
-    expect(() => se.checkpoint("s1", storyId, "complete", { isValidReceipt: () => true })).toThrow(/A1/)
-  })
-
-  it("throws when reopening a story whose status is not blocked/failed", () => {
-    const stateDir = temporaryRoot()
-    const { engine: se } = engine(stateDir)
-    const plan = se.createPlan("s1", [story()])
-    const storyId = plan.stories[0].id // active, not blocked/failed
-    expect(() => se.reopenStory("s1", storyId, { reason: "x" })).toThrow(/status is active/)
-  })
-
-  it("throws on an unknown session or story", () => {
-    const stateDir = temporaryRoot()
-    const { engine: se } = engine(stateDir)
-    se.createPlan("s1", [story()])
-    expect(() => se.reopenStory("unknown-session", "S1", { reason: "x" })).toThrow(/no story plan/)
-    expect(() => se.reopenStory("s1", "S99", { reason: "x" })).toThrow(/unknown story/)
-  })
-
-  it("records an amendment naming the previous status and logs story:reopened", () => {
-    const stateDir = temporaryRoot()
-    const { engine: se, logger } = engine(stateDir)
-    const plan = se.createPlan("s1", [story()])
-    const storyId = plan.stories[0].id
-    se.checkpoint("s1", storyId, "failed", {})
-
-    se.reopenStory("s1", storyId, { reason: "root cause fixed" })
-
-    const after = se.getPlan("s1")!.stories[0]
-    expect(after.amendments).toHaveLength(1)
-    expect(after.amendments[0].reason).toMatch(/reopened from failed/)
-    expect(after.amendments[0].reason).toMatch(/root cause fixed/)
-    expect(logger).toHaveBeenCalledWith("story:reopened", {
-      sessionID: "s1",
-      storyId,
-      previousStatus: "failed",
-      newStatus: "active",
+describe("createPlan archives the plan it replaces", () => {
+  it("keeps a recoverable copy and logs the replacement", () => {
+    const events: Array<[string, Record<string, unknown>]> = []
+    const root = temporaryRoot()
+    const engine = new StoryEngine({
+      stateDir: join(root, ".opencode", "elicify-vertex"),
+      logger: (event, payload) => events.push([event, payload as Record<string, unknown>]),
     })
+
+    engine.createPlan("s1", [
+      {
+        text: "migrate the schema",
+        acceptanceItems: ["migration applies"],
+        scopeGlobs: ["db/**"],
+        verifiers: [],
+        tasks: [{ text: "write migration" }],
+      },
+    ])
+    engine.createPlan("s1", [
+      {
+        text: "tidy up",
+        acceptanceItems: ["ok"],
+        scopeGlobs: ["**"],
+        verifiers: [],
+        tasks: [{ text: "tidy" }],
+      },
+    ])
+
+    const archived = readdirSync(join(root, ".opencode", "elicify-vertex", "archive"))
+    const planCopies = archived.filter((name) => name.startsWith("plan.s1."))
+    expect(planCopies.length, "the replaced plan must be recoverable").toBeGreaterThan(0)
+    expect(readFileSync(join(root, ".opencode", "elicify-vertex", "archive", planCopies[0]), "utf8")).toContain(
+      "migrate the schema",
+    )
+    expect(events.map(([event]) => event)).toContain("plan:replaced")
   })
 
-  it("reopening a story that is NOT the currently-active one returns it to pending, rejoining the queue behind the story that IS active (does not preempt it)", () => {
+  it("does not archive when there was no prior plan (discrimination)", () => {
+    const root = temporaryRoot()
+    const engine = new StoryEngine({
+      stateDir: join(root, ".opencode", "elicify-vertex"),
+      logger: () => {},
+    })
+    engine.createPlan("fresh", [{ text: "first", acceptanceItems: ["ok"], scopeGlobs: ["**"], verifiers: [], tasks: [{ text: "t" }] }])
+    const archiveDir = join(root, ".opencode", "elicify-vertex", "archive")
+    const archived = existsSync(archiveDir) ? readdirSync(archiveDir).filter((n) => n.startsWith("plan.fresh.")) : []
+    expect(archived, "a first plan replaces nothing").toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// plan.json round-trip with the redesign fields: tasks (required),
+// dependsOn, completedAt, judge accepted when well-formed, rejected when
+// malformed; old plans lacking tasks entirely now FAIL validation (hard
+// cutover — tasks ship with this redesign).
+// ---------------------------------------------------------------------------
+
+describe("plan.json round-trip with redesign fields", () => {
+  it("tasks, dependsOn, completedAt and a judge stamp persist and survive a fresh StoryEngine instance", () => {
     const stateDir = temporaryRoot()
     const { engine: se } = engine(stateDir)
     const plan = se.createPlan("s1", [
-      story({ text: "S1", acceptanceItems: ["A1"] }),
-      story({ text: "S2", acceptanceItems: ["A1"] }),
-      story({ text: "S3", acceptanceItems: ["A1"] }),
-      story({ text: "S4", acceptanceItems: ["A1"] }),
-      story({ text: "S5", acceptanceItems: ["A1"] }),
+      story({
+        acceptanceItems: ["A1"],
+        tasks: [{ text: "a" }],
+        dependsOn: [],
+      }),
     ])
-    const [s1, s2, s3, s4, s5] = plan.stories.map((s) => s.id)
-
-    // Directly block S2 while it is still "pending" (out of order), before
-    // S1 completes.
-    se.checkpoint("s1", s2, "blocked", {})
-    expect(se.getPlan("s1")!.stories.find((s) => s.id === s2)!.status).toBe("blocked")
-
-    // Complete S1: successor-promotion skips the now-blocked S2 (no longer
-    // "pending") and activates S3 instead.
-    se.attachEvidence("s1", s1, "A1", { receiptId: "vrf_1" })
-    se.checkpoint("s1", s1, "complete", { isValidReceipt: () => true })
-    expect(se.getActiveStory("s1")!.id).toBe(s3)
-
-    // Reopen S2 — S3 is currently active, so S2 must NOT preempt it.
-    se.reopenStory("s1", s2, { reason: "unblocked" })
-
-    const after = se.getPlan("s1")!
-    const byId = (id: string) => after.stories.find((s) => s.id === id)!
-    expect(byId(s2).status).toBe("pending") // rejoined the queue, did not preempt S3
-    expect(byId(s2).startedAt).toBeUndefined()
-    expect(byId(s3).status).toBe("active") // untouched, still in flight
-    expect(byId(s4).status).toBe("pending")
-    expect(byId(s5).status).toBe("pending")
-
-    // Confirm it really rejoined at its original array position: when S3
-    // completes next, S2 — not S4 — is the one successor-promotion activates.
-    se.attachEvidence("s1", s3, "A1", { receiptId: "vrf_3" })
-    se.checkpoint("s1", s3, "complete", { isValidReceipt: () => true })
-    expect(se.getActiveStory("s1")!.id).toBe(s2)
-  })
-
-  it("reopening the story that WAS active when it blocked/failed reactivates it directly, since no other story is active", () => {
-    const stateDir = temporaryRoot()
-    const { engine: se } = engine(stateDir)
-    const plan = se.createPlan("s1", [
-      story({ text: "S1", acceptanceItems: ["A1"] }),
-      story({ text: "S2", acceptanceItems: ["A1"] }),
-    ])
-    const [s1, s2] = plan.stories.map((s) => s.id)
-
-    se.attachEvidence("s1", s1, "A1", { receiptId: "vrf_1" })
-    se.checkpoint("s1", s1, "complete", { isValidReceipt: () => true })
-    expect(se.getActiveStory("s1")!.id).toBe(s2) // promoted, active
-
-    // Block S2 while it IS the active story — checkpoint's successor
-    // promotion only fires on a "complete" outcome, so nothing is promoted
-    // and the plan is left with zero active stories.
-    se.checkpoint("s1", s2, "blocked", {})
-    expect(se.getActiveStory("s1")).toBeNull()
-
-    const before = Date.now()
-    se.reopenStory("s1", s2, { reason: "resuming" })
-    const after = Date.now()
-
-    const reopened = se.getPlan("s1")!.stories.find((s) => s.id === s2)!
-    expect(reopened.status).toBe("active")
-    expect(typeof reopened.startedAt).toBe("string")
-    const startedMs = Date.parse(reopened.startedAt!)
-    expect(startedMs).toBeGreaterThanOrEqual(before)
-    expect(startedMs).toBeLessThanOrEqual(after)
-    expect(se.getActiveStory("s1")!.id).toBe(s2)
-  })
-
-  it("persists the reopened state across a restart (fresh StoryEngine instance)", () => {
-    const stateDir = temporaryRoot()
-    const { engine: se } = engine(stateDir)
-    const plan = se.createPlan("s1", [story()])
     const storyId = plan.stories[0].id
-    se.checkpoint("s1", storyId, "blocked", {})
-    se.reopenStory("s1", storyId, { reason: "retry" })
+    const taskId = plan.stories[0].tasks[0].id
+    se.checkpoint("s1", taskId, "complete")
+    se.applyJudgeVerdicts("s1", [{ storyId, pass: true, summary: "verified", items: [{ itemId: "A1", met: true, note: "ok" }] }])
 
     const restarted = new StoryEngine({ stateDir, logger: vi.fn() })
-    const reopened = restarted.getPlan("s1")!.stories[0]
-    expect(reopened.status).toBe("active")
-    expect(reopened.amendments).toHaveLength(1)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// C-11 fix (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md): checkpoint's successor-
-// promotion is a first-"pending"-match scan, not strict index order, and
-// blocked/failed carries no active-story requirement — so an out-of-order
-// blocked/failed story can be silently skipped by promotion while a LATER
-// story, including the plan's final one, marches on to "complete" without
-// it ever being resolved. Reproduces the exact scenario from the audit doc
-// and proves the fix: completing the final story now REJECTS while an
-// earlier story remains unresolved, and the plan can still legitimately
-// reach all-"complete" once that earlier story is reopened and recompleted.
-// ---------------------------------------------------------------------------
-
-describe("checkpoint requires every story complete before the FINAL story can complete (C-11 fix)", () => {
-  it("reproduces the audit scenario: S2 blocked out of order, S1 completes, promotion skips to S3 (final) — completing S3 now throws instead of silently 'finishing' the plan", () => {
-    const stateDir = temporaryRoot()
-    const { engine: se } = engine(stateDir)
-    const plan = se.createPlan("s1", [
-      story({ text: "S1", acceptanceItems: ["A1"] }),
-      story({ text: "S2", acceptanceItems: ["A1"] }),
-      story({ text: "S3 final", acceptanceItems: ["A1"] }),
-    ])
-    const [s1, s2, s3] = plan.stories.map((s) => s.id)
-    expect(plan.finalStoryId).toBe(s3)
-
-    // Story 2 checkpointed directly to "blocked" while still "pending" —
-    // out of order, nothing in `checkpoint` prevents this for blocked/failed.
-    se.checkpoint("s1", s2, "blocked", {})
-    expect(se.getPlan("s1")!.stories.find((s) => s.id === s2)!.status).toBe("blocked")
-
-    // Story 1 completes and triggers promotion. `find` skips S2 (blocked,
-    // not pending) and promotes S3 instead — the pre-existing, unchanged
-    // (and separately tested) skip-ahead behavior.
-    se.attachEvidence("s1", s1, "A1", { receiptId: "vrf_1" })
-    se.checkpoint("s1", s1, "complete", { isValidReceipt: () => true })
-    expect(se.getActiveStory("s1")!.id).toBe(s3)
-
-    // Before the C-11 fix, this next call SUCCEEDED: S3 (final) completed
-    // with S2 left permanently "blocked" — the plan looked all-done to any
-    // caller that (like wiring/gate.ts's appendJudgeCloseOut) trusts
-    // finalStory.status === "complete", even though it demonstrably wasn't.
-    se.attachEvidence("s1", s3, "A1", { receiptId: "vrf_3" })
-    expect(() => se.checkpoint("s1", s3, "complete", { isValidReceipt: () => true })).toThrow(
-      /final story.*S2:blocked|S2:blocked.*final story/s,
-    )
-
-    // Proof the gap is actually closed, not just that nothing crashed: the
-    // plan is NOT stuck with a false "done" signal — S3 is still "active"
-    // (the rejected checkpoint mutated nothing) and S2 is still "blocked".
-    const afterRejectedComplete = se.getPlan("s1")!
-    expect(afterRejectedComplete.stories.find((s) => s.id === s3)!.status).toBe("active")
-    expect(afterRejectedComplete.stories.find((s) => s.id === s2)!.status).toBe("blocked")
-    expect(afterRejectedComplete.stories.every((s) => s.status === "complete")).toBe(false)
-
-    // Recovery: free the active slot (re-block the final story — "blocked"
-    // carries no active-story requirement, same as the original out-of-order
-    // block), reopen S2 (no story is active now, so it resumes directly),
-    // complete it, then reopen and recomplete S3.
-    se.checkpoint("s1", s3, "blocked", {})
-    expect(se.getActiveStory("s1")).toBeNull()
-
-    se.reopenStory("s1", s2, { reason: "root cause identified and resolved" })
-    expect(se.getActiveStory("s1")!.id).toBe(s2)
-    se.attachEvidence("s1", s2, "A1", { receiptId: "vrf_2_fresh" })
-    se.checkpoint("s1", s2, "complete", { isValidReceipt: () => true })
-    expect(se.getPlan("s1")!.stories.find((s) => s.id === s2)!.status).toBe("complete")
-
-    se.reopenStory("s1", s3, { reason: "resuming final story" })
-    expect(se.getActiveStory("s1")!.id).toBe(s3)
-    se.attachEvidence("s1", s3, "A1", { receiptId: "vrf_3_fresh" })
-    expect(() =>
-      se.checkpoint("s1", s3, "complete", { isValidReceipt: (id) => id === "vrf_3_fresh" }),
-    ).not.toThrow()
-
-    // The plan genuinely reaches all-complete once every story really is.
-    const finalPlan = se.getPlan("s1")!
-    expect(finalPlan.stories.every((s) => s.status === "complete")).toBe(true)
+    const reloaded = restarted.getPlan("s1")!.stories[0]
+    expect(reloaded.tasks).toHaveLength(1)
+    expect(reloaded.tasks[0].id).toBe(taskId)
+    expect(reloaded.dependsOn).toEqual([])
+    expect(reloaded.status).toBe("complete")
+    expect(typeof reloaded.completedAt).toBe("string")
+    expect(reloaded.judge).toMatchObject({ pass: true, summary: "verified", items: [{ itemId: "A1", met: true, note: "ok" }] })
   })
 
-  it("does NOT block a non-final story from completing while an earlier story sits blocked/failed — the skip-ahead recovery shape stays intact", () => {
+  it("rejects a plan whose story has NO tasks (hard cutover: tasks are required)", () => {
     const stateDir = temporaryRoot()
+    mkdirSync(stateDir, { recursive: true })
+    const preRedesignPlan = {
+      schemaVersion: 2,
+      stories: [
+        {
+          id: "S1",
+          text: "pre-task story",
+          acceptanceItems: [{ id: "A1", text: "works", evidence: null }],
+          scopeGlobs: [],
+          verifiers: [],
+          assumptions: [],
+          rejectedAlternatives: [],
+          amendments: [],
+          status: "active",
+        },
+      ],
+      finalStoryId: "S1",
+      createdAt: new Date().toISOString(),
+    }
+    writeFileSync(join(stateDir, "plan.json"), JSON.stringify({ s1: preRedesignPlan }))
+
     const { engine: se } = engine(stateDir)
-    const plan = se.createPlan("s1", [
-      story({ text: "S1", acceptanceItems: ["A1"] }),
-      story({ text: "S2", acceptanceItems: ["A1"] }),
-      story({ text: "S3", acceptanceItems: ["A1"] }),
-      story({ text: "S4 final", acceptanceItems: ["A1"] }),
-    ])
-    const [s1, s2, s3] = plan.stories.map((s) => s.id)
-
-    se.checkpoint("s1", s2, "blocked", {}) // out of order, S2 still "pending" at this point
-    se.attachEvidence("s1", s1, "A1", { receiptId: "vrf_1" })
-    se.checkpoint("s1", s1, "complete", { isValidReceipt: () => true })
-    expect(se.getActiveStory("s1")!.id).toBe(s3) // promotion skipped S2, as before
-
-    // S3 is NOT the final story (S4 is) — completing it must still work even
-    // though S2 remains blocked. Only the FINAL story's completion is gated.
-    se.attachEvidence("s1", s3, "A1", { receiptId: "vrf_3" })
-    expect(() => se.checkpoint("s1", s3, "complete", { isValidReceipt: () => true })).not.toThrow()
-    expect(se.getPlan("s1")!.stories.find((s) => s.id === s3)!.status).toBe("complete")
+    expect(se.getPlan("s1")).toBeNull()
   })
-})
 
-// ---------------------------------------------------------------------------
-// End-to-end scenario: C-6's exact failure mode — a plan whose FINAL story
-// is blocked previously could never reach all-"complete". It now can, via
-// reopenStory.
-// ---------------------------------------------------------------------------
-
-describe("reopenStory end-to-end: a plan whose FINAL story is blocked can now reach all-complete (C-6's exact failure mode)", () => {
-  it("a 3-story plan whose final story is blocked while active is stuck (pre-fix symptom reproduced), then reaches all-complete once reopened", () => {
+  it("accepts a story-level dependsOn that is absent (back-compat: treated as [])", () => {
     const stateDir = temporaryRoot()
+    mkdirSync(stateDir, { recursive: true })
+    const planNoStoryDeps = {
+      schemaVersion: 2,
+      stories: [
+        {
+          id: "S1",
+          text: "no story dependsOn key",
+          acceptanceItems: [{ id: "A1", text: "works", evidence: null }],
+          scopeGlobs: [],
+          verifiers: [],
+          assumptions: [],
+          rejectedAlternatives: [],
+          amendments: [],
+          status: "active",
+          tasks: [{ id: "S1.T1", text: "do it", dependsOn: [], status: "active" }],
+        },
+      ],
+      finalStoryId: "S1",
+      createdAt: new Date().toISOString(),
+    }
+    writeFileSync(join(stateDir, "plan.json"), JSON.stringify({ s1: planNoStoryDeps }))
+
     const { engine: se } = engine(stateDir)
-    const plan = se.createPlan("s1", [
-      story({ text: "S1", acceptanceItems: ["A1"] }),
-      story({ text: "S2", acceptanceItems: ["A1"] }),
-      story({ text: "S3 final", acceptanceItems: ["A1"] }),
-    ])
-    const [s1, s2, s3] = plan.stories.map((s) => s.id)
-    expect(plan.finalStoryId).toBe(s3)
+    const plan = se.getPlan("s1")
+    expect(plan).not.toBeNull()
+    expect(plan!.stories[0].dependsOn).toEqual([])
+  })
 
-    se.attachEvidence("s1", s1, "A1", { receiptId: "vrf_1" })
-    se.checkpoint("s1", s1, "complete", { isValidReceipt: () => true })
-    se.attachEvidence("s1", s2, "A1", { receiptId: "vrf_2" })
-    se.checkpoint("s1", s2, "complete", { isValidReceipt: () => true })
-    expect(se.getActiveStory("s1")!.id).toBe(s3)
+  it("rejects a malformed task (present but wrong shape) — the entry is dropped on load", () => {
+    const stateDir = temporaryRoot()
+    mkdirSync(stateDir, { recursive: true })
+    const badPlan = {
+      schemaVersion: 2,
+      stories: [
+        {
+          id: "S1",
+          text: "bad task",
+          acceptanceItems: [],
+          scopeGlobs: [],
+          verifiers: [],
+          assumptions: [],
+          rejectedAlternatives: [],
+          amendments: [],
+          status: "active",
+          tasks: [{ id: "S1.T1", text: "", dependsOn: [], status: "active" }], // blank text
+        },
+      ],
+      finalStoryId: "S1",
+      createdAt: new Date().toISOString(),
+    }
+    writeFileSync(join(stateDir, "plan.json"), JSON.stringify({ s1: badPlan }))
 
-    // The final story hits a blocker while it is the active story.
-    se.checkpoint("s1", s3, "blocked", {})
+    const { engine: se } = engine(stateDir)
+    expect(se.getPlan("s1")).toBeNull()
+  })
 
-    // Pre-fix symptom, reproduced: the plan is now permanently stuck — no
-    // story is active, and (before this fix) there was no way for the final
-    // story to ever become "complete" again. Exactly
-    // docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md C-6.
-    expect(se.getActiveStory("s1")).toBeNull()
-    const stuckPlan = se.getPlan("s1")!
-    expect(stuckPlan.stories.every((s) => s.status === "complete")).toBe(false)
-    expect(stuckPlan.stories.find((s) => s.id === s3)!.status).toBe("blocked")
+  it("rejects a malformed judge stamp (present but wrong shape)", () => {
+    const stateDir = temporaryRoot()
+    mkdirSync(stateDir, { recursive: true })
+    const badPlan = {
+      schemaVersion: 2,
+      stories: [
+        {
+          id: "S1",
+          text: "bad judge",
+          acceptanceItems: [],
+          scopeGlobs: [],
+          verifiers: [],
+          assumptions: [],
+          rejectedAlternatives: [],
+          amendments: [],
+          status: "complete",
+          tasks: [{ id: "S1.T1", text: "ok", dependsOn: [], status: "complete" }],
+          judge: { pass: "yes", summary: 42, items: "nope", judgedAt: 123 },
+        },
+      ],
+      finalStoryId: "S1",
+      createdAt: new Date().toISOString(),
+    }
+    writeFileSync(join(stateDir, "plan.json"), JSON.stringify({ s1: badPlan }))
 
-    // Reopen the final story — the fix under test.
-    se.reopenStory("s1", s3, { reason: "blocker resolved" })
-    expect(se.getActiveStory("s1")!.id).toBe(s3)
+    const { engine: se } = engine(stateDir)
+    expect(se.getPlan("s1")).toBeNull()
+  })
 
-    // checkpoint("complete")'s own validation is untouched by this fix: the
-    // reopened final story still needs a fresh OBSERVED receipt (FR-020) —
-    // its pre-block evidence was cleared by the reopen.
-    expect(() => se.checkpoint("s1", s3, "complete", { isValidReceipt: () => true })).toThrow(/no evidence/)
-    se.attachEvidence("s1", s3, "A1", { receiptId: "vrf_3_fresh" })
-    expect(() =>
-      se.checkpoint("s1", s3, "complete", { isValidReceipt: (id) => id === "vrf_3_fresh" }),
-    ).not.toThrow()
+  it("rejects a task with an invalid status", () => {
+    const stateDir = temporaryRoot()
+    mkdirSync(stateDir, { recursive: true })
+    const badPlan = {
+      schemaVersion: 2,
+      stories: [
+        {
+          id: "S1",
+          text: "bad status",
+          acceptanceItems: [],
+          scopeGlobs: [],
+          verifiers: [],
+          assumptions: [],
+          rejectedAlternatives: [],
+          amendments: [],
+          status: "active",
+          tasks: [{ id: "S1.T1", text: "ok", dependsOn: [], status: "not-a-status" }],
+        },
+      ],
+      finalStoryId: "S1",
+      createdAt: new Date().toISOString(),
+    }
+    writeFileSync(join(stateDir, "plan.json"), JSON.stringify({ s1: badPlan }))
 
-    // The plan can now reach all-complete — the exact thing C-6 said was
-    // impossible.
-    const finalPlan = se.getPlan("s1")!
-    expect(finalPlan.stories.every((s) => s.status === "complete")).toBe(true)
+    const { engine: se } = engine(stateDir)
+    expect(se.getPlan("s1")).toBeNull()
   })
 })
 
@@ -1062,13 +1433,13 @@ describe("TRIVIAL_ASK_RE / SEQUENCING_WORDS / IMPERATIVE_VERBS — literal spec 
     expect(SEQUENCING_WORDS.test("first add the parser, then wire the CLI")).toBe(true)
     expect(SEQUENCING_WORDS.test("FIRST do this")).toBe(true)
     expect(SEQUENCING_WORDS.test("먼저 파서를 추가하고 그다음 CLI를 연결해줘")).toBe(true)
-    expect(SEQUENCING_WORDS.test("a firstclass citizen")).toBe(false) // word-boundary: "first" inside "firstclass" doesn't count
+    expect(SEQUENCING_WORDS.test("a firstclass citizen")).toBe(false)
   })
 
   it("IMPERATIVE_VERBS matches an imperative-led clause at the start only", () => {
     expect(IMPERATIVE_VERBS.test("add the parser")).toBe(true)
     expect(IMPERATIVE_VERBS.test("추가 파서")).toBe(true)
-    expect(IMPERATIVE_VERBS.test("the parser needs adding")).toBe(false) // not clause-initial
+    expect(IMPERATIVE_VERBS.test("the parser needs adding")).toBe(false)
   })
 })
 
@@ -1205,7 +1576,7 @@ describe("intake_prefilter_and_heuristics (test 38, Dataset: 14 rows)", () => {
     expect(client.session.prompt).not.toHaveBeenCalled()
   })
 
-  it("row 4: 'refactor auth end-to-end' (24 chars, short but non-trivial) reaches the classifier and issues a subturn", async () => {
+  it("row 4: 'refactor auth end-to-end' (short but non-trivial) reaches the classifier and issues a subturn", async () => {
     const client = makeIntakeClient({
       promptImpl: async () => ({ data: { parts: [{ type: "text", text: '{"multiStory":true}' }] }, error: undefined }),
     })
@@ -1289,11 +1660,8 @@ describe("intake_prefilter_and_heuristics (test 38, Dataset: 14 rows)", () => {
 
     const result = await classifyMultiStory(client, deps, { parentSessionID: "s1", sessionModel: SESSION_MODEL, askText })
 
-    // Non-trivial ("investigate" is not a TRIVIAL_ASK_RE verb and the text
-    // does not end in "?"), so the subturn IS issued.
     expect(client.session.prompt).toHaveBeenCalledTimes(1)
     expect(result.source).toBe("subturn")
-    // And directly on the heuristic: the fenced "then" must not trigger it.
     expect(classifyMultiStoryHeuristic(askText)).toBe(false)
   })
 
@@ -1315,12 +1683,6 @@ describe("intake_prefilter_and_heuristics (test 38, Dataset: 14 rows)", () => {
       promptImpl: async () => ({ data: { parts: [{ type: "text", text: '{"multiStory":false}' }] }, error: undefined }),
     })
     const { deps } = classifyDeps()
-    // Caller (wiring) is responsible for excluding attached file parts before
-    // building askText (FR-018a) — this module only ever sees the resulting
-    // flat string, so the test constructs it the way wiring would. Deliberately
-    // non-trivial (unlike a bare "explain ..." ask, which would match
-    // TRIVIAL_ASK_RE and never reach the subturn at all) so this test actually
-    // exercises the subturn call path.
     const askText = "add tests for this file and fix the failing edge cases"
 
     const result = await classifyMultiStory(client, deps, { parentSessionID: "s1", sessionModel: SESSION_MODEL, askText })
@@ -1329,16 +1691,13 @@ describe("intake_prefilter_and_heuristics (test 38, Dataset: 14 rows)", () => {
     expect(result.source).toBe("subturn")
   })
 
-  it("rows 12/13: this module does not self-throttle — each call issues its own subturn attempt (once-per-task/session caps are wiring's ledger, not this module's)", async () => {
+  it("rows 12/13: this module does not self-throttle — each call issues its own subturn attempt", async () => {
     const client = makeIntakeClient()
     const { deps } = classifyDeps()
 
     await classifyMultiStory(client, deps, { parentSessionID: "s1", sessionModel: SESSION_MODEL, askText: "refactor auth end-to-end" })
     await classifyMultiStory(client, deps, { parentSessionID: "s1", sessionModel: SESSION_MODEL, askText: "refactor billing end-to-end" })
 
-    // Both calls issued a subturn — proves no internal per-task/session cap
-    // state exists here; a real harness must call this function at most
-    // once per task and enforce VERTEX_INTAKE_SUBTURN_MAX itself.
     expect(client.session.prompt).toHaveBeenCalledTimes(2)
   })
 
@@ -1352,10 +1711,6 @@ describe("intake_prefilter_and_heuristics (test 38, Dataset: 14 rows)", () => {
       sessionModel: SESSION_MODEL,
       askText: "first add the parser, then wire the CLI",
     })
-    // Advance by the module's ACTUAL configured budget rather than a
-    // hardcoded 5000: the default was raised (and made env-overridable) once
-    // live runs showed 5s timing out on every real model round-trip, so a
-    // literal here would silently stop exercising the timeout path.
     await vi.advanceTimersByTimeAsync(INTAKE_SUBTURN_TIMEOUT_MS)
     const result = await resultPromise
 
@@ -1364,7 +1719,6 @@ describe("intake_prefilter_and_heuristics (test 38, Dataset: 14 rows)", () => {
       "intake:classify-fallback",
       expect.objectContaining({ sessionID: "s1", reason: "timeout" }),
     )
-    // session.delete still runs on the timeout exit path (subturn.ts's own FR-038 contract).
     expect(client.session.delete).toHaveBeenCalledTimes(1)
   })
 })
@@ -1401,54 +1755,5 @@ describe("intake capability probe (FR-030b, story.ts's obligation as the caller)
       "intake:classify-fallback",
       expect.objectContaining({ reason: "malformed subturn response" }),
     )
-  })
-})
-
-// ===========================================================================
-// A second `createPlan` must not silently discard the first plan.
-//
-// `clearPlan` archived; `createPlan` overwrote unconditionally. So a second
-// call threw away the user's stories, their acceptance items AND their
-// attached evidence, with no log and nothing to recover. Losing a contract is
-// exactly as bad as losing the evidence for it.
-// ===========================================================================
-
-describe("createPlan archives the plan it replaces", () => {
-  it("keeps a recoverable copy and logs the replacement", async () => {
-    const events: Array<[string, Record<string, unknown>]> = []
-    const root = temporaryRoot()
-    const engine = new StoryEngine({
-      stateDir: join(root, ".opencode", "elicify-vertex"),
-      logger: (event, payload) => events.push([event, payload as Record<string, unknown>]),
-    })
-
-    engine.createPlan("s1", [
-      { text: "migrate the schema", acceptanceItems: ["migration applies"], scopeGlobs: ["db/**"], verifiers: [] },
-      { text: "cut over traffic", acceptanceItems: ["traffic served"], scopeGlobs: ["lb/**"], verifiers: [] },
-    ])
-
-    engine.createPlan("s1", [
-      { text: "tidy up", acceptanceItems: ["ok"], scopeGlobs: ["**"], verifiers: [] },
-    ])
-
-    const archived = readdirSync(join(root, ".opencode", "elicify-vertex", "archive"))
-    const planCopies = archived.filter((name) => name.startsWith("plan.s1."))
-    expect(planCopies.length, "the replaced plan must be recoverable").toBeGreaterThan(0)
-    expect(readFileSync(join(root, ".opencode", "elicify-vertex", "archive", planCopies[0]), "utf8")).toContain(
-      "migrate the schema",
-    )
-    expect(events.map(([event]) => event)).toContain("plan:replaced")
-  })
-
-  it("does not archive when there was no prior plan (discrimination)", async () => {
-    const root = temporaryRoot()
-    const engine = new StoryEngine({
-      stateDir: join(root, ".opencode", "elicify-vertex"),
-      logger: () => {},
-    })
-    engine.createPlan("fresh", [{ text: "first", acceptanceItems: ["ok"], scopeGlobs: ["**"], verifiers: [] }])
-    const archiveDir = join(root, ".opencode", "elicify-vertex", "archive")
-    const archived = existsSync(archiveDir) ? readdirSync(archiveDir).filter((n) => n.startsWith("plan.fresh.")) : []
-    expect(archived, "a first plan replaces nothing").toEqual([])
   })
 })

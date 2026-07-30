@@ -4,150 +4,46 @@
  * resolution), backed by `StoryEngine` rather than v1's `MultiStoryGoalEngine`.
  * Structure mirrors v1's `elicify_vertex_goal_*` tools in `src/index.ts`.
  *
- * Waiver-provenance enforcement (`story.ts`'s module header, "Dataset row 6
- * of Checkpoint evidence validation" — flagged as high-severity in the wave
- * brief alongside FR-036/CRIT-001): `StoryEngine.checkpoint` only checks that
- * a waiver is STRUCTURALLY well-formed (a non-empty `sourceMessageId`). It
- * explicitly documents that the caller (this file) must independently prove
- * the referenced message id names a real `role: "user"` chat message before
- * ever attaching it as evidence — a waiver id supplied via tool-call
- * arguments is, by construction, something the MODEL wrote, so it can never
- * be trusted on its own. `checkpointTool` below resolves every
- * `waiverSourceMessageId` against `client.session.messages(...)` and REJECTS
- * (throws, does not silently drop) any waiver whose id does not resolve to a
- * `role: "user"` message.
+ * 2026-07-30 task/DAG redesign (supersedes the wave model): the atomic
+ * execution unit is the TASK. `elicify_vertex_plan_create` now requires
+ * each story to decompose into ≥1 `tasks` (each `{ text, dependsOn? }`)
+ * and optionally declare story-level `dependsOn`; the engine assigns every
+ * task a predictable id (`S{n}.T{m}`) and COMPUTES parallel waves from the
+ * dependency DAG (topological levels), so there is no `wave` argument
+ * anymore — waves are derived, never input. `elicify_vertex_plan_next`
+ * returns the active TASKS (one subagent per element); the model fans out
+ * a `task`-tool subagent against each. `elicify_vertex_plan_checkpoint`
+ * takes `{ taskId, status, reason? }` — a story auto-completes when all
+ * its tasks are done, at which point the completion judge audits it.
+ *
+ * HANDOVER.md redesign point 1 (preserved): a checkpoint is a CLAIM, not a
+ * close — no receipt, no waiver, no evidence validation. The old per-story
+ * citation apparatus (waiver-provenance, `signWaiver`, receipt-freshness,
+ * the attach-then-restore-on-reject dance) is gone, not just bypassed.
+ * Receipts and signed waivers still back the PLAN-LESS pinned-criteria
+ * path (`PinStore`, `tool.execute.after`'s auto-attach), which never went
+ * through this file.
  */
-import { resolve } from "node:path"
-
 import { tool } from "@opencode-ai/plugin"
-import { signWaiver } from "../../goals.js"
-import type { VerificationReceiptStore } from "../../goals.js"
 import type { PhaseEngine } from "../phase.js"
 import type { PinStore } from "../pin.js"
-import type { PlanV2, StoryEngine } from "../story.js"
+import type { PlanV2, StoryEngine, Task } from "../story.js"
 import type { OpencodeClient } from "../types.js"
 import type { V2SessionState } from "./state.js"
 
 export interface PlanToolsDeps {
   storyEngine: StoryEngine
   pinStore: PinStore
-  verificationReceipts: VerificationReceiptStore
   client: OpencodeClient
   states: Map<string, V2SessionState>
-  /** T8 (FR-001): rebinds phase to `execute` for the next story when a
-   * non-final story checkpoints complete. Without this call the phase
-   * engine's per-story slot for the newly-active story is never touched
-   * until its first mutation, so `getPhase()` reads a stale/default value
-   * in the window between checkpoint and that mutation. */
+  /** T8 (FR-001): rebinds phase to `execute` for a story whose first task
+   * just activated. Without this call the phase engine's per-story slot
+   * for the newly-active story is never touched until its first mutation,
+   * so `getPhase()` reads a stale/default value in the window between
+   * checkpoint/promotion and that mutation. */
   phaseEngine: PhaseEngine
   /** Runs when a plan is successfully created, so wiring can clear `multiStoryPending`. */
   onPlanCreated: (sessionID: string) => void
-}
-
-interface ClientMessage {
-  info?: { id?: string; role?: string }
-  message?: { id?: string; role?: string }
-}
-
-function isFieldsStyle(value: unknown): value is { data?: unknown; error?: unknown } {
-  return typeof value === "object" && value !== null && ("data" in value || "error" in value)
-}
-
-async function isUserMessage(client: OpencodeClient, sessionID: string, messageID: string): Promise<boolean> {
-  try {
-    const raw = await client.session.messages({ path: { id: sessionID } } as never)
-    const list = isFieldsStyle(raw) ? raw.data : raw
-    if (!Array.isArray(list)) return false
-    for (const entry of list as ClientMessage[]) {
-      const info = entry.info ?? entry.message
-      if (info?.id === messageID) return info.role === "user"
-    }
-    return false
-  } catch {
-    return false
-  }
-}
-
-function isValidTimestampString(value: unknown): value is string {
-  return typeof value === "string" && value.trim() !== "" && Number.isFinite(Date.parse(value))
-}
-
-/**
- * v1 parity (`src/goals.ts`'s `MultiStoryGoalEngine.checkpoint`, ~L300-312):
- * a `receiptId` evidence pointer is only as good as the receipt it names
- * still being an OBSERVED, workspace-matching, time-valid verification
- * (FR-020: "workspace-matching, time-valid receipt") — not merely present
- * in the store. Existence alone (this function's previous behaviour)
- * accepts a receipt recorded in a different workspace, one that failed, or
- * one whose timestamp cannot possibly cover this story's work.
- *
- * "Not before story start" is checked defensively: `StoryV2` does not carry
- * a `startedAt` field as of this fix (a sibling wave-4 agent may add one to
- * story.ts concurrently, which this file does not — and must not — depend
- * on). This falls back through a hypothetical `story.createdAt` to
- * `plan.createdAt`, and skips the time bound entirely if none of those
- * resolve to a valid timestamp — it never crashes on a field that may or
- * may not exist, and never skips the workspace/outcome/exitCode checks just
- * because the time bound can't be computed.
- *
- * ------------------------------------------------------------------
- * Reconciliation with PERSISTED receipts (`VerificationReceiptStore` now
- * writes `.opencode/elicify-vertex/receipts.json`):
- *
- *  - Hydration. `store.get()`'s two-argument signature carries no workspace
- *    root, so a receipt observed in an EARLIER process is invisible until
- *    the store is told where to read from. The `load()` call below does
- *    that, using the session's own `workspaceRoot`. Without it persistence
- *    would be inert on exactly the path it exists for: resuming tomorrow.
- *  - Staleness. This function does NOT re-implement freshness. `store.get()`
- *    is the single choke point: it recomputes the receipt's worktree
- *    fingerprint and returns `null` when anything under the worktree changed
- *    since the verification was observed. So "legitimately still valid from
- *    an earlier process" is accepted here through the ordinary `!receipt`
- *    branch, and "stale" is refused through the same branch — no second,
- *    drift-prone copy of the rule lives here.
- *  - Plan link. The product requirement is that a verification is linked to
- *    the story it verifies and that each story is validated once. A receipt
- *    minted while story S1 was active is evidence for S1; reusing it to
- *    close S2 is precisely the coincidence-of-timing loophole this closes.
- *    Hence: with a plan present, the receipt's `scope.storyId` must equal
- *    the story being checkpointed. With no plan the store records
- *    `scope.storyId: null` and this check is vacuous, which is the
- *    supported "executions with no plan" path.
- * ------------------------------------------------------------------
- */
-function isFreshReceipt(
-  deps: Pick<PlanToolsDeps, "verificationReceipts" | "states" | "storyEngine">,
-  sessionID: string,
-  storyId: string,
-  receiptId: string,
-): boolean {
-  const state = deps.states.get(sessionID)
-  // Make receipts persisted by an earlier process visible before looking one
-  // up. Idempotent and non-throwing (see `VerificationReceiptStore.load`).
-  if (state) deps.verificationReceipts.load(sessionID, state.workspaceRoot)
-
-  // `get()` enforces staleness itself and returns null for a retired receipt.
-  const receipt = deps.verificationReceipts.get(sessionID, receiptId)
-  if (!receipt) return false
-  if (receipt.outcome !== "verified" || receipt.exitCode !== 0) return false
-
-  if (state && resolve(receipt.workspaceRoot) !== resolve(state.workspaceRoot)) return false
-
-  const now = new Date().toISOString()
-  if (receipt.observedAt > now) return false
-
-  const plan = deps.storyEngine.getPlan(sessionID)
-  if (plan && (receipt.scope?.storyId ?? null) !== storyId) return false
-
-  const story = plan?.stories.find((s) => s.id === storyId)
-  const storyStart =
-    (story as Record<string, unknown> | undefined)?.startedAt ??
-    (story as Record<string, unknown> | undefined)?.createdAt ??
-    plan?.createdAt
-  if (isValidTimestampString(storyStart) && receipt.observedAt < storyStart) return false
-
-  return true
 }
 
 // ---------------------------------------------------------------------------
@@ -296,10 +192,10 @@ function buildPlanningChallenge(plan: PlanV2): string[] {
       "data model). Cheaper now than after four stories are built on a guess.",
     "2. Research it — read the code, the docs and the existing conventions, and resolve what can be resolved " +
       "without asking.",
-    // Verified against src/v2/story.ts as of 57dcc3f: `clearPlan` archives to
-    // archive/plan.<session>.<ts>.json before dropping the session's entry, and
-    // `createPlan` archives any existing plan before replacing it. Say so, or
-    // the model reads re-planning as destructive and avoids it.
+    // Verified against src/v2/story.ts: `clearPlan` archives to
+    // archive/plan.<session>.<ts>.json before dropping the session's entry,
+    // and `createPlan` archives any existing plan before replacing it. Say so,
+    // or the model reads re-planning as destructive and avoids it.
     "3. Clear and re-plan — if the stories encode assumptions rather than findings, call " +
       "elicify_vertex_plan_clear, ground the work, then elicify_vertex_plan_create again. The old plan is " +
       "ARCHIVED under .opencode/elicify-vertex/archive/, never deleted, so re-planning costs a tool call and " +
@@ -309,21 +205,55 @@ function buildPlanningChallenge(plan: PlanV2): string[] {
   return lines
 }
 
+/** 2026-07-30: enrich each active task with its parent story's id/text so the
+ * model has the context it needs to dispatch a subagent per task. Keeps the
+ * task's own fields intact (it is a shallow copy, not a mutation of the
+ * engine's in-memory task). */
+function activeTasksWithStoryContext(plan: PlanV2 | null, tasks: Task[]): Array<Task & { storyId: string; storyText: string }> {
+  if (!plan) return []
+  const storyOf = new Map<string, { id: string; text: string }>()
+  for (const story of plan.stories) {
+    for (const task of story.tasks) storyOf.set(task.id, { id: story.id, text: story.text })
+  }
+  return tasks.map((task) => {
+    const parent = storyOf.get(task.id)
+    return { ...task, storyId: parent?.id ?? "", storyText: parent?.text ?? "" }
+  })
+}
+
 export function buildPlanTools(deps: PlanToolsDeps) {
-  const { storyEngine, pinStore, verificationReceipts, client, states, phaseEngine } = deps
+  const { storyEngine, pinStore, phaseEngine } = deps
 
   const createTool = tool({
     description:
-      "Create the elicify-vertex v2 story-contract plan under <project>/.opencode/elicify-vertex/plan.json. " +
-      "Call only after the user has confirmed a proposed plan. Pass the confirmed stories.",
+      "Create the elicify-vertex v2 plan under <project>/.opencode/elicify-vertex/plan.json. Call only after the " +
+      "user has confirmed a proposed plan. Decompose EACH story into one or more tasks, and declare dependencies " +
+      "so parallel waves can be computed from the dependency graph (you never choose waves yourself — the engine " +
+      "derives them as topological levels over the task DAG). Task ids are assigned by the engine as S{n}.T{m} in " +
+      "story-then-task order (S1.T1, S1.T2, S2.T1, ...), so you CAN predict them and reference one task from " +
+      "another's dependsOn before the plan exists. A task's dependsOn may name other task ids (cross-story " +
+      "allowed) or whole story ids (the task then waits for every task of that story). A story's optional top-" +
+      "level dependsOn names other STORY ids and means none of this story's tasks can start until those stories " +
+      "are fully done. AcceptanceItems are written as functional, verifiable claims ('make check passes', 'X " +
+      "returns 200') because the completion judge will independently check every one of them against the real " +
+      "worktree. Tasks with no dependsOn all start active at once (wave 0) — fan out a subagent per active task.",
     args: {
       stories: tool.schema
         .array(
           tool.schema.object({
             text: tool.schema.string().min(1),
             acceptanceItems: tool.schema.array(tool.schema.string().min(1)).min(1),
+            tasks: tool.schema
+              .array(
+                tool.schema.object({
+                  text: tool.schema.string().min(1),
+                  dependsOn: tool.schema.array(tool.schema.string()).optional().default([]),
+                }),
+              )
+              .min(1),
             scopeGlobs: tool.schema.array(tool.schema.string()).optional().default([]),
             verifiers: tool.schema.array(tool.schema.string()).optional().default([]),
+            dependsOn: tool.schema.array(tool.schema.string()).optional().default([]),
           }),
         )
         .min(1),
@@ -348,151 +278,77 @@ export function buildPlanTools(deps: PlanToolsDeps) {
   })
 
   const nextTool = tool({
-    description: "Return the active story in the elicify-vertex v2 plan. Work only that story until checkpointed.",
+    description:
+      "Return every currently-active TASK in the elicify-vertex v2 plan as a JSON array (each enriched with its " +
+      "parent storyId/storyText). Fan out ONE task-tool subagent per active task and work them in parallel; tasks " +
+      "at the same computed wave are independent by construction. Checkpoint each task when its work is done.",
     args: {},
     async execute(_args, context) {
-      const story = storyEngine.getActiveStory(context.sessionID)
-      return JSON.stringify(story, null, 2)
+      const tasks = storyEngine.getActiveTasks(context.sessionID)
+      const plan = storyEngine.getPlan(context.sessionID)
+      return JSON.stringify(activeTasksWithStoryContext(plan, tasks), null, 2)
     },
   })
 
   const checkpointTool = tool({
     description:
-      "Checkpoint a story in the elicify-vertex v2 plan (complete|failed|blocked). " +
-      "For status=complete, every acceptance item needs evidence: either a verificationReceiptId observed " +
-      "earlier in this session, or a waiverSourceMessageId naming a real user chat message that explicitly waived it.",
+      "Checkpoint a TASK in the elicify-vertex v2 plan (complete|failed|blocked). A 'complete' checkpoint is a " +
+      "CLAIM, not a close: when the task's parent story has ALL its tasks complete, the story auto-completes, and " +
+      "at the next idle the completion judge independently audits every acceptance item against the real worktree " +
+      "(reading files, re-running the story's declared verifiers) and re-opens the story with named gaps if the " +
+      "claim does not hold. Claim only what you have genuinely delivered and verified. No receipt or waiver ids " +
+      "are needed or accepted. Pass a reason for failed/blocked.",
     args: {
-      storyId: tool.schema.string().min(1),
+      taskId: tool.schema.string().min(1),
       status: tool.schema.enum(["complete", "failed", "blocked"]),
-      items: tool.schema
-        .array(
-          tool.schema.object({
-            id: tool.schema.string().min(1),
-            receiptId: tool.schema.string().optional(),
-            waiverSourceMessageId: tool.schema.string().optional(),
-          }),
-        )
-        .optional()
-        .default([]),
+      reason: tool.schema.string().optional(),
     },
     async execute(args, context) {
-      // Validate EVERYTHING before writing anything.
-      //
-      // These attachments used to happen inline, before `checkpoint` validated
-      // any of them, so a REFUSED checkpoint still persisted the model's claim:
-      // `checkpoint(S1, complete, receiptId: "vrf_totally_made_up")` threw, and
-      // plan.json was left holding `"evidence": {"receiptId": "vrf_totally_made_up"}`.
-      // The story could not be completed -- validation re-runs every attempt --
-      // but the durable audit record showed fabricated evidence, contradicting
-      // story.ts's guarantee that a thrown error leaves the plan byte-for-byte
-      // unchanged. Waiver verification is an await, so it must also finish
-      // before the first write.
-      const pending: Array<{ itemId: string; evidence: { receiptId: string } | { waiver: true; sourceMessageId: string } }> = []
-      for (const item of args.items) {
-        if (item.receiptId) {
-          pending.push({ itemId: item.id, evidence: { receiptId: item.receiptId } })
-        } else if (item.waiverSourceMessageId) {
-          const verified = await isUserMessage(client, context.sessionID, item.waiverSourceMessageId)
-          if (!verified) {
-            throw new Error(
-              `waiver for acceptance item ${item.id} references message ${item.waiverSourceMessageId}, which does not resolve to a user-authored chat message — rejected`,
-            )
-          }
-          // Sign the waiver to the (session, criterion, message) it was
-          // validated for. Unsigned, this was the cheapest forgery left in the
-          // system: `pins.json` is an ordinary file and the gate trusts a
-          // waiver forever, so writing one over each criterion silenced the
-          // gate outright (measured: continuations 1 -> 0) -- no receipt to
-          // clone, no worktree digest to satisfy. Signing also stops a
-          // LEGITIMATE waiver being moved to a different criterion.
-          const waiverSignature = signWaiver({
-            sessionID: context.sessionID,
-            criterionId: item.id,
-            sourceMessageId: item.waiverSourceMessageId,
-          })
-          pending.push({
-            itemId: item.id,
-            evidence: {
-              waiver: true,
-              sourceMessageId: item.waiverSourceMessageId,
-              ...(waiverSignature ? { signature: waiverSignature } : {}),
-            },
-          })
-        }
-      }
-      // Receipt ids are validated here too, not only inside `checkpoint`.
-      // Otherwise a fabricated id is written to plan.json first and rejected
-      // second, leaving the forgery in the durable record.
-      for (const { itemId, evidence } of pending) {
-        if ("receiptId" in evidence) {
-          const fresh = isFreshReceipt(
-            { verificationReceipts, states, storyEngine },
-            context.sessionID,
-            args.storyId,
-            evidence.receiptId,
-          )
-          if (!fresh) {
-            throw new Error(
-              `cannot complete story ${args.storyId}: acceptance item ${itemId}'s receipt ${evidence.receiptId} is not an observed receipt for this story`,
-            )
+      // Capture the set of active STORY ids (and the checkpointed task's
+      // parent story) BEFORE the call so we can rebind phase to `execute`
+      // for every story that newly became active (its first task activated)
+      // as a side effect of this checkpoint + level-promotion.
+      const activeBefore = new Set(storyEngine.getActiveStories(context.sessionID).map((story) => story.id))
+      const planBefore = storyEngine.getPlan(context.sessionID)
+      let parentStoryId = args.taskId
+      if (planBefore) {
+        for (const story of planBefore.stories) {
+          if (story.tasks.some((task) => task.id === args.taskId)) {
+            parentStoryId = story.id
+            break
           }
         }
-      }
-      // `checkpoint` reads evidence off the plan, so it has to be attached
-      // before validation can run -- but a REFUSED checkpoint must not leave
-      // the model's claim behind. An audit showed exactly that: a checkpoint
-      // rejected for being out of order still wrote its waivers into
-      // plan.json, and they then satisfied the story on a later attempt with
-      // no further proof. Snapshot the prior evidence and restore it if
-      // `checkpoint` throws, so story.ts's stated guarantee -- "a thrown error
-      // leaves the plan file byte-for-byte unchanged" -- actually holds.
-      type Evidence = { receiptId: string } | { waiver: true; sourceMessageId: string; signature?: string } | null
-      const priorEvidence = new Map<string, Evidence>()
-      const storyBefore = storyEngine.getPlan(context.sessionID)?.stories.find((s) => s.id === args.storyId)
-      for (const { itemId } of pending) {
-        const item = storyBefore?.acceptanceItems.find((a) => a.id === itemId)
-        priorEvidence.set(itemId, (item?.evidence ?? null) as Evidence)
       }
 
-      for (const { itemId, evidence } of pending) {
-        storyEngine.attachEvidence(context.sessionID, args.storyId, itemId, evidence)
-      }
-      try {
-        storyEngine.checkpoint(context.sessionID, args.storyId, args.status, {
-          isValidReceipt: (receiptId) =>
-            isFreshReceipt({ verificationReceipts, states, storyEngine }, context.sessionID, args.storyId, receiptId),
-        })
-      } catch (error) {
-        for (const [itemId, evidence] of priorEvidence) {
-          storyEngine.attachEvidence(context.sessionID, args.storyId, itemId, evidence)
+      storyEngine.checkpoint(context.sessionID, args.taskId, args.status, { reason: args.reason })
+
+      // T8 (FR-001), task/wave-aware: completing/blocking/failing the last
+      // active task can promote a whole new level at once — possibly across
+      // several stories. Rebind phase to `execute` for EVERY newly-active
+      // story, not just a single successor. Best-effort: a phase-engine
+      // hiccup must not fail a successful checkpoint.
+      for (const nowActive of storyEngine.getActiveStories(context.sessionID)) {
+        if (activeBefore.has(nowActive.id)) continue
+        try {
+          phaseEngine.onStoryAdvance(context.sessionID, parentStoryId, nowActive.id)
+        } catch {
+          // best-effort — see comment above
         }
-        throw error
       }
+
       const plan = storyEngine.getPlan(context.sessionID)
-      // T8 (FR-001): a non-final story completing rebinds phase to `execute`
-      // for the newly-active successor story. `storyEngine.checkpoint` above
-      // already promoted the next "pending" story to "active" internally;
-      // if a different story is now active, that's the T8 arc.
-      if (args.status === "complete") {
-        const nowActive = storyEngine.getActiveStory(context.sessionID)
-        if (nowActive && nowActive.id !== args.storyId) {
-          phaseEngine.onStoryAdvance(context.sessionID, args.storyId, nowActive.id)
-        }
-      }
       return JSON.stringify(plan, null, 2)
     },
   })
 
   const reopenTool = tool({
     description:
-      "Reopen a blocked or failed story in the elicify-vertex v2 plan so work on it can resume. Use this ONLY " +
-      "after whatever actually caused the block or failure has been resolved (e.g. a missing dependency now " +
-      "exists, a design question got answered, an external blocker cleared) — never as a way to bypass a " +
-      "legitimate block or dodge unmet acceptance criteria. Reopening clears the story's acceptance-item " +
-      "evidence, so it must be re-proven via elicify_vertex_plan_checkpoint before the story can complete again. " +
-      "The story becomes the active story immediately if no other story is currently active, or rejoins the " +
-      "queue as pending (to be picked up by normal successor-promotion) if another story is already active. " +
-      "Fails if storyId is unknown or the story's current status is not 'blocked' or 'failed'.",
+      "Reopen a story in the elicify-vertex v2 plan so work on it can resume. Use this after whatever actually " +
+      "caused a block or failure has been resolved (a missing dependency now exists, a design question got " +
+      "answered, an external blocker cleared), or to resume a story the completion judge reverted — never as a " +
+      "way to dodge unmet acceptance criteria (the judge will audit the next claim all the same). The story's " +
+      "not-complete tasks are re-activated when their dependencies are satisfied, or rejoin the queue as pending " +
+      "otherwise; complete tasks are left complete.",
     args: {
       storyId: tool.schema.string().min(1),
       reason: tool.schema.string().min(1),
@@ -502,19 +358,13 @@ export function buildPlanTools(deps: PlanToolsDeps) {
       const plan = storyEngine.getPlan(context.sessionID)
       const story = plan?.stories.find((candidate) => candidate.id === args.storyId) ?? null
       // C-12: reopenStory resets StoryEngine's own status/evidence but has no
-      // knowledge of PhaseEngine (a deliberately separate module -- see
+      // knowledge of PhaseEngine (a deliberately separate module — see
       // story.ts's header). Without this, a story whose phase reached
-      // "close" before it blocked stays "close" after reopening -- and
+      // "close" before it blocked stays "close" after reopening — and
       // onMutation is a documented no-op from "close" (no table arc), so it
-      // cannot fix this; the gate-continuation exclusion on phase resets
-      // (plugin.ts) means the completion judge may then never re-trigger for
-      // this story even once it's genuinely re-completed. onStoryAdvance
-      // (T8) is the one phase transition that unconditionally forces the
-      // target back to "execute" regardless of its prior phase -- reused
-      // here as "resume this story now" rather than its usual "advance to
-      // the next story" meaning; fromStoryId is purely informational (see
-      // its own doc comment: "void fromStoryId"), so passing the same id
-      // for both is correct, not a workaround.
+      // cannot fix this. onStoryAdvance (T8) is the one phase transition
+      // that unconditionally forces the target back to "execute"; reused
+      // here as "resume this story now".
       if (story?.status === "active") phaseEngine.onStoryAdvance(context.sessionID, args.storyId, args.storyId)
       return JSON.stringify(
         {
@@ -531,7 +381,9 @@ export function buildPlanTools(deps: PlanToolsDeps) {
   })
 
   const statusTool = tool({
-    description: "Read the elicify-vertex v2 story-contract plan for the current session (null if none).",
+    description:
+      "Read the elicify-vertex v2 plan for the current session (null if none). Includes each story's tasks and " +
+      "their statuses, so the active tasks / computed waves are visible without a separate call.",
     args: {},
     async execute(_args, context) {
       return JSON.stringify(storyEngine.getPlan(context.sessionID), null, 2)

@@ -390,9 +390,9 @@ describe("test 26: elevate_once_per_turn", () => {
       (await hooks.tool!.elicify_vertex_plan_create.execute(
         {
           stories: [
-            { text: "story one", acceptanceItems: ["done"], scopeGlobs: [], verifiers: ["npx vitest run tests/s1.test.ts"] },
-            { text: "story two", acceptanceItems: ["done"], scopeGlobs: [], verifiers: ["npx vitest run tests/s2.test.ts"] },
-            { text: "story three", acceptanceItems: ["done"], scopeGlobs: [], verifiers: ["npx vitest run tests/s3.test.ts"] },
+            { text: "story one", acceptanceItems: ["done"], scopeGlobs: [], verifiers: ["npx vitest run tests/s1.test.ts"], tasks: [{ text: "do story one" }] },
+            { text: "story two", acceptanceItems: ["done"], scopeGlobs: [], verifiers: ["npx vitest run tests/s2.test.ts"], dependsOn: ["S1"], tasks: [{ text: "do story two" }] },
+            { text: "story three", acceptanceItems: ["done"], scopeGlobs: [], verifiers: ["npx vitest run tests/s3.test.ts"], dependsOn: ["S2"], tasks: [{ text: "do story three" }] },
           ],
         },
         toolContext(sid),
@@ -408,15 +408,17 @@ describe("test 26: elevate_once_per_turn", () => {
     const intermediateText = intermediateResult.system.join("\n")
     expect(intermediateText).not.toContain("Sweep adjacent findings")
 
-    // Advance to the final story via waiver-evidenced checkpoints (FR-020's
-    // observed-receipt bar applies only to the FINAL story; a non-final
-    // story's acceptance items may be waived).
+    // Advance to the final story via task-level completion claims. Each story
+    // has one task; with the chain S2->S1, S3->S2, completing S1.T1
+    // auto-completes S1 and promotes S2.T1 to active, and completing S2.T1
+    // likewise promotes S3.T1 (the final story) to active. A checkpoint is a
+    // bare CLAIM under the task/DAG redesign — no items/waiver citation.
     await hooks.tool!.elicify_vertex_plan_checkpoint.execute(
-      { storyId: "S1", status: "complete", items: [{ id: "A1", waiverSourceMessageId: "user-msg-1" }] },
+      { taskId: "S1.T1", status: "complete" },
       toolContext(sid),
     )
     await hooks.tool!.elicify_vertex_plan_checkpoint.execute(
-      { storyId: "S2", status: "complete", items: [{ id: "A1", waiverSourceMessageId: "user-msg-1" }] },
+      { taskId: "S2.T1", status: "complete" },
       toolContext(sid),
     )
 
@@ -467,8 +469,8 @@ describe("test 26: elevate_once_per_turn", () => {
       await hooks.tool!.elicify_vertex_plan_create.execute(
         {
           stories: [
-            { text: "story one", acceptanceItems: ["done"], scopeGlobs: [], verifiers: ["npx vitest run tests/s1.test.ts"] },
-            { text: "story two", acceptanceItems: ["done"], scopeGlobs: [], verifiers: ["npx vitest run tests/s2.test.ts"] },
+            { text: "story one", acceptanceItems: ["done"], scopeGlobs: [], verifiers: ["npx vitest run tests/s1.test.ts"], tasks: [{ text: "do story one" }] },
+            { text: "story two", acceptanceItems: ["done"], scopeGlobs: [], verifiers: ["npx vitest run tests/s2.test.ts"], dependsOn: ["S1"], tasks: [{ text: "do story two" }] },
           ],
         },
         toolContext(sid),
@@ -497,15 +499,15 @@ describe("test 26: elevate_once_per_turn", () => {
       await hooks.tool!.elicify_vertex_plan_create.execute(
         {
           stories: [
-            { text: "story one", acceptanceItems: ["done"], scopeGlobs: [], verifiers: [] },
-            { text: "story two", acceptanceItems: ["done"], scopeGlobs: [], verifiers: [] },
+            { text: "story one", acceptanceItems: ["done"], scopeGlobs: [], verifiers: [], tasks: [{ text: "do story one" }] },
+            { text: "story two", acceptanceItems: ["done"], scopeGlobs: [], verifiers: [], dependsOn: ["S1"], tasks: [{ text: "do story two" }] },
           ],
         },
         toolContext(sid),
       )
 
       await hooks.tool!.elicify_vertex_plan_checkpoint.execute(
-        { storyId: "S1", status: "complete", items: [{ id: "A1", waiverSourceMessageId: "user-msg-1" }] },
+        { taskId: "S1.T1", status: "complete" },
         toolContext(sid),
       )
 
@@ -563,7 +565,7 @@ describe("test 28: scope_directive_no_block", () => {
 
     await activate(hooks, sid, DEEP_ASK)
     await hooks.tool!.elicify_vertex_plan_create.execute(
-      { stories: [{ text: "parser work", acceptanceItems: ["done"], scopeGlobs: ["src/parser/**"], verifiers: [] }] },
+      { stories: [{ text: "parser work", acceptanceItems: ["done"], scopeGlobs: ["src/parser/**"], verifiers: [], tasks: [{ text: "do the parser work" }] }] },
       toolContext(sid),
     )
 

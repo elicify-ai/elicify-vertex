@@ -87,6 +87,20 @@ export interface V2SessionState {
   //    block counters (which back the zero-criteria fallback instead).
   criteriaBlocks: number
 
+  // -- Stall detection (HANDOVER.md redesign point 9, adopted from
+  //    opencode-goal-plugin's no-progress accounting). `activityMarker` is
+  //    monotonic for the session's lifetime and bumped by wiring on every
+  //    real unit of agent work (any tool call); the other three are compared
+  //    against it at each idle that wants to dispatch a continuation — see
+  //    `wiring/watchdog.ts`'s `evaluateStall`.
+  activityMarker: number
+  /** `activityMarker` as it stood when the last continuation was dispatched. */
+  markerAtLastContinuation: number
+  /** Consecutive continuation-dispatched idles that produced no activity. */
+  consecutiveNoProgress: number
+  /** Cap reached: the gate goes silent until the next real user message. */
+  stallPaused: boolean
+
   /** Last completed assistant text (mirrors v1's `lastAssistantText`, used nowhere safety-critical in v2 wiring today but kept for parity / future use). */
   lastAssistantText: string | null
 
@@ -119,6 +133,10 @@ export function freshSessionState(workspaceRoot: string): V2SessionState {
     turnIntroducedNewTestFile: false,
     repeatFailurePending: null,
     criteriaBlocks: 0,
+    activityMarker: 0,
+    markerAtLastContinuation: -1,
+    consecutiveNoProgress: 0,
+    stallPaused: false,
     lastAssistantText: null,
     instanceCounter: 0,
   }
@@ -139,6 +157,14 @@ export function resetTurnState(state: V2SessionState): void {
   state.everVerifiedThisTurn = false
   state.turnIntroducedNewTestFile = false
   state.repeatFailurePending = null
+  // Stall detection (redesign point 9): a real user message is the
+  // un-pause signal — the gate went silent because continuations produced
+  // no activity, and the user speaking again is exactly the event that
+  // should re-arm it. `activityMarker` itself is monotonic and deliberately
+  // NOT reset (it is compared by value, not by age).
+  state.markerAtLastContinuation = -1
+  state.consecutiveNoProgress = 0
+  state.stallPaused = false
   // Per-turn criteria idle-gate replay cap (FR-015 "criteria pinned" branch)
   // — v1 parity: EvidenceLedger.reset() zeroes stopBlocks on every
   // chat.message, so its cap is 3 blocks PER TURN, not 3 ever. Without this

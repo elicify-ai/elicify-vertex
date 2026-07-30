@@ -87,8 +87,11 @@ function denyAllAgent(name: string): Agent {
     name,
     mode: "subagent",
     builtIn: false,
-    permission: { edit: "deny", bash: { "*": "deny" }, webfetch: "deny" },
-    tools: { bash: false, edit: false, write: false, webfetch: false, read: false, "*": false },
+    // Deny the UNION of both probe policies: intake's default
+    // (edit/bash/webfetch) and the judge's JUDGE_PROBE_POLICY
+    // (edit/write/webfetch/task) — see src/v2/subturn.ts.
+    permission: { edit: "deny", write: "deny", bash: { "*": "deny" }, webfetch: "deny", task: "deny" },
+    tools: { bash: false, edit: false, write: false, webfetch: false, read: false, task: false, "*": false },
     options: {},
   } as Agent
 }
@@ -261,7 +264,7 @@ async function setUpFinalStoryVerified(
   sessionID: string,
   model: { providerID: string; id: string },
   recordSpy: ReceiptRecordSpy,
-): Promise<{ storyId: string; itemId: string; receiptId: string }> {
+): Promise<{ storyId: string; taskId: string; itemId: string; receiptId: string }> {
   // "fix a typo in the readme" matches TRIVIAL_ASK_RE -> classifyMultiStory
   // short-circuits to "skipped", issuing zero session.create/prompt calls.
   await activate(hooks, sessionID, "fix a typo in the readme", model)
@@ -276,25 +279,35 @@ async function setUpFinalStoryVerified(
           acceptanceItems: ["criterion one"],
           scopeGlobs: [],
           verifiers: ["npx vitest run"],
+          // 2026-07-30 task/DAG redesign: each story MUST decompose into >=1
+          // task; a single trivial task is enough — this helper only cares
+          // about reaching a claimable final story.
+          tasks: [{ text: "do the only story" }],
         },
       ],
     },
     sessionID,
   )
-  const plan = JSON.parse(createRaw) as { stories: Array<{ id: string; acceptanceItems: Array<{ id: string }> }> }
+  const plan = JSON.parse(createRaw) as {
+    stories: Array<{ id: string; acceptanceItems: Array<{ id: string }>; tasks: Array<{ id: string }> }>
+  }
   const storyId = plan.stories[0].id
   const itemId = plan.stories[0].acceptanceItems[0].id
+  const taskId = plan.stories[0].tasks[0].id
 
   await toolAfter(hooks, sessionID, "edit", { filePath: "src/foo.ts" }, "updated")
   await toolAfter(hooks, sessionID, "bash", { command: "npx vitest run" }, "20 passed", { exit: 0 })
 
   // Setup sanity check (not the behaviour under test): the verified
-  // bash command must have actually recorded a receipt.
+  // bash command must have actually recorded a receipt. (Under the task-model
+  // redesign a checkpoint is a bare CLAIM that no longer cites this receipt,
+  // but the receipt is still minted by tool.execute.after's verification
+  // recognition — so the spy still observes it here.)
   expect(recordSpy.mock.results.length).toBeGreaterThan(0)
   const lastResult = recordSpy.mock.results[recordSpy.mock.results.length - 1]
   const receiptId = (lastResult.value as { id: string }).id
 
-  return { storyId, itemId, receiptId }
+  return { storyId, taskId, itemId, receiptId }
 }
 
 // ===========================================================================
@@ -317,7 +330,7 @@ describe("test 29: judge_async_fail_open", () => {
     const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
     const sid = "judge-fail-open-session"
 
-    const { storyId, itemId, receiptId } = await setUpFinalStoryVerified(
+    const { taskId } = await setUpFinalStoryVerified(
       hooks,
       sid,
       { providerID: "minimax", id: "MiniMax-M3" },
@@ -327,7 +340,7 @@ describe("test 29: judge_async_fail_open", () => {
     const checkpointRaw = await callTool(
       hooks,
       "elicify_vertex_plan_checkpoint",
-      { storyId, status: "complete", items: [{ id: itemId, receiptId }] },
+      { taskId, status: "complete" },
       sid,
     )
     const checkpointed = JSON.parse(checkpointRaw) as { stories: Array<{ status: string }> }
@@ -367,7 +380,15 @@ describe("test 36: judge_model_selection_and_fallback", () => {
       promptImpl: async (args) => {
         if (args.body?.agent === "vertex-judge") {
           return {
-            data: { info: {}, parts: [{ type: "text", text: '{"fit":"pass","summary":"looks fine","gaps":[]}' }] },
+            data: {
+              info: {},
+              parts: [
+                {
+                  type: "text",
+                  text: '{"stories":[{"storyId":"S1","pass":true,"summary":"looks fine","items":[{"itemId":"A1","met":true,"note":"observed"}]}]}',
+                },
+              ],
+            },
             error: undefined,
           }
         }
@@ -378,7 +399,7 @@ describe("test 36: judge_model_selection_and_fallback", () => {
     const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
     const sid = "judge-model-default-session"
 
-    const { storyId, itemId, receiptId } = await setUpFinalStoryVerified(
+    const { taskId } = await setUpFinalStoryVerified(
       hooks,
       sid,
       { providerID: "minimax", id: "MiniMax-M3" },
@@ -388,7 +409,7 @@ describe("test 36: judge_model_selection_and_fallback", () => {
     const checkpointRaw = await callTool(
       hooks,
       "elicify_vertex_plan_checkpoint",
-      { storyId, status: "complete", items: [{ id: itemId, receiptId }] },
+      { taskId, status: "complete" },
       sid,
     )
     expect((JSON.parse(checkpointRaw) as { stories: Array<{ status: string }> }).stories[0].status).toBe("complete")
@@ -403,10 +424,10 @@ describe("test 36: judge_model_selection_and_fallback", () => {
     const createArgs = client.session.create.mock.calls[0]?.[0] as { body?: { parentID?: string } } | undefined
     expect(createArgs?.body?.parentID).toBe(sid)
 
-    // docs/JUDGE-PROMPT.md §4 "Proposed rendering", fit=pass: a single line,
-    // no gap list — asserting the EXACT rendered chat text, not a substring.
+    // Redesign point 2/4: a passed claim on the settled plan dispatches the
+    // close-out continuation (the judge verified every story).
     const continuationTexts = idleContinuationTexts(client, sid)
-    expect(continuationTexts).toContain("[vertex:judge] fit=pass — looks fine")
+    expect(continuationTexts.some((t) => t.includes("passed audit"))).toBe(true)
   })
 
   it("(b) falls back to the session model when the configured judgeModel's attempt rejects, appending the verdict on the retry's success", async () => {
@@ -419,7 +440,15 @@ describe("test 36: judge_model_selection_and_fallback", () => {
           throw new Error("provider-x unavailable")
         }
         return {
-          data: { info: {}, parts: [{ type: "text", text: '{"fit":"pass","summary":"fallback worked","gaps":[]}' }] },
+          data: {
+            info: {},
+            parts: [
+              {
+                type: "text",
+                text: '{"stories":[{"storyId":"S1","pass":true,"summary":"fallback worked","items":[{"itemId":"A1","met":true,"note":"observed"}]}]}',
+              },
+            ],
+          },
           error: undefined,
         }
       },
@@ -428,7 +457,7 @@ describe("test 36: judge_model_selection_and_fallback", () => {
     const hooks = await ElicifyVertexPluginV2(pluginInput(client), { judgeModel: "provider-x/model-y" } as never)
     const sid = "judge-model-fallback-session"
 
-    const { storyId, itemId, receiptId } = await setUpFinalStoryVerified(
+    const { taskId } = await setUpFinalStoryVerified(
       hooks,
       sid,
       { providerID: "minimax", id: "MiniMax-M3" },
@@ -438,7 +467,7 @@ describe("test 36: judge_model_selection_and_fallback", () => {
     const checkpointRaw = await callTool(
       hooks,
       "elicify_vertex_plan_checkpoint",
-      { storyId, status: "complete", items: [{ id: itemId, receiptId }] },
+      { taskId, status: "complete" },
       sid,
     )
     expect((JSON.parse(checkpointRaw) as { stories: Array<{ status: string }> }).stories[0].status).toBe("complete")
@@ -450,8 +479,9 @@ describe("test 36: judge_model_selection_and_fallback", () => {
     expect(calls[0]?.body?.model).toEqual({ providerID: "provider-x", modelID: "model-y" })
     expect(calls[1]?.body?.model).toEqual({ providerID: "minimax", modelID: "MiniMax-M3" })
 
+    // The retry's pass verdict closes the plan out.
     const continuationTexts = idleContinuationTexts(client, sid)
-    expect(continuationTexts.some((t) => t.includes("fallback worked"))).toBe(true)
+    expect(continuationTexts.some((t) => t.includes("passed audit"))).toBe(true)
   })
 })
 
@@ -460,18 +490,32 @@ describe("test 36: judge_model_selection_and_fallback", () => {
 // ===========================================================================
 
 describe("test 51: judge_verdict_appended_happy_path", () => {
-  it("a concern verdict never gates the checkpoint, and its summary + numbered gap list reach the close-out continuation", async () => {
-    const gaps = [
-      { issue: "criterion 2 evidence is type-only", evidence: "verifier summary only shows a typecheck", fix: "run the test suite and cite its output" },
-      { issue: "diff touches an unrelated config file", evidence: "diffSummary includes tsconfig.json", fix: "explain or revert the unrelated change" },
-    ]
+  it("a failed audit reverts the claimed story to active and dispatches a continuation naming the unmet acceptance item", async () => {
+    // Redesign points 2/4/8: the judge is the arbiter. A failing verdict on a
+    // claimed-complete story REVERTS it to "active" (the claim is rejected)
+    // and dispatches a constructive continuation that names each unmet
+    // acceptance item and the judge's note for it — not a generic reminder.
     const client = makeStubClient({
       promptImpl: async (args) => {
         if (args.body?.agent === "vertex-judge") {
           return {
             data: {
               info: {},
-              parts: [{ type: "text", text: JSON.stringify({ fit: "concern", summary: "two open items", gaps }) }],
+              parts: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    stories: [
+                      {
+                        storyId: "S1",
+                        pass: false,
+                        summary: "the test suite was never run",
+                        items: [{ itemId: "A1", met: false, note: "no passing verifier observed for this criterion" }],
+                      },
+                    ],
+                  }),
+                },
+              ],
             },
             error: undefined,
           }
@@ -483,7 +527,7 @@ describe("test 51: judge_verdict_appended_happy_path", () => {
     const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
     const sid = "judge-happy-path-session"
 
-    const { storyId, itemId, receiptId } = await setUpFinalStoryVerified(
+    const { storyId, taskId, itemId } = await setUpFinalStoryVerified(
       hooks,
       sid,
       { providerID: "anthropic", id: "claude-fable-5" },
@@ -493,30 +537,105 @@ describe("test 51: judge_verdict_appended_happy_path", () => {
     const checkpointRaw = await callTool(
       hooks,
       "elicify_vertex_plan_checkpoint",
-      { storyId, status: "complete", items: [{ id: itemId, receiptId }] },
+      { taskId, status: "complete" },
       sid,
     )
     const checkpointed = JSON.parse(checkpointRaw) as { stories: Array<{ status: string }> }
-    // The story checkpoint is validated purely on evidence (FR-019/FR-020)
-    // BEFORE the judge ever runs, so it always succeeds regardless of the
-    // eventual verdict.
+    // A checkpoint is a claim — it always succeeds; the judge audits it next.
     expect(checkpointed.stories[0].status).toBe("complete")
 
     await idle(hooks, sid)
 
-    // docs/JUDGE-PROMPT.md §4 "Proposed rendering", fit=concern: the header
-    // line followed by a numbered "To complete this to the standard
-    // expected:" list, one entry per gap — asserting the EXACT rendered chat
-    // text (gate.ts's `formatJudgeVerdict`), not just a substring.
+    // The failed audit REVERTS the claim: the story is active again, not
+    // complete.
+    const afterAudit = JSON.parse(await callTool(hooks, "elicify_vertex_plan_status", {}, sid)) as {
+      stories: Array<{ id: string; status: string }>
+    }
+    expect(afterAudit.stories.find((s) => s.id === storyId)?.status).toBe("active")
+
+    // The continuation names the unmet item id and the judge's note verbatim.
     const continuationTexts = idleContinuationTexts(client, sid)
-    const expectedText = [
-      "[vertex:judge] fit=concern — two open items",
-      "",
-      "To complete this to the standard expected:",
-      "1. criterion 2 evidence is type-only — run the test suite and cite its output",
-      "2. diff touches an unrelated config file — explain or revert the unrelated change",
-    ].join("\n")
-    expect(continuationTexts).toContain(expectedText)
+    expect(continuationTexts.some((t) => t.includes("[vertex:judge]"))).toBe(true)
+    expect(continuationTexts.some((t) => t.includes(itemId))).toBe(true)
+    expect(continuationTexts.some((t) => t.includes("no passing verifier observed for this criterion"))).toBe(true)
+  })
+})
+
+// ===========================================================================
+// Staggered-audit close-out (redesign point 2/4): the close-out continuation
+// fires once the WHOLE plan is settled and every story has a passing judge
+// stamp — including when stories pass audit in SEPARATE idle audits, not only
+// when the final story is in the settling audit's set. Pins the gap a review
+// flagged (a final story passing while a non-final one is still unjudged).
+// ===========================================================================
+describe("judge close-out fires once every story has passed audit, across staggered audits", () => {
+  it("final passes in audit 1, non-final passes in audit 2 -> close-out fires on audit 2", async () => {
+    let judgeCall = 0
+    const client = makeStubClient({
+      promptImpl: async (args) => {
+        if (args.body?.agent !== "vertex-judge") {
+          return { data: { info: {}, parts: [{ type: "text", text: '{"multiStory":false}' }] }, error: undefined }
+        }
+        // Audit 1 audits only S2 (the final story, the sole unjudged claim at
+        // that point because S1 was claimed in the same batch but... see below);
+        // audit 2 audits S1. Each returns a pass for the story it was asked
+        // about. (The payload's `plan` field names the audit set; call order
+        // is deterministic since there is no judgeModel override.)
+        judgeCall += 1
+        const storyId = judgeCall === 1 ? "S2" : "S1"
+        return {
+          data: {
+            info: {},
+            parts: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  stories: [
+                    { storyId, pass: true, summary: "ok", items: [{ itemId: "A1", met: true, note: "observed" }] },
+                  ],
+                }),
+              },
+            ],
+          },
+          error: undefined,
+        }
+      },
+    })
+    const recordSpy = vi.spyOn(VerificationReceiptStore.prototype, "record")
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "judge-staggered-session"
+    await activate(hooks, sid, "fix a typo in the readme", { providerID: "anthropic", id: "claude-fable-5" })
+
+    await callTool(
+      hooks,
+      "elicify_vertex_plan_create",
+      {
+        stories: [
+          { text: "non-final story", acceptanceItems: ["nf done"], scopeGlobs: [], verifiers: ["npx vitest run"], tasks: [{ text: "do the non-final story" }] },
+          { text: "final story", acceptanceItems: ["f done"], scopeGlobs: [], verifiers: ["npx vitest run"], tasks: [{ text: "do the final story" }] },
+        ],
+      },
+      sid,
+    )
+
+    // Claim both stories complete (a claim needs no evidence now). Each story
+    // has one task; with no cross-story deps both tasks start active at create,
+    // so each can be checkpointed in turn.
+    await callTool(hooks, "elicify_vertex_plan_checkpoint", { taskId: "S1.T1", status: "complete" }, sid)
+    await callTool(hooks, "elicify_vertex_plan_checkpoint", { taskId: "S2.T1", status: "complete" }, sid)
+
+    // Audit 1: both are unjudged. The judge (stub) returns a pass for "S2"
+    // only; the audit set is {S1,S2}, so S1 is left without a stamp -> NOT
+    // settled+allPassed -> no close-out yet.
+    await idle(hooks, sid)
+    let continuations = idleContinuationTexts(client, sid)
+    expect(continuations.some((t) => t.includes("passed audit"))).toBe(false)
+
+    // Audit 2: S1 is the sole remaining unjudged claim; it passes -> now every
+    // story has a passing stamp -> close-out fires.
+    await idle(hooks, sid)
+    continuations = idleContinuationTexts(client, sid)
+    expect(continuations.some((t) => t.includes("passed audit"))).toBe(true)
   })
 })
 
@@ -576,13 +695,13 @@ describe("fetchJudgeTranscriptFields: lastResponse is the last ASSISTANT message
     const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
     const sid = "judge-transcript-lastresponse-session"
 
-    const { storyId, itemId, receiptId } = await setUpFinalStoryVerified(
+    const { taskId } = await setUpFinalStoryVerified(
       hooks,
       sid,
       { providerID: "minimax", id: "MiniMax-M3" },
       recordSpy,
     )
-    await callTool(hooks, "elicify_vertex_plan_checkpoint", { storyId, status: "complete", items: [{ id: itemId, receiptId }] }, sid)
+    await callTool(hooks, "elicify_vertex_plan_checkpoint", { taskId, status: "complete" }, sid)
 
     await idle(hooks, sid)
 
@@ -612,13 +731,13 @@ describe("fetchJudgeTranscriptFields: recentTranscript is truncated to the turn 
     const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
     const sid = "judge-transcript-window-session"
 
-    const { storyId, itemId, receiptId } = await setUpFinalStoryVerified(
+    const { taskId } = await setUpFinalStoryVerified(
       hooks,
       sid,
       { providerID: "minimax", id: "MiniMax-M3" },
       recordSpy,
     )
-    await callTool(hooks, "elicify_vertex_plan_checkpoint", { storyId, status: "complete", items: [{ id: itemId, receiptId }] }, sid)
+    await callTool(hooks, "elicify_vertex_plan_checkpoint", { taskId, status: "complete" }, sid)
 
     await idle(hooks, sid)
 
@@ -651,13 +770,13 @@ describe("fetchJudgeTranscriptFields: both client.session.messages response shap
     const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
     const sid = `judge-transcript-shape-${Math.random().toString(36).slice(2)}`
 
-    const { storyId, itemId, receiptId } = await setUpFinalStoryVerified(
+    const { taskId } = await setUpFinalStoryVerified(
       hooks,
       sid,
       { providerID: "minimax", id: "MiniMax-M3" },
       recordSpy,
     )
-    await callTool(hooks, "elicify_vertex_plan_checkpoint", { storyId, status: "complete", items: [{ id: itemId, receiptId }] }, sid)
+    await callTool(hooks, "elicify_vertex_plan_checkpoint", { taskId, status: "complete" }, sid)
     await idle(hooks, sid)
     return judgePayloadFromCall(judgePromptCalls(client)[0])
   }
@@ -699,13 +818,13 @@ describe("a secret in a real (mocked) transcript is redacted through the full fe
     const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
     const sid = "judge-transcript-secret-lastresponse-session"
 
-    const { storyId, itemId, receiptId } = await setUpFinalStoryVerified(
+    const { taskId } = await setUpFinalStoryVerified(
       hooks,
       sid,
       { providerID: "minimax", id: "MiniMax-M3" },
       recordSpy,
     )
-    await callTool(hooks, "elicify_vertex_plan_checkpoint", { storyId, status: "complete", items: [{ id: itemId, receiptId }] }, sid)
+    await callTool(hooks, "elicify_vertex_plan_checkpoint", { taskId, status: "complete" }, sid)
     await idle(hooks, sid)
 
     const call = judgePromptCalls(client)[0]
@@ -731,13 +850,13 @@ describe("a secret in a real (mocked) transcript is redacted through the full fe
     const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
     const sid = "judge-transcript-secret-recenttranscript-session"
 
-    const { storyId, itemId, receiptId } = await setUpFinalStoryVerified(
+    const { taskId } = await setUpFinalStoryVerified(
       hooks,
       sid,
       { providerID: "minimax", id: "MiniMax-M3" },
       recordSpy,
     )
-    await callTool(hooks, "elicify_vertex_plan_checkpoint", { storyId, status: "complete", items: [{ id: itemId, receiptId }] }, sid)
+    await callTool(hooks, "elicify_vertex_plan_checkpoint", { taskId, status: "complete" }, sid)
     await idle(hooks, sid)
 
     const call = judgePromptCalls(client)[0]

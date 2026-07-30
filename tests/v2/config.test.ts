@@ -54,26 +54,45 @@ describe("applyV2Config", () => {
     ])
   })
 
-  it("registers vertex-judge/vertex-intake with the wildcard permission deny that actually delivers zero tools", async () => {
+  it("registers vertex-intake fully zero-tool (wildcard permission deny), unchanged", async () => {
     const cfgInput: { command?: Record<string, unknown>; agent?: Record<string, unknown> } = {}
     await applyV2Config(cfgInput as never, {} as OpencodeClient, "elicify-vertex")
 
-    const judge = cfgInput.agent!["vertex-judge"] as { permission: Record<string, string> }
-    const intake = cfgInput.agent!["vertex-intake"] as { permission: Record<string, string> }
-    for (const permission of [judge.permission, intake.permission]) {
-      // The load-bearing entry: live-host testing showed the `tools` map is
-      // ignored entirely and ONLY `permission: {"*": "deny"}` resolves the
-      // agent to zero enabled tools (see config.ts's module header).
-      expect(permission["*"]).toBe("deny")
-      // Kept alongside the wildcard because probeCapability requires a rule
-      // *naming* each of these three to prove denial on read-back.
-      expect(permission.edit).toBe("deny")
-      expect(permission.bash).toBe("deny")
-      expect(permission.webfetch).toBe("deny")
-    }
+    const intake = cfgInput.agent!["vertex-intake"] as { permission: Record<string, string>; maxSteps: number }
+    // The load-bearing entry: live-host testing showed the `tools` map is
+    // ignored entirely and ONLY `permission: {"*": "deny"}` resolves the
+    // agent to zero enabled tools (see config.ts's module header).
+    expect(intake.permission["*"]).toBe("deny")
+    // Kept alongside the wildcard because probeCapability requires a rule
+    // *naming* each of these three to prove denial on read-back.
+    expect(intake.permission.edit).toBe("deny")
+    expect(intake.permission.bash).toBe("deny")
+    expect(intake.permission.webfetch).toBe("deny")
+    expect(intake.maxSteps).toBe(1)
   })
 
-  it("never registers an agent whose tools deny map contains an enabled entry", async () => {
+  it("registers vertex-judge with the HANDOVER.md point-3 read-only tool grant: read/grep/glob/list/bash allow, edit/write/webfetch/task deny, maxSteps 12", async () => {
+    const cfgInput: { command?: Record<string, unknown>; agent?: Record<string, unknown> } = {}
+    await applyV2Config(cfgInput as never, {} as OpencodeClient, "elicify-vertex")
+
+    const judge = cfgInput.agent!["vertex-judge"] as { permission: Record<string, string>; maxSteps: number }
+    // Base stays deny-everything; the five read-only tools are the explicit
+    // carve-out (bash so the judge can re-run declared verifiers itself).
+    expect(judge.permission["*"]).toBe("deny")
+    for (const allowed of ["read", "grep", "glob", "list", "bash"]) {
+      expect(judge.permission[allowed]).toBe("allow")
+    }
+    // Explicit deny entries are what JUDGE_PROBE_POLICY's denyPermissions
+    // read back to prove the denial.
+    for (const denied of ["edit", "write", "webfetch", "task"]) {
+      expect(judge.permission[denied]).toBe("deny")
+    }
+    // A tool-using judge needs multiple steps (tool calls, THEN a final
+    // answer) — 1 step made the granted tools useless.
+    expect(judge.maxSteps).toBe(12)
+  })
+
+  it("static tools maps: intake's is fully denied; the judge's true entries are exactly the point-3 allowlist", async () => {
     const cfgInput: { command?: Record<string, unknown>; agent?: Record<string, unknown> } = {}
     await applyV2Config(cfgInput as never, {} as OpencodeClient, "elicify-vertex")
 
@@ -81,9 +100,13 @@ describe("applyV2Config", () => {
     const intake = cfgInput.agent!["vertex-intake"] as { tools: Record<string, boolean> }
     // The tools map is not the control of record (the host ignores it), but
     // it must never contradict the permission block if a host DOES honour it.
-    for (const toolsMap of [judge.tools, intake.tools]) {
-      expect(Object.values(toolsMap).every((v) => v === false)).toBe(true)
-    }
+    expect(Object.values(intake.tools).every((v) => v === false)).toBe(true)
+    const enabled = Object.entries(judge.tools)
+      .filter(([, v]) => v === true)
+      .map(([k]) => k)
+      .sort()
+    expect(enabled).toEqual(["bash", "glob", "grep", "list", "read"])
+    expect(judge.tools["*"]).toBe(false)
   })
 
   // Sign-off finding: KNOWN_TOOL_NAMES (this file) is hand-maintained
@@ -144,7 +167,7 @@ describe("elicify_vertex_plan_clear tool", () => {
 
   it("clears both the plan and pinned criteria for the session, reporting what was cleared", async () => {
     const { tools, storyEngine, pinStore } = harness()
-    storyEngine.createPlan("s1", [{ text: "do it", acceptanceItems: ["works"], scopeGlobs: [], verifiers: [] }])
+    storyEngine.createPlan("s1", [{ text: "do it", acceptanceItems: ["works"], scopeGlobs: [], verifiers: [], tasks: [{ text: "do it" }] }])
     pinStore.pin("s1", ["a pinned criterion"])
 
     const result = await tools.elicify_vertex_plan_clear.execute!({}, { sessionID: "s1" } as never)
@@ -162,8 +185,8 @@ describe("elicify_vertex_plan_clear tool", () => {
 
   it("does not disturb another session's plan/pins", async () => {
     const { tools, storyEngine, pinStore } = harness()
-    storyEngine.createPlan("s1", [{ text: "s1 work", acceptanceItems: ["works"], scopeGlobs: [], verifiers: [] }])
-    storyEngine.createPlan("s2", [{ text: "s2 work", acceptanceItems: ["works"], scopeGlobs: [], verifiers: [] }])
+    storyEngine.createPlan("s1", [{ text: "s1 work", acceptanceItems: ["works"], scopeGlobs: [], verifiers: [], tasks: [{ text: "s1 work" }] }])
+    storyEngine.createPlan("s2", [{ text: "s2 work", acceptanceItems: ["works"], scopeGlobs: [], verifiers: [], tasks: [{ text: "s2 work" }] }])
     pinStore.pin("s2", ["s2's criterion"])
 
     await tools.elicify_vertex_plan_clear.execute!({}, { sessionID: "s1" } as never)

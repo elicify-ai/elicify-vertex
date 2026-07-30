@@ -377,7 +377,7 @@ describe("test 53: archival_is_reversible (integration)", () => {
 
     // Drive the REAL plan-create tool, not StoryEngine directly.
     const createResult = await hooks.tool!.elicify_vertex_plan_create!.execute(
-      { stories: [{ text: "New v2 story", acceptanceItems: ["it works"], scopeGlobs: [], verifiers: [] }] },
+      { stories: [{ text: "New v2 story", acceptanceItems: ["it works"], scopeGlobs: [], verifiers: [], tasks: [{ text: "do the new v2 story" }] }] },
       toolCtx,
     )
     const createText = typeof createResult === "string" ? createResult : createResult.output
@@ -444,7 +444,7 @@ describe("test 53: archival_is_reversible (integration)", () => {
     const toolCtx = makeToolContext(sid)
 
     await hooks.tool!.elicify_vertex_plan_create!.execute(
-      { stories: [{ text: "Another story", acceptanceItems: ["done"], scopeGlobs: [], verifiers: [] }] },
+      { stories: [{ text: "Another story", acceptanceItems: ["done"], scopeGlobs: [], verifiers: [], tasks: [{ text: "do another story" }] }] },
       toolCtx,
     )
 

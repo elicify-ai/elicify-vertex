@@ -8,11 +8,31 @@
  * `recordVerification` from `tool.execute.after`, `reset` from
  * `chat.message`), so `shouldBlockStop` sees exactly the state v1 would.
  *
+ * HANDOVER.md redesign (2026-07-29, points 2/4/8/9) — the completion model
+ * changed fundamentally:
+ *  - The completion JUDGE is now the sole arbiter of story/plan completion.
+ *    It runs here, at idle, over every story that CLAIMED complete since its
+ *    last audit (`handleJudgeAudit`) — no longer gated behind the
+ *    deterministic state it exists to rescue (the old `appendJudgeCloseOut`
+ *    could only run once every story was already `complete`, so a session
+ *    stalled on the deterministic gate — exactly the failure it existed
+ *    for — never saw a judge at all: the 894-message field session ended
+ *    5/5 blocked with 0 audits).
+ *  - Judge verdicts are structured per acceptance item and are APPLIED:
+ *    a failed claim reverts the story to `active` with named gaps, and the
+ *    continuation names those gaps per story (point 8).
+ *  - The gate defers ALL nudging while a `task`-tool delegation is in
+ *    flight or a child session is still busy, and pauses auto-continuations
+ *    after a capped run of continuations that produced no observable
+ *    activity (point 9, `wiring/watchdog.ts`).
+ *
  * v1's promise-no-act detector is deliberately NOT ported here: it is not
  * named by FR-015, by the module contracts doc's "Reused v1 primitives"
  * list, or by the task brief's session.idle bullet — porting it would be
  * scope creep into a mechanism the spec does not ask this wave to carry
  * forward, so it is left out on purpose (documented, not a silent gap).
+ * (It was later ported anyway — see `handlePromiseNoAct` — and the
+ * redesign keeps it.)
  */
 import { detectPromiseNoAct, shouldBlockPromiseNoAct } from "../../index.js"
 import type { EvidenceLedger } from "../../index.js"
@@ -25,12 +45,14 @@ import type { PhaseEngine } from "../phase.js"
 import type { PinStore } from "../pin.js"
 import type { StoryEngine } from "../story.js"
 import { resolveVerifier } from "../resolve.js"
-import { runJudge, buildJudgePayload, type JudgeVerdict } from "../judge.js"
+import { runJudge, buildJudgePayload, type JudgeStoryVerdict } from "../judge.js"
+import type { PlanV2 } from "../story.js"
 import type { SelfCreatedSessions } from "../subturn.js"
 import type { ManifestCache } from "./manifest.js"
 import { incompletePlanFinding } from "./findings.js"
 import { bindSession } from "./logger.js"
 import { nextInstanceId, type V2SessionState } from "./state.js"
+import { evaluateStall, hasBusyChildren, type DelegationTracker } from "./watchdog.js"
 
 export interface GateContext {
   client: OpencodeClient
@@ -60,6 +82,13 @@ export interface GateContext {
    * continuation — see that function for the rationale and the reverted
    * alternatives. */
   composer: InjectionComposer
+  /** Redesign point 9: defers all idle nudging while a `task`-tool
+   * delegation is mid-flight for the session (backed by a best-effort
+   * busy-children probe — see `wiring/watchdog.ts`). */
+  delegation: DelegationTracker
+  /** Redesign point 9: pause auto-continuations after this many consecutive
+   * continuations produced no observable activity. <= 0 disables. */
+  maxNoProgressTurns: number
   /** FR-060/FR-061: surfaces gate fires and health signals to the operator.
    * Optional so existing callers and tests need no change; when absent the
    * gate simply reports nothing, exactly as before. */
@@ -154,8 +183,50 @@ async function promptContinuation(
   }
 }
 
-function narrowestPrescription(ctx: GateContext, state: V2SessionState, sid: string, storyVerifiers: readonly string[] | null): string {
-  const changedPaths = ctx.evidenceLedger.getChangedPaths(sid).filter((p) => !p.endsWith("-mutation"))
+/**
+ * Redesign point 9 (stall detection): every continuation the gate wants to
+ * dispatch goes through here instead of calling `promptContinuation`
+ * directly. Before dispatching, the session's activity marker is compared
+ * against the marker recorded at the PREVIOUS continuation: an unchanged
+ * marker means the model spent the whole intervening turn without a single
+ * tool call — one no-progress continuation. Once `ctx.maxNoProgressTurns`
+ * of those stack up consecutively, the gate pauses itself (`stallPaused`,
+ * cleared by the next real user message in `resetTurnState`) and surfaces
+ * ONE health notification instead of nudging forever — the exact
+ * 19-identical-warnings-never-corrected failure the field session showed.
+ *
+ * Returns `true` iff a continuation was actually dispatched.
+ */
+async function dispatchContinuation(ctx: GateContext, sid: string, state: V2SessionState, text: string): Promise<boolean> {
+  const verdict = evaluateStall({
+    activityMarker: state.activityMarker,
+    markerAtLastContinuation: state.markerAtLastContinuation,
+    consecutiveNoProgress: state.consecutiveNoProgress,
+    maxNoProgressTurns: ctx.maxNoProgressTurns,
+  })
+  state.consecutiveNoProgress = verdict.nextConsecutiveNoProgress
+  state.markerAtLastContinuation = state.activityMarker
+  if (verdict.stalled) {
+    state.stallPaused = true
+    ctx.logger("gate:stall-paused", { sessionID: sid, consecutiveNoProgress: state.consecutiveNoProgress })
+    void ctx.visibility?.notify("health", {
+      sessionID: sid,
+      family: "gate:stall-paused",
+      message:
+        `auto-continuations paused: ${state.consecutiveNoProgress} consecutive continuations produced no ` +
+        `observable work — the session appears stalled and will not be nudged again until your next message`,
+      variant: "error",
+    })
+    return false
+  }
+  if (verdict.noProgress) {
+    ctx.logger("gate:no-progress", { sessionID: sid, consecutiveNoProgress: state.consecutiveNoProgress })
+  }
+  await promptContinuation(ctx, sid, text)
+  return true
+}
+
+function narrowestPrescription(ctx: GateContext, state: V2SessionState, sid: string, storyVerifiers: readonly string[] | null): string {  const changedPaths = ctx.evidenceLedger.getChangedPaths(sid).filter((p) => !p.endsWith("-mutation"))
   const manifest = ctx.manifests.get(state.workspaceRoot)
   const resolution = resolveVerifier(
     { changedPaths, storyVerifiers },
@@ -270,7 +341,7 @@ async function handleIncompletePlan(ctx: GateContext, sid: string, state: V2Sess
     instanceId: nextInstanceId(state),
     totalStories: plan.stories.length,
     incomplete,
-    activeStory: ctx.storyEngine.getActiveStory(sid),
+    activeStories: ctx.storyEngine.getActiveStories(sid),
   })
   ctx.logger("gate:plan-incomplete", {
     sessionID: sid,
@@ -285,7 +356,7 @@ async function handleIncompletePlan(ctx: GateContext, sid: string, state: V2Sess
     `Diagnosis: ${finding.diagnosis}`,
     `Do now: ${finding.prescription}`,
   ].join("\n")
-  await promptContinuation(ctx, sid, formatGateContinuationText(reason))
+  await dispatchContinuation(ctx, sid, state, formatGateContinuationText(reason))
   return true
 }
 
@@ -336,7 +407,7 @@ async function handlePromiseNoAct(ctx: GateContext, sid: string, state: V2Sessio
   const hits = detectPromiseNoAct(lastText)
   const labels = hits.map((h) => h.label).join(", ")
   const reason = `[vertex:promise-no-act] Your last message states an intent to do further work (${labels}) after changing files, without doing it. Do that work now with tool calls. End the turn only when the work is complete, or ask the user a direct question if you are blocked on input only they can provide.`
-  await promptContinuation(ctx, sid, reason)
+  await dispatchContinuation(ctx, sid, state, reason)
   return true
 }
 
@@ -359,7 +430,7 @@ async function handleZeroCriteriaFallback(ctx: GateContext, sid: string, state: 
   const activeStory = ctx.storyEngine.getActiveStory(sid)
   const command = narrowestPrescription(ctx, state, sid, activeStory?.verifiers ?? null)
   const reason = `[vertex:stop-block] No acceptance criteria were captured for this session. Changed this turn: ${changedList} — no successful verification observed since the latest change. Run ${command} now and cite its observed result.`
-  await promptContinuation(ctx, sid, formatGateContinuationText(reason))
+  await dispatchContinuation(ctx, sid, state, formatGateContinuationText(reason))
 }
 
 /** FR-015 criteria-pinned branch: replay each criterion, block only when >=1 lacks evidence. */
@@ -415,7 +486,7 @@ async function handleCriteriaReplay(ctx: GateContext, sid: string, state: V2Sess
   const activeStory = ctx.storyEngine.getActiveStory(sid)
   const command = narrowestPrescription(ctx, state, sid, activeStory?.verifiers ?? null)
   const reason = `[vertex:criteria-block] Unmet acceptance criterion ${unmet.id}: "${unmet.text}" — no evidence recorded. Run ${command} and cite its observed result, or explain why this criterion no longer applies.`
-  await promptContinuation(ctx, sid, formatGateContinuationText(reason))
+  await dispatchContinuation(ctx, sid, state, formatGateContinuationText(reason))
   return false
 }
 
@@ -511,41 +582,118 @@ async function fetchJudgeTranscriptFields(
 }
 
 /**
- * `docs/JUDGE-PROMPT.md` §4 "Proposed rendering": a `pass` verdict is a
- * single line; a `concern` verdict is the same header line, then a numbered
- * "what would close it" list built from `gaps`. Judgment call: the design
- * doc's rendering is keyed on `fit`, but `isJudgeVerdictShape` (judge.ts)
- * only hard-requires `gaps === []` when `fit === "pass"` — it does not
- * forbid a `"concern"` verdict with an empty `gaps` array (deliberately, per
- * the task brief). Rendering therefore branches on `gaps.length`, not `fit`,
- * so a `concern` verdict with no gaps still degrades gracefully to the
- * one-line form instead of printing an empty "To complete this..." list.
+ * Redesign point 4/8: renders the plan for the judge payload's `plan` field —
+ * the whole plan for context, with the stories to audit named up front. The
+ * judge reads this, then verifies the claims against the worktree itself
+ * (its own read/grep/glob/bash), so the digest's job is precision, not
+ * persuasion: statuses, the task decomposition (id/dependsOn/status), the
+ * acceptance items that ARE the contract, and declared verifiers, verbatim.
+ *
+ * 2026-07-30 task/DAG redesign: the old stored `StoryV2.wave` field is GONE
+ * — waves are computed from the task DAG as topological levels, never stored
+ * or input — so the digest now renders each story's TASKS (with their own
+ * `dependsOn`) instead of a wave number, handing the judge the same
+ * dependency structure the engine promotes by. The judge still audits STORIES
+ * (acceptance items are the contract); a story becomes auditable when all its
+ * tasks complete, which is exactly when `handleJudgeAudit` picks it up.
  */
-function formatJudgeVerdict(verdict: JudgeVerdict): string {
-  const header = `[vertex:judge] fit=${verdict.fit} — ${verdict.summary}`
-  if (verdict.gaps.length === 0) return header
-  const gapLines = verdict.gaps.map((gap, i) => `${i + 1}. ${gap.issue} — ${gap.fix}`)
-  return [header, "", "To complete this to the standard expected:", ...gapLines].join("\n")
+function renderPlanDigest(plan: PlanV2, auditIds: ReadonlySet<string>): string {
+  const lines: string[] = [
+    `Plan: ${plan.stories.length} stories. Audit these claimed-complete stories: ${[...auditIds].join(", ")}.`,
+  ]
+  plan.stories.forEach((story) => {
+    const claimed = story.completedAt ? `, claimed complete at ${story.completedAt}` : ""
+    const storyDeps = story.dependsOn.length > 0 ? `, dependsOn: ${story.dependsOn.join("+")}` : ""
+    lines.push(`${story.id} (${story.status}${claimed}${storyDeps}): "${story.text}"`)
+    for (const task of story.tasks) {
+      const taskDeps = task.dependsOn.length > 0 ? `, dependsOn: ${task.dependsOn.join("+")}` : ""
+      lines.push(`  ${task.id} (${task.status}${taskDeps}): ${task.text}`)
+    }
+    for (const item of story.acceptanceItems) {
+      lines.push(`  ${item.id}: ${item.text}`)
+    }
+    if (story.verifiers.length > 0) {
+      lines.push(`  verifiers: ${story.verifiers.join(" && ")}`)
+    }
+  })
+  return lines.join("\n")
 }
 
-async function appendJudgeCloseOut(ctx: GateContext, sid: string, state: V2SessionState): Promise<void> {
+/**
+ * Redesign point 8: the revert continuation is where the judge's structured
+ * verdict becomes constructive, per-story detail — "story S2 not delivered;
+ * A3, A4 still missing, and here is what the judge saw" — instead of a
+ * generic "the plan is not done" reminder.
+ */
+function formatJudgeReverts(plan: PlanV2, verdicts: readonly JudgeStoryVerdict[]): string {
+  const lines: string[] = [
+    "[vertex:judge] The completion judge independently audited your claimed stories against the worktree and found them NOT delivered.",
+  ]
+  for (const verdict of verdicts.filter((v) => !v.pass)) {
+    const story = plan.stories.find((s) => s.id === verdict.storyId)
+    lines.push(`Story ${verdict.storyId}${story ? ` — "${story.text}"` : ""} is re-opened: ${verdict.summary}`)
+    for (const item of verdict.items.filter((i) => !i.met)) {
+      const acceptance = story?.acceptanceItems.find((a) => a.id === item.itemId)
+      lines.push(`  ${item.itemId}${acceptance ? ` ("${acceptance.text}")` : ""} — ${item.note}`)
+    }
+  }
+  lines.push(
+    "Fix exactly the named items, run each story's declared verifiers as standalone commands (never ';'-chained " +
+      "or piped — that hides the real exit code) and read their output, then checkpoint each reverted task complete " +
+      "again (elicify_vertex_plan_checkpoint with the taskId) — the story auto-completes when all its tasks are done, " +
+      "and the judge re-audits it. Do not re-claim without new evidence — the judge re-audits every claim.",
+  )
+  return lines.join("\n")
+}
+
+/**
+ * Redesign points 2/4 — THE ARBITER. Replaces the old `appendJudgeCloseOut`,
+ * which could only run after every story had already reached `complete`
+ * through the deterministic gate — i.e. it could never fire in the one
+ * situation it existed for (a session stalled on that gate). This stage runs
+ * at EVERY idle in which at least one story has claimed `complete` since its
+ * last audit, hands those claims to the tool-using judge, and APPLIES the
+ * structured verdicts:
+ *
+ *  - failed claim   -> `StoryEngine.applyJudgeVerdicts` reverts the story to
+ *    `active`, and a constructive continuation names the unmet items
+ *    (returns true — the rest of the tree skips this idle).
+ *  - all claims pass -> silent for intermediate stories; a single close-out
+ *    line only when the WHOLE plan is settled and the final story's claim
+ *    just passed (returns true).
+ *  - judge unavailable/malformed -> fail open (claims stand, a health
+ *    notification says the audit did not happen), exactly the posture the
+ *    judge has always had.
+ *
+ * A story needs auditing when it is `complete` and either carries no judge
+ * stamp at all or was re-claimed (`completedAt`) after its latest stamp —
+ * so a judged-and-passed plan never re-audits, and a re-claimed story
+ * always does.
+ */
+async function handleJudgeAudit(ctx: GateContext, sid: string, state: V2SessionState): Promise<boolean> {
+  if (!ctx.judgeEnabled) return false
   const plan = ctx.storyEngine.getPlan(sid)
-  if (!plan) return
-  const finalStory = plan.stories.find((s) => s.id === plan.finalStoryId)
-  if (!finalStory || finalStory.status !== "complete") return
-  if (!ctx.judgeEnabled) return
-  if (!state.modelId) return
+  if (!plan) return false
+  if (!state.modelId) return false
+
+  const unjudged = plan.stories.filter(
+    (story) =>
+      story.status === "complete" &&
+      (!story.judge || (story.completedAt !== undefined && story.judge.judgedAt < story.completedAt)),
+  )
+  if (unjudged.length === 0) return false
 
   const [providerID, ...rest] = state.modelId.split("/")
   const modelID = rest.join("/")
-  if (!providerID || !modelID) return
+  if (!providerID || !modelID) return false
 
+  const auditIds = new Set(unjudged.map((story) => story.id))
   const criteria = ctx.pinStore.get(sid).map((c) => c.text)
   const verifierSummaries = ctx.recentVerifierSummaries(sid)
   const diffSummary = ctx.diffSummary(sid)
   const { lastResponse, recentTranscript } = await fetchJudgeTranscriptFields(ctx.client, sid)
   const payload = buildJudgePayload(
-    { criteria, diffSummary, verifierSummaries, lastResponse, recentTranscript },
+    { criteria, diffSummary, verifierSummaries, lastResponse, recentTranscript, plan: renderPlanDigest(plan, auditIds) },
     bindSession(sid, ctx.logger),
   )
 
@@ -566,13 +714,53 @@ async function appendJudgeCloseOut(ctx: GateContext, sid: string, state: V2Sessi
     void ctx.visibility?.notify("health", {
       sessionID: sid,
       family: "judge:unavailable",
-      message: `the completion judge did not run (${result.reason ?? "unknown"}) — no verdict for this plan`,
+      message: `the completion judge did not run (${result.reason ?? "unknown"}) — claimed stories are unverified`,
       variant: "warning",
     })
-    return
+    return false
   }
-  const verdict: JudgeVerdict = result.verdict
-  await promptContinuation(ctx, sid, formatJudgeVerdict(verdict))
+
+  // Verdicts for stories outside the audit set are dropped, not applied —
+  // the judge was told what to audit; anything else it chose to opine on is
+  // not grounded in this run's payload.
+  const verdicts = result.verdict.stories.filter((v) => auditIds.has(v.storyId))
+  if (verdicts.length === 0) {
+    ctx.logger("judge:off-target", {
+      sessionID: sid,
+      requested: [...auditIds],
+      received: result.verdict.stories.map((v) => v.storyId),
+    })
+    return false
+  }
+
+  const applied = ctx.storyEngine.applyJudgeVerdicts(sid, verdicts)
+
+  if (applied.reverted.length > 0) {
+    return dispatchContinuation(ctx, sid, state, formatGateContinuationText(formatJudgeReverts(plan, verdicts)))
+  }
+
+  // Close-out fires when the WHOLE plan is settled and EVERY story carries a
+  // passing judge stamp — not only when the final story was in this audit's
+  // set. `applyJudgeVerdicts` stamps `story.judge` in place on the plan
+  // object this closure holds, so `plan` already reflects the fresh stamps;
+  // a story judged-pass in an earlier audit keeps its stamp, so staggered
+  // audits (final passes first, a non-final story passes in a later audit)
+  // still produce the close-out line on the audit that settles the plan.
+  // It cannot re-fire on a later idle: once every story is complete with a
+  // passing stamp, none is "unjudged", so this function returns early before
+  // reaching here.
+  const settled = plan.stories.every((story) => story.status === "complete")
+  const allPassed = plan.stories.every((story) => story.judge?.pass === true)
+  if (settled && allPassed) {
+    return dispatchContinuation(
+      ctx,
+      sid,
+      state,
+      "[vertex:judge] The completion judge independently verified every story of the plan against the worktree — " +
+        "all claims passed audit. Report what was delivered, the commands you ran and the results you observed, then stop.",
+    )
+  }
+  return false
 }
 
 /**
@@ -646,6 +834,32 @@ export async function handleSessionIdle(ctx: GateContext, sid: string): Promise<
   // per-session flag, so a busy session never gates an idle peer.
   if (state.idleContinuationInFlight) return
 
+  // Redesign point 9 (stall): the gate paused itself after a run of
+  // continuations that produced no observable activity. It stays silent
+  // until the next real user message re-arms it (`resetTurnState`) — nudging
+  // harder is precisely the failure this exists to stop.
+  if (state.stallPaused) return
+
+  // Redesign point 9 (task-blocking awareness): never nudge a parent that is
+  // legitimately waiting on its own `task`-tool delegation. The tracker is the
+  // cheap synchronous answer; the busy-children probe is the ground-truth
+  // cross-check that ALSO repairs a stale tracker entry (a `task` whose
+  // `tool.execute.after` the host dropped, or an inconsistent callID between
+  // the before/after hooks). So when the tracker reports in-flight we still
+  // probe, and defer ONLY if the probe confirms a busy child — otherwise the
+  // stale entry is logged and the gate proceeds. A tracker positive never
+  // silences the gate on its own. Both fail open.
+  if (ctx.delegation.hasInFlightDelegation(sid)) {
+    if (await hasBusyChildren(ctx.client, sid)) {
+      ctx.logger("gate:delegation-defer", { sessionID: sid, via: "tracker+probe" })
+      return
+    }
+    ctx.logger("gate:delegation-stale", { sessionID: sid })
+  } else if (await hasBusyChildren(ctx.client, sid)) {
+    ctx.logger("gate:delegation-defer", { sessionID: sid, via: "probe" })
+    return
+  }
+
   // Degraded-attribution ADVISORY (never a suppression — see doc above).
   //
   // FR-036: a session the harness itself created (judge/intake subturn) is
@@ -664,9 +878,15 @@ export async function handleSessionIdle(ctx: GateContext, sid: string): Promise<
     state.needsCriteriaReinject = true // advisory surface on the next transform
   }
 
-  // STAGE 1 (deterministic completion) — ahead of every other branch,
-  // including promise-no-act. See `handleIncompletePlan` for the ordering,
-  // cap and scope decisions this encodes.
+  // THE ARBITER (redesign point 2) — first among the content branches: judge
+  // every story that claimed complete since its last audit, applying verdicts
+  // (reverting over-claimed stories with named gaps) BEFORE any deterministic
+  // nudge is composed, so the rest of the tree sees post-audit plan state.
+  if (await handleJudgeAudit(ctx, sid, state)) return
+
+  // STAGE 1 (deterministic completion) — ahead of every other remaining
+  // branch, including promise-no-act. See `handleIncompletePlan` for the
+  // ordering, cap and scope decisions this encodes.
   if (await handleIncompletePlan(ctx, sid, state)) return
 
   // v1 ordering: promise-no-act is checked BEFORE the criteria/zero-criteria
@@ -679,7 +899,7 @@ export async function handleSessionIdle(ctx: GateContext, sid: string): Promise<
   // "complete" (nothing is "active" anymore) — fall back to the plan's final
   // story so the just-completed plan still resolves to a real phase slot at
   // idle instead of a fresh, untouched "null" slot that can never read
-  // "elevate" and therefore can never close/judge (CRIT-001 follow-up).
+  // "elevate" (CRIT-001 follow-up).
   const storyId = activeStory?.id ?? ctx.storyEngine.getPlan(sid)?.finalStoryId ?? null
 
   let criteriaAllEvidenced: boolean
@@ -691,13 +911,12 @@ export async function handleSessionIdle(ctx: GateContext, sid: string): Promise<
   }
 
   const unverifiedChangesExist = ctx.evidenceLedger.hasChangedFiles(sid) && !ctx.evidenceLedger.hasVerification(sid)
-  const closed = ctx.phaseEngine.onIdle(sid, storyId, {
+  // The phase engine's close arc no longer gates the judge — the arbiter
+  // above runs on claims directly. `onIdle` still drives the phase machine
+  // itself (elevate/close transitions feed the composer).
+  ctx.phaseEngine.onIdle(sid, storyId, {
     criteriaAllEvidenced,
     hasPins: criteria.length > 0,
     unverifiedChangesExist,
   })
-
-  if (closed) {
-    await appendJudgeCloseOut(ctx, sid, state)
-  }
 }

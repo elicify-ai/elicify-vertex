@@ -71,6 +71,7 @@ import {
 } from "./wiring/state.js"
 import { injectSubagentPreamble } from "./wiring/subagentInjection.js"
 import { buildPlanTools } from "./wiring/tools.js"
+import { DelegationTracker } from "./wiring/watchdog.js"
 
 export interface ElicifyVertexV2Options {
   readonly activeAgent?: string
@@ -85,6 +86,10 @@ export interface ElicifyVertexV2Options {
   readonly visibility?: string
   /** FR-063 toast rate cap per minute (default 6). */
   readonly maxToastsPerMinute?: number
+  /** Redesign point 9: pause idle-gate auto-continuations after this many
+   * consecutive continuations produced no observable tool activity
+   * (default 3; <= 0 disables). `VERTEX_MAX_NO_PROGRESS_TURNS` overrides. */
+  readonly maxNoProgressTurns?: number
   /** Consumed by `src/plugin.ts`'s kill switch; harmless if also present here. */
   readonly engine?: string
 }
@@ -224,6 +229,7 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
     cooldowns: userOpts.cooldowns,
     visibility: userOpts.visibility,
     maxToastsPerMinute: userOpts.maxToastsPerMinute,
+    maxNoProgressTurns: Number(process.env.VERTEX_MAX_NO_PROGRESS_TURNS) || userOpts.maxNoProgressTurns || 3,
   }
   const activateCommandName = opts.activeSkillTrigger.replace(/^\//, "")
 
@@ -290,6 +296,10 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
   const selfCreatedGuard = new SelfCreatedGuard()
   const selfCreated = new TrackingSelfCreatedSessions(selfCreatedGuard)
   const manifests = new ManifestCache()
+  // Redesign point 9: `task`-tool delegations in flight per session, so the
+  // idle gate can defer nudging a parent that is legitimately waiting on a
+  // subagent (see wiring/watchdog.ts).
+  const delegationTracker = new DelegationTracker()
   const commandActivatedSessions = new Set<string>()
   // FIX #7: most recent verifier command's real output text per session
   // (bounded), for the judge payload's verifierSummaries — not part of
@@ -392,6 +402,8 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
     },
     composer,
     visibility,
+    delegation: delegationTracker,
+    maxNoProgressTurns: opts.maxNoProgressTurns,
   }
 
   function formatChangedPathsSummary(paths: readonly string[]): string {
@@ -401,7 +413,6 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
   const planTools = buildPlanTools({
     storyEngine,
     pinStore,
-    verificationReceipts,
     client,
     states,
     phaseEngine,
@@ -536,6 +547,11 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
         phaseEngine.onUserMessage(sid)
         composer.newTurn(sid)
         resetTurnState(state)
+        // Redesign point 9: a real user message re-arms the delegation
+        // tracker — a `task` whose `tool.execute.after` the host dropped (or
+        // an inconsistent before/after callID) would otherwise leave a stale
+        // in-flight entry that the idle gate has to probe around every turn.
+        delegationTracker.clearSession(sid)
         // FIX #8: plugin-local turn-scoped pending state (not part of
         // V2SessionState's resetTurnState) — cleared at the same turn
         // boundary.
@@ -658,6 +674,10 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       // `runSubturn` (`client.session.create` + `client.session.prompt`),
       // never through the `task` tool, so they never reach this branch.
       if (toolInput.tool === "task") {
+        // Redesign point 9: record the delegation so the idle gate defers
+        // nudging while it is mid-flight (paired with `noteTaskDone` in
+        // `tool.execute.after`).
+        delegationTracker.noteTaskCall(sid, toolInput.callID)
         const args = (toolOutput?.args ?? {}) as Record<string, unknown>
         const injected = injectSubagentPreamble(args)
         // `injectSubagentPreamble` returns `false` (no-op, defensively) when
@@ -714,6 +734,11 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       state.lastAssistantText = null
 
       const toolName = toolInput.tool
+      // Redesign point 9: every real tool call is observable activity — the
+      // stall detector compares this marker across idle boundaries, and a
+      // completed `task` call closes its delegation record.
+      state.activityMarker += 1
+      if (toolName === "task") delegationTracker.noteTaskDone(sid, toolInput.callID)
       const args = (toolInput.args ?? {}) as Record<string, unknown>
       const out = toolOutput.output ?? ""
       const meta = (toolOutput.metadata ?? {}) as Record<string, unknown>
@@ -1129,6 +1154,16 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       let verifyGapCandidate: { instanceId: string; command: string | null } | null = null
       const changedPaths = evidenceLedger.getChangedPaths(sid)
       const hasVerification = evidenceLedger.hasVerification(sid)
+      // HANDOVER.md redesign point 7: the per-turn verify-gap nudge fired on
+      // EVERY turn with unverified changes regardless of relevance, and in
+      // the field session the model simply learned to ignore it (19 identical
+      // warnings, never corrected). It now fires only when JUSTIFIED — the
+      // resolver can name a concrete command (a story's declared verifiers or
+      // a manifest/basename convention), so the nudge says "run X", not
+      // "run something relevant". The generic case stays silent here; the
+      // idle stop-block (gate.ts's zero-criteria fallback) still catches
+      // genuinely unverified work at turn end. The composer cap table's
+      // per-turn ceiling is the "capped" half of the redesign point.
       if (mode !== "quick" && evidenceLedger.hasChangedFiles(sid) && !hasVerification) {
         const realPaths = changedPaths.filter((p) => !NON_PATH_MUTATION_MARKERS.has(p))
         const manifest = manifests.get(state.workspaceRoot)
@@ -1137,18 +1172,19 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
           { changedPaths: realPaths, storyVerifiers: activeStory?.verifiers ?? null },
           { readManifest: () => manifest },
         )
-        if (resolutionResult.rationale === "none") {
+        if (resolutionResult.command !== null) {
+          const instanceId = nextInstanceId(state)
+          verifyGapCandidate = { instanceId, command: resolutionResult.command }
+          findings.push(
+            verifyGapFinding({
+              instanceId,
+              changedPathsLabel: changedPaths.length ? changedPaths.join(", ") : "files changed",
+              resolution: resolutionResult,
+            }),
+          )
+        } else {
           logger("resolution:none", { sessionID: sid, changedPaths: realPaths })
         }
-        const instanceId = nextInstanceId(state)
-        verifyGapCandidate = { instanceId, command: resolutionResult.command }
-        findings.push(
-          verifyGapFinding({
-            instanceId,
-            changedPathsLabel: changedPaths.length ? changedPaths.join(", ") : "files changed",
-            resolution: resolutionResult,
-          }),
-        )
       }
 
       if (state.scopeDriftPending) {
