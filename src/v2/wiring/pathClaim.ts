@@ -85,6 +85,26 @@ function stripQuoted(note: string): string {
  * Extract the paths a note asserts to be ABSENT, or explain why it is not a
  * pure path-absence claim. Pure string work: never throws, no fs, no exec.
  */
+/**
+ * A trailing qualifier turns an absence claim about the PATH into a claim
+ * about something the path contains: "x.md is missing **its Sources
+ * section**", "x.md not found **in the index**". Adversarial probing during
+ * implementation found three such shapes that the earlier version dropped —
+ * each of which would have suppressed a genuine content failure, the exact
+ * hazard FR-001 was re-scoped to avoid. So the absence predicate must be the
+ * LAST substantive thing in its clause.
+ */
+const TRAILING_QUALIFIER = /\b(?:does\s+not\s+exist|is\s+missing|are\s+missing|was\s+not\s+found|were\s+not\s+found|not\s+found|not\s+present|missing)\s+(?!on\s+disk\b|in\s+the\s+worktree\b|from\s+disk\b)\S/i
+
+/**
+ * Sentence splitter for rule 2. `"x.md missing. Additionally the KPIs are
+ * fabricated."` is TWO claims: the harness may only contradict the first, and
+ * since it cannot drop half an item, the whole item is kept.
+ */
+function sentences(text: string): string[] {
+  return text.split(/(?<=[.;])\s+/).filter((s) => s.trim() !== "")
+}
+
 export function parsePathAbsenceClaim(note: string): PathClaim {
   if (typeof note !== "string" || note.trim() === "") return { paths: [], reason: "no-path-token" }
 
@@ -94,6 +114,42 @@ export function parsePathAbsenceClaim(note: string): PathClaim {
 
   // Rule 2: a second negation means there is a content claim riding along.
   if (SECOND_NEGATION.test(note)) return { paths: [], reason: "second-negation" }
+
+  // Rule 2b: a multi-sentence note whose LATER sentences make any other claim
+  // is not a pure path-absence claim. Only a note whose every sentence is
+  // either an absence claim or empty of substance qualifies.
+  const parts = sentences(note)
+  if (parts.length > 1) {
+    // A CONSEQUENCE of the absence ("; cannot verify cited sources") is not a
+    // second claim — 5 of the real corpus notes take that shape, and treating
+    // them as mixed made the discriminator miss genuine fabrications.
+    const CONSEQUENCE = /^\s*(?:cannot|can't|unable\s+to|so\s|therefore|hence|which\s+means|no\s+way\s+to)\b/i
+    const substantive = parts.filter((part) => /\w/.test(part))
+    const allAbsenceOrConsequence = substantive.every(
+      (part) => ABSENCE_PREDICATE.test(part) || LEADING_ABSENCE.test(part) || CONSEQUENCE.test(part),
+    )
+    if (!allAbsenceOrConsequence) return { paths: [], reason: "second-negation" }
+  }
+
+  const bareForSubject = stripQuoted(note)
+
+  // Rule 1b: the absence must be predicated OF the path, not of something the
+  // path contains.
+  if (TRAILING_QUALIFIER.test(note)) return { paths: [], reason: "second-negation" }
+
+  // Rule 1c: the path must be the SUBJECT of the absence, not the object of a
+  // preposition. "the Sources section **of** research/x.md was not found" is a
+  // content claim whose grammatical subject is "the Sources section", so
+  // dropping it would suppress a real finding. Only rejects when EVERY
+  // occurrence of every path token is preposition-bound — "x.md not found in
+  // research/" still has `x.md` as a bare subject and stays droppable.
+  const pathHits = [...bareForSubject.matchAll(PATH_TOKEN)]
+  if (pathHits.length > 0) {
+    const everyHitPrepositionBound = pathHits.every((hit) =>
+      /\b(?:of|inside|within|belonging\s+to)\s+$/i.test(bareForSubject.slice(0, hit.index ?? 0)),
+    )
+    if (everyHitPrepositionBound) return { paths: [], reason: "second-negation" }
+  }
 
   const bare = stripQuoted(note)
   if (bare.trim() !== note.trim() && !/[\w.-]*\//.test(bare)) {

@@ -116,6 +116,31 @@ describe("parsePathAbsenceClaim — rules (FR-001, C-3)", () => {
     expect(parsePathAbsenceClaim("the kpis object has only 2 entries").paths).toEqual([])
   })
 
+  /**
+   * Adversarial probing found three shapes the first implementation dropped,
+   * EACH of which would have suppressed a genuine content failure — the exact
+   * hazard FR-001 was re-scoped to avoid. They are pinned here because the
+   * 49-note corpus does not contain them: the corpus proves the matcher
+   * handles what the judge DID say, these prove it handles what a judge
+   * plausibly COULD say.
+   */
+  it.each([
+    ["research/x.md is missing its Sources section", "trailing qualifier: absence is of the section, not the file"],
+    ["the Sources section of research/x.md was not found", "path is the object of a preposition, not the subject"],
+    ["x.md missing. Additionally the KPIs are fabricated.", "a later sentence makes an independent claim"],
+  ])("never drops a content claim dressed as absence: %s", (note) => {
+    expect(parsePathAbsenceClaim(note).paths).toEqual([])
+  })
+
+  /** A consequence clause is NOT a second claim — 5 real corpus notes take
+   * this shape, and treating them as mixed made the matcher miss genuine
+   * fabrications (caught by the corpus test). */
+  it("still drops an absence claim followed by a consequence clause", () => {
+    expect(parsePathAbsenceClaim("research/x.json does not exist on disk; cannot verify structured KPIs.").paths).toEqual([
+      "research/x.json",
+    ])
+  })
+
   it("is total: never throws on degenerate input", () => {
     for (const input of ["", "   ", "no", "/", "....", "a".repeat(5000)]) {
       expect(() => parsePathAbsenceClaim(input)).not.toThrow()
