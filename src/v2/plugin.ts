@@ -514,18 +514,37 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
         }
       }
 
-      if (state.idleContinuationInFlight) {
-        // v1's `gateContinuationSessions` pattern: the reentrant chat.message
-        // caused by our own session.prompt continuation must not reset the
-        // turn — ledger/phase/pins all stay exactly as they were.
-        state.active = true
-        return
-      }
-
       const text = (output.parts || [])
         .filter((p) => p && p.type === "text" && typeof (p as { text?: unknown }).text === "string")
         .map((p) => (p as { text: string }).text)
         .join("\n")
+
+      if (state.idleContinuationInFlight) {
+        // v1's `gateContinuationSessions` pattern: the reentrant chat.message
+        // caused by our own session.prompt continuation must not reset the
+        // turn — ledger/phase/pins all stay exactly as they were.
+        //
+        // M4 (grill round 2): this used to return unconditionally, which made
+        // it the wedge it was meant to be a backstop against. `promptContinuation`
+        // deliberately does NOT release the flag on its timeout path, and
+        // documents that the next real `chat.message` is "the turn boundary
+        // that genuinely ends it" — but the release lives in `resetTurnState`
+        // further down, which this `return` skipped. A continuation that never
+        // settled therefore left the flag set forever and every subsequent
+        // user message short-circuited here: the harness inert, silently.
+        //
+        // So distinguish the two cases the flag conflates. Our own echo
+        // carries the exact text we dispatched; anything else is user intent,
+        // and user intent IS the turn boundary.
+        const ownEcho = state.lastContinuationText !== null && text.includes(state.lastContinuationText)
+        if (ownEcho) {
+          state.active = true
+          return
+        }
+        state.idleContinuationInFlight = false
+        state.lastContinuationText = null
+        logger("gate:continuation-guard-released", { sessionID: sid, reason: "real user message" })
+      }
 
       const triggerEscaped = opts.activeSkillTrigger.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
       const triggerRe = new RegExp(`^\\s*${triggerEscaped}\\b`, "m")

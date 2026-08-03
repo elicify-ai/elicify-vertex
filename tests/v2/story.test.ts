@@ -1628,6 +1628,103 @@ describe("FR-002c/FR-010: lock contention retries, then aborts the write without
     expect(se.getPlan("s1")!.stories[0].tasks[0].status).toBe("complete")
   })
 
+  // -------------------------------------------------------------------------
+  // C3 / M8 (grill round 2) — what happens to an aborted write AFTER the abort.
+  // -------------------------------------------------------------------------
+
+  it("C3: reports the abort once, so a caller can stop claiming the write landed", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [story()])
+    const taskId = plan.stories[0].tasks[0].id
+
+    expect(se.consumeWriteAbort("s1")).toBe(false) // the create succeeded
+
+    vi.spyOn(lockIO, "sleep").mockImplementation(() => {})
+    const acquire = vi.spyOn(lockIO, "acquire").mockImplementation(() => {
+      throw new Error("elicify-vertex state directory is locked by another process")
+    })
+    se.checkpoint("s1", taskId, "complete")
+    acquire.mockRestore()
+
+    expect(se.consumeWriteAbort("s1")).toBe(true)
+    expect(se.consumeWriteAbort("s1")).toBe(false) // reported once, then cleared
+  })
+
+  // The retained-in-memory change used to be stranded behind any later
+  // mutation that happened to change nothing, because `runMutation` returns
+  // early on `!outcome.changed` and never reaches `persistPlan`.
+  it("C3: a no-op mutation still flushes a change stranded by an aborted write", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [story()])
+    const taskId = plan.stories[0].tasks[0].id
+    const planPath = join(stateDir, "plan.json")
+
+    vi.spyOn(lockIO, "sleep").mockImplementation(() => {})
+    const acquire = vi.spyOn(lockIO, "acquire").mockImplementation(() => {
+      throw new Error("elicify-vertex state directory is locked by another process")
+    })
+    se.checkpoint("s1", taskId, "complete")
+    acquire.mockRestore()
+
+    // Not on disk yet.
+    expect(JSON.parse(readFileSync(planPath, "utf8")).s1.stories[0].tasks[0].status).not.toBe("complete")
+
+    // FR-003's idempotent re-claim changes NOTHING, so it used to return
+    // before persisting. The stranded change must ride out on it.
+    se.checkpoint("s1", taskId, "complete")
+    expect(JSON.parse(readFileSync(planPath, "utf8")).s1.stories[0].tasks[0].status).toBe("complete")
+  })
+
+  // The measured 7-12% judge-stamp loss: a peer writes while our change is
+  // still only in memory, and `reconcileWithDisk` overwrites it. That IS
+  // allowed to happen — what must not happen is it being indistinguishable
+  // from an ordinary merge.
+  it("C3: a peer merge that destroys an unpersisted change reports it as loss", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se, logger } = engine(stateDir)
+    const plan = se.createPlan("s1", [story()])
+    const taskId = plan.stories[0].tasks[0].id
+    const planPath = join(stateDir, "plan.json")
+
+    vi.spyOn(lockIO, "sleep").mockImplementation(() => {})
+    const acquire = vi.spyOn(lockIO, "acquire").mockImplementation(() => {
+      throw new Error("elicify-vertex state directory is locked by another process")
+    })
+    se.checkpoint("s1", taskId, "complete")
+    acquire.mockRestore()
+
+    // A peer instance writes a NEWER revision of the same session's plan.
+    const onDisk = JSON.parse(readFileSync(planPath, "utf8"))
+    onDisk.s1.revision = (onDisk.s1.revision ?? 0) + 50
+    writeFileSync(planPath, JSON.stringify(onDisk))
+
+    se.checkpoint("s1", taskId, "complete") // triggers reconcileWithDisk
+
+    expect(logger).toHaveBeenCalledWith("plan:unpersisted-change-lost", expect.objectContaining({ sessionID: "s1" }))
+    expect(se.consumeWriteAbort("s1")).toBe(true)
+  })
+
+  // M8: `archiveV1IfPresent` took the lock with the RAW import, which throws
+  // on EEXIST — and it runs at the top of createPlan/checkpoint/checkScope,
+  // all synchronous tool calls. A peer holding the lock threw into the host.
+  it("M8: a contended lock defers the v1 archive instead of throwing into the host", () => {
+    const stateDir = temporaryRoot()
+    mkdirSync(stateDir, { recursive: true })
+    writeFileSync(join(stateDir, "goals.json"), JSON.stringify({ schemaVersion: 1, goals: [] }))
+    const { engine: se, logger } = engine(stateDir)
+
+    // Hold the lock the way a peer process would.
+    writeFileSync(join(stateDir, "state.lock"), String(process.pid), { flag: "wx" })
+
+    expect(() => se.archiveV1IfPresent()).not.toThrow()
+    expect(se.archiveV1IfPresent()).toBe(false)
+    expect(logger).toHaveBeenCalledWith("story:v1-archive-deferred", expect.objectContaining({}))
+    // Deferred, not consumed: the file is still there for the next attempt.
+    expect(existsSync(join(stateDir, "goals.json"))).toBe(true)
+  })
+
   it("a transient lock failure that clears within the retry budget still writes", () => {
     const stateDir = temporaryRoot()
     const { engine: se, logger } = engine(stateDir)

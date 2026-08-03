@@ -821,6 +821,30 @@ export class StoryEngine {
    */
   private lockHeld = false
 
+  /**
+   * C3: sessions whose most recent mutation could not be persisted. Read and
+   * cleared through `consumeWriteAbort`, so a caller reports each abort once
+   * instead of the engine silently swallowing it.
+   */
+  private readonly writeAborted = new Set<string>()
+
+  /**
+   * C3: sessions holding an in-memory mutation that never reached disk.
+   *
+   * `mutate` deliberately keeps an aborted write's change in memory, on the
+   * documented reasoning that "the next mutation re-reads and re-persists
+   * it". That holds only while no PEER writes in between — and a peer writing
+   * is exactly why the lock was contended. When one does, `reconcileWithDisk`
+   * sees a newer disk revision and overwrites the cache, taking the
+   * unpersisted change with it under a generic `plan:concurrent-merge` log.
+   * That is the measured 7-12% judge-stamp loss.
+   *
+   * Tracking it does two things the old code could not: a no-op mutation
+   * still flushes a pending change (instead of stranding it behind an
+   * unchanged outcome), and a genuine loss is reported as itself.
+   */
+  private readonly pendingPersist = new Set<string>()
+
   constructor(opts: { stateDir: string; logger: EventLogger }) {
     this.stateDir = opts.stateDir
     this.planPath = join(this.stateDir, "plan.json")
@@ -870,7 +894,24 @@ export class StoryEngine {
     }
     if (schemaVersion !== undefined && schemaVersion !== 1) return false // a v2+ file: not ours to touch
 
-    const lock = this.lockHeld ? null : acquireStateLock(this.stateDir)
+    // M8 (grill round 2): `acquireStateLock` THROWS on contention (EEXIST),
+    // and this runs at the top of `createPlan` / `checkpoint` / `checkScope`
+    // / `proposePlan` — all synchronous tool calls. A peer instance holding
+    // the lock for a couple of milliseconds therefore threw straight out of a
+    // tool handler and into the host, which the fail-open convention forbids.
+    // Archiving a v1 file is a best-effort one-time migration: if the lock is
+    // busy, the next call will do it.
+    let lock: { release(): void } | null = null
+    if (!this.lockHeld) {
+      try {
+        lock = acquireStateLock(this.stateDir)
+      } catch (error) {
+        this.logger("story:v1-archive-deferred", {
+          reason: error instanceof Error ? error.message : String(error),
+        })
+        return false
+      }
+    }
     try {
       if (!fsIO.existsSync(this.goalsPath)) return false // raced away by another process
       fsIO.mkdirSync(this.archiveDir, { recursive: true, mode: 0o700 })
@@ -1947,6 +1988,22 @@ export class StoryEngine {
       const outcome = fn(this.plans.get(sessionID) ?? null)
       if (outcome.changed) {
         this.logger("plan:write-aborted", { sessionID, reason: "state lock contended", retries: MUTATE_LOCK_RETRIES })
+        // C3/M10/M11 (grill round 2). `fn` has already mutated the cached
+        // plan IN PLACE, but nothing reached disk. Leaving it there is worse
+        // than losing the write, because memory and disk now disagree and
+        // every caller reports success:
+        //   - a judge stamp applied only in memory is erased by the next
+        //     merge from a peer's copy — the measured 7-12% stamp loss;
+        //   - an aborted `clearPlan` reports "cleared" while the plan is
+        //     still on disk, so it resurrects on the next hydrate;
+        //   - an aborted `createPlan` reports the NEW plan while the OLD one
+        //     is still on disk, and the old one comes back.
+        // Keeping the change in memory is DELIBERATE and tested: after a
+        // transient collision the next mutation re-persists it, so an abort
+        // is usually not lost work. What was missing is what happens when it
+        // IS lost — see `pendingPersist`.
+        this.writeAborted.add(sessionID)
+        this.pendingPersist.add(sessionID)
       }
       return outcome.result
     }
@@ -1959,13 +2016,30 @@ export class StoryEngine {
     }
   }
 
+  /**
+   * C3: did the last mutation for this session fail to reach disk? Reading
+   * CLEARS the flag, so each abort is reported once. Callers surface it
+   * rather than throwing — a contended lock is not a reason to break the
+   * host, but it IS a reason to stop claiming the write succeeded.
+   */
+  consumeWriteAbort(sessionID: string): boolean {
+    const aborted = this.writeAborted.has(sessionID)
+    this.writeAborted.delete(sessionID)
+    return aborted
+  }
+
   /** The lock-free body of `mutate` (see that method for the contract). */
   private runMutation<T>(sessionID: string, fn: (plan: PlanV2 | null) => MutateOutcome<T>, mode: MutateMode): T {
     const file = this.readPlanFile(sessionID)
     if (mode === "merge") this.reconcileWithDisk(sessionID, file[sessionID])
     const outcome = fn(this.plans.get(sessionID) ?? null)
-    if (!outcome.changed) return outcome.result
+    // C3: a pending change from an earlier aborted write must be flushed even
+    // if THIS mutation changed nothing — otherwise it sits in memory until
+    // some later mutation happens to be a write, and a peer merge in the
+    // meantime discards it.
+    if (!outcome.changed && !this.pendingPersist.has(sessionID)) return outcome.result
     this.persistPlan(sessionID, file)
+    this.pendingPersist.delete(sessionID)
     return outcome.result
   }
 
@@ -2080,6 +2154,15 @@ export class StoryEngine {
     const cachedRevision = cached.revision ?? 0
     const diskRevision = onDisk.revision ?? 0
     if (diskRevision <= cachedRevision) return
+    if (this.pendingPersist.has(sessionID)) {
+      // C3: this merge is about to overwrite a change that never reached
+      // disk. It is real data loss (the judge stamps that vanished in the
+      // audited session), and it was previously indistinguishable from an
+      // ordinary merge.
+      this.logger("plan:unpersisted-change-lost", { sessionID, cachedRevision, diskRevision })
+      this.pendingPersist.delete(sessionID)
+      this.writeAborted.add(sessionID)
+    }
     assignPlanInPlace(cached, onDisk)
     this.logger("plan:concurrent-merge", {
       sessionID,

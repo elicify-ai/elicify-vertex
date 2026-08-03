@@ -1761,3 +1761,72 @@ describe("fetchJudgeTranscriptFields: messagesImpl override wired through this f
     expect(payload.lastResponse).toBe("final assistant answer for the judge to see")
   })
 })
+
+// ===========================================================================
+// M4 (grill round 2) — the CRIT-002 backstop was inert.
+//
+// `chat.message` skips the turn reset while a continuation is in flight, so
+// our own echo does not clobber the ledger. It did that with an unconditional
+// `return`, placed ABOVE the `resetTurnState` that clears the flag. But
+// `promptContinuation` deliberately does NOT release the flag on its timeout
+// path, documenting that "the next real chat.message is the turn boundary
+// that genuinely ends it" — a boundary the `return` made unreachable. One
+// continuation that never settled therefore left the harness inert forever:
+// every later user message short-circuited, silently.
+// ===========================================================================
+describe("M4: a real user message releases a stuck continuation guard", () => {
+  async function chatMessage(hooks: Hooks, sessionID: string, text: string) {
+    await hooks["chat.message"]!(
+      { sessionID, agent: "elicify-vertex-agent" } as never,
+      { message: { id: `msg-${sessionID}-${text.length}` } as never, parts: [{ type: "text", text } as never] },
+    )
+  }
+
+  it("holds for our own echo, releases for a real message", async () => {
+    // A continuation whose prompt NEVER settles — the timeout path, which
+    // deliberately leaves `idleContinuationInFlight` set. This wedges the
+    // guard through the real code path rather than by poking at state.
+    const client = makeStubClient()
+    client.session.prompt.mockImplementation(
+      (args: { body?: { agent?: string } }) =>
+        args?.body?.agent === undefined
+          ? new Promise(() => {}) // gate continuation: hangs forever
+          : Promise.resolve({ data: { info: {}, parts: [{ type: "text", text: '{"multiStory":false}' }] }, error: undefined }),
+    )
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = `m4-guard-${Date.now().toString(36)}`
+
+    await activate(hooks, sid, "build the reporting dashboard end to end")
+    await hooks.tool!.elicify_vertex_plan_create!.execute!(
+      { stories: [{ text: "ship it", acceptanceItems: ["A1"], scopeGlobs: [], verifiers: [], tasks: [{ text: "do the work" }] }] } as never,
+      { sessionID: sid } as never,
+    )
+    await toolAfter(hooks, sid, "edit", { filePath: "src/report.ts" }, "updated")
+    // The prompt never settles, so drive the gate's own 30s timeout — the
+    // path that deliberately leaves the guard set — with fake timers, which
+    // also keeps the pending handle from outliving the test.
+    vi.useFakeTimers()
+    const idling = idle(hooks, sid)
+    await vi.advanceTimersByTimeAsync(31_000)
+    await idling
+    vi.useRealTimers()
+
+    const dispatched = idleContinuationTexts(client, sid)
+    expect(dispatched.length, "the idle gate never dispatched a continuation").toBeGreaterThan(0)
+    const echo = dispatched[dispatched.length - 1]
+
+    const releases = (): number =>
+      readEvents().filter((e) => e.event_type === "gate:continuation-guard-released" && e.session_id === sid).length
+
+    // Our own echo: the guard must hold, or the continuation clobbers the very
+    // turn state it was dispatched to act on.
+    await chatMessage(hooks, sid, echo)
+    expect(releases()).toBe(0)
+
+    // A genuine user message is the turn boundary that ends the continuation.
+    // Before the fix the guard stayed set here and every later message
+    // short-circuited — the harness inert for the rest of the session.
+    await chatMessage(hooks, sid, "actually, do something else entirely")
+    expect(releases()).toBe(1)
+  })
+})

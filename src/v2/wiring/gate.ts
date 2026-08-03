@@ -136,7 +136,12 @@ async function promptContinuation(
   // the late settler only releases if its ticket is still the current one.
   const ticket = (continuationTicket.get(sid) ?? 0) + 1
   continuationTicket.set(sid, ticket)
-  if (state) state.idleContinuationInFlight = true
+  if (state) {
+    state.idleContinuationInFlight = true
+    // M4: recorded so the reentrant `chat.message` this prompt causes can be
+    // recognised as our own echo rather than as user intent.
+    state.lastContinuationText = text
+  }
 
   // A dispatched continuation is a fresh prompt, so it opens a new turn in
   // the same sense a user message does — per-family spend resets, phase and
@@ -190,7 +195,10 @@ async function promptContinuation(
   const release = (): void => {
     settled = true
     // Only the CURRENT dispatch may clear the flag (MIN-006).
-    if (state && continuationTicket.get(sid) === ticket) state.idleContinuationInFlight = false
+    if (state && continuationTicket.get(sid) === ticket) {
+      state.idleContinuationInFlight = false
+      state.lastContinuationText = null
+    }
   }
   try {
     const timeoutPromise = new Promise<never>((_, reject) => {

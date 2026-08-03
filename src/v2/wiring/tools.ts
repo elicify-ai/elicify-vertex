@@ -413,15 +413,31 @@ export function buildPlanTools(deps: PlanToolsDeps) {
       }
 
       const plan = storyEngine.getPlan(context.sessionID)
+      // C3 (grill round 2): a contended state lock aborts the WRITE while the
+      // mutation still applies in memory, and the tool used to return the
+      // updated plan as though it had been saved. Say so instead — the model
+      // is the only thing in a position to re-checkpoint, and an operator
+      // reading the transcript should not have to infer a lost write from a
+      // `plan:write-aborted` line in the event log.
+      const writeAborted = storyEngine.consumeWriteAbort(context.sessionID)
+      const abortNote = writeAborted
+        ? {
+            persisted: false,
+            warning:
+              `The checkpoint of ${args.taskId} was applied in memory but could NOT be written to disk (the state ` +
+              "lock was held by another instance). It may be lost. Re-run this checkpoint before relying on it.",
+          }
+        : {}
       return JSON.stringify(
         checkpointResult.idempotent
           ? {
               idempotent: true,
               note: `${args.taskId} was already complete — no change made.`,
               activeTaskIds: checkpointResult.activeTaskIds,
+              ...abortNote,
               ...plan,
             }
-          : plan,
+          : { ...abortNote, ...plan },
         null,
         2,
       )

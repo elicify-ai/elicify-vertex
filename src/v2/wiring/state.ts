@@ -39,6 +39,13 @@ export interface V2SessionState {
   /** In-flight guard: a `client.session.prompt` idle-gate continuation is pending for this session. */
   idleContinuationInFlight: boolean
   /**
+   * M4: the text of the continuation currently in flight, so `chat.message`
+   * can tell OUR OWN echo (which must not reset the turn) from a real user
+   * message (which must, and which is the turn boundary that releases the
+   * guard). `null` whenever nothing is in flight.
+   */
+  lastContinuationText: string | null
+  /**
    * C2: the settled-but-never-audited escalation has already been dispatched
    * for this plan. It fires from `handleJudgeAudit`'s early return, which runs
    * on every subsequent idle, so without this it would repeat forever.
@@ -127,6 +134,7 @@ export function freshSessionState(workspaceRoot: string): V2SessionState {
     active: false,
     activateCueShown: false,
     idleContinuationInFlight: false,
+    lastContinuationText: null,
     unauditedEscalated: false,
     compacting: false,
     workspaceRoot,
