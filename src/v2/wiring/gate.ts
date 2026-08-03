@@ -665,12 +665,40 @@ async function fetchJudgeTranscriptFields(
  * dependency structure the engine promotes by. The judge still audits STORIES
  * (acceptance items are the contract); a story becomes auditable when all its
  * tasks complete, which is exactly when `handleJudgeAudit` picks it up.
+ *
+ * FR-011 (P0 — `docs/JUDGE-RELIABILITY-FIXES-SPEC.md` US-9 AS1): the digest
+ * MUST open with the ABSOLUTE worktree root. Every path the plan carries
+ * (acceptance items, `verifiers:` lines, scope globs) is written relative to
+ * the worktree, and the judge runs in a child session whose cwd it cannot see
+ * in the payload. In the audited session (`ses_04dc77bdaffej8SFJvYm5yO0CW`)
+ * that gap produced the signature fabrication: the judge asserted
+ * "research/x.json does not exist" about a file that DID exist, because a bare
+ * relative path is unresolvable text unless you know what it is relative to.
+ * One line of context turns every path in the digest into something the judge
+ * can actually `read`/`ls`, which is the precondition for the prompt's
+ * "observe before you claim absence" rule to be followable at all.
+ *
+ * MIN-002 / FR-006: the stories UNDER AUDIT render first. The digest is
+ * truncated at `JUDGE_PLAN_FIELD_CHAR_CAP` from the END, so plan order alone
+ * decided what survived — and in the audited session the truncation removed
+ * exactly the `verifiers:` lines of the later stories, after which the judge
+ * FAILed those stories citing the content the cap had removed ("S5 has no
+ * independent verifier set in the digest"). Ordering audited stories first
+ * makes truncation structurally incapable of dropping the contract being
+ * audited; it can now only shed unaudited context, which is what context is
+ * for. Relative order WITHIN each group is preserved so the DAG still reads
+ * top-to-bottom.
  */
-function renderPlanDigest(plan: PlanV2, auditIds: ReadonlySet<string>): string {
+function renderPlanDigest(plan: PlanV2, auditIds: ReadonlySet<string>, workspaceRoot: string): string {
   const lines: string[] = [
+    `Worktree root (all paths below are relative to this): ${workspaceRoot}`,
     `Plan: ${plan.stories.length} stories. Audit these claimed-complete stories: ${[...auditIds].join(", ")}.`,
   ]
-  plan.stories.forEach((story) => {
+  const ordered = [
+    ...plan.stories.filter((story) => auditIds.has(story.id)),
+    ...plan.stories.filter((story) => !auditIds.has(story.id)),
+  ]
+  ordered.forEach((story) => {
     const claimed = story.completedAt ? `, claimed complete at ${story.completedAt}` : ""
     const storyDeps = story.dependsOn.length > 0 ? `, dependsOn: ${story.dependsOn.join("+")}` : ""
     lines.push(`${story.id} (${story.status}${claimed}${storyDeps}): "${story.text}"`)
@@ -843,14 +871,23 @@ function applyPathVeto(
     if (!allExist) return item
     contradicted.push(item.itemId)
     ctx.logger("judge:contradicted", { sessionID: sid, storyId: verdict.storyId, itemId: item.itemId, paths })
-    return { ...item, met: true }
+    // MIN-003 (code review): FR-001b says the stamp must RETAIN the original
+    // items plus the marker. Flipping `met` to true here rewrote the judge's
+    // finding in the durable record; the note is annotated instead so a reader
+    // sees both what the judge claimed and that the harness disproved it.
+    // `contradictedItemIds` on the stamp remains the machine-readable signal.
+    return { ...item, note: `${item.note} [harness: contradicted — path(s) exist: ${paths.join(", ")}]` }
   })
 
   if (contradicted.length === 0) return { verdict, contradicted }
   // FR-001 AS2: every failing item was individually disproven, so the story's
   // pass is re-derived — but FR-001b requires the result stay distinguishable
   // from a genuine judge pass (see `applyJudgeVerdicts`'s `contradictedItemIds`).
-  const stillFailing = items.some((i) => !i.met)
+  // A story passes only when EVERY failing item was individually disproven.
+  // Derived from the contradiction set because `met` is deliberately left
+  // untouched above (MIN-003).
+  const contradictedIds = new Set(contradicted)
+  const stillFailing = items.some((i) => !i.met && !contradictedIds.has(i.itemId))
   return { verdict: { ...verdict, items, pass: !stillFailing }, contradicted }
 }
 
@@ -877,7 +914,16 @@ async function handleJudgeAudit(ctx: GateContext, sid: string, state: V2SessionS
   const diffSummary = ctx.diffSummary(sid)
   const { lastResponse, recentTranscript } = await fetchJudgeTranscriptFields(ctx.client, sid)
   const payload = buildJudgePayload(
-    { criteria, diffSummary, verifierSummaries, lastResponse, recentTranscript, plan: renderPlanDigest(plan, auditIds) },
+    {
+      criteria,
+      diffSummary,
+      verifierSummaries,
+      lastResponse,
+      recentTranscript,
+      // FR-011: the judge cannot resolve the digest's relative paths without
+      // the root it is told they are relative to.
+      plan: renderPlanDigest(plan, auditIds, state.workspaceRoot),
+    },
     bindSession(sid, ctx.logger),
   )
 

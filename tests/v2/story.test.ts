@@ -2365,3 +2365,122 @@ describe("intake capability probe (FR-030b, story.ts's obligation as the caller)
     )
   })
 })
+
+// ---------------------------------------------------------------------------
+// MIN-005 (code review 2026-08-03): the lock-contention retry blocks the HOST
+// event loop with `Atomics.wait`, so the total block must stay bounded. The
+// retry COUNT is the FR-002c contract (asserted above); this asserts the
+// BUDGET — `MUTATE_LOCK_MAX_BLOCK_MS` = 50ms, worst case 5 x 6ms x 1.5 = 45ms,
+// down from the pre-fix 5 x 100ms x 1.5 = 750ms.
+// ---------------------------------------------------------------------------
+
+describe("MIN-005: mutate's synchronous backoff is budget-capped", () => {
+  it("spends at most ~50ms of event-loop blocking across the whole retry budget", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se, logger } = engine(stateDir)
+    const plan = se.createPlan("s1", [story()])
+    const taskId = plan.stories[0].tasks[0].id
+
+    const sleep = vi.spyOn(lockIO, "sleep").mockImplementation(() => {})
+    vi.spyOn(lockIO, "acquire").mockImplementation(() => {
+      throw new Error("elicify-vertex state directory is locked by another process")
+    })
+
+    expect(() => se.checkpoint("s1", taskId, "complete")).not.toThrow()
+
+    const requested = sleep.mock.calls.map(([ms]) => ms as number)
+    expect(requested).toHaveLength(5)
+    // Every backoff still blocks for a real, non-zero interval: a 0ms sleep
+    // would turn the remaining retries into a filesystem busy-spin.
+    for (const ms of requested) expect(ms).toBeGreaterThanOrEqual(1)
+    const total = requested.reduce((sum, ms) => sum + ms, 0)
+    expect(total).toBeLessThanOrEqual(50)
+    // The operator-visible signal carries the spent budget, not just "busy".
+    expect(logger).toHaveBeenCalledWith(
+      "plan:lock-contended",
+      expect.objectContaining({ sessionID: "s1", attempts: 6, blockedMs: expect.any(Number) }),
+    )
+    const contended = logger.mock.calls.find(([event]) => event === "plan:lock-contended")!
+    expect((contended[1] as { blockedMs: number }).blockedMs).toBeLessThanOrEqual(50)
+  })
+
+  it("holds the cap even when every jitter draw is the maximum", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [story()])
+    const taskId = plan.stories[0].tasks[0].id
+
+    // Math.random() === 1 → the 1.5x jitter ceiling on every single backoff.
+    vi.spyOn(Math, "random").mockReturnValue(1)
+    const sleep = vi.spyOn(lockIO, "sleep").mockImplementation(() => {})
+    vi.spyOn(lockIO, "acquire").mockImplementation(() => {
+      throw new Error("locked by another process")
+    })
+
+    se.checkpoint("s1", taskId, "complete")
+
+    const total = sleep.mock.calls.reduce((sum, [ms]) => sum + (ms as number), 0)
+    expect(total).toBeLessThanOrEqual(50)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// MAJ-008 / FR-009: a verdict that enforces nothing is still visible in the
+// log. `handleJudgeAudit` selects only COMPLETE stories, so a verdict landing
+// on a non-complete one means a peer instance / reopen / blocked checkpoint
+// moved it in between — previously that produced an audit summary naming the
+// story nowhere at all, indistinguishable from "the judge returned nothing".
+// ---------------------------------------------------------------------------
+
+describe("MAJ-008: a stamped-but-unenforced verdict is logged", () => {
+  const items = [{ itemId: "A1", met: false, note: "not delivered" }]
+
+  it("logs judge:verdict-not-enforced when the verdict's story is no longer complete", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se, logger } = engine(stateDir)
+    const plan = se.createPlan("s1", [story({ acceptanceItems: ["A1"], tasks: [{ text: "a" }] })])
+    const storyId = plan.stories[0].id
+
+    // The story is `active` (its only task was never checkpointed complete).
+    const result = se.applyJudgeVerdicts("s1", [{ storyId, pass: false, summary: "A1 missing", items }])
+
+    expect(result).toEqual({ reverted: [], passed: [], unknown: [] })
+    // The stamp is still recorded — the verdict is audit information even
+    // when it transitions nothing.
+    expect(se.getPlan("s1")!.stories[0].judge).toMatchObject({ pass: false, summary: "A1 missing" })
+    expect(logger).toHaveBeenCalledWith(
+      "judge:verdict-not-enforced",
+      expect.objectContaining({ sessionID: "s1", storyId, status: "active", pass: false }),
+    )
+  })
+
+  it("does NOT log it for a verdict that actually transitions the story", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se, logger } = engine(stateDir)
+    const plan = se.createPlan("s1", [story({ acceptanceItems: ["A1"], tasks: [{ text: "a" }] })])
+    const storyId = plan.stories[0].id
+    se.checkpoint("s1", plan.stories[0].tasks[0].id, "complete")
+
+    se.applyJudgeVerdicts("s1", [{ storyId, pass: false, summary: "A1 missing", items }])
+
+    expect(se.getPlan("s1")!.stories[0].status).toBe("active") // reverted
+    expect(logger).not.toHaveBeenCalledWith("judge:verdict-not-enforced", expect.anything())
+  })
+
+  it("an unknown story id stays on the existing `unknown` channel, not the new event", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se, logger } = engine(stateDir)
+    se.createPlan("s1", [story()])
+
+    const result = se.applyJudgeVerdicts("s1", [{ storyId: "S-nope", pass: false, summary: "?", items }])
+
+    expect(result.unknown).toEqual(["S-nope"])
+    expect(logger).not.toHaveBeenCalledWith("judge:verdict-not-enforced", expect.anything())
+    expect(logger).toHaveBeenCalledWith("story:judge-audit", {
+      sessionID: "s1",
+      passed: [],
+      reverted: [],
+      unknown: ["S-nope"],
+    })
+  })
+})

@@ -549,11 +549,23 @@ export async function applyV2Config(
     description:
       "elicify-vertex internal judge subturn — read-only completion auditor; verifies claimed stories with read/grep/glob/list/bash; no write/edit.",
     // HANDOVER.md point 3: allow-aware map + JUDGE_PERMISSION (reverses the
-    // old zero-tool registration). maxSteps 12, not 1: a tool-using judge
-    // needs multiple steps (tool calls to read files and re-run verifiers,
-    // THEN a final answer step) — maxSteps 1 made the granted tools useless.
+    // old zero-tool registration).
     tools: buildJudgeToolsMap(),
     permission: JUDGE_PERMISSION,
+    // FR-008 — ADVISORY ONLY: THE HOST IGNORES THIS FIELD. Live probe
+    // 2026-08-03 (opencode 1.18.x, spec Findings/FR-008): `opencode debug
+    // agent` resolves `maxSteps: None` for this registration, and the same
+    // probe then watched the judge run THREE steps with TWO real tool calls
+    // (`bash ls -la`, `read`; two `step-finish reason:"tool-calls"` rows in
+    // the persisted parts). So the number below neither grants nor caps
+    // anything — the previous comment here claimed the opposite of what the
+    // probe found ("maxSteps 1 made the granted tools useless"; in fact an
+    // unresolved `None` did not make them useless either, and the judge's
+    // real defect was the payload/prompt path, FR-011). Kept rather than
+    // deleted for the same reason as the `tools` map above: harmless, and
+    // correct per the documented SDK `AgentConfig` type should a host ever
+    // honour it — but never a control this code relies on, and no test may
+    // assert a resolved value the host does not honour (FR-008 AS2).
     maxSteps: 12,
   }
   cfgInput.agent["vertex-intake"] = {
@@ -561,6 +573,10 @@ export async function applyV2Config(
     description: "elicify-vertex internal intake multi-story classification subturn — zero-tool.",
     tools: deny,
     permission: AGENT_PERMISSION,
+    // FR-008 — advisory only, same probe finding as the judge above: the
+    // host resolves `None` here too. Intake's single-shot shape is carried
+    // by its zero-tool `permission` block (a subturn with no tools has
+    // nothing to spend a second step on), never by this field.
     maxSteps: 1,
   }
 

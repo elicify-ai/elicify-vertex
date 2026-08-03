@@ -656,31 +656,97 @@ function joinDir(base: string, next: string): string {
 }
 
 /**
+ * FR-013 — re-express an ABSOLUTE path that lies inside the worktree as a path
+ * relative to the worktree root. Returns `null` when the path is not absolute,
+ * when it is absolute but lies outside the root, or when no root was supplied.
+ *
+ * ## Why this exists (measured, not hypothesised)
+ *
+ * Story verifiers are model-authored and are written relative to the worktree
+ * (`test -f research/crispr-gene-editing.md`), because that is how a plan reads.
+ * The command the agent actually runs is captured verbatim from the tool call,
+ * and agents routinely spell paths absolutely
+ * (`test -f /workspace/vertextest2/research/crispr-gene-editing.md`). Those two
+ * strings name the SAME FILE and every path-level comparison in this module
+ * scored them as disjoint: `["workspace","vertextest2","research","…"]` is not
+ * segment-equal to `["research","…"]`.
+ *
+ * Consequence in the audited session (`ses_04dc77bdaffej8SFJvYm5yO0CW`):
+ * **146 `verify:relevance-gap` events and ZERO receipts minted**, while the
+ * agent was in fact running the stories' own declared verifiers one at a time.
+ * An empty receipt store then starved the judge's cross-check of any data,
+ * which is how a path-matching detail became a judge-reliability defect.
+ *
+ * ## Why it stays fail-closed
+ *
+ * Only a path under the root is rewritten. `/tmp/elsewhere/x` is left absolute
+ * and therefore still matches nothing root-relative — a run outside the
+ * worktree is not evidence about the worktree, and `cd /tmp/elsewhere && npm
+ * test` must keep failing to cover a prescribed `npm test` (it does). The root
+ * itself maps to `"."`, i.e. "this location", never to a universal target — so
+ * normalisation can only make two names for one path agree, never widen what a
+ * command is credited with. With no root supplied every call returns `null`
+ * and the module behaves byte-identically to before.
+ */
+function rootRelative(path: string, root: string | undefined): string | null {
+  if (root === undefined) return null
+  // Only an ABSOLUTE root can anchor an absolute path. A relative or empty root
+  // would make the prefix test meaningless (every path "starts with" "").
+  const base = root.replace(/\/+$/, "")
+  if (base === "" || !base.startsWith("/")) return null
+  if (!path.startsWith("/")) return null
+  if (path === base || path === `${base}/`) return "."
+  if (!path.startsWith(`${base}/`)) return null
+  const rest = path.slice(base.length + 1).replace(/^\/+/, "")
+  return rest === "" ? "." : rest
+}
+
+/**
  * Fold `cd` effects into the chain: each surviving sub-command records the
  * directory it runs in, and its relative targets are re-expressed from the repo
  * root. `cd` parts execute nothing, so they are dropped once folded.
+ *
+ * FR-013 adds the absolute-path axis: when `root` is known, a path under it is
+ * rebased onto the root here, in the one place that already owns "re-express
+ * this target from the repo root".
  */
-function applyDirectoryChanges(parts: SubCommand[]): SubCommand[] {
+function applyDirectoryChanges(parts: SubCommand[], root: string | undefined): SubCommand[] {
   let cwd = ""
   const out: SubCommand[] = []
   for (const part of parts) {
     const words = part.runner.split(" ").filter((w) => !/^[{}()]+$/.test(w))
     if (words.length > 0 && DIRECTORY_CHANGING_RUNNERS.has(words[0])) {
       const dir = part.targets[0] ?? words[1] ?? ""
-      if (dir) cwd = joinDir(cwd, dir)
+      const rebased = rootRelative(dir, root)
+      // An absolute `cd` REPLACES the working directory, it does not append to
+      // it: `cd sub && cd <root>` lands at the root, not at `sub/`. Joining
+      // from "" rather than from `cwd` is what encodes that.
+      if (rebased !== null) cwd = joinDir("", rebased)
+      else if (dir) cwd = joinDir(cwd, dir)
       continue
     }
+    // An absolute target is CWD-INDEPENDENT — `/root/a/b.md` names the same file
+    // whatever directory the command runs in — so it is rebased here and then
+    // exempted from the cwd re-rooting below. Getting that order wrong would
+    // turn `cd sub && test -f /root/a.md` into `sub/a.md`, a file that need not
+    // exist.
+    const rebased = part.targets.map((t) => {
+      const rel = rootRelative(t, root)
+      return { value: rel ?? t, absolute: rel !== null }
+    })
     if (cwd === "") {
       // Leave `cwd` ABSENT at the repo root rather than setting "". Absent and
       // "" mean the same thing to every reader, and omitting it keeps the
-      // parsed shape byte-identical for the common case.
-      out.push(part)
+      // parsed shape byte-identical for the common case — including when no
+      // target was rebased, where the original object is passed through.
+      out.push(rebased.some((r) => r.absolute) ? { ...part, targets: rebased.map((r) => r.value) } : part)
       continue
     }
     out.push({
       ...part,
       cwd,
-      targets: part.targets.map((t) => {
+      targets: rebased.map(({ value: t, absolute }) => {
+        if (absolute) return t
         if (t.startsWith("/")) return t
         const recursive = t.endsWith("/...")
         const bare = recursive ? t.slice(0, -4) : t
@@ -696,7 +762,13 @@ function applyDirectoryChanges(parts: SubCommand[]): SubCommand[] {
   return out
 }
 
-export function parseSubcommands(command: string): SubCommand[] {
+/**
+ * `workspaceRoot` is OPTIONAL and defaults to "unknown" (FR-013): callers that
+ * have no root — `changesWorkingDirectory`, `isTestRunnerCommand`, direct test
+ * use — get exactly the previous parse, and only a caller that supplies a root
+ * gains absolute-path normalisation.
+ */
+export function parseSubcommands(command: string, workspaceRoot?: string): SubCommand[] {
   const subCommands: SubCommand[] = []
 
   for (const rawPart of unwrapShellWrapper(command).split(COMPOUND_SEPARATOR_RE)) {
@@ -710,7 +782,7 @@ export function parseSubcommands(command: string): SubCommand[] {
     if (parsed) subCommands.push(parsed)
   }
 
-  return applyDirectoryChanges(subCommands)
+  return applyDirectoryChanges(subCommands, workspaceRoot)
 }
 
 function toSubCommand(tokens: readonly string[]): SubCommand | null {
@@ -1077,7 +1149,18 @@ export function isNonExecutingCommand(command: string): boolean {
   return parts.length > 0 && parts.every((p) => p.nonExecuting === true)
 }
 
-export function observedCoversPrescribed(prescribed: string, observed: string): boolean {
+/**
+ * `workspaceRoot` (FR-013, OPTIONAL) is the absolute worktree root that both
+ * sides' paths are interpreted against, so an observed
+ * `test -f /workspace/vertextest2/research/x.md` can be recognised as the
+ * declared `test -f research/x.md`. Both sides are normalised, because either
+ * may be the absolutely-spelled one. Omitting it preserves the previous
+ * behaviour exactly (`rootRelative` returns `null` for every path), so the
+ * callers that genuinely have no session — and every existing test — are
+ * unaffected. See `rootRelative` for the 146-gaps/0-receipts measurement that
+ * motivated this.
+ */
+export function observedCoversPrescribed(prescribed: string, observed: string, workspaceRoot?: string): boolean {
   // `go -C` is refused on either side: the directory is unrecoverable after
   // parsing (see DIR_CHANGING_FLAG_RE), so there is nothing to normalise.
   // Plain `cd` is NOT refused -- it is folded into each sub-command's `cwd`.
@@ -1087,11 +1170,11 @@ export function observedCoversPrescribed(prescribed: string, observed: string): 
   const headOf = (c: string): string => unwrapShellWrapper(c).split("|")[0]
   if (DIR_CHANGING_FLAG_RE.test(headOf(observed)) || DIR_CHANGING_FLAG_RE.test(headOf(prescribed))) return false
 
-  const prescribedParts = parseSubcommands(prescribed)
+  const prescribedParts = parseSubcommands(prescribed, workspaceRoot)
   // `||` operands are dropped from the OBSERVED side: for `A || B` that exited
   // 0 we cannot tell which one ran, so crediting either could mint a receipt
   // for a verifier that never executed (see ALTERNATION_SEPARATOR_RE).
-  const observedParts = ALTERNATION_SEPARATOR_RE.test(observed) ? [] : parseSubcommands(observed)
+  const observedParts = ALTERNATION_SEPARATOR_RE.test(observed) ? [] : parseSubcommands(observed, workspaceRoot)
   if (prescribedParts.length === 0 || observedParts.length === 0) return false
 
   return prescribedParts.every((part) => observedParts.some((candidate) => subCommandCovers(candidate, part)))

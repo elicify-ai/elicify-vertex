@@ -609,3 +609,218 @@ describe("-C after a pipe is a display flag, not a directory change", () => {
     expect(observedCoversPrescribed("go -C services/api test ./...", "go -C other build ./...")).toBe(false)
   })
 })
+
+// ===========================================================================
+// FR-013 — absolute/relative path normalisation against the worktree root.
+// (Spec dataset rows 30 and 31, docs/JUDGE-RELIABILITY-FIXES-SPEC.md.)
+//
+// Grounding: in the audited session (`ses_04dc77bdaffej8SFJvYm5yO0CW`) the
+// agent ran each story's declared verifiers one at a time, spelling the paths
+// absolutely, while the plan declared them relatively. Every comparison scored
+// disjoint, producing **146 `verify:relevance-gap` events and ZERO receipts**.
+// Every fixture below is that shape, verbatim.
+//
+// The safety contract is asserted alongside: normalisation may only make two
+// SPELLINGS of one path agree. It must never turn an unrelated command into a
+// cover, and it must never rescue a run outside the worktree.
+// ===========================================================================
+
+const WORKTREE = "/workspace/vertextest2"
+
+describe("FR-013: absolute observed path matches relative declared verifier (dataset row 31)", () => {
+  it("credits the exact field shape once a root is supplied", () => {
+    // MUTATION: drop the third argument -> red (this is the 146-gap case).
+    expect(
+      observedCoversPrescribed(
+        "test -f research/crispr-gene-editing.md",
+        `test -f ${WORKTREE}/research/crispr-gene-editing.md`,
+        WORKTREE,
+      ),
+    ).toBe(true)
+  })
+
+  it("normalises the PRESCRIBED side too — either side may be the absolute one", () => {
+    expect(
+      observedCoversPrescribed(
+        `test -f ${WORKTREE}/research/crispr-gene-editing.md`,
+        "test -f research/crispr-gene-editing.md",
+        WORKTREE,
+      ),
+    ).toBe(true)
+  })
+
+  it("normalises recursive absolute targets", () => {
+    expect(observedCoversPrescribed("go test ./internal/auth/...", `go test ${WORKTREE}/...`, WORKTREE)).toBe(true)
+    expect(observedCoversPrescribed(`go test ${WORKTREE}/internal/...`, "go test ./internal/auth/...", WORKTREE)).toBe(
+      false,
+    )
+  })
+
+  it("tolerates a trailing slash on the root", () => {
+    expect(
+      observedCoversPrescribed("test -f research/a.md", `test -f ${WORKTREE}/research/a.md`, `${WORKTREE}/`),
+    ).toBe(true)
+  })
+
+  it("keeps the previous behaviour when NO root is supplied", () => {
+    // The regression this whole requirement is about: without a root the two
+    // spellings are still disjoint, which is why the old two-argument call
+    // sites minted nothing.
+    expect(
+      observedCoversPrescribed(
+        "test -f research/crispr-gene-editing.md",
+        `test -f ${WORKTREE}/research/crispr-gene-editing.md`,
+      ),
+    ).toBe(false)
+  })
+})
+
+describe("FR-013: normalisation does not blanket-accept", () => {
+  it("an UNRELATED command still reports a relevance gap", () => {
+    // Different runner entirely — the story verifier is a file assertion, the
+    // agent ran a linter.
+    expect(observedCoversPrescribed("test -f research/a.md", "npx eslint .", WORKTREE)).toBe(false)
+    // Same runner, different file.
+    expect(
+      observedCoversPrescribed("test -f research/a.md", `test -f ${WORKTREE}/research/b.md`, WORKTREE),
+    ).toBe(false)
+    // Same runner, the root itself rather than the declared file.
+    expect(observedCoversPrescribed("test -f research/a.md", `test -f ${WORKTREE}`, WORKTREE)).toBe(false)
+  })
+
+  it("an absolute path OUTSIDE the root is still disjoint", () => {
+    expect(observedCoversPrescribed("test -f research/a.md", "test -f /other/repo/research/a.md", WORKTREE)).toBe(false)
+    // A sibling directory sharing the root's prefix must not be swallowed:
+    // `/workspace/vertextest22` is not inside `/workspace/vertextest2`.
+    expect(
+      observedCoversPrescribed("test -f research/a.md", `test -f ${WORKTREE}2/research/a.md`, WORKTREE),
+    ).toBe(false)
+  })
+
+  it("a run outside the worktree is still refused with a root supplied", () => {
+    expect(observedCoversPrescribed("npm test", "cd /tmp/elsewhere && npm test", WORKTREE)).toBe(false)
+    expect(observedCoversPrescribed("npm test", "cd .. && npm test", WORKTREE)).toBe(false)
+  })
+
+  it("a narrowed run is still not a cover, absolutely spelled", () => {
+    expect(observedCoversPrescribed("go test ./...", `go test -run TestFoo ${WORKTREE}/...`, WORKTREE)).toBe(false)
+  })
+
+  it("a non-executing run is still not a cover, absolutely spelled", () => {
+    expect(observedCoversPrescribed("pytest tests/unit", `pytest --collect-only ${WORKTREE}/tests/unit`, WORKTREE)).toBe(
+      false,
+    )
+  })
+})
+
+describe("FR-013: an absolute cd is resolved against the root", () => {
+  it("`cd <root>` is the repo root, not 'outside the worktree'", () => {
+    expect(observedCoversPrescribed("npm test", `cd ${WORKTREE} && npm test`, WORKTREE)).toBe(true)
+  })
+
+  it("`cd <root>/backend` is the same as `cd backend`", () => {
+    expect(observedCoversPrescribed("cd backend && npm test", `cd ${WORKTREE}/backend && npm test`, WORKTREE)).toBe(true)
+  })
+
+  it("an absolute cd REPLACES the directory rather than appending to it", () => {
+    // `cd backend && cd <root> && npm test` runs at the ROOT, so it must not
+    // cover a prescription scoped to `backend`.
+    expect(
+      observedCoversPrescribed("cd backend && npm test", `cd backend && cd ${WORKTREE} && npm test`, WORKTREE),
+    ).toBe(false)
+  })
+
+  it("an absolute target stays cwd-independent when a cd is also present", () => {
+    // `/root/research/a.md` names the same file whatever directory the command
+    // runs in — it must NOT be re-rooted to `backend/research/a.md`.
+    expect(
+      observedCoversPrescribed(
+        "test -f research/a.md",
+        `cd backend && test -f ${WORKTREE}/research/a.md`,
+        WORKTREE,
+      ),
+    ).toBe(true)
+    expect(
+      observedCoversPrescribed(
+        "test -f backend/research/a.md",
+        `cd backend && test -f ${WORKTREE}/research/a.md`,
+        WORKTREE,
+      ),
+    ).toBe(false)
+  })
+})
+
+describe("FR-013: parseSubcommands rebases absolute targets only when asked", () => {
+  it("leaves the parse byte-identical with no root", () => {
+    expect(parseSubcommands(`test -f ${WORKTREE}/research/a.md`)).toEqual([
+      { runner: "test", targets: [`${WORKTREE}/research/a.md`], narrowing: [], nonExecuting: false },
+    ])
+  })
+
+  it("rebases onto the root when one is supplied", () => {
+    expect(parseSubcommands(`test -f ${WORKTREE}/research/a.md`, WORKTREE)).toEqual([
+      { runner: "test", targets: ["research/a.md"], narrowing: [], nonExecuting: false },
+    ])
+  })
+
+  it("maps the root itself to '.', never to a universal target", () => {
+    expect(parseSubcommands(`test -d ${WORKTREE}`, WORKTREE)).toEqual([
+      { runner: "test", targets: ["."], narrowing: [], nonExecuting: false },
+    ])
+  })
+
+  it("ignores a relative or empty root (nothing to anchor against)", () => {
+    expect(parseSubcommands(`test -f ${WORKTREE}/research/a.md`, "")).toEqual(
+      parseSubcommands(`test -f ${WORKTREE}/research/a.md`),
+    )
+    expect(parseSubcommands(`test -f ${WORKTREE}/research/a.md`, "workspace/vertextest2")).toEqual(
+      parseSubcommands(`test -f ${WORKTREE}/research/a.md`),
+    )
+  })
+})
+
+describe("FR-013 AS1: one declared verifier of six is creditable on its own (dataset row 30)", () => {
+  // The plugin's prescription block picks the FIRST declared verifier the
+  // observed command covers, instead of `join(" && ")`-ing all six into a
+  // single prescription that only a six-in-one command could satisfy. This
+  // asserts the coverage-level contract that choice depends on: each verifier
+  // is independently matchable, and the joined form is not.
+  const declared = [
+    "test -f research/crispr-gene-editing.md",
+    "test -f research/renewable-energy.json",
+    "test -f research/space-exploration.json",
+    "test -f research/quantum-computing.md",
+    "test -f research/ocean-acidification.md",
+    "test -f research/urban-agriculture.md",
+  ]
+
+  it("each verifier is credited by the single command that runs it", () => {
+    for (const verifier of declared) {
+      const observed = verifier.replace("research/", `${WORKTREE}/research/`)
+      expect(
+        declared.find((candidate) => observedCoversPrescribed(candidate, observed, WORKTREE)),
+        observed,
+      ).toBe(verifier)
+    }
+  })
+
+  it("the OLD `&&`-joined prescription is what could never be covered", () => {
+    // MUTATION: revert plugin.ts to `storyVerifiers.join(" && ")` -> the
+    // prescription becomes this, and every one-at-a-time run is a gap.
+    expect(
+      observedCoversPrescribed(
+        declared.join(" && "),
+        `test -f ${WORKTREE}/research/crispr-gene-editing.md`,
+        WORKTREE,
+      ),
+    ).toBe(false)
+    // ...while the six-in-one command nobody runs would have satisfied it.
+    expect(observedCoversPrescribed(declared.join(" && "), declared.join(" && "), WORKTREE)).toBe(true)
+  })
+
+  it("a run of a DIFFERENT story's verifier still matches nothing", () => {
+    expect(
+      declared.find((candidate) => observedCoversPrescribed(candidate, `test -f ${WORKTREE}/notes/unrelated.md`, WORKTREE)),
+    ).toBeUndefined()
+  })
+})

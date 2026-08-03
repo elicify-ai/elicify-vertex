@@ -389,7 +389,14 @@ export function buildPlanTools(deps: PlanToolsDeps) {
         }
       }
 
-      storyEngine.checkpoint(context.sessionID, args.taskId, args.status, { reason: args.reason })
+      // MIN-001 (code review): consume the result. For an IDEMPOTENT no-op
+      // this is the only remaining corrective signal — the thrown error that
+      // used to name the currently-active tasks is gone by design (FR-003),
+      // so without surfacing it the model cannot tell "already done, carry on"
+      // from "just completed".
+      const checkpointResult = storyEngine.checkpoint(context.sessionID, args.taskId, args.status, {
+        reason: args.reason,
+      })
 
       // T8 (FR-001), task/wave-aware: completing/blocking/failing the last
       // active task can promote a whole new level at once — possibly across
@@ -406,7 +413,18 @@ export function buildPlanTools(deps: PlanToolsDeps) {
       }
 
       const plan = storyEngine.getPlan(context.sessionID)
-      return JSON.stringify(plan, null, 2)
+      return JSON.stringify(
+        checkpointResult.idempotent
+          ? {
+              idempotent: true,
+              note: `${args.taskId} was already complete — no change made.`,
+              activeTaskIds: checkpointResult.activeTaskIds,
+              ...plan,
+            }
+          : plan,
+        null,
+        2,
+      )
     },
   })
 

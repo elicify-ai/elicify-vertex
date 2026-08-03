@@ -200,6 +200,19 @@ export const lockIO = {
    * a bounded time. If it is unavailable for any reason the retry simply
    * happens immediately rather than failing — a degraded retry beats a
    * thrown error (FR-010).
+   *
+   * MIN-005 (code review, 2026-08-03) — THIS BLOCKS THE HOST'S EVENT LOOP.
+   * The plugin runs in-process inside opencode, so every millisecond spent
+   * here freezes the whole server, not just this call. An async sleep is the
+   * only way to avoid that and is NOT available: all seven `mutate` callers
+   * (`createPlan`, `checkpoint`, `applyJudgeVerdicts`, `reopenStory`,
+   * `clearPlan`, `amendStory`, `attachEvidence`) are synchronous methods,
+   * called synchronously from `wiring/tools.ts`, `wiring/gate.ts` and
+   * `plugin.ts`, so making this awaitable means turning the whole
+   * StoryEngine mutation surface async across four modules — a change no
+   * bounded-blocking defect justifies. The blocking is capped instead — see
+   * `MUTATE_LOCK_MAX_BLOCK_MS` below for the budget and the trade-off it
+   * buys.
    */
   sleep(ms: number): void {
     if (!(ms > 0)) return
@@ -218,11 +231,39 @@ export const lockIO = {
  * collision into a successful write. Spec wording: "bounded jittered retry
  * (5 x 100ms), then log and abort the write — NEVER throw into the host".
  * One initial attempt plus `MUTATE_LOCK_RETRIES` retries, each preceded by
- * a jittered `0.5x..1.5x` backoff, so the worst case is ~750ms and the
- * common case is one uncontended attempt with no sleep at all.
+ * a jittered `0.5x..1.5x` backoff, and the common case is one uncontended
+ * attempt with no sleep at all.
+ *
+ * MIN-005 (code review, 2026-08-03): the spec's literal `100ms` unit made
+ * the worst case ~750ms of `Atomics.wait` — a three-quarter-second freeze of
+ * the HOST's event loop (see `lockIO.sleep`) inside a synchronous tool call,
+ * paid whenever the lock is genuinely stuck. The retry COUNT is kept (it is
+ * the spec's bound and what the FR-002c tests assert); the unit drops to
+ * `MUTATE_LOCK_BACKOFF_MS`, and `MUTATE_LOCK_MAX_BLOCK_MS` hard-caps the
+ * SUM of the backoffs regardless of what the unit is later set to:
+ *   5 retries x 6ms x 1.5 jitter = 45ms worst case, clamped at 50ms.
+ *
+ * The trade-off, stated precisely: a peer critical section longer than
+ * ~45ms is no longer waited out, so the write aborts (logged
+ * `plan:lock-contended` + `plan:write-aborted`) where it previously had up
+ * to 750ms to succeed. That is the right side of the trade because (a) the
+ * critical section is one small-file read + parse + in-place merge + atomic
+ * rename — single-digit milliseconds, so 45ms already covers several
+ * consecutive peer writes; (b) an aborted write is NOT lost work — the
+ * mutation still applies in memory, the session keeps running, and the next
+ * mutation re-reads and re-persists it (`revision` keeps the merge ordered);
+ * (c) a lock held longer than that is usually a crashed peer, which no
+ * amount of blocking fixes — `pin.ts` reclaims it as stale after 30s
+ * anyway; and (d) blocking the host's event loop degrades every OTHER
+ * session on the machine, while aborting degrades only this write.
  */
 const MUTATE_LOCK_RETRIES = 5
-const MUTATE_LOCK_BACKOFF_MS = 100
+const MUTATE_LOCK_BACKOFF_MS = 6
+/** MIN-005: hard ceiling on the TOTAL synchronous block one `mutate` may
+ * impose on the host event loop. Each backoff is clamped to the remaining
+ * budget (and to a 1ms floor, so a retry never degenerates into a busy
+ * spin that hammers the filesystem). */
+const MUTATE_LOCK_MAX_BLOCK_MS = 50
 
 // ---------------------------------------------------------------------------
 // Public types (module-contracts.md §9)
@@ -1337,7 +1378,10 @@ export class StoryEngine {
    *    re-doing the work, so the claim's evidence is withdrawn; id in
    *    `reverted`.
    *  - any verdict on a non-`"complete"` story: the stamp is recorded
-   *    (still useful audit information) but nothing transitions.
+   *    (still useful audit information) but nothing transitions, and
+   *    `judge:verdict-not-enforced` names the story so the no-op is visible
+   *    in the log rather than inferable only from an empty audit summary
+   *    (FR-009 / MAJ-008).
    * Unknown story ids are collected into `unknown` and NEVER throw. Persists
    * once at the end and logs `story:judge-audit`. Throws only when the
    * session has no plan at all.
@@ -1414,6 +1458,24 @@ export class StoryEngine {
             }
           }
           reverted.push(story.id)
+        } else {
+          // FR-009 (MAJ-008, code review 2026-08-03): the stamp is recorded
+          // but the verdict enforces NOTHING, because the story is no longer
+          // `"complete"` — the gate selects only complete stories, so this
+          // means a peer instance, a `reopenStory`, or a `blocked`/`failed`
+          // checkpoint moved it between selection and application. Without
+          // this event the audit reads `{passed:[], reverted:[], unknown:[]}`
+          // with no story named anywhere, which is indistinguishable from
+          // "the judge returned nothing" — exactly the invisible-skip class
+          // FR-009 exists to close. It is logged per story rather than folded
+          // into `story:judge-audit` below, which is a summary of TRANSITIONS
+          // and has no slot for a per-story reason.
+          this.logger("judge:verdict-not-enforced", {
+            sessionID,
+            storyId: story.id,
+            status: story.status,
+            pass: verdict.pass,
+          })
         }
       }
 
@@ -1844,8 +1906,17 @@ export class StoryEngine {
    * jittered backoff (the jitter keeps two colliding instances from
    * re-colliding in lockstep); return `null` — never throw — when the budget
    * is spent, leaving the caller to abort the write.
+   *
+   * MIN-005: `blockedMs` accumulates every millisecond this method asks the
+   * host's event loop to stand still and clamps the next backoff to what is
+   * left of `MUTATE_LOCK_MAX_BLOCK_MS` (never below 1ms — a 0ms "sleep"
+   * would turn the remaining retries into a filesystem busy-spin). The
+   * `attempts` field on `plan:lock-contended` is joined by `blockedMs` so an
+   * operator can see the budget was spent, not merely that the lock was
+   * busy.
    */
   private acquireLockWithRetry(sessionID: string): { release(): void } | null {
+    let blockedMs = 0
     for (let attempt = 0; attempt <= MUTATE_LOCK_RETRIES; attempt += 1) {
       try {
         return lockIO.acquire(this.stateDir)
@@ -1854,11 +1925,15 @@ export class StoryEngine {
           this.logger("plan:lock-contended", {
             sessionID,
             attempts: attempt + 1,
+            blockedMs: Math.round(blockedMs),
             reason: error instanceof Error ? error.message : String(error),
           })
           return null
         }
-        lockIO.sleep(MUTATE_LOCK_BACKOFF_MS * (0.5 + Math.random()))
+        const jittered = MUTATE_LOCK_BACKOFF_MS * (0.5 + Math.random())
+        const budgeted = Math.max(1, Math.min(jittered, MUTATE_LOCK_MAX_BLOCK_MS - blockedMs))
+        blockedMs += budgeted
+        lockIO.sleep(budgeted)
       }
     }
     return null

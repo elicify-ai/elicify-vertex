@@ -58,7 +58,7 @@ describe("applyV2Config", () => {
     const cfgInput: { command?: Record<string, unknown>; agent?: Record<string, unknown> } = {}
     await applyV2Config(cfgInput as never, {} as OpencodeClient, "elicify-vertex")
 
-    const intake = cfgInput.agent!["vertex-intake"] as { permission: Record<string, string>; maxSteps: number }
+    const intake = cfgInput.agent!["vertex-intake"] as { permission: Record<string, string> }
     // The load-bearing entry: live-host testing showed the `tools` map is
     // ignored entirely and ONLY `permission: {"*": "deny"}` resolves the
     // agent to zero enabled tools (see config.ts's module header).
@@ -68,14 +68,15 @@ describe("applyV2Config", () => {
     expect(intake.permission.edit).toBe("deny")
     expect(intake.permission.bash).toBe("deny")
     expect(intake.permission.webfetch).toBe("deny")
-    expect(intake.maxSteps).toBe(1)
+    // FR-008 AS2: `intake.maxSteps` is deliberately NOT asserted here — see
+    // the advisory-field test below for the probe evidence.
   })
 
-  it("registers vertex-judge with the HANDOVER.md point-3 read-only tool grant: read/grep/glob/list/bash allow, edit/write/webfetch/task deny, maxSteps 12", async () => {
+  it("registers vertex-judge with the HANDOVER.md point-3 read-only tool grant: read/grep/glob/list/bash allow, edit/write/webfetch/task deny", async () => {
     const cfgInput: { command?: Record<string, unknown>; agent?: Record<string, unknown> } = {}
     await applyV2Config(cfgInput as never, {} as OpencodeClient, "elicify-vertex")
 
-    const judge = cfgInput.agent!["vertex-judge"] as { permission: Record<string, string>; maxSteps: number }
+    const judge = cfgInput.agent!["vertex-judge"] as { permission: Record<string, string> }
     // Base stays deny-everything; the five read-only tools are the explicit
     // carve-out (bash so the judge can re-run declared verifiers itself).
     expect(judge.permission["*"]).toBe("deny")
@@ -87,9 +88,26 @@ describe("applyV2Config", () => {
     for (const denied of ["edit", "write", "webfetch", "task"]) {
       expect(judge.permission[denied]).toBe("deny")
     }
-    // A tool-using judge needs multiple steps (tool calls, THEN a final
-    // answer) — 1 step made the granted tools useless.
-    expect(judge.maxSteps).toBe(12)
+  })
+
+  // FR-008 (US-8 AS1/AS2, TDD row 26). The live probe of 2026-08-03
+  // (spec Findings/FR-008) settled this empirically: `opencode debug agent`
+  // resolves `maxSteps: None` for BOTH registrations on opencode 1.18.x,
+  // and the judge nonetheless ran 3 steps with 2 real tool calls. The
+  // previous two assertions here (`toBe(12)` / `toBe(1)`) therefore asserted
+  // a resolved value the host does not honour — exactly what AS2 forbids —
+  // and are gone. What IS assertable is the shape: the field may be present
+  // (advisory, correct per the SDK type) or absent, and either way the
+  // capability control of record is the `permission` block.
+  it("FR-008: maxSteps is advisory only — no resolved value is asserted, permission stays the control", async () => {
+    const cfgInput: { command?: Record<string, unknown>; agent?: Record<string, unknown> } = {}
+    await applyV2Config(cfgInput as never, {} as OpencodeClient, "elicify-vertex")
+
+    for (const name of ["vertex-judge", "vertex-intake"]) {
+      const agent = cfgInput.agent![name] as { maxSteps?: number; permission: Record<string, string> }
+      if (agent.maxSteps !== undefined) expect(typeof agent.maxSteps).toBe("number")
+      expect(agent.permission["*"]).toBe("deny")
+    }
   })
 
   it("static tools maps: intake's is fully denied; the judge's true entries are exactly the point-3 allowlist", async () => {

@@ -1184,3 +1184,121 @@ describe("judge re-audit counter — MIN-004", () => {
     expect(state.storyReaudits.S1).toBeUndefined()
   })
 })
+
+// ===========================================================================
+// FR-011 / FR-006 (MIN-002) — the plan digest the judge is actually sent.
+//
+// Both requirements are properties of ONE string: the `plan` field of the
+// payload dispatched to the `vertex-judge` subturn. So these read it back off
+// the prompt mock rather than re-rendering it — a re-render could agree with a
+// broken caller (the whole MAJ-005 finding was that `renderPlanDigest` was
+// correct in isolation but the call site never gave it the root).
+//
+// Grounding (`ses_04dc77bdaffej8SFJvYm5yO0CW`): with bare relative paths in the
+// digest the judge asserted "research/x.json does not exist" about files that
+// DID exist, and the 4000-char cap truncated the tail of the plan, after which
+// it FAILed stories citing "S5 has no independent verifier set in the digest"
+// — the content the cap had removed.
+// ===========================================================================
+
+/** The `plan` field of the payload the judge was actually prompted with. */
+function judgePlanDigest(h: ReturnType<typeof harness>): string {
+  const session = h.ctx.client.session as unknown as Record<string, unknown>
+  const prompt = session.prompt as ReturnType<typeof vi.fn>
+  const call = prompt.mock.calls.find((c) => (c[0] as { body?: { agent?: string } })?.body?.agent === "vertex-judge")
+  expect(call, "the judge subturn was never prompted").toBeDefined()
+  const text = (call![0] as { body: { parts: Array<{ text: string }> } }).body.parts[0].text
+  return (JSON.parse(text) as { plan?: string }).plan ?? ""
+}
+
+describe("renderPlanDigest — FR-011 absolute worktree root", () => {
+  it("states the absolute worktree root as the digest's first line", async () => {
+    const h = harness({ judgeEnabled: true })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid, ["test -f research/x.md"])
+    stubJudge(h, {
+      stories: [{ storyId: "S1", pass: true, summary: "delivered", items: [{ itemId: "A1", met: true, note: "read it" }] }],
+    })
+
+    await handleSessionIdle(h.ctx, sid)
+
+    const digest = judgePlanDigest(h)
+    // MUTATION: drop the `workspaceRoot` argument at the call site -> red.
+    expect(digest.split("\n")[0]).toBe(`Worktree root (all paths below are relative to this): ${h.stateDir}`)
+    // The root is an ABSOLUTE path, which is the entire point of AS1: a
+    // relative root would leave the digest's paths as unresolvable as before.
+    expect(h.stateDir.startsWith("/")).toBe(true)
+    // ...and the plan summary still follows it, so nothing was displaced.
+    expect(digest.split("\n")[1]).toContain("Audit these claimed-complete stories: S1.")
+    // The declared verifier — a bare relative path — is now resolvable.
+    expect(digest).toContain("verifiers: test -f research/x.md")
+  })
+})
+
+describe("renderPlanDigest — FR-006 / MIN-002: audited stories render first", () => {
+  it("puts the story under audit ahead of the stories that are not", async () => {
+    const h = harness({ judgeEnabled: true })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+
+    // Three INDEPENDENT stories, so the DAG activates all three tasks at level
+    // 0 and only the one we checkpoint becomes complete. The audited story is
+    // deliberately the LAST in plan order — the position truncation eats first.
+    h.storyEngine.createPlan(sid, [
+      {
+        text: "First story",
+        acceptanceItems: ["a1 done"],
+        scopeGlobs: [],
+        verifiers: ["test -f research/first.md"],
+        tasks: [{ text: "do the first" }],
+      },
+      {
+        text: "Second story",
+        acceptanceItems: ["a2 done"],
+        scopeGlobs: [],
+        verifiers: ["test -f research/second.md"],
+        tasks: [{ text: "do the second" }],
+      },
+      {
+        text: "Third story",
+        acceptanceItems: ["a3 done"],
+        scopeGlobs: [],
+        verifiers: ["test -f research/third.md"],
+        tasks: [{ text: "do the third" }],
+      },
+    ])
+    h.storyEngine.checkpoint(sid, "S3.T1", "complete")
+    expect(h.storyEngine.getPlan(sid)!.stories.map((s) => s.status)).toEqual(["active", "active", "complete"])
+
+    stubJudge(h, {
+      stories: [{ storyId: "S3", pass: true, summary: "delivered", items: [{ itemId: "A1", met: true, note: "read it" }] }],
+    })
+
+    await handleSessionIdle(h.ctx, sid)
+
+    const digest = judgePlanDigest(h)
+    const s3 = digest.indexOf("S3 (")
+    const s1 = digest.indexOf("S1 (")
+    const s2 = digest.indexOf("S2 (")
+    expect(s3, "S3 must be rendered").toBeGreaterThan(-1)
+    // MUTATION: render `plan.stories` in plan order again -> red.
+    expect(s3).toBeLessThan(s1)
+    expect(s3).toBeLessThan(s2)
+    // Relative order WITHIN the non-audited group is preserved, so the DAG
+    // still reads top-to-bottom for the context stories.
+    expect(s1).toBeLessThan(s2)
+    // Every story is still present — ordering must not drop context.
+    expect(digest).toContain("verifiers: test -f research/first.md")
+    expect(digest).toContain("verifiers: test -f research/third.md")
+    // ...and the audited story's contract precedes the unaudited ones', which
+    // is what makes truncation-from-the-tail structurally safe.
+    expect(digest.indexOf("test -f research/third.md")).toBeLessThan(
+      digest.indexOf("test -f research/first.md"),
+    )
+  })
+})

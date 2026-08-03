@@ -916,10 +916,21 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
             // receipt store is also why the receipt-based judge cross-check
             // had no data to use. Any single declared verifier the observed
             // command covers is now sufficient.
-            prescribed = storyVerifiers.find((verifier) => observedCoversPrescribed(verifier, command)) ?? storyVerifiers[0]
+            //
+            // The individual-crediting half is only HALF the fix: the observed
+            // command in that measurement was spelled ABSOLUTELY
+            // (`/workspace/vertextest2/research/…`) while the declared verifier
+            // was relative, so `find` still matched nothing. `workspaceRoot` is
+            // the second half — it lets `observedCoversPrescribed` recognise
+            // the two spellings as the same path (see `coverage.ts`'s
+            // `rootRelative`). Both call sites must pass it, or `find` locates
+            // the right verifier and the check below immediately re-rejects it.
+            prescribed =
+              storyVerifiers.find((verifier) => observedCoversPrescribed(verifier, command, state.workspaceRoot)) ??
+              storyVerifiers[0]
           }
 
-          if (prescribed && !observedCoversPrescribed(prescribed, command)) {
+          if (prescribed && !observedCoversPrescribed(prescribed, command, state.workspaceRoot)) {
             relevanceGap = true
             // FR-061 health signal. This is the exact condition that
             // silently suppressed every receipt for 94 minutes in the
