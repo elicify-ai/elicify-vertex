@@ -51,7 +51,8 @@ const LEADING_ABSENCE = /\b(?:no|missing)\s+(?=[\w./-]*[./][\w./-]*)/i
  * A path-shaped token: contains a `/` or a known file extension, and no shell
  * metacharacters (a token inside a command is naming a command, not a claim).
  */
-const PATH_TOKEN = /\b[\w.-]*(?:\/[\w.-]+)+\/?|\b[\w-]+\.(?:md|json|jsx|tsx|ts|js|css|html|ya?ml|toml|txt)\b/g
+const PATH_TOKEN =
+  /\b[\w.-]*(?:\/[\w.-]+)+\/?|\b[\w-]+\/(?![\w.-])|\b[\w-]+\.(?:md|json|jsx|tsx|ts|js|css|html|ya?ml|toml|txt)\b/g
 
 /**
  * An explicit POSITIVE existence assertion disqualifies the note. The negative
@@ -68,6 +69,28 @@ const EXISTENCE_ASSERTION =
  * addition to (or instead of) a path claim, so it must not be dropped.
  */
 const SECOND_NEGATION = /\b(?:but|however|although|though|yet)\b|\bcontains?\s+no\b|\bhas\s+no\b|\bwithout\b|\bempty\b|\bstub\b|\bhardcoded\b|\bno\s+(?:urls?|sources?|citations?|imports?|charts?|kpis?|tests?|content)\b/i
+
+/**
+ * Rule 1c's clause-lead matcher. `or`/`nor`/`and` are in the skip set because
+ * the clause splitter only breaks on `and`, so `"…, or research/x.md does not
+ * exist"` arrives with the conjunction still attached and the path then failed
+ * to read as clause-initial at all (M2, grill round 2).
+ */
+const SUBJECT_LEAD =
+  /^\s*(?:(?:the|a|an|file|directory|folder|and|or|nor|no|missing)\s+)*([\w.-]*(?:\/[\w.-]+)+\/?|[\w-]+\/(?![\w.-])|[\w-]+\.(?:md|json|jsx|tsx|ts|js|css|html|ya?ml|toml|txt))(?![\w.-])/i
+
+/** The clause led with an absence WORD before the path ("No src/App.tsx"). */
+const LEADING_ABSENCE_LEAD = /^\s*(?:(?:the|a|an|file|directory|folder|and|or|nor)\s+)*(?:no|missing)\s+/i
+
+/**
+ * What may sit between the path and its absence predicate (M1): auxiliaries,
+ * adverbs, and appositives that merely restate the path. Anything else — a
+ * noun phrase like "Sources section", "chart legend", "KPI values" — means the
+ * absence is predicated of that, not of the path, and the note is a content
+ * finding the harness must not touch.
+ */
+const ABSENCE_TAIL =
+  /^[\s:,-]*(?:no\s+such\s+file\b|(?:(?:is|are|was|were|does|do|did|has|have|had|seems?|appears?|still|apparently|actually|simply|entirely|completely|currently|now|also|even|file|directory|dir|folder|path|itself)\s+)*(?:(?:not|never)\s+)?(?:exists?|present|found|missing|absent)\b)/i
 
 export interface PathClaim {
   /** Every path the note asserts to be absent. Empty when this is not a path claim. */
@@ -142,8 +165,12 @@ export function parsePathAbsenceClaim(note: string): PathClaim {
   const bareForSubject = bare
 
   // Rule 1b: the absence must be predicated OF the path, not of something the
-  // path contains.
-  if (TRAILING_QUALIFIER.test(note)) return { paths: [], reason: "second-negation" }
+  // path contains. Skipped for the LEADING form ("missing research/x.md"),
+  // where the absence word precedes its path: TRAILING_QUALIFIER reads the
+  // path itself as the qualifier and rejected every note of that shape.
+  if (!LEADING_ABSENCE_LEAD.test(note) && TRAILING_QUALIFIER.test(note)) {
+    return { paths: [], reason: "second-negation" }
+  }
 
   // Rule 1c (rewritten after code review MAJ-001): the path must be the
   // GRAMMATICAL SUBJECT of the absence, not the object of a preposition.
@@ -169,12 +196,57 @@ export function parsePathAbsenceClaim(note: string): PathClaim {
   const clauses = bareForSubject
     .split(/(?:[.;,](?=\s|$)|\s+\band\b\s+|\s+\bbut\b\s+)/i)
     .filter((c) => /\w/.test(c))
-  const SUBJECT_LEAD = /^\s*(?:the\s+|a\s+|an\s+|file\s+|directory\s+|no\s+|missing\s+)*([\w.-]*(?:\/[\w.-]+)+\/?|[\w-]+\.(?:md|json|jsx|tsx|ts|js|css|html|ya?ml|toml|txt))\b/i
   const subjectPaths = new Set<string>()
+  const coordinated = new Set<string>()
+  let mixed = false
   for (const clause of clauses) {
     const lead = SUBJECT_LEAD.exec(clause)
-    if (lead) subjectPaths.add(lead[1].replace(/[.,;:]+$/, ""))
+    if (!lead) {
+      // No path leads this clause. If it nonetheless asserts an absence, the
+      // absence is of something the harness cannot check — a section, a
+      // skeleton, a capability. Corpus note N-"No src/App.tsx, src/App.jsx,
+      // src/main.tsx, or src/main.jsx; layout shell / routing skeleton not
+      // present." is exactly this: four real path claims riding with a
+      // structural one, labelled `keep` because dropping the item would take
+      // the structural finding with it.
+      if (ABSENCE_PREDICATE.test(clause)) mixed = true
+      continue
+    }
+    // M1 (grill round 2, REPRODUCED — 9 of 10 phrasings). Leading the clause
+    // is necessary but NOT sufficient. In
+    //
+    //     research/renewable-energy.md Sources section is missing
+    //
+    // the path leads the clause, but the subject of "is missing" is "Sources
+    // section" — the note is a CONTENT finding, and dropping it suppresses
+    // exactly the class of real defect FR-001 was narrowed to protect. The
+    // absence predicate must attach to the PATH, so what sits between them
+    // may only be auxiliary/adverbial filler or an appositive restating the
+    // path ("the research/ directory does not exist").
+    const tail = clause.slice(lead[0].length)
+    const ledByAbsence = LEADING_ABSENCE_LEAD.test(clause)
+    const path = lead[1].replace(/[.,;:]+$/, "")
+    if (ABSENCE_TAIL.test(tail) || (ledByAbsence && /^\s*$/.test(tail))) {
+      subjectPaths.add(path)
+    } else if (/^\s*$/.test(tail)) {
+      // A clause that is JUST a path is a coordinated subject waiting for its
+      // predicate: the splitter breaks `"renewable-energy.md and
+      // space-exploration.md are MISSING"` in two, and the first conjunct
+      // would otherwise be silently dropped from a claim that clearly covers
+      // both files. Held until some clause supplies an absence predicate.
+      coordinated.add(path)
+    } else {
+      // A path leads the clause but the absence is predicated of something
+      // else — a content finding. The note is therefore MIXED, and since the
+      // harness cannot drop half an item, the whole item must be kept. This
+      // is the conservative direction by design: dropping the path half of
+      // `"x.md Sources section is missing and y.md does not exist"` would
+      // suppress the content half along with it.
+      mixed = true
+    }
   }
+  if (mixed) return { paths: [], reason: "second-negation" }
+  if (subjectPaths.size > 0) for (const path of coordinated) subjectPaths.add(path)
   if (subjectPaths.size === 0) return { paths: [], reason: "second-negation" }
 
   // Rule 1: the note must actually predicate absence.

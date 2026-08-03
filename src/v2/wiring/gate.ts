@@ -802,7 +802,7 @@ function boundUnappliedVerdicts(
   sid: string,
   state: V2SessionState,
   verdicts: readonly JudgeStoryVerdict[],
-  reason: "contradictory" | "unverified",
+  reason: "contradictory" | "unverified" | "capped",
 ): void {
   for (const verdict of verdicts) {
     bumpReaudit(state, verdict.storyId)
@@ -921,20 +921,37 @@ async function emitUnauditedEscalation(
 ): Promise<boolean> {
   if (state.unauditedEscalated) return false
   if (!plan.stories.every((story) => story.status === "complete" && story.judge !== undefined)) return false
-  const unaudited = plan.stories.filter((story) => story.judge?.unapplied !== undefined).map((story) => story.id)
+  // A capped story WAS audited — the judge failed it and the harness stopped
+  // reverting. Reporting it as "never verified" would be false, so the two
+  // groups are named separately.
+  const unverified = plan.stories.filter((s2) => s2.judge?.unapplied !== undefined && s2.judge.unapplied !== "capped")
+  const disputed = plan.stories.filter((s2) => s2.judge?.unapplied === "capped")
+  const unaudited = [...unverified, ...disputed].map((story) => story.id)
   if (unaudited.length === 0) return false
   // Once only: this runs on EVERY idle after the plan settles, and repeating
   // the escalation each time would be its own loop.
   state.unauditedEscalated = true
   ctx.logger("judge:unaudited-escalation", { sessionID: sid, stories: unaudited })
+  const clauses: string[] = []
+  if (unverified.length > 0) {
+    clauses.push(
+      `the completion judge produced no usable verdict for ${unverified.map((s2) => s2.id).join(", ")}, so ` +
+        "those stories were NOT verified against the worktree",
+    )
+  }
+  if (disputed.length > 0) {
+    clauses.push(
+      `the judge repeatedly failed ${disputed.map((s2) => s2.id).join(", ")} and the re-audit cap was reached, so ` +
+        "the harness stopped re-opening them — those stories are DISPUTED, not confirmed",
+    )
+  }
   return dispatchContinuation(
     ctx,
     sid,
     state,
-    "[vertex:judge] Every story of the plan is complete, but the completion judge produced no usable verdict for " +
-      `${unaudited.join(", ")} — those stories were NOT verified against the worktree, and the harness did not act on ` +
-      "the unusable verdicts rather than trust them. Report what was delivered, the commands you ran and the results " +
-      `you observed, state explicitly that ${unaudited.join(", ")} remain unverified, then stop.`,
+    `[vertex:judge] Every story of the plan is complete, but ${clauses.join("; and ")}. Report what was delivered, ` +
+      `the commands you ran and the results you observed, state explicitly that ${unaudited.join(", ")} did not pass ` +
+      "audit, then stop.",
   )
 }
 
@@ -1079,6 +1096,14 @@ async function handleJudgeAudit(ctx: GateContext, sid: string, state: V2SessionS
         message: `story ${verdict.storyId} has been re-opened by the judge ${reaudits(state, verdict.storyId)} times — not reverting again; resolve it or amend the story`,
         variant: "error",
       })
+      // M3 (grill round 2): the cap used to `continue` here WITHOUT stamping,
+      // which stopped the revert but not the loop. `story.judge` kept its
+      // previous stamp, whose `judgedAt` predates the `completedAt` written
+      // when the story was re-completed, so the audit selector re-selected it
+      // on the very next idle — a full judge subturn every idle, forever, the
+      // exact runaway FR-007 exists to end. Stamping it bounds the selector;
+      // marking it `capped` keeps it out of the close-out's `allPassed`.
+      boundUnappliedVerdicts(ctx, sid, state, [verdict], "capped")
       continue
     }
     // MIN-004: the cap is on CONSECUTIVE reverts, so a pass clears the streak.

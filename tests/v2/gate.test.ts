@@ -1147,6 +1147,65 @@ describe("handleJudgeAudit — verdict reconciliation", () => {
     expect(loggedEventTypes(h.logger)).toContain("judge:reaudit-capped")
     expect(h.storyEngine.getPlan(sid)!.stories[0].status).toBe("complete") // not reverted again
   })
+
+  // M3 (grill round 2): the cap stopped the REVERT but not the LOOP. It
+  // `continue`d without stamping, so `story.judge` kept the stamp from the
+  // previous audit — whose `judgedAt` predates the `completedAt` written when
+  // the story was re-completed — and the selector re-picked the story on every
+  // subsequent idle, running a full judge subturn each time. Measured in the
+  // field as 5 subturns over 5 idles with no exit.
+  it("M3: past the cap the story is stamped, so the judge is not re-run on later idles", async () => {
+    const h = harness({ judgeEnabled: true, maxStoryReaudits: 1 })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid)
+    stubJudge(h, {
+      stories: [{ storyId: "S1", pass: false, summary: "still not done", items: [{ itemId: "A1", met: false, note: "no sources cited" }] }],
+    })
+
+    const judgeSubturns = (): number =>
+      h.prompt.mock.calls.filter((c) => (c[0] as { body?: { agent?: string } })?.body?.agent === "vertex-judge").length
+
+    await handleSessionIdle(h.ctx, sid) // revert 1 of 1
+    h.storyEngine.checkpoint(sid, "S1.T1", "complete")
+    await handleSessionIdle(h.ctx, sid) // cap reached
+    const atCap = judgeSubturns()
+
+    const stamp = h.storyEngine.getPlan(sid)!.stories[0].judge!
+    expect(stamp.unapplied).toBe("capped")
+
+    // Three more idles with nothing changed: the judge must not run again.
+    await handleSessionIdle(h.ctx, sid)
+    await handleSessionIdle(h.ctx, sid)
+    await handleSessionIdle(h.ctx, sid)
+    expect(judgeSubturns()).toBe(atCap)
+  })
+
+  // A capped story WAS audited — saying it was "never verified" would be
+  // false. The escalation names it as disputed instead.
+  it("M3: the settled-plan escalation calls a capped story disputed, not unverified", async () => {
+    const h = harness({ judgeEnabled: true, maxStoryReaudits: 1 })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid)
+    stubJudge(h, {
+      stories: [{ storyId: "S1", pass: false, summary: "still not done", items: [{ itemId: "A1", met: false, note: "no sources cited" }] }],
+    })
+    await handleSessionIdle(h.ctx, sid)
+    h.storyEngine.checkpoint(sid, "S1.T1", "complete")
+    await handleSessionIdle(h.ctx, sid) // cap reached, stamped
+    await handleSessionIdle(h.ctx, sid) // settled -> escalation
+
+    const said = continuations(h.prompt)
+      .map((c) => c.text)
+      .join("\n")
+    expect(said).toContain("DISPUTED")
+    expect(said).not.toContain("independently verified")
+  })
 })
 
 // ===========================================================================

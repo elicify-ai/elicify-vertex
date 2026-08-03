@@ -785,6 +785,15 @@ export function parseSubcommands(command: string, workspaceRoot?: string): SubCo
   return applyDirectoryChanges(subCommands, workspaceRoot)
 }
 
+/**
+ * Runners whose entire purpose is to assert something about a filesystem
+ * entry, so an operand that is not "path-shaped" (a bare directory name) is
+ * still unambiguously a path. Deliberately closed and small: it exists to stop
+ * `test -d research` from parsing as a target-less command, not to widen path
+ * detection generally.
+ */
+const FILESYSTEM_PREDICATE_RUNNERS = new Set(["test", "[", "ls", "stat", "readlink", "realpath"])
+
 function toSubCommand(tokens: readonly string[]): SubCommand | null {
   const runnerTokens: string[] = []
   let index = 0
@@ -817,9 +826,23 @@ function toSubCommand(tokens: readonly string[]): SubCommand | null {
 
   const rest = tokens.slice(index)
 
+  // C4 (grill round 2, REPRODUCED). `isPathShaped` requires a `/`, `.` or `*`,
+  // so a BARE directory operand is not path-shaped and was silently dropped:
+  // `test -d research` parsed to `{runner:"test", targets:[]}`, and a
+  // sub-command with no targets covers anything with the same runner — so a
+  // prescribed `test -d research` was credited by an observed `test -d src`,
+  // minting a receipt asserting `research` was verified by a command that
+  // never looked at it. (`test -f package.json` was unaffected only because
+  // the dot made it path-shaped, which is why this never showed in testing.)
+  //
+  // Broadening `isPathShaped` itself is not safe — `toSubCommand` uses it to
+  // find where the runner ends, so `npm run build` would treat `build` as a
+  // path. Instead, for runners that exist ONLY to assert something about a
+  // filesystem entry, every non-flag operand IS the subject, shaped or not.
+  const bareOperandsArePaths = FILESYSTEM_PREDICATE_RUNNERS.has(runnerTokens[0])
   const targets = rest
     .filter((token) => !isFlagToken(token))
-    .filter((token) => isPathShaped(token))
+    .filter((token) => bareOperandsArePaths || isPathShaped(token))
 
   const runner = normalizeRunner(runnerTokens.join(" "))
   const runnerScoped = scopedFlags(RUNNER_NON_EXECUTING_FLAGS, runner)

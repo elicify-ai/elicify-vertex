@@ -882,7 +882,11 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
         if (rawSuccess && exitCode === 0 && !relevanceGap) {
           const realChangedPaths = evidenceLedger.getChangedPaths(sid).filter((p) => !NON_PATH_MUTATION_MARKERS.has(p))
           const storyForResolve = storyEngine.getActiveStory(sid)
-          const storyVerifiers = storyForResolve?.verifiers ?? null
+          // M7: same reachable-bad-input guard as `resolve.ts` — these strings
+          // are LLM-authored, and `observedCoversPrescribed` would throw on a
+          // non-string straight out of a `tool.execute.after` hook.
+          const storyVerifiers =
+            storyForResolve?.verifiers?.filter((v) => typeof v === "string" && v.trim().length > 0) ?? null
 
           // The prescription to compare against. Previously this whole check
           // was gated on `realChangedPaths.length > 0`, which left a hole a
@@ -894,13 +898,16 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
           // changed paths we fall back to the story's own declared verifiers,
           // which are a prescription in their own right.
           hadWorkToMeasure = realChangedPaths.length > 0 || (storyVerifiers?.length ?? 0) > 0
-          if (realChangedPaths.length > 0) {
-            const manifest = manifests.get(state.workspaceRoot)
-            prescribed = resolveVerifier(
-              { changedPaths: realChangedPaths, storyVerifiers },
-              { readManifest: () => manifest },
-            ).command
-          } else if (storyVerifiers && storyVerifiers.length > 0) {
+          // M5 (grill round 2): the story branch must come FIRST. Story
+          // precedence is absolute — `resolveVerifier` returns tier 1
+          // ("story") ahead of every ecosystem inference — so with changed
+          // paths present the old ordering reached the same verifiers by the
+          // other route and got them back `.join(" && ")`-ed, which is
+          // precisely the joined prescription FR-013 exists to undo. The
+          // individual crediting below therefore only ever ran in the
+          // no-changed-paths branch: the rare case. Whenever a story declares
+          // verifiers they ARE the prescription, changed paths or not.
+          if (storyVerifiers && storyVerifiers.length > 0) {
             // FR-013: credit a story's verifiers INDIVIDUALLY. This used to be
             // `storyVerifiers.join(" && ")`, which — combined with
             // `observedCoversPrescribed`'s `prescribedParts.every(...)` —
@@ -928,6 +935,14 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
             prescribed =
               storyVerifiers.find((verifier) => observedCoversPrescribed(verifier, command, state.workspaceRoot)) ??
               storyVerifiers[0]
+          } else if (realChangedPaths.length > 0) {
+            const manifest = manifests.get(state.workspaceRoot)
+            prescribed = resolveVerifier(
+              // `storyVerifiers` is empty on this branch by construction, so
+              // passing it would be noise; tier 1 cannot apply here.
+              { changedPaths: realChangedPaths, storyVerifiers: null },
+              { readManifest: () => manifest },
+            ).command
           }
 
           if (prescribed && !observedCoversPrescribed(prescribed, command, state.workspaceRoot)) {
@@ -1128,7 +1143,12 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
 
         // FR-034 compliance join
         for (const rendered of state.renderedVerifyGaps) {
-          if (observedCoversPrescribed(rendered.command, command)) {
+          // M6 (grill round 2): this call was the one site still omitting the
+          // root, so an observed command spelled absolutely never matched a
+          // relatively-spelled prescription and the verify-gap was never
+          // marked complied — the same absolute-vs-relative mismatch FR-013
+          // fixed for receipts.
+          if (observedCoversPrescribed(rendered.command, command, state.workspaceRoot)) {
             composer.recordCompliance(sid, "verify-gap", rendered.instanceId)
             state.compliedFamiliesEver.add("verify-gap")
           }

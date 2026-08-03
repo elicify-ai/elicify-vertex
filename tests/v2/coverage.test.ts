@@ -824,3 +824,33 @@ describe("FR-013 AS1: one declared verifier of six is creditable on its own (dat
     ).toBeUndefined()
   })
 })
+
+// ---------------------------------------------------------------------------
+// C4 (grill round 2) — a bare directory operand is still the command's subject.
+//
+// `isPathShaped` requires a `/`, `.` or `*`. A prescribed `test -d research`
+// therefore parsed to `{runner:"test", targets:[]}`, and a target-less
+// sub-command covers anything with the same runner — so an observed
+// `test -d src` minted a receipt asserting `research` had been verified.
+// `test -f package.json` hid the bug: the dot made it path-shaped.
+// ---------------------------------------------------------------------------
+describe("C4 — bare-word operands of filesystem predicates", () => {
+  it("keeps a bare directory as a target", () => {
+    expect(parseSubcommands("test -d research")[0].targets).toEqual(["research"])
+  })
+
+  it("does NOT credit a different directory", () => {
+    expect(observedCoversPrescribed("test -d research", "test -d src")).toBe(false)
+  })
+
+  it("still credits the identical assertion", () => {
+    expect(observedCoversPrescribed("test -d research", "test -d research")).toBe(true)
+  })
+
+  it("does not treat a non-predicate runner's bare word as a path", () => {
+    // The reason `isPathShaped` could not simply be widened: `toSubCommand`
+    // uses it to find where the runner ends.
+    expect(parseSubcommands("npm run build")[0].targets).toEqual([])
+    expect(observedCoversPrescribed("npm run build", "npm run build")).toBe(true)
+  })
+})

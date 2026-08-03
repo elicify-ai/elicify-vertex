@@ -335,10 +335,14 @@ export interface StoryJudgeStamp {
    * this field records that the verdict was never enforced and why.
    *   - `"contradictory"` — FR-005: `pass:false` with every item `met:true`.
    *   - `"unverified"`    — FR-014: the judge never observed the worktree.
+   *   - `"capped"`        — FR-007: the re-audit cap was reached, so the
+   *     harness stopped reverting. Unlike the other two the verdict was
+   *     USABLE; the harness declined to keep acting on it. The story is
+   *     disputed, not unchecked.
    * Absent means a genuine, applied verdict. Optional on disk so pre-existing
    * plans still load (mirrors `contradictedItemIds`).
    */
-  unapplied?: "contradictory" | "unverified"
+  unapplied?: "contradictory" | "unverified" | "capped"
 }
 
 /**
@@ -518,7 +522,12 @@ function isStoryJudgeStamp(value: unknown): value is StoryJudgeStamp {
   // still load); reject only a PRESENT-but-wrong-shaped value.
   if (value.contradictedItemIds !== undefined && !isStringArray(value.contradictedItemIds)) return false
   // C2: optional on disk for the same reason; reject only a present-but-wrong value.
-  if (value.unapplied !== undefined && value.unapplied !== "contradictory" && value.unapplied !== "unverified")
+  if (
+    value.unapplied !== undefined &&
+    value.unapplied !== "contradictory" &&
+    value.unapplied !== "unverified" &&
+    value.unapplied !== "capped"
+  )
     return false
   return true
 }
@@ -1436,7 +1445,7 @@ export class StoryEngine {
       summary: string
       items: JudgeItemNote[]
       /** C2: mark the stamp as bookkeeping for a verdict the harness did NOT enforce. */
-      unapplied?: "contradictory" | "unverified"
+      unapplied?: "contradictory" | "unverified" | "capped"
     }>,
     contradictedByStory?: ReadonlyMap<string, string[]>,
   ): { reverted: string[]; passed: string[]; unknown: string[] } {

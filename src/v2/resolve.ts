@@ -536,7 +536,14 @@ export function resolveVerifier(ctx: ResolveContext, deps: ResolveDeps): Resolut
 
   // Tier 1: active-story verifiers. Story precedence is absolute — a story that
   // declares its own verifiers overrides every ecosystem inference below.
-  const storyVerifiers = (ctx.storyVerifiers ?? []).filter((verifier) => verifier.trim().length > 0)
+  // M7 (grill round 2): `verifiers` is LLM-authored and reaches the plan
+  // through `tool.schema.string()`, so an element that is not a string is a
+  // reachable input, not a theoretical one — and a bare `.trim()` on it throws
+  // straight out of a `tool.execute.after` hook, violating the fail-open
+  // convention. Filter by type before touching the value.
+  const storyVerifiers = (ctx.storyVerifiers ?? []).filter(
+    (verifier) => typeof verifier === "string" && verifier.trim().length > 0,
+  )
   if (storyVerifiers.length > 0) {
     return { command: storyVerifiers.join(" && "), rationale: "story", matchedPaths: [...paths] }
   }

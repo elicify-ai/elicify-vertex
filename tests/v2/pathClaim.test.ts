@@ -43,9 +43,19 @@ describe("parsePathAbsenceClaim — the 49-note real corpus (FR-001, SC-001a/SC-
     // Labels are derived from FILESYSTEM GROUND TRUTH against the audited
     // worktree: a note is `drop` only when it predicates absence, makes no
     // content claim, and every path it names actually exists.
-    expect(corpus.filter((r) => r.expected === "drop").length).toBeGreaterThan(0)
-    expect(corpus.filter((r) => r.expected === "keep").length).toBeGreaterThan(0)
-    expect(corpus.filter((r) => r.expected === "drop").length + corpus.filter((r) => r.expected === "keep").length).toBe(49)
+    // M12 (grill round 2): these were `toBeGreaterThan(0)`, which passes for a
+    // 48/1 corpus — i.e. it would not notice the dataset being gutted, which
+    // is the one thing an "is the corpus intact" test exists to catch. The
+    // split is 36 keep / 13 drop; SC-001a's older 42/7 figure predates the
+    // ground-truth relabelling and is wrong.
+    expect(corpus.filter((r) => r.expected === "keep")).toHaveLength(36)
+    expect(corpus.filter((r) => r.expected === "drop")).toHaveLength(13)
+    // Every row is labelled and non-empty — a blank note would silently
+    // "pass" every assertion below.
+    for (const row of corpus) {
+      expect(["keep", "drop"]).toContain(row.expected)
+      expect(row.note.trim().length).toBeGreaterThan(10)
+    }
   })
 
   // SC-002: the correct-FAIL notes MUST survive. If this ever goes red the
@@ -208,4 +218,70 @@ describe("parsePathAbsenceClaim — adversarial breadth", () => {
   ])("DROPS the pure absence claim: %s", (note) => {
     expect(parsePathAbsenceClaim(note).paths.length).toBeGreaterThan(0)
   })
+})
+
+
+// ---------------------------------------------------------------------------
+// M1 / M2 (grill round 2) — the MAJ-001 inversion, re-attacked.
+//
+// Leading a clause made a path the "subject", but in
+// `"research/renewable-energy.md Sources section is missing"` the subject of
+// "is missing" is the SECTION. 9 of 10 probed content phrasings were dropped —
+// each one a real finding the harness would have suppressed. The predicate now
+// has to attach to the path, with only auxiliaries and appositives between.
+// ---------------------------------------------------------------------------
+describe("M1 — the absence must be predicated of the path, not of its contents", () => {
+  const CONTENT_CLAIMS = [
+    "research/renewable-energy.md Sources section is missing",
+    "research/renewable-energy.md URLs are missing",
+    "research/x.md citations are missing",
+    "src/App.jsx chart legend is missing",
+    "research/x.md the Sources heading is missing",
+    "research/x.md sources not found",
+    "research/x.md KPI values are missing",
+    "src/pages/Renewable.jsx import statement is missing",
+    "research/x.md data section not present",
+    "research/x.md is missing its Sources section",
+    "research/x.md not found in the index",
+    // Mixed: one content claim, one path claim. The item cannot be half
+    // dropped, so it is kept whole.
+    "research/x.md Sources section is missing and research/y.md does not exist",
+  ]
+  for (const note of CONTENT_CLAIMS) {
+    it(`keeps: ${note}`, () => {
+      expect(parsePathAbsenceClaim(note).paths).toEqual([])
+    })
+  }
+})
+
+describe("M2 — genuine absence claims still parse, including the shapes that regressed", () => {
+  const ABSENCE_CLAIMS: Array<[string, string[]]> = [
+    ["research/renewable-energy.md does not exist", ["research/renewable-energy.md"]],
+    // An appositive restating the path is filler, not a new subject. Also the
+    // bare trailing-slash directory shape, which no path regex matched at all:
+    // `\b` cannot fire between "/" and " ", so the anchor rejected it.
+    ["the research/ directory does not exist", ["research/"]],
+    ["research/x.md is missing", ["research/x.md"]],
+    ["research/x.md missing.", ["research/x.md"]],
+    ["research/x.md was not found", ["research/x.md"]],
+    ["research/x.md is not present", ["research/x.md"]],
+    ["No src/App.tsx", ["src/App.tsx"]],
+    // The LEADING form: TRAILING_QUALIFIER read the path itself as the
+    // qualifier and rejected every note shaped this way.
+    ["missing research/x.md", ["research/x.md"]],
+    // M2 proper: the clause splitter breaks on `and` but not `or`, so the
+    // conjunction arrived attached and the path never read as clause-initial.
+    ["or research/x.md does not exist", ["research/x.md"]],
+    // Coordinated subject: the splitter separates the conjuncts, and the first
+    // one carries no predicate of its own.
+    [
+      "renewable-energy.md and space-exploration.md are MISSING on disk",
+      ["renewable-energy.md", "space-exploration.md"],
+    ],
+  ]
+  for (const [note, expected] of ABSENCE_CLAIMS) {
+    it(`recognises: ${note}`, () => {
+      expect(parsePathAbsenceClaim(note).paths).toEqual(expected)
+    })
+  }
 })
