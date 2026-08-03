@@ -169,6 +169,14 @@ export function resetTurnState(state: V2SessionState): void {
   // no activity, and the user speaking again is exactly the event that
   // should re-arm it. `activityMarker` itself is monotonic and deliberately
   // NOT reset (it is compared by value, not by age).
+  // CRIT-002 (code review): the ONLY unconditional release of the in-flight
+  // guard. `promptContinuation` deliberately holds it across a timeout (the
+  // turn is still streaming), so without this a prompt that never settles —
+  // or a synchronous throw — would leave the harness inert for the rest of
+  // the session: `plugin.ts`'s `chat.message` returns early while it is set.
+  // A real user message is the turn boundary that genuinely ends any
+  // outstanding continuation.
+  state.idleContinuationInFlight = false
   state.markerAtLastContinuation = -1
   state.consecutiveNoProgress = 0
   state.stallPaused = false

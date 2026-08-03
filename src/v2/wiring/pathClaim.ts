@@ -131,38 +131,61 @@ export function parsePathAbsenceClaim(note: string): PathClaim {
     if (!allAbsenceOrConsequence) return { paths: [], reason: "second-negation" }
   }
 
-  const bareForSubject = stripQuoted(note)
+  // Rule 5: a path inside a quoted/backticked span names a COMMAND, not a
+  // claim ("Declared verifier `test -f package.json` would fail").
+  const bare = stripQuoted(note)
+  if (bare.trim() !== note.trim() && !PATH_TOKEN.test(bare)) {
+    PATH_TOKEN.lastIndex = 0
+    return { paths: [], reason: "quoted-command" }
+  }
+  PATH_TOKEN.lastIndex = 0
+  const bareForSubject = bare
 
   // Rule 1b: the absence must be predicated OF the path, not of something the
   // path contains.
   if (TRAILING_QUALIFIER.test(note)) return { paths: [], reason: "second-negation" }
 
-  // Rule 1c: the path must be the SUBJECT of the absence, not the object of a
-  // preposition. "the Sources section **of** research/x.md was not found" is a
-  // content claim whose grammatical subject is "the Sources section", so
-  // dropping it would suppress a real finding. Only rejects when EVERY
-  // occurrence of every path token is preposition-bound — "x.md not found in
-  // research/" still has `x.md` as a bare subject and stays droppable.
-  const pathHits = [...bareForSubject.matchAll(PATH_TOKEN)]
-  if (pathHits.length > 0) {
-    const everyHitPrepositionBound = pathHits.every((hit) =>
-      /\b(?:of|inside|within|belonging\s+to)\s+$/i.test(bareForSubject.slice(0, hit.index ?? 0)),
-    )
-    if (everyHitPrepositionBound) return { paths: [], reason: "second-negation" }
+  // Rule 1c (rewritten after code review MAJ-001): the path must be the
+  // GRAMMATICAL SUBJECT of the absence, not the object of a preposition.
+  //
+  // The previous version whitelisted only `of|inside|within|belonging to` and
+  // required EVERY occurrence to be bound, so six content claims still
+  // dropped — each of which would have suppressed a real finding:
+  //
+  //     Sources for research/renewable-energy.md are missing
+  //     Citations in research/renewable-energy.md are missing
+  //     The chart legend in src/pages/Renewable.jsx is missing
+  //
+  // Inverted to a whitelist: the note qualifies only when a path token is the
+  // subject, i.e. it appears at the very start of a clause (optionally after
+  // a determiner/quantifier) or directly after a leading absence word. Any
+  // other placement — notably after ANY preposition — is a content claim.
+  // Split on clause boundaries WITHOUT shredding path tokens: a bare `.` or
+  // `,` inside `research/x.md` must not end a clause, so a delimiter only
+  // counts when followed by whitespace (or end of string). An earlier version
+  // split on `[.;,]` unconditionally and turned `research/x.md ...` into the
+  // clauses `research/x` + `md does not exist`, which made every genuine
+  // absence claim unrecognisable (caught by the corpus test).
+  const clauses = bareForSubject
+    .split(/(?:[.;,](?=\s|$)|\s+\band\b\s+|\s+\bbut\b\s+)/i)
+    .filter((c) => /\w/.test(c))
+  const SUBJECT_LEAD = /^\s*(?:the\s+|a\s+|an\s+|file\s+|directory\s+|no\s+|missing\s+)*([\w.-]*(?:\/[\w.-]+)+\/?|[\w-]+\.(?:md|json|jsx|tsx|ts|js|css|html|ya?ml|toml|txt))\b/i
+  const subjectPaths = new Set<string>()
+  for (const clause of clauses) {
+    const lead = SUBJECT_LEAD.exec(clause)
+    if (lead) subjectPaths.add(lead[1].replace(/[.,;:]+$/, ""))
   }
-
-  const bare = stripQuoted(note)
-  if (bare.trim() !== note.trim() && !/[\w.-]*\//.test(bare)) {
-    // Every path lived inside a quoted command.
-    return { paths: [], reason: "quoted-command" }
-  }
+  if (subjectPaths.size === 0) return { paths: [], reason: "second-negation" }
 
   // Rule 1: the note must actually predicate absence.
   if (!ABSENCE_PREDICATE.test(bare) && !LEADING_ABSENCE.test(bare)) {
     return { paths: [], reason: "no-absence-predicate" }
   }
 
-  const paths = [...new Set((bare.match(PATH_TOKEN) ?? []).map((p) => p.replace(/[.,;:]+$/, "")))]
+  // Only subject-position paths are contradictable (rule 1c).
+  const paths = [...new Set((bare.match(PATH_TOKEN) ?? []).map((p) => p.replace(/[.,;:]+$/, "")))].filter((p) =>
+    subjectPaths.has(p),
+  )
   if (paths.length === 0) return { paths: [], reason: "no-path-token" }
   return { paths }
 }

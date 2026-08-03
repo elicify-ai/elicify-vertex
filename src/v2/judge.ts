@@ -413,7 +413,7 @@ function unitTrips(text: string): boolean {
  * FR-006a (it would contradict US6 AS3, "a secret in the plan digest is
  * still redacted").
  */
-const ENTROPY_PAIR_MIN_FRAGMENT_CHARS = ENTROPY_MIN_TOKEN_LENGTH / 2
+// (superseded by PATHLIKE_AT_JOIN — see CRIT-001 note below)
 
 /**
  * Does a `SECRET_PATTERNS` match cross `joinIdx`?
@@ -461,6 +461,28 @@ function hexRunStraddles(joined: string, joinIdx: number): boolean {
  * `ENTROPY_PAIR_MIN_FRAGMENT_CHARS`' comment for the measurements behind the
  * fragment bar.
  */
+/**
+ * Characters that never appear inside a secret token but are ubiquitous in
+ * the file paths / identifiers this fix exists to protect. A fused token
+ * containing one of these on the LEFT of the join is a path-plus-next-word
+ * artifact, not a wrapped secret.
+ *
+ * CRIT-001 fix (code review, reproduced): the previous discriminator was a
+ * fragment-LENGTH bar (each side >= 16 chars). That let a real wrapped secret
+ * leak whenever the split was uneven — a 42-char token split 27/15 transmitted
+ * BOTH fragments where the pre-fix code redacted them:
+ *
+ *     pre-fix : criteria: undefined            events: [judge:field-dropped]
+ *     post-fix: criteria: ["sV8kQz3RtY7pLm…","1jK5aZ0eR8uT3iO"]   events: []
+ *
+ * Length cannot separate the classes (a wrap can be arbitrarily uneven), so
+ * the bar is now SHAPE: a secret is continuous random material, whereas the
+ * production false positive (`…space-exploration.json` + `S2`) carries `/`
+ * and `.` — structure a random token does not have. Erring toward redaction
+ * is the correct direction for a payload leaving the process.
+ */
+const PATHLIKE_AT_JOIN = /[/\\.:@=+ ]/
+
 function entropyTokenStraddles(joined: string, joinIdx: number): boolean {
   const re = /\S+/g
   let match: RegExpExecArray | null
@@ -470,9 +492,14 @@ function entropyTokenStraddles(joined: string, joinIdx: number): boolean {
     const end = start + token.length
     if (token.length < ENTROPY_MIN_TOKEN_LENGTH) continue
     if (!(start < joinIdx && end > joinIdx)) continue
-    if (joinIdx - start < ENTROPY_PAIR_MIN_FRAGMENT_CHARS) continue
-    if (end - joinIdx < ENTROPY_PAIR_MIN_FRAGMENT_CHARS) continue
-    if (shannonEntropyBitsPerChar(token) >= ENTROPY_EFFECTIVE_THRESHOLD_BITS) return true
+    if (shannonEntropyBitsPerChar(token) < ENTROPY_EFFECTIVE_THRESHOLD_BITS) continue
+    // The join is only exonerated when the material immediately around it is
+    // structurally path-like. Everything else — including a lopsided wrap —
+    // is treated as a possible secret and the pair is dropped.
+    const leftFragment = joined.slice(start, joinIdx)
+    const rightFragment = joined.slice(joinIdx, end)
+    if (PATHLIKE_AT_JOIN.test(leftFragment) || PATHLIKE_AT_JOIN.test(rightFragment)) continue
+    return true
   }
   return false
 }

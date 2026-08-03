@@ -19,7 +19,7 @@
  * which is exactly the failure mode that killed the original story-level veto
  * (grill round 2, C-2/C-3).
  */
-import { existsSync, readFileSync } from "node:fs"
+import { readFileSync } from "node:fs"
 import { join } from "node:path"
 
 import { describe, expect, it } from "vitest"
@@ -67,11 +67,22 @@ describe("parsePathAbsenceClaim — the 49-note real corpus (FR-001, SC-001a/SC-
    * exist and two do not — is correctly KEPT even though the parser extracts
    * its paths.
    */
-  const AUDITED_WORKTREE = "/workspace/vertextest2"
+  /**
+   * CRIT-003 (code review): this used to call `existsSync` against
+   * `/workspace/vertextest2` — a directory outside the repo, absent on any
+   * other machine (measured: 13/49 misclassified there) and mutable live
+   * state on the pod it did exist on. The audited worktree's LAYOUT is now a
+   * committed fixture, so SC-001a is reproducible anywhere.
+   */
+  const layout: Record<string, boolean> = (
+    JSON.parse(
+      readFileSync(join(process.cwd(), "tests/fixtures/judge-replay/worktree-layout.json"), "utf8"),
+    ) as { paths: Record<string, boolean> }
+  ).paths
   const wouldDrop = (note: string): boolean => {
     const { paths } = parsePathAbsenceClaim(note)
     if (paths.length === 0) return false
-    return paths.every((p) => existsSync(join(AUDITED_WORKTREE, p)))
+    return paths.every((p) => layout[p] === true)
   }
 
   it("matches the labelled expectation for every one of the 49 notes", () => {
@@ -129,6 +140,24 @@ describe("parsePathAbsenceClaim — rules (FR-001, C-3)", () => {
     ["the Sources section of research/x.md was not found", "path is the object of a preposition, not the subject"],
     ["x.md missing. Additionally the KPIs are fabricated.", "a later sentence makes an independent claim"],
   ])("never drops a content claim dressed as absence: %s", (note) => {
+    expect(parsePathAbsenceClaim(note).paths).toEqual([])
+  })
+
+  /**
+   * MAJ-001 (code review): the path must be the GRAMMATICAL SUBJECT of the
+   * absence. Every one of these is a CONTENT failure phrased with the path as
+   * a prepositional object — the first is a trivial rephrasing of the corpus's
+   * own correct-FAIL note. Dropping any of them would suppress a real finding,
+   * which is the exact hazard that forced the story-level veto's withdrawal.
+   */
+  it.each([
+    ["Sources for research/renewable-energy.md are missing"],
+    ["Citations in research/renewable-energy.md are missing"],
+    ["Three of the five KPIs in data/kpis.json are missing"],
+    ["The chart legend in src/pages/Renewable.jsx is missing"],
+    ["A Sources section for research/renewable-energy.md was not found"],
+    ["The import statement in src/pages/Renewable.jsx is missing"],
+  ])("keeps a content claim whose path is a prepositional object: %s", (note) => {
     expect(parsePathAbsenceClaim(note).paths).toEqual([])
   })
 

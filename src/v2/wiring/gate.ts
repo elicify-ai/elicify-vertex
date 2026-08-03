@@ -178,27 +178,43 @@ async function promptContinuation(
   //     cleared only when the prompt actually settles — and by the next real
   //     `chat.message`, which is the turn boundary that genuinely ends it.
   let settled = false
+  const release = (): void => {
+    settled = true
+    if (state) state.idleContinuationInFlight = false
+  }
   try {
     const timeoutPromise = new Promise<never>((_, reject) => {
       timeoutHandle = setTimeout(() => reject(new Error(CONTINUATION_TIMEOUT_ERROR)), CONTINUATION_TIMEOUT_MS)
     })
-    const prompt = ctx.client.session
-      .prompt({ path: { id: sid }, body: { parts: [{ type: "text", text }] } } as never)
-      // The prompt keeps running past a timeout; clear the guard whenever it
-      // eventually settles so a stalled session cannot stay wedged forever.
-      .then(
+    // CRIT-002 (code review): `session.prompt` may throw SYNCHRONOUSLY. That
+    // throw never reaches the `.then`/`.catch` below, so with the guard
+    // released only there, one sync throw left `idleContinuationInFlight`
+    // stuck true — and `plugin.ts`'s `chat.message` returns early while it is
+    // set, so the whole harness went inert for the session with no log. The
+    // promise is therefore constructed inside its own try, and every
+    // non-timeout exit releases the guard.
+    let prompt: Promise<unknown>
+    try {
+      prompt = Promise.resolve(
+        ctx.client.session.prompt({ path: { id: sid }, body: { parts: [{ type: "text", text }] } } as never),
+      )
+    } catch (syncErr) {
+      release()
+      throw syncErr
+    }
+    await Promise.race([
+      prompt.then(
         (value: unknown) => {
-          settled = true
-          if (state) state.idleContinuationInFlight = false
+          release()
           return value
         },
         (err: unknown) => {
-          settled = true
-          if (state) state.idleContinuationInFlight = false
+          release()
           throw err
         },
-      )
-    await Promise.race([prompt, timeoutPromise])
+      ),
+      timeoutPromise,
+    ])
   } catch (err) {
     const isTimeout = err instanceof Error && err.message === CONTINUATION_TIMEOUT_ERROR
     if (isTimeout) {
@@ -217,9 +233,11 @@ async function promptContinuation(
     }
   } finally {
     if (timeoutHandle) clearTimeout(timeoutHandle)
-    // Only release the guard when the prompt actually settled. On the timeout
-    // path the turn is still streaming, so the `.then`/`.catch` above owns the
-    // release (see FR-012 note).
+    // Only the TIMEOUT path leaves the guard held (the turn is still
+    // streaming and the guard is the sole defence against the continuation
+    // echoing itself — see `handleSessionIdle`). Every other exit released it
+    // above, and `resetTurnState` clears it on the next real user message so
+    // a never-settling prompt cannot wedge the session forever.
     if (settled && state) state.idleContinuationInFlight = false
   }
 }
