@@ -54,7 +54,7 @@
  */
 
 import { redactSecrets } from "../redaction.js"
-import { JUDGE_PROBE_POLICY, probeCapabilityBounded, runSubturn, type SelfCreatedSessions } from "./subturn.js"
+import { JUDGE_PROBE_POLICY, probeCapabilityBounded, runSubturn, type SelfCreatedSessions, type SubturnResult } from "./subturn.js"
 import type { EventLogger, OpencodeClient } from "./types.js"
 
 // ---------------------------------------------------------------------------
@@ -892,8 +892,8 @@ type ModelRef = { providerID: string; modelID: string }
  * exists.
  */
 export type JudgeRunResult =
-  | { verdict: JudgeVerdict; childSessionID?: string }
-  | { verdict: null; reason: "unsupported" | "unavailable" | "malformed"; childSessionID?: string }
+  | { verdict: JudgeVerdict; childSessionID?: string; observedToolCall?: boolean }
+  | { verdict: null; reason: "unsupported" | "unavailable" | "malformed"; childSessionID?: string; observedToolCall?: boolean }
 
 const JUDGE_AGENT_NAME = "vertex-judge"
 
@@ -1231,7 +1231,9 @@ export async function runJudge(
   const attempts: ModelRef[] = judgeModelOverride ? [judgeModelOverride, sessionModel] : [sessionModel]
   const parts = [{ type: "text" as const, text: JSON.stringify(payload) }]
 
-  let last: { ok: true; text: string } | { ok: false; reason: string } | null = null
+  // NOTE: must carry `observedToolCall` (FR-014) — a narrower type here
+  // silently strips the flag `runSubturn` captured before deleting the child.
+  let last: SubturnResult | null = null
 
   for (const model of attempts) {
     const remaining = JUDGE_TOTAL_BUDGET_MS - (Date.now() - start)
@@ -1257,22 +1259,27 @@ export async function runJudge(
   // the key — so it is spread conditionally, keeping "no child" as an ABSENT
   // key rather than an explicitly-undefined one.
   const child = observed.childSessionID === undefined ? {} : { childSessionID: observed.childSessionID }
+  // FR-014 (code review MAJ-004): `runSubturn` reads the tool-call fact BEFORE
+  // it deletes the child session, so the flag rides on the subturn result. Same
+  // absent-vs-undefined discipline as `child` above: "we could not tell" must
+  // stay an ABSENT key so the gate fails open on it.
+  const toolCall = last?.observedToolCall === undefined ? {} : { observedToolCall: last.observedToolCall }
 
   if (!last || !last.ok) {
     logger("judge:unavailable", { reason: last?.reason ?? "unknown" })
-    return { verdict: null, reason: "unavailable", ...child }
+    return { verdict: null, reason: "unavailable", ...child, ...toolCall }
   }
 
   const parsed = parseJudgeResponse(last.text)
   if (parsed === undefined) {
     logger("judge:malformed", { reason: "response is not valid JSON" })
-    return { verdict: null, reason: "malformed", ...child }
+    return { verdict: null, reason: "malformed", ...child, ...toolCall }
   }
 
   if (!isJudgeVerdictShape(parsed)) {
     logger("judge:malformed", { reason: "response does not match {stories: [{storyId, pass, summary, items}]} shape" })
-    return { verdict: null, reason: "malformed", ...child }
+    return { verdict: null, reason: "malformed", ...child, ...toolCall }
   }
 
-  return { verdict: parsed, ...child }
+  return { verdict: parsed, ...child, ...toolCall }
 }

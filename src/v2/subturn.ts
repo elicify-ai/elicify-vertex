@@ -509,7 +509,42 @@ export interface SubturnRequest {
   timeoutMs: number
 }
 
-export type SubturnResult = { ok: true; text: string } | { ok: false; reason: string }
+export type SubturnResult =
+  | { ok: true; text: string; observedToolCall?: boolean }
+  | { ok: false; reason: string; observedToolCall?: boolean }
+
+/**
+ * FR-014 (code review MAJ-004): did the child session make at least one tool
+ * call before answering?
+ *
+ * This MUST be read inside `runSubturn`, because its `finally` AWAITS
+ * `deleteChildSession` before returning — by the time a caller sees the
+ * result the session is gone, so a caller-side read always degrades to
+ * "cannot tell" and the tool-call floor never fires against a real host.
+ * That is exactly the defect the code review found: the passing test only
+ * worked because its stub kept serving parts after `session.delete`.
+ *
+ * Returns `undefined` (not `false`) when the parts cannot be read, so the
+ * caller can distinguish "the judge did not look" from "we could not tell"
+ * and fail open on the latter.
+ */
+async function readObservedToolCall(client: OpencodeClient, childID: string): Promise<boolean | undefined> {
+  try {
+    const raw = await client.session.messages({ path: { id: childID } } as never)
+    const list = isFieldsStyleResult(raw) ? raw.data : raw
+    if (!Array.isArray(list)) return undefined
+    let sawAnyPart = false
+    for (const entry of list as Array<{ parts?: Array<{ type?: string }> }>) {
+      for (const part of entry.parts ?? []) {
+        sawAnyPart = true
+        if (part?.type === "tool") return true
+      }
+    }
+    return sawAnyPart ? false : undefined
+  } catch {
+    return undefined
+  }
+}
 
 const SUBTURN_TIMEOUT_MESSAGE = "vertex:subturn-timeout"
 /** Internal-only title for harness-created child sessions; not part of the public contract. */
@@ -637,7 +672,10 @@ export async function runSubturn(
   selfCreated.record(childID, req.parentSessionID)
 
   try {
-    return await promptChildSession(client, childID, req)
+    const result = await promptChildSession(client, childID, req)
+    // FR-014: read the tool-call fact BEFORE the `finally` deletes the child.
+    const observedToolCall = await readObservedToolCall(client, childID)
+    return observedToolCall === undefined ? result : { ...result, observedToolCall }
   } finally {
     await deleteChildSession(client, childID, logger)
   }

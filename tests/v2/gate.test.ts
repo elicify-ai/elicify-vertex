@@ -911,10 +911,18 @@ function stubJudge(
   childParts: Array<{ type: string }> = [{ type: "tool" }],
 ): void {
   const session = h.ctx.client.session as unknown as Record<string, unknown>
+  // Model the REAL host: `runSubturn`'s finally AWAITS session.delete, and a
+  // deleted session serves no parts. The FR-014 read must therefore happen
+  // inside runSubturn (code review MAJ-004) — a stub that keeps serving parts
+  // after delete would hide that the floor never fires in production.
+  let childDeleted = false
   session.create = vi.fn(async () => ({ data: { id: "judge-child-1" }, error: undefined }))
-  session.delete = vi.fn(async () => ({ data: {}, error: undefined }))
+  session.delete = vi.fn(async () => {
+    childDeleted = true
+    return { data: {}, error: undefined }
+  })
   session.messages = vi.fn(async (args: { path?: { id?: string } }) =>
-    args?.path?.id === "judge-child-1"
+    args?.path?.id === "judge-child-1" && !childDeleted
       ? { data: [{ info: { role: "assistant" }, parts: childParts }], error: undefined }
       : { data: [], error: undefined },
   )

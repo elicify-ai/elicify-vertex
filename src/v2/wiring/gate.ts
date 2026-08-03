@@ -741,39 +741,42 @@ function bumpReaudit(state: V2SessionState, storyId: string): void {
 }
 
 /**
- * FR-014 — did the judge actually look at anything before failing a story?
+ * MAJ-003 — a verdict the harness declines to APPLY must still be bounded.
  *
- * Reads the judge child session's persisted parts for a tool call. Returns
- * `null` when it cannot tell (no child id, fetch failure, session already
- * deleted) — the caller treats `null` as "apply the verdict", preserving the
- * fail-open convention. Only an explicit `false` (parts readable, zero tool
- * calls) suppresses.
+ * Both non-applying paths (FR-005 contradictory, FR-014 unverified) used to
+ * `return false` without stamping the story, so the audit selector's
+ * `!story.judge` test re-selected it on the very next idle — a full judge
+ * subturn per idle, forever, with FR-007's cap never reached because it is
+ * enforced further down. Measured before this fix: 8 subturns over 8 idles.
  *
- * The child is deleted in `subturn.ts`'s `finally`, so this is best-effort by
- * construction; `runJudge` surfaces the id so the read can happen before that
- * cleanup where the host allows it.
+ * Stamping records WHY the verdict was not applied (so the state is
+ * inspectable) and bumping the counter lets the cap eventually escalate to
+ * the operator, which is the intended terminal state.
  */
-async function judgeObservedSomething(
+function boundUnappliedVerdicts(
   ctx: GateContext,
   sid: string,
-  childSessionID: string | undefined,
-): Promise<boolean | null> {
-  if (!childSessionID) return null
+  state: V2SessionState,
+  verdicts: readonly JudgeStoryVerdict[],
+  reason: "contradictory" | "unverified",
+): void {
+  for (const verdict of verdicts) {
+    bumpReaudit(state, verdict.storyId)
+  }
   try {
-    const raw = await ctx.client.session.messages({ path: { id: childSessionID } } as never)
-    const list = isFieldsStyle(raw) ? raw.data : raw
-    if (!Array.isArray(list)) return null
-    let sawPart = false
-    for (const entry of list as Array<{ parts?: Array<{ type?: string }> }>) {
-      for (const part of entry.parts ?? []) {
-        sawPart = true
-        if (part?.type === "tool") return true
-      }
-    }
-    return sawPart ? false : null
+    ctx.storyEngine.applyJudgeVerdicts(
+      sid,
+      verdicts.map((v) => ({
+        storyId: v.storyId,
+        // Never revert on an unapplied verdict — the point is to record that
+        // the harness did NOT act on it, not to act on it by another route.
+        pass: true,
+        summary: `verdict not applied (${reason}): ${v.summary}`,
+        items: v.items,
+      })),
+    )
   } catch {
-    void sid
-    return null
+    // Fail-open: bounding is best-effort bookkeeping, never a new throw path.
   }
 }
 
@@ -906,7 +909,11 @@ async function handleJudgeAudit(ctx: GateContext, sid: string, state: V2SessionS
   // the 49 recovered real notes are content-only, the class no path check can
   // ever contradict). Fail-open: an unreadable child session applies the
   // verdict exactly as before.
-  const observed = await judgeObservedSomething(ctx, sid, result.childSessionID)
+  // FR-014 — the tool-call floor. Reads the flag `runSubturn` captured BEFORE
+  // it deleted the child session (code review MAJ-004: a gate-side read always
+  // saw a deleted session, so this floor never fired against a real host).
+  // `undefined` means "could not tell" and fails open, exactly as before.
+  const observed = result.observedToolCall
   if (observed === false && onTarget.some((v) => v.items.some((i) => !i.met))) {
     ctx.logger("judge:unverified", { sessionID: sid, stories: onTarget.map((v) => v.storyId) })
     void ctx.visibility?.notify("health", {
@@ -915,7 +922,14 @@ async function handleJudgeAudit(ctx: GateContext, sid: string, state: V2SessionS
       message: "the completion judge failed stories without observing the worktree — verdict not applied",
       variant: "warning",
     })
+    // MAJ-003: this drop-path must still count toward the re-audit cap and
+    // stamp the story, or the audit selector re-selects it every idle forever
+    // (measured: 8 judge subturns over 8 idles, cap never firing).
+    boundUnappliedVerdicts(ctx, sid, state, onTarget, "unverified")
     return false
+  }
+  if (observed === undefined) {
+    ctx.logger("judge:crosscheck-inconclusive", { sessionID: sid, reason: "child session parts unreadable" })
   }
 
   // FR-001 + FR-005 — reconcile each verdict against deterministic fact
@@ -930,7 +944,10 @@ async function handleJudgeAudit(ctx: GateContext, sid: string, state: V2SessionS
     // re-audit cap bound the retry.
     if (!verdict.pass && verdict.items.length > 0 && verdict.items.every((i) => i.met)) {
       ctx.logger("judge:verdict-contradictory", { sessionID: sid, storyId: verdict.storyId })
-      bumpReaudit(state, verdict.storyId)
+      // MAJ-003: bound it — bump the cap AND stamp the story, otherwise the
+      // audit selector (`!story.judge`) re-selects it on every subsequent
+      // idle and the judge is re-run forever with no exit.
+      boundUnappliedVerdicts(ctx, sid, state, [verdict], "contradictory")
       continue
     }
 
