@@ -19,3 +19,4 @@ coverage/
 
 # opencode local project state
 .opencode/
+.playwright-mcp/
