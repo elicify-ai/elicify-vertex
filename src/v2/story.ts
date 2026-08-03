@@ -512,6 +512,17 @@ function isJudgeItemNote(value: unknown): value is JudgeItemNote {
   )
 }
 
+/**
+ * M9: does this `plan.json` entry come from a schema NEWER than the one this
+ * module writes? Such an entry cannot be validated here, but it is real data
+ * belonging to another session — see `readPlanFile`.
+ */
+function isFutureSchemaEntry(value: unknown): boolean {
+  if (!isRecord(value)) return false
+  const version = value.schemaVersion
+  return typeof version === "number" && version > 2
+}
+
 function isStoryJudgeStamp(value: unknown): value is StoryJudgeStamp {
   if (!isRecord(value)) return false
   if (typeof value.pass !== "boolean") return false
@@ -844,6 +855,14 @@ export class StoryEngine {
    * unchanged outcome), and a genuine loss is reported as itself.
    */
   private readonly pendingPersist = new Set<string>()
+
+  /**
+   * M9: `plan.json` entries belonging to OTHER sessions that this version's
+   * validator rejected. Held verbatim between the read and the write of a
+   * single `mutate` so a write never deletes data it merely failed to
+   * understand. Refreshed on every `readPlanFile`.
+   */
+  private foreignEntries: Record<string, unknown> = {}
 
   constructor(opts: { stateDir: string; logger: EventLogger }) {
     this.stateDir = opts.stateDir
@@ -2116,8 +2135,34 @@ export class StoryEngine {
     // and can safely disregard entry-by-entry (not "someone else's unreadable
     // data") — degrade gracefully, same as before.
     if (isRecord(parsed)) {
+      // M9 (grill round 2): an entry this version cannot validate used to be
+      // DROPPED here — and `persistPlan` then wrote the file back without it,
+      // deleting another session's plan from disk with no log and no error.
+      // The realistic trigger is a mixed-version machine (the audited session
+      // had two plugin instances live at once): a newer peer writes a plan
+      // carrying a field this validator rejects, and this instance quietly
+      // destroys it on its next write.
+      //
+      // An entry from a FUTURE schema is not ours to delete: keep it verbatim
+      // and hand it back untouched at write time. Deliberately narrow —
+      // schema-invalid junk (`stories: "not an array"` at our own version) is
+      // still dropped, which is the existing, tested graceful degradation.
+      // Only a higher `schemaVersion` says "a newer peer wrote this and I am
+      // not equipped to read it". Only THIS session's entry is ever rewritten
+      // from parsed state, so preserving a raw value can never resurrect a
+      // stale copy of our own plan.
+      this.foreignEntries = {}
       for (const [sid, value] of Object.entries(parsed)) {
-        if (isPlanV2(value)) file[sid] = coerceLoadedPlan(value)
+        if (isPlanV2(value)) {
+          file[sid] = coerceLoadedPlan(value)
+        } else if (sid !== sessionID && isFutureSchemaEntry(value)) {
+          this.foreignEntries[sid] = value
+          this.logger("plan:foreign-entry-preserved", {
+            sessionID,
+            foreignSessionID: sid,
+            schemaVersion: (value as { schemaVersion?: unknown }).schemaVersion,
+          })
+        }
       }
     }
     return file
@@ -2189,11 +2234,13 @@ export class StoryEngine {
       next = { ...file }
       delete next[sessionID]
     }
-    this.atomicWrite(next)
+    // M9: entries this version could not parse are written back exactly as
+    // they were read. Spread FIRST so a real entry always wins the key.
+    this.atomicWrite({ ...this.foreignEntries, ...next })
   }
 
   /** Atomic write: `wx` temp file + rename, mode 0600 (pattern reference: `src/goals.ts`, `pin.ts`). */
-  private atomicWrite(file: Record<string, PlanV2>): void {
+  private atomicWrite(file: Record<string, PlanV2 | unknown>): void {
     fsIO.mkdirSync(this.stateDir, { recursive: true, mode: 0o700 })
     const tmpPath = join(this.stateDir, `.plan.${process.pid}.${randomUUID()}.tmp`)
     try {

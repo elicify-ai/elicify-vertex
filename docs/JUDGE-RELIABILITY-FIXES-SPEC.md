@@ -652,7 +652,7 @@ A live probe isolated the true cause of the fabrications. Given only the plan di
 
 ### Dataset: Path-claim discrimination (built from the 49 recovered real notes)
 
-Committed as `tests/fixtures/judge-replay/item-notes.json` (49 unique notes, 42 `keep` / 7 `drop`). Representative rows:
+Committed as `tests/fixtures/judge-replay/item-notes.json` (49 unique notes, 36 `keep` / 13 `drop`). Representative rows:
 
 | # | Note (real text, truncated) | Class | Expected | Traces to |
 |---|---|---|---|---|
@@ -724,7 +724,7 @@ New regression guards: TDD tests 2, 3, 12, 14, plus the 49-note corpus (test 5).
 
 ## Success Criteria
 
-- **SC-001a** *(deterministic)*: against `tests/fixtures/judge-replay/item-notes.json` (49 real recovered notes, 42 `keep` / 7 `drop`), the discriminator matches the labelled `expected` for **all 49**, and the 7 path fabrications produce **0 reverts**.
+- **SC-001a** *(deterministic)*: against `tests/fixtures/judge-replay/item-notes.json` (49 real recovered notes, 36 `keep` / 13 `drop`), the discriminator matches the labelled `expected` for **all 49**, and the 13 path fabrications produce **0 reverts**. *(Corrected 2026-08-03: the earlier 42/7 figure predates the filesystem-ground-truth relabelling of the fixture.)*
 - **SC-001b** *(measured, not asserted)*: on the live P1 probe with the FR-011 prompt+digest, the judge makes ≥1 tool call and does not fabricate. An expectation about a model, stated as such.
 - **SC-002**: the 3 real correct-FAIL notes are labelled `keep` and still produce a revert — the discriminator cannot suppress a correct FAIL. Uses the REAL recovered strings, so the test cannot be tuned to the matcher.
 - **SC-003**: a two-engine concurrent-write test ends with **both** stamps present (0 lost updates).
@@ -868,3 +868,42 @@ Two adversarial review rounds, both returning FAIL. Every material finding was *
 | P4 | `pwd && ls -1` via the judge | `/tmp/judgeprobe/wt` — **cwd correct** |
 
 Conclusions: `maxSteps: None` does not cap the judge (it ran 3 steps); tools, permissions and cwd are all correct; **the defect is the payload/prompt path** — P1 and P2 differ only in prompt specificity and produced opposite verdicts on identical bytes. FR-008 downgraded to cleanup; **FR-011** is the root-cause fix, with FR-014 as the deterministic floor.
+
+
+---
+
+## Round-3 corrections (post-implementation code review, 2026-08-03)
+
+Findings from the second `/grill-code` pass, each reproduced before being
+fixed. Recorded here because several contradict what an earlier round of this
+spec asserted.
+
+| # | Finding | Status |
+|---|---------|--------|
+| C1 | A secret split across two payload units leaked a usable fragment at 800 of 3425 probed split points: the tail tripped alone and was dropped, the head was under every standalone threshold and survived. The adjacent-pair check was skipped whenever either unit had already tripped. | Fixed. 0 leaks over 5800 two-way splits (base64/hex/base64url/48-byte). Three-way splits where no two consecutive pieces reach 32 chars remain out of scope — measured at 135/1005 and documented at `scanUnits`. |
+| C2 | `boundUnappliedVerdicts` wrote `pass: true` for verdicts the harness refused to act on, so an unverified story satisfied the close-out's `allPassed`. | Fixed — `judge.unapplied` carries the refusal; `pass` reports what the judge said. |
+| C3 | An aborted plan write is retained in memory, which is correct after a transient collision but silently lost when a peer merge follows — the measured 7-12% stamp loss. | Fixed — pending changes are flushed by any later mutation, a destructive merge logs `plan:unpersisted-change-lost`, and `consumeWriteAbort` lets the checkpoint tool report `persisted: false`. |
+| C4 | `test -d research` parsed to `targets: []`, so an observed `test -d src` minted a receipt for `research`. | Fixed — filesystem-predicate runners treat every non-flag operand as a path. |
+| M1/M2 | The MAJ-001 inversion was not fixed, only moved: 9 of 10 content phrasings still false-dropped. Plus three further defects found while measuring (coordinated subjects, absence claims with no path, the bare `research/` shape no regex matched). | Fixed — 0 false drops and 0 missed fabrications on the 49-note corpus. |
+| M3 | The FR-007 cap stopped the revert but not the loop: it never stamped, so the selector re-ran a full judge subturn every idle. | Fixed — capped verdicts take a `"capped"` bounding stamp and are reported as DISPUTED, not unverified. |
+| M4 | The CRIT-002 backstop was inert — `chat.message` returned above the `resetTurnState` that releases the guard. | Fixed — the guard distinguishes our own echo from user intent. |
+| M5/M6/M7 | FR-013's individual crediting only ran in the no-changed-paths branch; the FR-034 compliance join omitted `workspaceRoot`; `.trim()` on an LLM-authored verifier could throw into a hook. | Fixed. |
+| M8 | `archiveV1IfPresent` threw into the host on lock contention. | Fixed — deferred to the next call. |
+| M9 | `readPlanFile` dropped entries it could not validate and `persistPlan` wrote the file back without them, deleting a peer's plan silently. | Fixed narrowly — only entries with a HIGHER `schemaVersion` are preserved; junk at the current version still degrades gracefully, as its existing test requires. |
+| M10/M11 | An aborted `clearPlan`/`createPlan` reported success. | Covered by C3's `consumeWriteAbort` surface. |
+| M12 | "The corpus itself is intact" asserted `toBeGreaterThan(0)`, which passes for a 48/1 corpus. | Fixed — pinned to the real 36/13 split. |
+
+### Two spec assertions that were wrong
+
+1. **SC-001a's 42/7 split.** The fixture is 36 `keep` / 13 `drop`. Corrected above.
+2. **"An aborted write is not lost work — the next mutation re-reads and re-persists it."** True only while no peer writes in between, and a peer writing is precisely why the lock was contended. See C3.
+
+### Two contracts deliberately NOT changed
+
+Both were reconsidered during this round and kept, because an existing test
+encodes them as intentional:
+
+- `mutate` keeps an aborted write's change in memory rather than rolling it
+  back. Rolling back would discard the change in the common recoverable case.
+- Schema-invalid entries at the current version are still discarded. Only a
+  future `schemaVersion` is preserved.

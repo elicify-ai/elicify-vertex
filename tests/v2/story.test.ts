@@ -1725,6 +1725,54 @@ describe("FR-002c/FR-010: lock contention retries, then aborts the write without
     expect(existsSync(join(stateDir, "goals.json"))).toBe(true)
   })
 
+  // M9 (grill round 2): a mixed-version machine. `readPlanFile` dropped every
+  // entry its validator rejected, and `persistPlan` then wrote the file back
+  // without them — deleting another session's plan with no log and no error.
+  // The audited session had two plugin instances live at once, which is
+  // exactly the setup where a newer peer's plan meets an older reader.
+  it("M9: a NEWER-schema peer entry survives this version's write", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se, logger } = engine(stateDir)
+    const plan = se.createPlan("s1", [story()])
+    const taskId = plan.stories[0].tasks[0].id
+    const planPath = join(stateDir, "plan.json")
+
+    const onDisk = JSON.parse(readFileSync(planPath, "utf8")) as Record<string, unknown>
+    onDisk["peer-session"] = { schemaVersion: 3, stories: [], somethingNew: { we: "cannot parse" } }
+    writeFileSync(planPath, JSON.stringify(onDisk))
+
+    se.checkpoint("s1", taskId, "complete")
+
+    const after = JSON.parse(readFileSync(planPath, "utf8")) as Record<string, unknown>
+    expect(after["peer-session"]).toEqual({ schemaVersion: 3, stories: [], somethingNew: { we: "cannot parse" } })
+    expect(logger).toHaveBeenCalledWith(
+      "plan:foreign-entry-preserved",
+      expect.objectContaining({ foreignSessionID: "peer-session" }),
+    )
+    // ...and this session's own write still landed.
+    expect((after.s1 as { stories: Array<{ tasks: Array<{ status: string }> }> }).stories[0].tasks[0].status).toBe(
+      "complete",
+    )
+  })
+
+  // The narrowness is the point: junk at OUR OWN version is still dropped,
+  // which is the pre-existing graceful degradation and its test.
+  it("M9: schema-invalid junk at the current version is still discarded", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [story()])
+    const taskId = plan.stories[0].tasks[0].id
+    const planPath = join(stateDir, "plan.json")
+
+    const onDisk = JSON.parse(readFileSync(planPath, "utf8")) as Record<string, unknown>
+    onDisk["junk-session"] = { schemaVersion: 2, stories: "not an array" }
+    writeFileSync(planPath, JSON.stringify(onDisk))
+
+    se.checkpoint("s1", taskId, "complete")
+
+    expect((JSON.parse(readFileSync(planPath, "utf8")) as Record<string, unknown>)["junk-session"]).toBeUndefined()
+  })
+
   it("a transient lock failure that clears within the retry budget still writes", () => {
     const stateDir = temporaryRoot()
     const { engine: se, logger } = engine(stateDir)
