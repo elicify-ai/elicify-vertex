@@ -1,0 +1,296 @@
+[
+  {
+    "id": "N01",
+    "itemId": "A2",
+    "note": "research/renewable-energy.md exists (1046 bytes) but contains no URLs or Sources section \u2014 it's a short prose summary without cited sources",
+    "expected": "keep"
+  },
+  {
+    "id": "N02",
+    "itemId": "A4",
+    "note": "research/ai-breakthroughs.md exists (1390 bytes) but contains no URLs or Sources section \u2014 no cited sources",
+    "expected": "keep"
+  },
+  {
+    "id": "N03",
+    "itemId": "A6",
+    "note": "research/space-exploration.md exists (1371 bytes) but contains no URLs or Sources section \u2014 no cited sources",
+    "expected": "keep"
+  },
+  {
+    "id": "N04",
+    "itemId": "A2",
+    "note": "research/climate-indicators.md exists (1263 bytes) but contains no URLs or Sources section",
+    "expected": "keep"
+  },
+  {
+    "id": "N05",
+    "itemId": "A4",
+    "note": "research/quantum-computing.md exists (1261 bytes) but contains no URLs or Sources section",
+    "expected": "keep"
+  },
+  {
+    "id": "N06",
+    "itemId": "A6",
+    "note": "research/crispr-gene-editing.md exists (1246 bytes) but contains no URLs or Sources section",
+    "expected": "keep"
+  },
+  {
+    "id": "N07",
+    "itemId": "A1",
+    "note": "research/renewable-energy.json does not exist on disk (ls research/ returned no such file); cannot verify structured KPIs or chart-ready arrays.",
+    "expected": "keep"
+  },
+  {
+    "id": "N08",
+    "itemId": "A2",
+    "note": "research/renewable-energy.md does not exist on disk; cannot verify cited sources / URLs.",
+    "expected": "keep"
+  },
+  {
+    "id": "N09",
+    "itemId": "A3",
+    "note": "research/ai-breakthroughs.json does not exist on disk; cannot verify structured KPIs.",
+    "expected": "keep"
+  },
+  {
+    "id": "N10",
+    "itemId": "A4",
+    "note": "research/ai-breakthroughs.md does not exist on disk; cannot verify cited sources.",
+    "expected": "keep"
+  },
+  {
+    "id": "N11",
+    "itemId": "A5",
+    "note": "research/space-exploration.json does not exist on disk; cannot verify structured KPIs.",
+    "expected": "keep"
+  },
+  {
+    "id": "N12",
+    "itemId": "A6",
+    "note": "research/space-exploration.md does not exist on disk; cannot verify cited sources.",
+    "expected": "keep"
+  },
+  {
+    "id": "N13",
+    "itemId": "A1",
+    "note": "research/climate-indicators.json missing (no research/ directory exists in workspace).",
+    "expected": "keep"
+  },
+  {
+    "id": "N14",
+    "itemId": "A2",
+    "note": "research/climate-indicators.md missing.",
+    "expected": "drop"
+  },
+  {
+    "id": "N15",
+    "itemId": "A3",
+    "note": "research/quantum-computing.json missing.",
+    "expected": "drop"
+  },
+  {
+    "id": "N16",
+    "itemId": "A4",
+    "note": "research/quantum-computing.md missing.",
+    "expected": "drop"
+  },
+  {
+    "id": "N17",
+    "itemId": "A5",
+    "note": "research/crispr-gene-editing.json missing.",
+    "expected": "drop"
+  },
+  {
+    "id": "N18",
+    "itemId": "A6",
+    "note": "research/crispr-gene-editing.md missing.",
+    "expected": "drop"
+  },
+  {
+    "id": "N19",
+    "itemId": "A1",
+    "note": "package.json not present (ls -la shows only AGENTS.md); node_modules absent. Declared verifier `test -f package.json && ... && test -d node_modules` would fail on first check.",
+    "expected": "drop"
+  },
+  {
+    "id": "N20",
+    "itemId": "A2",
+    "note": "No src/index.css or tailwind config exists in workspace; Tailwind v4 theme cannot be verified.",
+    "expected": "keep"
+  },
+  {
+    "id": "N21",
+    "itemId": "A3",
+    "note": "No src/App.tsx, src/App.jsx, src/main.tsx, or src/main.jsx; layout shell / routing skeleton not present.",
+    "expected": "drop"
+  },
+  {
+    "id": "N22",
+    "itemId": "A4",
+    "note": "No src/ tree at all; sample Recharts chart cannot render",
+    "expected": "keep"
+  },
+  {
+    "id": "N23",
+    "itemId": "A1",
+    "note": "research/renewable-energy.json exists and is valid JSON with capacity, growth KPIs. kpis object present (3+ entries: capacity_gw, growth_rate, solar_share, wind_share). Acceptable. PARTIAL: JSON exists with structured KPIs and arrays \u2014 met for this story's stated A1 (which only requires existence + structured KPIs + chart-ready arrays). Re-check: file is valid JSON with 'kpis' and 'series' keys. MET.",
+    "expected": "keep"
+  },
+  {
+    "id": "N24",
+    "itemId": "A2",
+    "note": "research/renewable-energy.md exists (verified on disk) BUT grep for 'https://' or 'http://' returns 0 matches. No cited URL sources in the markdown \u2014 fails acceptance criterion A2 which explicitly requires 'cited sources (URLs)'.",
+    "expected": "keep"
+  },
+  {
+    "id": "N25",
+    "itemId": "A3",
+    "note": "research/ai-breakthroughs.json exists and is valid JSON. However, the 'kpis' object has only 2 entries (model_releases, benchmarks); A3 explicitly requires structured KPIs covering 'model releases, parameter counts, benchmarks' (3 KPIs). Also no parameter_counts KPI present. FAILS the \u22653 KPIs requirement as written.",
+    "expected": "keep"
+  },
+  {
+    "id": "N26",
+    "itemId": "A4",
+    "note": "research/ai-breakthroughs.md exists on disk BUT grep for 'https://' or 'http://' returns 0 matches. No cited URL sources.",
+    "expected": "keep"
+  },
+  {
+    "id": "N27",
+    "itemId": "A5",
+    "note": "research/space-exploration.json exists and is valid JSON. 'kpis' object has only 2 entries (missions, spending); A5 explicitly requires 'launches, missions, spending' (3 KPIs). No launches KPI present. FAILS the \u22653 KPIs requirement.",
+    "expected": "keep"
+  },
+  {
+    "id": "N28",
+    "itemId": "A6",
+    "note": "research/space-exploration.md exists on disk BUT grep for 'https://' or 'http://' returns 0 matches. No cited URL sources.",
+    "expected": "keep"
+  },
+  {
+    "id": "N29",
+    "itemId": "A2",
+    "note": "research/climate-indicators.md exists on disk BUT grep -c 'https://' returns 0 (and 'http://' returns 0). No cited URL sources. Fails acceptance criterion A2 which requires 'cited sources'.",
+    "expected": "keep"
+  },
+  {
+    "id": "N30",
+    "itemId": "A4",
+    "note": "research/quantum-computing.md exists on disk BUT grep finds no http(s) URLs. No cited URL sources. Fails A4.",
+    "expected": "keep"
+  },
+  {
+    "id": "N31",
+    "itemId": "A6",
+    "note": "research/crispr-gene-editing.md exists on disk BUT grep finds no http(s) URLs. No cited URL sources. Fails A6.",
+    "expected": "keep"
+  },
+  {
+    "id": "N32",
+    "itemId": "A4",
+    "note": "Sample Recharts chart not found in src/App.jsx or src/components/ \u2014 no recharts import or chart component in the shell. The verifier declared by S3 does not check for chart rendering; parent claimed it but disk shows no sample chart in the shell.",
+    "expected": "keep"
+  },
+  {
+    "id": "N33",
+    "itemId": "A4",
+    "note": "Dark/light toggle mechanism exists in App.jsx but per-page wiring/theme Class usage not directly verified in each page file (theme is applied via root html class; pages rely on Tailwind dark: variants \u2014 plausible but not explicitly verified).",
+    "expected": "keep"
+  },
+  {
+    "id": "N34",
+    "itemId": "A4",
+    "note": "Dark/light toggle per-page not directly verified (same caveat as S4.A4).",
+    "expected": "keep"
+  },
+  {
+    "id": "N35",
+    "itemId": "A2",
+    "note": "Could not confirm Tailwind v4 CSS-variable-based theme tokens for light/dark from a quick read of index.css \u2014 v4 quirk noted that utility classes bake literal light-mode colors instead of var(--color-*). Unverified.",
+    "expected": "keep"
+  },
+  {
+    "id": "N36",
+    "itemId": "A6",
+    "note": "research/space-exploration.md does NOT exist on disk; only the JSON sibling is present. Acceptance item A6 unmet.",
+    "expected": "keep"
+  },
+  {
+    "id": "N37",
+    "itemId": "A1",
+    "note": "research/renewable-energy.json exists with KPIs (capacity 4339 GW, growth rates) but has no chart-ready arrays \u2014 only a 'trends' object with scalar year/value pairs, not arrays of data points suitable for direct charting",
+    "expected": "keep"
+  },
+  {
+    "id": "N38",
+    "itemId": "A2",
+    "note": "research/renewable-energy.md does not exist \u2014 only the .json file is present on disk",
+    "expected": "keep"
+  },
+  {
+    "id": "N39",
+    "itemId": "A6",
+    "note": "research/space-exploration.md does not exist on disk",
+    "expected": "keep"
+  },
+  {
+    "id": "N40",
+    "itemId": "A1",
+    "note": "src/pages/Renewable.jsx exists and renders with KPI grid + BarChart + LineChart, but data is hardcoded as inline 'energyData' and 'capacityData' arrays, not sourced from research/renewable-energy.json. grep shows no import of the json file.",
+    "expected": "keep"
+  },
+  {
+    "id": "N41",
+    "itemId": "A2",
+    "note": "src/pages/AI.jsx exists with KPI grid + 3 charts, but data is hardcoded inline (modelData, benchmarkData, capabilityData), not imported from research/ai-breakthroughs.json",
+    "expected": "keep"
+  },
+  {
+    "id": "N42",
+    "itemId": "A3",
+    "note": "src/pages/Space.jsx exists with KPI grid + charts, but data is hardcoded inline (launchData, spendingData, missions), not imported from research/space-exploration.json",
+    "expected": "keep"
+  },
+  {
+    "id": "N43",
+    "itemId": "A1",
+    "note": "research/renewable-energy.json exists, has KPIs (capacity 4339 GW, growth rates), but contains no chart-ready arrays \u2014 the 'trends' field is an object with scalar year/value entries, not arrays of points suitable for charting. Confirmed by reading the file.",
+    "expected": "keep"
+  },
+  {
+    "id": "N44",
+    "itemId": "A2",
+    "note": "research/renewable-energy.md does NOT exist on disk (only the .json is present).",
+    "expected": "keep"
+  },
+  {
+    "id": "N45",
+    "itemId": "A5",
+    "note": "research/space-exploration.json exists with KPIs but lacks chart-ready arrays (no arrays suitable for Recharts).",
+    "expected": "keep"
+  },
+  {
+    "id": "N46",
+    "itemId": "A6",
+    "note": "research/space-exploration.md does NOT exist on disk.",
+    "expected": "keep"
+  },
+  {
+    "id": "N47",
+    "itemId": "A1",
+    "note": "research/renewable-energy.json exists with KPIs, but 'trends' is an object of {year: value} scalar pairs, not arrays of points suitable for charting. No chart-ready arrays present.",
+    "expected": "keep"
+  },
+  {
+    "id": "N48",
+    "itemId": "A3",
+    "note": "research/ai-breakthroughs.json: chart arrays present (modelReleases, benchmarkScores) but need to verify shape.",
+    "expected": "keep"
+  },
+  {
+    "id": "N49",
+    "itemId": "A5",
+    "note": "research/space-exploration.json: trends object of scalar pairs, no chart-ready arrays.",
+    "expected": "keep"
+  }
+]
