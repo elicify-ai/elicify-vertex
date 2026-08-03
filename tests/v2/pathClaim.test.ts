@@ -177,3 +177,35 @@ describe("parsePathAbsenceClaim — rules (FR-001, C-3)", () => {
     expect(parsePathAbsenceClaim(undefined as unknown as string).paths).toEqual([])
   })
 })
+
+// ===========================================================================
+// MAJ-001 re-attack — phrasings absent from the corpus and from every earlier
+// test. A false DROP here silently suppresses a real judge failure, so this is
+// the highest-consequence property in the module and deserves adversarial
+// breadth rather than the happy path.
+// ===========================================================================
+describe("parsePathAbsenceClaim — adversarial breadth", () => {
+  it.each([
+    ["research/x.md lacks a Sources section"],
+    ["The KPIs array in research/x.json is empty"],
+    ["x.json has zero chart entries"],
+    ["src/App.jsx never imports research/x.json"],
+    ["research/x.md is only a stub"],
+    ["Sources missing from research/x.md"],
+    ["research/x.md contains no citations"],
+    ["No Sources section in research/x.md"],
+    ["The file research/x.md is missing sources"],
+  ])("KEEPS the content claim: %s", (note) => {
+    expect(parsePathAbsenceClaim(note).paths).toEqual([])
+  })
+
+  it.each([
+    ["research/x.md does not exist"],
+    ["research/x.md is missing"],
+    ["No research/x.md"],
+    ["research/x.json not found"],
+    ["src/App.tsx and src/main.tsx are missing"],
+  ])("DROPS the pure absence claim: %s", (note) => {
+    expect(parsePathAbsenceClaim(note).paths.length).toBeGreaterThan(0)
+  })
+})

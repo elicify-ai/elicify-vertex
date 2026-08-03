@@ -1663,3 +1663,60 @@ describe("parseJudgeResponse", () => {
     expect(parseJudgeResponse("{fit: pass, notes: unquoted}")).toBeUndefined()
   })
 })
+
+// ===========================================================================
+// CRIT-001 regression — the wrapped-secret guarantee across EVERY split point.
+//
+// My first FR-006a fix used a fragment-LENGTH bar and re-opened the C-9 leak
+// for uneven splits. The replacement is a SHAPE bar (`PATHLIKE_AT_JOIN`). This
+// sweeps every split of a 42-char high-entropy token and asserts the real
+// property that matters: no USABLE fragment (>= 16 chars of the secret) ever
+// reaches the payload. Long fragments trip `unitTrips` alone; short remainders
+// are not a secret. A crude "was the whole field dropped?" assertion reports
+// false alarms here, which is why the check is written against what is
+// actually transmitted.
+// ===========================================================================
+describe("FR-006a / C-9 — no usable secret fragment survives any wrap point", () => {
+  const SECRET = "sV8kQz3RtY7pLmN2xW9bC4dF6gH1jK5aZ0eR8uT3iO"
+
+  it("leaks no >=16-char fragment at any of the 41 split points", () => {
+    const leaks: string[] = []
+    for (let i = 1; i < SECRET.length; i++) {
+      const payload = buildJudgePayload(
+        {
+          criteria: [SECRET.slice(0, i), SECRET.slice(i)],
+          diffSummary: "",
+          verifierSummaries: [],
+          lastResponse: "",
+          recentTranscript: "",
+          plan: "",
+        },
+        () => {},
+      )
+      for (const line of payload.criteria ?? []) {
+        if (line.length >= 16 && SECRET.includes(line)) leaks.push(`split ${i}: ${line}`)
+      }
+    }
+    expect(leaks, `usable fragments transmitted: ${leaks.length}`).toEqual([])
+  })
+
+  it("still keeps the innocent path-join that motivated the fix", () => {
+    const events: string[] = []
+    const payload = buildJudgePayload(
+      {
+        criteria: [
+          "  verifiers: jq -e .kpis research/space-exploration.json",
+          'S2 (active): "Research Wave B"',
+        ],
+        diffSummary: "",
+        verifierSummaries: [],
+        lastResponse: "",
+        recentTranscript: "",
+        plan: "",
+      },
+      (event) => events.push(event),
+    )
+    expect(payload.criteria).toHaveLength(2)
+    expect(events).not.toContain("judge:field-partial-drop")
+  })
+})
