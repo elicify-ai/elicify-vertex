@@ -814,9 +814,13 @@ function boundUnappliedVerdicts(
         storyId: v.storyId,
         // Never revert on an unapplied verdict — the point is to record that
         // the harness did NOT act on it, not to act on it by another route.
-        pass: true,
+        // C2: `pass: true` was doing double duty here and laundering the
+        // refusal into an audit pass; `unapplied` carries the "do not
+        // transition" meaning now, and `pass` reports what the judge said.
+        pass: v.pass,
         summary: `verdict not applied (${reason}): ${v.summary}`,
         items: v.items,
+        unapplied: reason,
       })),
     )
   } catch {
@@ -891,6 +895,49 @@ function applyPathVeto(
   return { verdict: { ...verdict, items, pass: !stillFailing }, contradicted }
 }
 
+/**
+ * C2 — the settled-but-never-audited close-out.
+ *
+ * A bounding stamp (`judge.unapplied`) stops the audit selector from re-running
+ * the judge on that story, which is its whole point. The consequence is that
+ * once every story is complete and stamped, `handleJudgeAudit` returns early
+ * and the plan's real close-out — the one that reports the audit result — is
+ * never reached. While the bounding stamp said `pass: true`, that did not show:
+ * the story counted toward `allPassed` and the run ended claiming the judge had
+ * independently verified everything. With `pass` now telling the truth, the
+ * same path would instead end in SILENCE, which is a different way of not
+ * telling the operator that a story was never checked.
+ *
+ * So say it. This fires at the early return, the only place reachable once the
+ * selector is empty, and only when at least one stamp is a bounding stamp — a
+ * genuinely all-passed plan still returns false here and gets its close-out
+ * from the audit that settled it.
+ */
+async function emitUnauditedEscalation(
+  ctx: GateContext,
+  sid: string,
+  state: V2SessionState,
+  plan: PlanV2,
+): Promise<boolean> {
+  if (state.unauditedEscalated) return false
+  if (!plan.stories.every((story) => story.status === "complete" && story.judge !== undefined)) return false
+  const unaudited = plan.stories.filter((story) => story.judge?.unapplied !== undefined).map((story) => story.id)
+  if (unaudited.length === 0) return false
+  // Once only: this runs on EVERY idle after the plan settles, and repeating
+  // the escalation each time would be its own loop.
+  state.unauditedEscalated = true
+  ctx.logger("judge:unaudited-escalation", { sessionID: sid, stories: unaudited })
+  return dispatchContinuation(
+    ctx,
+    sid,
+    state,
+    "[vertex:judge] Every story of the plan is complete, but the completion judge produced no usable verdict for " +
+      `${unaudited.join(", ")} — those stories were NOT verified against the worktree, and the harness did not act on ` +
+      "the unusable verdicts rather than trust them. Report what was delivered, the commands you ran and the results " +
+      `you observed, state explicitly that ${unaudited.join(", ")} remain unverified, then stop.`,
+  )
+}
+
 async function handleJudgeAudit(ctx: GateContext, sid: string, state: V2SessionState): Promise<boolean> {
   if (!ctx.judgeEnabled) return false
   const plan = ctx.storyEngine.getPlan(sid)
@@ -902,7 +949,7 @@ async function handleJudgeAudit(ctx: GateContext, sid: string, state: V2SessionS
       story.status === "complete" &&
       (!story.judge || (story.completedAt !== undefined && story.judge.judgedAt < story.completedAt)),
   )
-  if (unjudged.length === 0) return false
+  if (unjudged.length === 0) return emitUnauditedEscalation(ctx, sid, state, plan)
 
   const [providerID, ...rest] = state.modelId.split("/")
   const modelID = rest.join("/")
@@ -1060,7 +1107,11 @@ async function handleJudgeAudit(ctx: GateContext, sid: string, state: V2SessionS
   // passing stamp, none is "unjudged", so this function returns early before
   // reaching here.
   const settled = plan.stories.every((story) => story.status === "complete")
-  const allPassed = plan.stories.every((story) => story.judge?.pass === true)
+  // C2: a bounding stamp (`unapplied`) is NOT a pass. It records that the
+  // harness refused to act on an unusable verdict, so the story has never
+  // actually been audited — counting it here let an unverified story satisfy
+  // "every story passed" and produce the independently-verified close-out.
+  const allPassed = plan.stories.every((story) => story.judge?.pass === true && story.judge.unapplied === undefined)
   if (settled && allPassed) {
     // FR-001b: a pass the HARNESS re-derived (by contradicting the judge's
     // path claims) must not be reported as "the judge independently

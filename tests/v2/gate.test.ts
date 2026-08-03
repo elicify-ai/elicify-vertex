@@ -1046,6 +1046,86 @@ describe("handleJudgeAudit — verdict reconciliation", () => {
     expect(h.storyEngine.getPlan(sid)!.stories[0].status).toBe("complete")
   })
 
+  // -------------------------------------------------------------------------
+  // C2 (grill round 2) — a bounding stamp is NOT an audit pass.
+  //
+  // `boundUnappliedVerdicts` must write a stamp, or the `!story.judge` audit
+  // selector re-runs the judge on the story every idle forever (MAJ-003). It
+  // used to write `pass: true` to do that, which meant an unusable verdict —
+  // one the harness explicitly refused to act on — read downstream as "this
+  // story passed audit", including to the close-out's `judge?.pass === true`
+  // gate. The refusal now has its own field.
+  // -------------------------------------------------------------------------
+  it("C2: an UNVERIFIED verdict is stamped as unapplied, not as a pass", async () => {
+    const h = harness({ judgeEnabled: true })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid)
+    stubJudge(
+      h,
+      { stories: [{ storyId: "S1", pass: false, summary: "nope", items: [{ itemId: "A1", met: false, note: "not delivered" }] }] },
+      [{ type: "text" }], // no tool call -> FR-014 refuses the verdict
+    )
+
+    await handleSessionIdle(h.ctx, sid)
+
+    const stamp = h.storyEngine.getPlan(sid)!.stories[0].judge!
+    expect(stamp.unapplied).toBe("unverified")
+    // The judge's actual answer is preserved rather than overwritten with a
+    // pass the judge never gave.
+    expect(stamp.pass).toBe(false)
+    // ...and refusing to apply it still means refusing to REVERT on it.
+    expect(h.storyEngine.getPlan(sid)!.stories[0].status).toBe("complete")
+  })
+
+  it("C2: a CONTRADICTORY verdict is stamped as unapplied and reverts nothing", async () => {
+    const h = harness({ judgeEnabled: true })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid)
+    stubJudge(h, {
+      stories: [{ storyId: "S1", pass: false, summary: "contradictory", items: [{ itemId: "A1", met: true, note: "all good" }] }],
+    })
+
+    await handleSessionIdle(h.ctx, sid)
+
+    const stamp = h.storyEngine.getPlan(sid)!.stories[0].judge!
+    expect(stamp.unapplied).toBe("contradictory")
+    expect(h.storyEngine.getPlan(sid)!.stories[0].status).toBe("complete")
+  })
+
+  it("C2: a plan settled only by unapplied stamps does NOT get the independently-verified close-out", async () => {
+    const h = harness({ judgeEnabled: true })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid)
+    stubJudge(
+      h,
+      { stories: [{ storyId: "S1", pass: false, summary: "nope", items: [{ itemId: "A1", met: false, note: "not delivered" }] }] },
+      [{ type: "text" }],
+    )
+    await handleSessionIdle(h.ctx, sid)
+
+    // Second idle: every story is complete and stamped, so the judge is not
+    // re-run. The harness must say the story was never verified rather than
+    // claim the judge confirmed it — or go silent, which is what an
+    // `allPassed` that counted the bounding stamp would have produced.
+    await handleSessionIdle(h.ctx, sid)
+
+    const said = continuations(h.prompt)
+      .map((c) => c.text)
+      .join("\n")
+    expect(said).not.toContain("independently verified")
+    expect(said).toContain("S1")
+    expect(said).toMatch(/were NOT verified|remain unverified/)
+  })
+
   it("FR-007: past the re-audit cap the story is escalated, not reverted again", async () => {
     const h = harness({ judgeEnabled: true, maxStoryReaudits: 1 })
     const sid = "s1"

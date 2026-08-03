@@ -1720,3 +1720,61 @@ describe("FR-006a / C-9 — no usable secret fragment survives any wrap point", 
     expect(events).not.toContain("judge:field-partial-drop")
   })
 })
+
+// ---------------------------------------------------------------------------
+// C1 (grill round 2) — the FR-006a exoneration must not exempt the other HALF
+// of a confirmed secret. `scanUnits` used to `continue` whenever either unit of
+// a pair had already been dropped alone, to protect an innocent neighbor. That
+// also skipped the one check able to tell an abutter from a fragment.
+// ---------------------------------------------------------------------------
+describe("C1 — split-secret fragment adjacent to a unit dropped alone", () => {
+  const scan = (criteria: string[]) =>
+    buildJudgePayload(
+      { criteria, diffSummary: "", verifierSummaries: [], lastResponse: "", recentTranscript: "", plan: "" },
+      () => {},
+    ).criteria ?? []
+
+  // The regression, exactly: a 64-char hex key split at 16. The 48-char tail
+  // exceeds ENTROPY_MIN_TOKEN_LENGTH so it trips and is dropped on its own; the
+  // 16-char head is under every standalone threshold and used to survive.
+  it("drops BOTH halves when a 64-char hex key is split so only the tail trips alone", () => {
+    const key = "4145244f7f8dbe2cf1" + "0123456789abcdef".repeat(2) + "99887766554433"
+    expect(key).toHaveLength(64)
+    expect(scan([key.slice(0, 16), key.slice(16)])).toHaveLength(0)
+  })
+
+  it("leaks no >=16-char fragment at ANY split point, across four key encodings", () => {
+    const keys = [
+      "HUZxXdF2O3ftvnSNicpJtsJI0PCeI/m9Ri1u0CYfbfQ=", // base64, contains / and =
+      "4145244f7f8dbe2cf10123456789abcdef0123456789abcdef99887766554433", // hex
+      "Svzr9U0zES32u3j1XrjO5C1DqJjuNf7CQM0ScPyuXXU", // base64url
+      "c54xIohNq3mTWNOliSvCjt70Tdkdj19nXeS2hgxQabcdefghijklmn", // alnum only
+    ]
+    const leaks: string[] = []
+    for (const key of keys) {
+      for (let i = 1; i < key.length; i++) {
+        for (const line of scan([key.slice(0, i), key.slice(i)])) {
+          if (line.length >= 16 && key.includes(line)) leaks.push(`${i}:${line}`)
+        }
+      }
+    }
+    expect(leaks).toEqual([])
+  })
+
+  // The guarantee the old `continue` was protecting must still hold: abutting a
+  // secret is not the same as being part of one. A pattern match that BEGINS at
+  // the join has start === joinIdx, so it is not a straddle and the neighbor is
+  // kept.
+  it("keeps an innocent neighbor that merely abuts a standalone secret", () => {
+    const kept = scan(["Story S4 delivered the chart component. ", "AKIAIOSFODNN7EXAMPLEKEYMATERIAL01"])
+    expect(kept).toEqual(["Story S4 delivered the chart component. "])
+  })
+
+  // FR-006a's production case, re-asserted here because C1's fix touches the
+  // same loop: the plan-digest lines that lost S1/S2/S3 must still both survive.
+  it("still keeps the two plan-digest lines whose no-separator join manufactures a token", () => {
+    expect(
+      scan(["  verifiers: jq -e .kpis research/space-exploration.json", 'S2 (active): "Research Wave B"']),
+    ).toHaveLength(2)
+  })
+})

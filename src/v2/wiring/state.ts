@@ -38,6 +38,14 @@ export interface V2SessionState {
   activateCueShown: boolean
   /** In-flight guard: a `client.session.prompt` idle-gate continuation is pending for this session. */
   idleContinuationInFlight: boolean
+  /**
+   * C2: the settled-but-never-audited escalation has already been dispatched
+   * for this plan. It fires from `handleJudgeAudit`'s early return, which runs
+   * on every subsequent idle, so without this it would repeat forever.
+   * Per-session rather than per-plan because a new plan resets the session
+   * state alongside it.
+   */
+  unauditedEscalated: boolean
   /** True between `experimental.session.compacting` and the matching `session.compacted`. */
   compacting: boolean
 
@@ -119,6 +127,7 @@ export function freshSessionState(workspaceRoot: string): V2SessionState {
     active: false,
     activateCueShown: false,
     idleContinuationInFlight: false,
+    unauditedEscalated: false,
     compacting: false,
     workspaceRoot,
     modelId: null,

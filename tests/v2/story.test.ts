@@ -1871,6 +1871,39 @@ describe("FR-004: a story reopened while complete is audit-eligible again immedi
     expect(isAuditEligible(se.getPlan("s1")!.stories[0])).toBe(true)
   })
 
+  // The SECOND site. `freshCompletionStamp` was wired into `reopenStory` only,
+  // but the path that actually runs after a judge revert is `checkpoint` — the
+  // revert directive orders the model to re-checkpoint the reverted tasks. It
+  // used to stamp a raw `now`, so a revert and the re-checkpoint that followed
+  // could share a millisecond and the story became permanently invisible to
+  // the judge. Surfaced as a 2-in-8 full-suite flake, pinned deterministically
+  // here with a frozen clock.
+  it("re-CHECKPOINTING a reverted task in the same millisecond as the verdict stays audit-eligible", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [story()])
+    const t1 = plan.stories[0].tasks[0].id
+    se.checkpoint("s1", t1, "complete")
+
+    // A FAILING verdict reverts the story and its task back to active.
+    se.applyJudgeVerdicts("s1", [
+      { storyId: "S1", pass: false, summary: "not done", items: [{ itemId: "A1", met: false, note: "no sources" }] },
+    ])
+    const judgedAt = se.getPlan("s1")!.stories[0].judge!.judgedAt
+    expect(se.getPlan("s1")!.stories[0].status).toBe("active")
+
+    // The model obeys the revert directive within the same millisecond.
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(judgedAt))
+    se.checkpoint("s1", t1, "complete")
+    vi.useRealTimers()
+
+    const story1 = se.getPlan("s1")!.stories[0]
+    expect(story1.status).toBe("complete")
+    expect(story1.judge!.judgedAt < story1.completedAt!).toBe(true)
+    expect(isAuditEligible(story1)).toBe(true)
+  })
+
   it("a reopened-then-BLOCKED story is not audit-eligible (the fresh stamp is not a blanket pass)", () => {
     const stateDir = temporaryRoot()
     const { engine: se } = engine(stateDir)

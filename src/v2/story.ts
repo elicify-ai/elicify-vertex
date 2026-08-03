@@ -319,6 +319,26 @@ export interface StoryJudgeStamp {
    * (mirrors `dependsOn`/`revision`).
    */
   contradictedItemIds?: string[]
+  /**
+   * C2 (grill round 2, 2026-08-03): this stamp exists only to BOUND a verdict
+   * the harness refused to act on — it is not an audit result.
+   *
+   * `boundUnappliedVerdicts` has to write a stamp, because the audit selector
+   * keys off `!story.judge` and would otherwise re-run the judge on this story
+   * on every subsequent idle forever (MAJ-003). It used to write `pass: true`
+   * for that purpose, which laundered "the harness declined to apply this"
+   * into "this story passed audit" — and since the close-out's gate is
+   * `story.judge?.pass === true`, an unverified story could satisfy the
+   * plan-complete claim outright.
+   *
+   * So the two states are now distinct: `pass` stays whatever it means, and
+   * this field records that the verdict was never enforced and why.
+   *   - `"contradictory"` — FR-005: `pass:false` with every item `met:true`.
+   *   - `"unverified"`    — FR-014: the judge never observed the worktree.
+   * Absent means a genuine, applied verdict. Optional on disk so pre-existing
+   * plans still load (mirrors `contradictedItemIds`).
+   */
+  unapplied?: "contradictory" | "unverified"
 }
 
 /**
@@ -497,6 +517,9 @@ function isStoryJudgeStamp(value: unknown): value is StoryJudgeStamp {
   // FR-001b: optional on disk (stamps written before the field existed must
   // still load); reject only a PRESENT-but-wrong-shaped value.
   if (value.contradictedItemIds !== undefined && !isStringArray(value.contradictedItemIds)) return false
+  // C2: optional on disk for the same reason; reject only a present-but-wrong value.
+  if (value.unapplied !== undefined && value.unapplied !== "contradictory" && value.unapplied !== "unverified")
+    return false
   return true
 }
 
@@ -1407,7 +1430,14 @@ export class StoryEngine {
    */
   applyJudgeVerdicts(
     sessionID: string,
-    verdicts: Array<{ storyId: string; pass: boolean; summary: string; items: JudgeItemNote[] }>,
+    verdicts: Array<{
+      storyId: string
+      pass: boolean
+      summary: string
+      items: JudgeItemNote[]
+      /** C2: mark the stamp as bookkeeping for a verdict the harness did NOT enforce. */
+      unapplied?: "contradictory" | "unverified"
+    }>,
     contradictedByStory?: ReadonlyMap<string, string[]>,
   ): { reverted: string[]; passed: string[]; unknown: string[] } {
     if (!this.getPlan(sessionID)) throw new Error(`no story plan for session ${sessionID}`)
@@ -1439,9 +1469,27 @@ export class StoryEngine {
           // on-disk shape of an untouched verdict is byte-identical to what
           // pre-FR-001b engines wrote.
           ...(contradicted && contradicted.length > 0 ? { contradictedItemIds: [...contradicted] } : {}),
+          // C2: absent for a real verdict, so the on-disk shape of an applied
+          // stamp is byte-identical to what pre-C2 engines wrote.
+          ...(verdict.unapplied ? { unapplied: verdict.unapplied } : {}),
         }
         stamped += 1
-        if (verdict.pass && story.status === "complete") {
+        if (verdict.unapplied) {
+          // C2: a bounding stamp records that the harness DECLINED to act.
+          // It must transition nothing in either direction — not a revert on
+          // `pass:false` (the verdict was rejected as unusable, so acting on
+          // it is precisely what the caller refused to do) and not a `passed`
+          // entry on `pass:true` (which is how the laundering arose). The
+          // stamp's only job is to stop the `!story.judge` selector from
+          // re-running the judge on this story forever.
+          this.logger("judge:verdict-not-enforced", {
+            sessionID,
+            storyId: story.id,
+            status: story.status,
+            pass: verdict.pass,
+            unapplied: verdict.unapplied,
+          })
+        } else if (verdict.pass && story.status === "complete") {
           passed.push(story.id)
         } else if (!verdict.pass && story.status === "complete") {
           // 2026-07-30: re-open the story's complete TASKS too — re-audit
@@ -1674,7 +1722,20 @@ export class StoryEngine {
         story.startedAt = undefined
       }
       if (next === "complete" && prev !== "complete") {
-        story.completedAt = now
+        // FR-004, second site (REPRODUCED 2026-08-03). `freshCompletionStamp`
+        // was wired into `reopenStory` only, but this is the path that runs
+        // when the model re-checkpoints a task the judge just reverted — the
+        // common case, since the revert directive orders exactly that. With a
+        // raw `now`, an audit and the re-checkpoint that follows it can land
+        // in the same millisecond; the gate's selector is the string test
+        // `story.judge.judgedAt < story.completedAt`, so an EQUAL stamp reads
+        // as "not re-claimed" and the story is never re-audited again.
+        //
+        // Caught as a 2-in-8 flake in the full suite (`a PASSING verdict
+        // clears that story's consecutive-revert streak`): under load the
+        // audit and the checkpoint collided on the millisecond, the second
+        // audit never ran, and the re-audit counter stayed at 1.
+        story.completedAt = freshCompletionStamp(now, story.judge?.judgedAt)
       } else if (next !== "complete") {
         story.completedAt = undefined
       }

@@ -481,7 +481,31 @@ function hexRunStraddles(joined: string, joinIdx: number): boolean {
  * and `.` — structure a random token does not have. Erring toward redaction
  * is the correct direction for a payload leaving the process.
  */
-const PATHLIKE_AT_JOIN = /[/\\.:@=+ ]/
+/**
+ * The join is exonerated ONLY when it looks like "a path token ran into the
+ * next line's short leading word" — the exact production false positive
+ * (`…/space-exploration.json` + `S2`). Everything else is treated as a
+ * possible wrapped secret.
+ *
+ * Two earlier attempts failed, both reproduced:
+ *  - a fragment-LENGTH bar (each side >= 16 chars) leaked an unevenly split
+ *    secret (42-char token split 27/15 transmitted both halves);
+ *  - a character-CLASS bar (`/ \ . : @ = +` anywhere in a fragment) was far
+ *    worse: base64 — the canonical wire form of a random key — is built from
+ *    `/` and `+` with `=` padding, so a real 32-byte key leaked a >=16-char
+ *    fragment at 19 of its 43 split points.
+ *
+ * Hence a POSITIVE, anchored shape test instead of a negative char-class one:
+ * the left fragment must END in a path-like token (segments joined by `/`, or
+ * a dotted filename) and the right fragment must BEGIN with a short
+ * identifier-ish word. Random material satisfies neither anchor, so a secret
+ * is never exonerated regardless of which characters it happens to contain.
+ * The cost is a false drop on two adjacent long random-looking identifiers,
+ * which errs toward redaction — the correct direction for a payload leaving
+ * the process.
+ */
+const LEFT_ENDS_IN_PATH = /[\w-]+\.(?:md|json|jsx|tsx|ts|js|mjs|cjs|css|html|ya?ml|toml|txt|lock|sh|py|go|rs|java|rb)$/i
+const RIGHT_STARTS_SHORT_WORD = /^[A-Za-z][\w-]{0,7}$/
 
 function entropyTokenStraddles(joined: string, joinIdx: number): boolean {
   const re = /\S+/g
@@ -498,7 +522,7 @@ function entropyTokenStraddles(joined: string, joinIdx: number): boolean {
     // is treated as a possible secret and the pair is dropped.
     const leftFragment = joined.slice(start, joinIdx)
     const rightFragment = joined.slice(joinIdx, end)
-    if (PATHLIKE_AT_JOIN.test(leftFragment) || PATHLIKE_AT_JOIN.test(rightFragment)) continue
+    if (LEFT_ENDS_IN_PATH.test(leftFragment) && RIGHT_STARTS_SHORT_WORD.test(rightFragment)) continue
     return true
   }
   return false
@@ -535,7 +559,18 @@ function pairTripsOnJoin(a: string, b: string): boolean {
  *     considered (not arbitrary N-way spans): every hygiene dataset row
  *     tests a single two-way split, and bounding the reassembly window to
  *     one boundary at a time keeps the algorithm linear and its behavior
- *     easy to reason about. FR-006a: a pair may only be dropped when the
+ *     easy to reason about.
+ *
+ *     KNOWN, MEASURED LIMIT of that choice: a secret split into THREE or
+ *     more units where no two consecutive pieces reach
+ *     ENTROPY_MIN_TOKEN_LENGTH is invisible to both passes — e.g. a 44-char
+ *     base64 key as [16][6][22] leaks its 16-char head, at 135 of 1005
+ *     probed three-way splits. Two-way splits are clean (0 of 5800). Closing
+ *     this needs a span pass that attributes an offending token back to the
+ *     units it crosses, which is a larger change than C1 called for; it is
+ *     recorded here rather than left to be rediscovered.
+ *
+ *     FR-006a: a pair may only be dropped when the
  *     offending match is genuinely ON the join — see `pairTripsOnJoin`,
  *     whose doc comment carries the reproduced production failure this
  *     second condition exists to stop.
@@ -546,6 +581,36 @@ function pairTripsOnJoin(a: string, b: string): boolean {
  * "trips" because the secret alone does — that must not implicate the
  * innocent unit).
  */
+/**
+ * C1: is this fragment plausibly a PIECE of the secret it abuts, rather than
+ * ordinary text that merely sits next to one?
+ *
+ * `pairTripsOnJoin` cannot answer this when the neighbor is a confirmed
+ * secret. A secret flush against a unit boundary fuses with whatever follows,
+ * so a high-entropy token straddles the join no matter what the neighbor says
+ * — "…all tests pass" scores identically to a key fragment. Asking the
+ * straddle question there drops every innocent neighbor (it did: three
+ * existing partial-drop tests failed).
+ *
+ * So judge the surviving side's OWN contributed fragment instead:
+ *  - long enough to matter (a shorter piece is below the leak bar anyway),
+ *  - drawn only from the secret alphabet — any prose punctuation, `.` or `:`
+ *    included, disqualifies it, which is what keeps `assistant:` and
+ *    `space-exploration.json` safe,
+ *  - and mixing at least two character classes, which is what separates
+ *    random key material from a long lowercase word like `documentation`.
+ */
+const SECRET_ALPHABET_RUN = /^[A-Za-z0-9+/=_-]+$/
+const SECRET_FRAGMENT_MIN_CHARS = 12
+
+function looksLikeSecretFragment(fragment: string): boolean {
+  if (fragment.length < SECRET_FRAGMENT_MIN_CHARS) return false
+  if (!SECRET_ALPHABET_RUN.test(fragment)) return false
+  const classes =
+    (/[a-z]/.test(fragment) ? 1 : 0) + (/[A-Z]/.test(fragment) ? 1 : 0) + (/[0-9]/.test(fragment) ? 1 : 0)
+  return classes >= 2
+}
+
 function scanUnits(units: string[]): { kept: string[]; anyDropped: boolean } {
   const toDrop = new Set<number>()
 
@@ -553,15 +618,54 @@ function scanUnits(units: string[]): { kept: string[]; anyDropped: boolean } {
     if (unitTrips(unit)) toDrop.add(idx)
   })
 
-  for (let i = 0; i + 1 < units.length; i++) {
-    if (toDrop.has(i) || toDrop.has(i + 1)) continue
-    // Cheap gate first (unchanged), then FR-006a's join-locality check —
-    // which only ever runs on the rare pair that already tripped.
-    if (unitTrips(units[i] + units[i + 1]) && pairTripsOnJoin(units[i], units[i + 1])) {
-      toDrop.add(i)
-      toDrop.add(i + 1)
+  // Both directions, because a secret can be split into three or more units:
+  // the forward pass propagates a drop rightward, the backward pass leftward.
+  // Two linear passes rather than iterate-to-fixpoint: every real split seen
+  // in the hygiene dataset is two- or three-way, and a bounded pass count
+  // keeps this predictable on a large `recentTranscript`.
+  const sweep = (order: number[]) => {
+    for (const i of order) {
+      const leftDropped = toDrop.has(i)
+      const rightDropped = toDrop.has(i + 1)
+      if (leftDropped && rightDropped) continue
+      if (leftDropped || rightDropped) {
+        // C1 (grill round 2, REPRODUCED). One side is a CONFIRMED secret.
+        // The old code `continue`d here to protect an innocent neighbor, but
+        // that also exempted the other HALF of the same secret: a 64-char hex
+        // key split at 16 leaves a 48-char tail that trips alone (so it is
+        // dropped) and a 16-char head that is under ENTROPY_MIN_TOKEN_LENGTH
+        // and therefore never trips — measured, it survived at 800 of 3425
+        // split points across base64/hex/base64url keys.
+        //
+        // The innocent-neighbor guarantee does not require skipping the pair,
+        // only refusing to implicate a neighbor that merely ABUTS a secret.
+        // `pairTripsOnJoin` is precisely that discriminator: it demands the
+        // offending token STRADDLE the join. A standalone secret next to
+        // ordinary prose does not straddle (a pattern match beginning at the
+        // join has `start === joinIdx`, so it is not a straddle); a fragment
+        // of the same secret always does.
+        const survivingIdx = leftDropped ? i + 1 : i
+        const surviving = dewrap(units[survivingIdx])
+        const secret = dewrap(units[leftDropped ? i : i + 1])
+        // Fusion only happens when BOTH edges at the boundary are
+        // non-whitespace; a secret line ending in a newline-stripped space
+        // cannot bleed into its neighbor's token.
+        const secretEdge = leftDropped ? /\S+$/.exec(secret) : /^\S+/.exec(secret)
+        const fragment = leftDropped ? /^\S+/.exec(surviving) : /\S+$/.exec(surviving)
+        if (secretEdge && fragment && looksLikeSecretFragment(fragment[0])) toDrop.add(survivingIdx)
+        continue
+      }
+      // Cheap gate first (unchanged), then FR-006a's join-locality check —
+      // which only ever runs on the rare pair that already tripped.
+      if (unitTrips(units[i] + units[i + 1]) && pairTripsOnJoin(units[i], units[i + 1])) {
+        toDrop.add(i)
+        toDrop.add(i + 1)
+      }
     }
   }
+  const forward = units.slice(0, -1).map((_, i) => i)
+  sweep(forward)
+  sweep([...forward].reverse())
 
   const kept = units.filter((_, idx) => !toDrop.has(idx))
   return { kept, anyDropped: toDrop.size > 0 }
