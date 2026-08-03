@@ -1748,7 +1748,11 @@ describe("C1 — split-secret fragment adjacent to a unit dropped alone", () => 
       "HUZxXdF2O3ftvnSNicpJtsJI0PCeI/m9Ri1u0CYfbfQ=", // base64, contains / and =
       "4145244f7f8dbe2cf10123456789abcdef0123456789abcdef99887766554433", // hex
       "Svzr9U0zES32u3j1XrjO5C1DqJjuNf7CQM0ScPyuXXU", // base64url
-      "c54xIohNq3mTWNOliSvCjt70Tdkdj19nXeS2hgxQabcdefghijklmn", // alnum only
+      // Real random alnum material. An earlier version of this row was
+      // hand-authored and happened to end in the literal string
+      // "abcdefghijklmn", which the structural test correctly reads as a WORD
+      // and keeps — see the documented trade-off on `looksLikeSecretFragment`.
+      "KsZwACdq04WhV2Fn8pQXwRrRn5grnym14poxtRbM", // alnum only
     ]
     const leaks: string[] = []
     for (const key of keys) {
@@ -1765,9 +1769,52 @@ describe("C1 — split-secret fragment adjacent to a unit dropped alone", () => 
   // secret is not the same as being part of one. A pattern match that BEGINS at
   // the join has start === joinIdx, so it is not a straddle and the neighbor is
   // kept.
+  // MAJ-5: the previous version of this test ended its first line with a
+  // TRAILING SPACE, so `/\S+$/` matched nothing and the fragment predicate was
+  // never reached — the guarantee it claimed to pin was untested. No trailing
+  // space here, so the edge token is really examined.
   it("keeps an innocent neighbor that merely abuts a standalone secret", () => {
-    const kept = scan(["Story S4 delivered the chart component. ", "AKIAIOSFODNN7EXAMPLEKEYMATERIAL01"])
-    expect(kept).toEqual(["Story S4 delivered the chart component. "])
+    const kept = scan(["Story S4 delivered the chart component.", "AKIAIOSFODNN7EXAMPLEKEYMATERIAL01"])
+    expect(kept).toEqual(["Story S4 delivered the chart component."])
+  })
+
+  // MAJ-5, the regression proper: the first C1 fix DROPPED a neighbouring
+  // unit whose edge token looked random enough, and each newly-dropped unit
+  // implicated its own neighbour in turn. Measured then: four of five lines
+  // lost, and a 40-char git SHA — a documented false positive of the hex-run
+  // rule, no real secret involved — emptied the field outright, re-creating
+  // the FR-006a failure this module exists to prevent.
+  it("does not cascade: ordinary identifier lines beside a secret all survive", () => {
+    const kept = scan([
+      "tok AKIAIOSFODNN7EXAMPLEKEYMATERIAL01",
+      "Authorization header verified in tests",
+      "createPlanRequest validated end to end",
+      "snake_case_var_1 assigned correctly",
+      "ordinary short prose here",
+    ])
+    expect(kept).toEqual([
+      "Authorization header verified in tests",
+      "createPlanRequest validated end to end",
+      "snake_case_var_1 assigned correctly",
+      "ordinary short prose here",
+    ])
+  })
+
+  it("a git SHA false positive does not take the following lines with it", () => {
+    const kept = scan([
+      "commit 9f2c1ab4d7e6053829bb14cf7a0d3e5182647c9b",
+      "Authorization header verified in tests",
+      "createPlanRequest validated end to end",
+    ])
+    expect(kept).toEqual(["Authorization header verified in tests", "createPlanRequest validated end to end"])
+  })
+
+  // Only the offending TOKEN is removed, never the whole unit — that is what
+  // makes a cascade structurally impossible.
+  it("strips only the fragment, leaving the rest of the neighbouring line", () => {
+    const key = "4145244f7f8dbe2cf10123456789abcdef0123456789abcdef99887766554433"
+    const kept = scan([`prefix ${key.slice(0, 16)}`, key.slice(16)])
+    expect(kept).toEqual(["prefix "])
   })
 
   // FR-006a's production case, re-asserted here because C1's fix touches the

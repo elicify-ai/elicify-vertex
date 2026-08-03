@@ -285,3 +285,64 @@ describe("M2 — genuine absence claims still parse, including the shapes that r
     })
   }
 })
+
+// ---------------------------------------------------------------------------
+// CRIT-2 (grill round 3) — the M1 guarantee, tested where the corpus cannot.
+//
+// Measured during review: all 36 `keep` notes in the 49-note corpus are
+// rejected by the two cheap pre-filters (`asserts-existence`,
+// `second-negation`) and NOT ONE reaches SUBJECT_LEAD / ABSENCE_TAIL /
+// coordinated / mixed. "0 false drops on 49 notes" was true and uninformative
+// about the machinery M1 actually added. These rows exercise it directly.
+//
+// The concrete hole: the "nothing else in the clause" guarantee rested on
+// TRAILING_QUALIFIER, a closed verb list requiring whitespace after the verb.
+// Four punctuation marks walked past it, and `absent` / `no such file` were
+// not in the list at all. ABSENCE_TAIL is end-anchored now, and every clause
+// must account for itself.
+// ---------------------------------------------------------------------------
+describe("CRIT-2 — a second claim in the same note keeps the whole item", () => {
+  const MIXED_NOTES = [
+    "research/x.md is missing, the KPI values are fabricated",
+    "research/x.md is missing: the KPI values are fabricated",
+    "research/x.md is missing; the KPI values are fabricated",
+    "research/x.md is missing! nothing else was done",
+    "research/x.md is missing? unclear",
+    // `absent` and `no such file` were absent from TRAILING_QUALIFIER entirely.
+    // The first is a near-verbatim paraphrase of corpus note N32 — a CORRECT
+    // judge failure against a file that exists, which the harness would have
+    // overruled into a pass.
+    "src/pages/Renewable.jsx is absent the recharts import",
+    "research/x.md no such file the sources are fake",
+    "research/x.md is missing its Sources section",
+  ]
+  for (const note of MIXED_NOTES) {
+    it(`keeps: ${note}`, () => {
+      expect(parsePathAbsenceClaim(note).paths).toEqual([])
+    })
+  }
+
+  // A consequence is not a second claim, or the genuine fabrications stop
+  // being recognisable — 5 real corpus notes take this shape.
+  it("still recognises an absence claim trailed by a consequence clause", () => {
+    expect(
+      parsePathAbsenceClaim("research/space-exploration.md does not exist on disk; cannot verify cited sources.").paths,
+    ).toEqual(["research/space-exploration.md"])
+  })
+
+  // Supporting evidence in parentheses is not a second claim either.
+  it("still recognises an absence claim with a parenthetical", () => {
+    expect(
+      parsePathAbsenceClaim("research/renewable-energy.json does not exist on disk (ls research/ returned no such file)")
+        .paths,
+    ).toEqual(["research/renewable-energy.json"])
+  })
+
+  // Guards the observation above: if the corpus ever DOES start exercising
+  // this machinery, that is a change worth noticing rather than assuming.
+  it("documents that the corpus decides every keep by pre-filter, not by clause analysis", () => {
+    const keeps = corpus.filter((r) => r.expected === "keep")
+    const reasons = new Set(keeps.map((r) => parsePathAbsenceClaim(r.note).reason))
+    expect([...reasons].sort()).toEqual(["asserts-existence", "second-negation"])
+  })
+})

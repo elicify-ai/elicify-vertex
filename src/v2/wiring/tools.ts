@@ -342,7 +342,22 @@ export function buildPlanTools(deps: PlanToolsDeps) {
       // `planningChallenge` FIRST so the model meets it before the plan body;
       // the plan's own keys follow unchanged, so callers that `JSON.parse`
       // this return value keep working.
-      return JSON.stringify(planningChallenge ? { planningChallenge, ...plan } : plan, null, 2)
+      // MAJ-1: an aborted create leaves the OLD plan on disk while returning
+      // the new one, so the old plan resurrects on the next hydrate.
+      const createAborted = storyEngine.consumeWriteAbort(context.sessionID)
+      const createWarning = createAborted
+        ? {
+            persisted: false,
+            warning:
+              "This plan was created in memory but could NOT be written to disk (the state lock was held by " +
+              "another instance). Any previous plan is still on disk and will reappear. Re-create the plan.",
+          }
+        : {}
+      return JSON.stringify(
+        planningChallenge ? { planningChallenge, ...createWarning, ...plan } : { ...createWarning, ...plan },
+        null,
+        2,
+      )
     },
   })
 
@@ -502,7 +517,25 @@ export function buildPlanTools(deps: PlanToolsDeps) {
     async execute(_args, context) {
       const planCleared = storyEngine.clearPlan(context.sessionID)
       const pinsCleared = pinStore.clearPins(context.sessionID)
-      return JSON.stringify({ planCleared, pinsCleared }, null, 2)
+      // MAJ-1 (grill round 3): C3's abort signal was wired into `checkpoint`
+      // only, so an aborted clear still returned `planCleared: true` while the
+      // plan sat untouched on disk — it comes straight back on the next
+      // hydrate. Same for create, below.
+      const writeAborted = storyEngine.consumeWriteAbort(context.sessionID)
+      return JSON.stringify(
+        writeAborted
+          ? {
+              planCleared,
+              pinsCleared,
+              persisted: false,
+              warning:
+                "The plan was cleared in memory but the change could NOT be written to disk (the state lock was " +
+                "held by another instance). The plan is still on disk and will reappear. Re-run this to clear it.",
+            }
+          : { planCleared, pinsCleared },
+        null,
+        2,
+      )
     },
   })
 

@@ -24,11 +24,11 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { afterEach, describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 
 import { PhaseEngine } from "../../src/v2/phase.js"
 import { PinStore } from "../../src/v2/pin.js"
-import { StoryEngine, type PlanV2 } from "../../src/v2/story.js"
+import { StoryEngine, lockIO, type PlanV2 } from "../../src/v2/story.js"
 import type { OpencodeClient } from "../../src/v2/types.js"
 import { buildPlanTools } from "../../src/v2/wiring/tools.js"
 import { freshSessionState, type V2SessionState } from "../../src/v2/wiring/state.js"
@@ -632,5 +632,82 @@ describe("plan_status and plan_clear", () => {
 
     const statusRaw = (await harness.tools.elicify_vertex_plan_status.execute({}, { sessionID: SESSION } as never)) as string
     expect(JSON.parse(statusRaw)).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// MAJ-1 / C3 (grill round 3) — a write that did not reach disk must not be
+// reported as a success.
+//
+// C3 added `consumeWriteAbort`, but wired it into `checkpoint` only. An
+// aborted `plan_create` still returned the new plan while the OLD one sat on
+// disk (it comes back on the next hydrate), and an aborted `plan_clear` still
+// returned `planCleared: true` against a plan that was never removed.
+// ---------------------------------------------------------------------------
+describe("MAJ-1: the plan tools surface an aborted write", () => {
+  /** Make every lock acquisition fail, the way a peer instance holding it does. */
+  function jamTheLock(): () => void {
+    const acquire = vi.spyOn(lockIO, "acquire").mockImplementation(() => {
+      throw new Error("elicify-vertex state directory is locked by another process")
+    })
+    const sleep = vi.spyOn(lockIO, "sleep").mockImplementation(() => {})
+    return () => {
+      acquire.mockRestore()
+      sleep.mockRestore()
+    }
+  }
+
+  it("checkpoint reports persisted:false", async () => {
+    const h = boot(temporaryRoot())
+    await createStories(h, [{ text: "ship", acceptanceItems: ["A1"], tasks: [{ text: "do it" }] }])
+    const release = jamTheLock()
+    const out = JSON.parse(
+      (await h.tools.elicify_vertex_plan_checkpoint.execute({ taskId: "S1.T1", status: "complete" }, { sessionID: SESSION } as never)) as string,
+    ) as { persisted?: boolean; warning?: string }
+    release()
+    expect(out.persisted).toBe(false)
+    expect(out.warning).toMatch(/could NOT be written to disk/)
+  })
+
+  it("plan_clear reports persisted:false instead of a bare planCleared:true", async () => {
+    const h = boot(temporaryRoot())
+    await createStories(h, [{ text: "ship", acceptanceItems: ["A1"], tasks: [{ text: "do it" }] }])
+    const release = jamTheLock()
+    const out = JSON.parse(
+      (await h.tools.elicify_vertex_plan_clear.execute({}, { sessionID: SESSION } as never)) as string,
+    ) as { planCleared?: boolean; persisted?: boolean; warning?: string }
+    release()
+    expect(out.persisted).toBe(false)
+    expect(out.warning).toMatch(/still on disk and will reappear/)
+  })
+
+  it("plan_create reports persisted:false instead of returning the plan as saved", async () => {
+    const h = boot(temporaryRoot())
+    const release = jamTheLock()
+    const out = JSON.parse(
+      (await h.tools.elicify_vertex_plan_create.execute(
+        { stories: [{ text: "ship", acceptanceItems: ["A1"], scopeGlobs: [], verifiers: [], dependsOn: [], tasks: [{ text: "do it", dependsOn: [] }] }] },
+        { sessionID: SESSION } as never,
+      )) as string,
+    ) as { persisted?: boolean; warning?: string }
+    release()
+    expect(out.persisted).toBe(false)
+    expect(out.warning).toMatch(/could NOT be written to disk/)
+  })
+
+  // MAJ-2: the flag is per-mutation, not a sticky session property. An
+  // aborted reopen used to make the NEXT checkpoint — which persisted fine —
+  // tell the model to re-run a write that had already landed.
+  it("does not report a stale abort against a later write that succeeded", async () => {
+    const h = boot(temporaryRoot())
+    await createStories(h, [{ text: "ship", acceptanceItems: ["A1"], tasks: [{ text: "do it" }, { text: "and this" }] }])
+    const release = jamTheLock()
+    h.storyEngine.checkpoint(SESSION, "S1.T1", "complete") // aborts
+    release()
+
+    const out = JSON.parse(
+      (await h.tools.elicify_vertex_plan_checkpoint.execute({ taskId: "S1.T2", status: "complete" }, { sessionID: SESSION } as never)) as string,
+    ) as { persisted?: boolean }
+    expect(out.persisted).toBeUndefined()
   })
 })

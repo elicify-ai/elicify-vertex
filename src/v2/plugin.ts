@@ -533,16 +533,27 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
         // settled therefore left the flag set forever and every subsequent
         // user message short-circuited here: the harness inert, silently.
         //
-        // So distinguish the two cases the flag conflates. Our own echo
-        // carries the exact text we dispatched; anything else is user intent,
-        // and user intent IS the turn boundary.
-        const ownEcho = state.lastContinuationText !== null && text.includes(state.lastContinuationText)
-        if (ownEcho) {
+        // So distinguish the two cases the flag conflates. A dispatched
+        // continuation produces exactly ONE echo, so the first message while
+        // the guard is up is consumed as that echo and every later one is
+        // user intent — which IS the turn boundary.
+        //
+        // MAJ-9 (grill round 3): this used to be
+        // `text.includes(state.lastContinuationText)`. A host that trims,
+        // re-wraps or prefixes the echoed prompt would fail the match, release
+        // the guard and let the continuation clobber the very ledger it was
+        // dispatched to act on — and the emitted event said "real user
+        // message" either way, so the log could not tell them apart. The
+        // one-shot consume (v1's `gateContinuationSessions` behaviour) has
+        // neither failure mode: text is a corroborating signal, not the test.
+        if (state.lastContinuationText !== null) {
+          const looksLikeEcho = text.includes(state.lastContinuationText)
+          state.lastContinuationText = null
+          logger("gate:continuation-echo-consumed", { sessionID: sid, textMatched: looksLikeEcho })
           state.active = true
           return
         }
         state.idleContinuationInFlight = false
-        state.lastContinuationText = null
         logger("gate:continuation-guard-released", { sessionID: sid, reason: "real user message" })
       }
 
@@ -1161,13 +1172,30 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
         }
 
         // FR-034 compliance join
+        // MAJ-7 (grill round 3): a verify-gap prescription built from a
+        // story's verifiers arrives `&&`-joined (`resolve.ts` tier 1), and
+        // `observedCoversPrescribed` requires ONE observed command to cover
+        // EVERY prescribed part. A multi-verifier story's nudge could
+        // therefore never be marked complied, no matter what the agent ran —
+        // the same joined-prescription defect FR-013 fixed for receipts,
+        // surviving on the compliance path.
+        //
+        // Compliance measures whether the nudge was ACTED ON, not whether
+        // verification is complete (that is the receipt path, which still
+        // demands full coverage). Running one declared verifier of an
+        // `&&` chain is acting on it.
+        const compliesWith = (prescription: string): boolean => {
+          if (observedCoversPrescribed(prescription, command, state.workspaceRoot)) return true
+          const parts = prescription.split(/\s*&&\s*/).filter((part) => part.trim() !== "")
+          return parts.length > 1 && parts.some((part) => observedCoversPrescribed(part, command, state.workspaceRoot))
+        }
         for (const rendered of state.renderedVerifyGaps) {
           // M6 (grill round 2): this call was the one site still omitting the
           // root, so an observed command spelled absolutely never matched a
           // relatively-spelled prescription and the verify-gap was never
           // marked complied — the same absolute-vs-relative mismatch FR-013
           // fixed for receipts.
-          if (observedCoversPrescribed(rendered.command, command, state.workspaceRoot)) {
+          if (compliesWith(rendered.command)) {
             composer.recordCompliance(sid, "verify-gap", rendered.instanceId)
             state.compliedFamiliesEver.add("verify-gap")
           }

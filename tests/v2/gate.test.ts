@@ -1098,6 +1098,81 @@ describe("handleJudgeAudit — verdict reconciliation", () => {
     expect(h.storyEngine.getPlan(sid)!.stories[0].status).toBe("complete")
   })
 
+  // MAJ-3 (grill round 3): the close-out guard — the load-bearing half of C2 —
+  // had no test at all. Reverting `allPassed` to `story.judge?.pass === true`
+  // left the whole suite green, so the laundering could have been reinstated
+  // silently.
+  //
+  // The `pass:true` + `unapplied` shape is unreachable for ONE story
+  // (`isJudgeVerdictShape` rejects pass:true with an unmet item). It is
+  // reachable via the FR-014 BATCH sweep: the tool-call floor is evaluated
+  // across the whole batch, so one story failing an item bounds every verdict
+  // in it — including a sibling the judge genuinely passed.
+  it("MAJ-3: a pass:true stamp bounded by a failing sibling does NOT count toward the close-out", async () => {
+    const h = harness({ judgeEnabled: true })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    h.storyEngine.createPlan(sid, [
+      { text: "Research wave", acceptanceItems: ["x.md cites sources"], scopeGlobs: [], verifiers: [], tasks: [{ text: "write it" }] },
+      { text: "Chart wave", acceptanceItems: ["chart renders"], scopeGlobs: [], verifiers: [], tasks: [{ text: "build it" }] },
+    ])
+    h.storyEngine.checkpoint(sid, "S1.T1", "complete")
+    h.storyEngine.checkpoint(sid, "S2.T1", "complete")
+
+    stubJudge(
+      h,
+      {
+        stories: [
+          { storyId: "S1", pass: false, summary: "no sources", items: [{ itemId: "A1", met: false, note: "no sources cited" }] },
+          { storyId: "S2", pass: true, summary: "chart is there", items: [{ itemId: "A1", met: true, note: "verified" }] },
+        ],
+      },
+      [{ type: "text" }], // judge observed nothing -> FR-014 bounds the batch
+    )
+    await handleSessionIdle(h.ctx, sid)
+
+    const s2 = h.storyEngine.getPlan(sid)!.stories[1].judge!
+    expect(s2.pass).toBe(true)
+    expect(s2.unapplied).toBe("unverified")
+
+    // S1 is re-opened and re-audited CLEANLY, so it ends with a genuine
+    // passing stamp. Every story now reads `pass: true` — and only the
+    // `unapplied` clause stands between S2's bounding stamp and a close-out
+    // claiming the judge independently verified the whole plan.
+    h.storyEngine.reopenStory(sid, "S1", { reason: "re-audit after the judge observed nothing" })
+    stubJudge(h, {
+      stories: [
+        { storyId: "S1", pass: true, summary: "sources are cited", items: [{ itemId: "A1", met: true, note: "verified by reading the file" }] },
+      ],
+    })
+    await handleSessionIdle(h.ctx, sid) // the audit that settles the plan
+
+    const stories = h.storyEngine.getPlan(sid)!.stories
+    expect(stories.every((story) => story.judge?.pass === true)).toBe(true)
+    expect(stories[0].judge!.unapplied).toBeUndefined()
+    expect(stories[1].judge!.unapplied).toBe("unverified")
+
+    // THIS is the mutation-killing assertion: with the `unapplied` clause
+    // removed from `allPassed`, the settling audit above emits the
+    // independently-verified close-out for a plan half of which the judge
+    // never looked at.
+    const afterSettling = continuations(h.prompt)
+      .map((c) => c.text)
+      .join("\n")
+    expect(afterSettling).not.toContain("independently verified")
+
+    // On the next idle the selector is empty, and the escalation says plainly
+    // which story was never verified.
+    await handleSessionIdle(h.ctx, sid)
+    const said = continuations(h.prompt)
+      .map((c) => c.text)
+      .join("\n")
+    expect(said).toContain("S2")
+    expect(said).not.toContain("independently verified")
+  })
+
   it("C2: a plan settled only by unapplied stamps does NOT get the independently-verified close-out", async () => {
     const h = harness({ judgeEnabled: true })
     const sid = "s1"
@@ -1166,7 +1241,8 @@ describe("handleJudgeAudit — verdict reconciliation", () => {
     })
 
     const judgeSubturns = (): number =>
-      h.prompt.mock.calls.filter((c) => (c[0] as { body?: { agent?: string } })?.body?.agent === "vertex-judge").length
+      h.prompt.mock.calls.filter((c: unknown[]) => (c[0] as { body?: { agent?: string } })?.body?.agent === "vertex-judge")
+        .length
 
     await handleSessionIdle(h.ctx, sid) // revert 1 of 1
     h.storyEngine.checkpoint(sid, "S1.T1", "complete")

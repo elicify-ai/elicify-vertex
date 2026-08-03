@@ -792,7 +792,33 @@ export function parseSubcommands(command: string, workspaceRoot?: string): SubCo
  * `test -d research` from parsing as a target-less command, not to widen path
  * detection generally.
  */
-const FILESYSTEM_PREDICATE_RUNNERS = new Set(["test", "[", "ls", "stat", "readlink", "realpath"])
+const FILESYSTEM_PREDICATE_RUNNERS = new Set(["test", "["])
+
+/**
+ * CRIT-1 (grill round 3). The first version of this set omitted `[[`, bash's
+ * idiomatic spelling, so the ORIGINAL C4 false receipt survived verbatim:
+ * prescribed `[[ -d research ]]` was credited by observed `[[ -d src ]]`.
+ *
+ * It also listed `ls`, `stat`, `readlink` and `realpath`, which never did
+ * anything: `toSubCommand`'s runner-word loop consumes tokens until it hits a
+ * flag or a path-shaped token, so `ls research` parses as
+ * `runner: "ls research"` and this code is never reached for them. They are
+ * dropped rather than left as decoration — resurrecting them needs a change
+ * to the runner loop, not to this set.
+ */
+const BRACKET_TEST_RUNNERS = new Set(["[[", "[", "test"])
+
+/**
+ * CRIT-1. `test`/`[`/`[[` are only filesystem assertions under a FILE-TEST
+ * operator. `test -n research` is a string test that exits 0 without touching
+ * the filesystem, and crediting it for `test -d research` is worse than the
+ * bug this whole rule was added to fix — an unconditionally-succeeding
+ * command minting a filesystem receipt. Only these operators make the operand
+ * a path.
+ */
+const FILE_TEST_OPERATORS = new Set([
+  "-e", "-f", "-d", "-s", "-r", "-w", "-x", "-L", "-h", "-p", "-S", "-b", "-c", "-g", "-u", "-k", "-O", "-G", "-N",
+])
 
 function toSubCommand(tokens: readonly string[]): SubCommand | null {
   const runnerTokens: string[] = []
@@ -839,9 +865,18 @@ function toSubCommand(tokens: readonly string[]): SubCommand | null {
   // find where the runner ends, so `npm run build` would treat `build` as a
   // path. Instead, for runners that exist ONLY to assert something about a
   // filesystem entry, every non-flag operand IS the subject, shaped or not.
-  const bareOperandsArePaths = FILESYSTEM_PREDICATE_RUNNERS.has(runnerTokens[0])
+  // CRIT-1: a bracket/`test` command names a path only when a FILE-TEST
+  // operator says so. Without that check `test -n research` — a string test —
+  // credited `test -d research`.
+  const bareOperandsArePaths =
+    (FILESYSTEM_PREDICATE_RUNNERS.has(runnerTokens[0]) || BRACKET_TEST_RUNNERS.has(runnerTokens[0])) &&
+    rest.some((token) => FILE_TEST_OPERATORS.has(token))
   const targets = rest
     .filter((token) => !isFlagToken(token))
+    // CRIT-1 (C4-5): `test -d "research"` kept its quotes as part of the
+    // target and therefore no longer matched the identical unquoted command.
+    // Quoting is shell syntax, not part of the path.
+    .map((token) => token.replace(/^(['"])(.*)\1$/, "$2"))
     .filter((token) => bareOperandsArePaths || isPathShaped(token))
 
   const runner = normalizeRunner(runnerTokens.join(" "))

@@ -588,27 +588,74 @@ function pairTripsOnJoin(a: string, b: string): boolean {
  * `pairTripsOnJoin` cannot answer this when the neighbor is a confirmed
  * secret. A secret flush against a unit boundary fuses with whatever follows,
  * so a high-entropy token straddles the join no matter what the neighbor says
- * — "…all tests pass" scores identically to a key fragment. Asking the
- * straddle question there drops every innocent neighbor (it did: three
- * existing partial-drop tests failed).
+ * — "…all tests pass" scores identically to a key fragment.
  *
- * So judge the surviving side's OWN contributed fragment instead:
- *  - long enough to matter (a shorter piece is below the leak bar anyway),
- *  - drawn only from the secret alphabet — any prose punctuation, `.` or `:`
- *    included, disqualifies it, which is what keeps `assistant:` and
- *    `space-exploration.json` safe,
- *  - and mixing at least two character classes, which is what separates
- *    random key material from a long lowercase word like `documentation`.
+ * The first attempt at this test (>=12 chars, secret alphabet, >=2 character
+ * classes) was far too loose — MAJ-5, measured: `Authorization`,
+ * `createPlanRequest` and `snake_case_var_1` all matched, so four of five
+ * lines were dropped from a field whose first line held a secret, and a
+ * 40-char git SHA (a DOCUMENTED false positive of the hex-run rule, no real
+ * secret needed) emptied the field outright. That re-created FR-006a, the
+ * exact failure this module exists to prevent.
+ *
+ * So the bar is now structural, not statistical: key material is what does
+ * NOT decompose into words. A fragment is treated as secret only when it is
+ * long enough to matter, drawn from the secret alphabet, and fails
+ * `looksLikeWord` — which segments it on `_`, `-` and camelCase/digit
+ * boundaries and asks whether the pieces read like an identifier.
  */
 const SECRET_ALPHABET_RUN = /^[A-Za-z0-9+/=_-]+$/
-const SECRET_FRAGMENT_MIN_CHARS = 12
+const SECRET_FRAGMENT_MIN_CHARS = 16
+
+/**
+ * Does this token decompose into word-shaped segments? `createPlanRequest` ->
+ * create|Plan|Request (all >=3 letters) is an identifier; `HUZxXdF2O3ftvnSN`
+ * -> HUZx|Xd|F2|O3|ftvn|SN is not. Deliberately generous toward "word": a
+ * false "yes" keeps a line that might hold a fragment, a false "no" deletes
+ * evidence the judge needs, and the second failure is the one that has
+ * actually hurt in production.
+ */
+function looksLikeWord(token: string): boolean {
+  const segments = token
+    .split(/[_-]|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Za-z])(?=\d)|(?<=\d)(?=[A-Za-z])/)
+    .filter((part) => part !== "")
+  if (segments.length === 0) return false
+  const wordy = segments.filter((part) => /^[A-Za-z]{3,}$/.test(part))
+  // At least half the segments must be real alphabetic runs. Random material
+  // fragments into one- and two-character shards; identifiers do not.
+  return wordy.length * 2 >= segments.length
+}
+
+/**
+ * A long run of nothing but hex digits. Decided BEFORE `looksLikeWord`,
+ * because hex fragments segment into convincing pseudo-words — `fceff65ebc6fecde`
+ * splits as fceff|65|ebc|6|fecde, three of five "wordy", which is how eight
+ * residual leaks survived the structural test. An English word 16+ characters
+ * long drawn solely from a-f and digits does not occur.
+ */
+const LONG_HEX_RUN = /^[0-9a-f]{16,}$/i
 
 function looksLikeSecretFragment(fragment: string): boolean {
   if (fragment.length < SECRET_FRAGMENT_MIN_CHARS) return false
   if (!SECRET_ALPHABET_RUN.test(fragment)) return false
-  const classes =
-    (/[a-z]/.test(fragment) ? 1 : 0) + (/[A-Z]/.test(fragment) ? 1 : 0) + (/[0-9]/.test(fragment) ? 1 : 0)
-  return classes >= 2
+  if (LONG_HEX_RUN.test(fragment)) return true
+  return !looksLikeWord(fragment)
+}
+
+/**
+ * C1/MAJ-5: strip a secret fragment off the edge of a unit that FACES a unit
+ * dropped for holding a secret.
+ *
+ * The first version dropped the whole neighbouring unit, which cascaded: each
+ * newly-dropped unit implicated its own neighbour in turn, so one trigger
+ * could empty an entire field. Removing just the offending token bounds the
+ * damage to that token and makes a cascade structurally impossible — a
+ * stripped unit is never added to `toDrop`, so it never implicates anything.
+ */
+function stripFacingFragment(unit: string, facing: "start" | "end"): string {
+  const edge = facing === "start" ? /^\S+/.exec(unit) : /\S+$/.exec(unit)
+  if (!edge || !looksLikeSecretFragment(edge[0])) return unit
+  return facing === "start" ? unit.slice(edge[0].length) : unit.slice(0, unit.length - edge[0].length)
 }
 
 function scanUnits(units: string[]): { kept: string[]; anyDropped: boolean } {
@@ -618,56 +665,41 @@ function scanUnits(units: string[]): { kept: string[]; anyDropped: boolean } {
     if (unitTrips(unit)) toDrop.add(idx)
   })
 
-  // Both directions, because a secret can be split into three or more units:
-  // the forward pass propagates a drop rightward, the backward pass leftward.
-  // Two linear passes rather than iterate-to-fixpoint: every real split seen
-  // in the hygiene dataset is two- or three-way, and a bounded pass count
-  // keeps this predictable on a large `recentTranscript`.
-  const sweep = (order: number[]) => {
-    for (const i of order) {
-      const leftDropped = toDrop.has(i)
-      const rightDropped = toDrop.has(i + 1)
-      if (leftDropped && rightDropped) continue
-      if (leftDropped || rightDropped) {
-        // C1 (grill round 2, REPRODUCED). One side is a CONFIRMED secret.
-        // The old code `continue`d here to protect an innocent neighbor, but
-        // that also exempted the other HALF of the same secret: a 64-char hex
-        // key split at 16 leaves a 48-char tail that trips alone (so it is
-        // dropped) and a 16-char head that is under ENTROPY_MIN_TOKEN_LENGTH
-        // and therefore never trips — measured, it survived at 800 of 3425
-        // split points across base64/hex/base64url keys.
-        //
-        // The innocent-neighbor guarantee does not require skipping the pair,
-        // only refusing to implicate a neighbor that merely ABUTS a secret.
-        // `pairTripsOnJoin` is precisely that discriminator: it demands the
-        // offending token STRADDLE the join. A standalone secret next to
-        // ordinary prose does not straddle (a pattern match beginning at the
-        // join has `start === joinIdx`, so it is not a straddle); a fragment
-        // of the same secret always does.
-        const survivingIdx = leftDropped ? i + 1 : i
-        const surviving = dewrap(units[survivingIdx])
-        const secret = dewrap(units[leftDropped ? i : i + 1])
-        // Fusion only happens when BOTH edges at the boundary are
-        // non-whitespace; a secret line ending in a newline-stripped space
-        // cannot bleed into its neighbor's token.
-        const secretEdge = leftDropped ? /\S+$/.exec(secret) : /^\S+/.exec(secret)
-        const fragment = leftDropped ? /^\S+/.exec(surviving) : /\S+$/.exec(surviving)
-        if (secretEdge && fragment && looksLikeSecretFragment(fragment[0])) toDrop.add(survivingIdx)
-        continue
-      }
-      // Cheap gate first (unchanged), then FR-006a's join-locality check —
-      // which only ever runs on the rare pair that already tripped.
-      if (unitTrips(units[i] + units[i + 1]) && pairTripsOnJoin(units[i], units[i + 1])) {
-        toDrop.add(i)
-        toDrop.add(i + 1)
-      }
+  // The adjacent-pair pass, for two units that are BOTH individually clean.
+  for (let i = 0; i + 1 < units.length; i++) {
+    if (toDrop.has(i) || toDrop.has(i + 1)) continue
+    // Cheap gate first (unchanged), then FR-006a's join-locality check —
+    // which only ever runs on the rare pair that already tripped.
+    if (unitTrips(units[i] + units[i + 1]) && pairTripsOnJoin(units[i], units[i + 1])) {
+      toDrop.add(i)
+      toDrop.add(i + 1)
     }
   }
-  const forward = units.slice(0, -1).map((_, i) => i)
-  sweep(forward)
-  sweep([...forward].reverse())
 
-  const kept = units.filter((_, idx) => !toDrop.has(idx))
+  // C1: a secret wrapped across a unit boundary leaves a fragment in the
+  // SURVIVING neighbour that is too short to trip on its own — a 64-char hex
+  // key split at 16 drops the 48-char tail and used to keep the 16-char head
+  // (measured: 800 of 3425 split points). The pair pass above cannot catch it,
+  // because it skips any pair with an already-dropped member.
+  //
+  // Only the offending EDGE TOKEN is removed, not the unit (MAJ-5), and only
+  // units dropped by the passes above seed this — a stripped unit is not
+  // dropped, so nothing propagates and a field can never empty itself.
+  const seeds = [...toDrop]
+  const edited = [...units]
+  for (const i of seeds) {
+    const secret = dewrap(units[i])
+    // Fusion needs BOTH edges non-whitespace: a secret line ending in a space
+    // cannot bleed into its neighbour's token.
+    if (/\S$/.test(secret) && i + 1 < units.length && !toDrop.has(i + 1)) {
+      edited[i + 1] = stripFacingFragment(edited[i + 1], "start")
+    }
+    if (/^\S/.test(secret) && i - 1 >= 0 && !toDrop.has(i - 1)) {
+      edited[i - 1] = stripFacingFragment(edited[i - 1], "end")
+    }
+  }
+
+  const kept = edited.filter((_, idx) => !toDrop.has(idx))
   return { kept, anyDropped: toDrop.size > 0 }
 }
 

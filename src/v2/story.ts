@@ -144,7 +144,7 @@
  *    audited session failed with "cannot complete task X: it is not active"
  *    because the harness's own revert directive orders "checkpoint each
  *    reverted task complete again". Re-completing an ALREADY-COMPLETE task
- *    is now a logged no-op that mutates nothing (and skips the disk write
+ *    is now a logged no-op that mutates nothing (and normally skips the disk write, unless C3 has a stranded change to flush
  *    entirely); pending/blocked/failed still throw — those are genuine
  *    out-of-order claims, not re-claims.
  *  - FR-004 (a reopened story can be re-audited). `reopenStory` cleared
@@ -949,6 +949,16 @@ export class StoryEngine {
       // drop it.
       this.logger("story:v1-archived", { archivePath })
       return true
+    } catch (error) {
+      // MAJ-6: only the lock ACQUISITION was made fail-open; the body was not.
+      // `mkdirSync`/`renameSync` throw on a read-only state dir, a permissions
+      // change, or an `EEXIST` race, and this runs at the top of createPlan /
+      // checkpoint / checkScope / proposePlan — four synchronous tool handlers
+      // with no wrapper of their own, so the throw reached the host.
+      this.logger("story:v1-archive-failed", {
+        reason: error instanceof Error ? error.message : String(error),
+      })
+      return false
     } finally {
       lock?.release()
     }
@@ -1035,7 +1045,17 @@ export class StoryEngine {
         // `undefined`. Defend at the point of use rather than trust the
         // caller's type.
         scopeGlobs: [...(input.scopeGlobs ?? [])],
-        verifiers: [...(input.verifiers ?? [])],
+        // MAJ-8: element-type validation at the boundary, matching `dependsOn`
+      // above. Downstream `.trim()`/`.join()` guards were patches; this is the
+      // reason a non-string can no longer reach `gate.ts`'s judge prompt or
+      // `findings.ts`.
+      verifiers: (() => {
+        const raw = input.verifiers ?? []
+        if (!Array.isArray(raw) || !raw.every((v) => typeof v === "string")) {
+          throw new Error(`stories[${index}].verifiers must be an array of strings`)
+        }
+        return [...raw]
+      })(),
         assumptions: [],
         rejectedAlternatives: [],
         amendments: [],
@@ -2002,6 +2022,12 @@ export class StoryEngine {
     // body under the lock we already hold.
     if (this.lockHeld) return this.runMutation(sessionID, fn, mode)
 
+    // MAJ-2 (grill round 3): the abort flag reports on THIS mutation, so it
+    // starts clear. Without this an aborted `reopenStory` made the NEXT
+    // checkpoint — which persisted correctly — return `persisted: false` and
+    // tell the model to re-run a write that had already landed.
+    this.writeAborted.delete(sessionID)
+
     const lock = this.acquireLockWithRetry(sessionID)
     if (!lock) {
       const outcome = fn(this.plans.get(sessionID) ?? null)
@@ -2109,6 +2135,11 @@ export class StoryEngine {
    */
   private readPlanFile(sessionID: string): Record<string, PlanV2> {
     const file: Record<string, PlanV2> = {}
+    // Reset FIRST: this map is per-read state, and leaving a previous read's
+    // entries in place resurrected them when `plan.json` had since been
+    // deleted (measured: delete the file, checkpoint, the stale peer entry
+    // comes back).
+    this.foreignEntries = {}
     if (!fsIO.existsSync(this.planPath)) return file
     const raw = fsIO.readFileSync(this.planPath, "utf8")
     let parsed: unknown
@@ -2151,11 +2182,17 @@ export class StoryEngine {
       // not equipped to read it". Only THIS session's entry is ever rewritten
       // from parsed state, so preserving a raw value can never resurrect a
       // stale copy of our own plan.
-      this.foreignEntries = {}
       for (const [sid, value] of Object.entries(parsed)) {
         if (isPlanV2(value)) {
           file[sid] = coerceLoadedPlan(value)
-        } else if (sid !== sessionID && isFutureSchemaEntry(value)) {
+        } else if (isFutureSchemaEntry(value)) {
+          // Includes THIS session's own id. The audited configuration was two
+          // plugin runtimes driving one session, so "a newer peer wrote our
+          // session's entry" is not hypothetical — excluding it was excluding
+          // the measured case. `persistPlan` overwrites `file[sessionID]` from
+          // the cached plan whenever one exists, so preserving the raw value
+          // here can still never resurrect a stale copy of our own plan; it
+          // only protects the entry when this engine has nothing to write.
           this.foreignEntries[sid] = value
           this.logger("plan:foreign-entry-preserved", {
             sessionID,
@@ -2234,9 +2271,14 @@ export class StoryEngine {
       next = { ...file }
       delete next[sessionID]
     }
+    // M9 edge: an explicit clear must clear even an entry this version could
+    // not parse. Preserving a future-schema entry is right when we simply have
+    // nothing to say about it; it is wrong when the user asked for it gone.
+    const foreign = { ...this.foreignEntries }
+    if (!this.plans.has(sessionID)) delete foreign[sessionID]
     // M9: entries this version could not parse are written back exactly as
     // they were read. Spread FIRST so a real entry always wins the key.
-    this.atomicWrite({ ...this.foreignEntries, ...next })
+    this.atomicWrite({ ...foreign, ...next })
   }
 
   /** Atomic write: `wx` temp file + rename, mode 0600 (pattern reference: `src/goals.ts`, `pin.ts`). */

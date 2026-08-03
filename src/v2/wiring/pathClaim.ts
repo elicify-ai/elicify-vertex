@@ -22,8 +22,8 @@
  * matcher loose enough to catch "…md does not exist" also catches that and
  * would re-derive a pass on a real defect, destroying the whole reason the
  * story-level veto was withdrawn. So the rules below are clause-anchored and
- * closed-set, and are validated against all 49 recovered real notes (42 keep /
- * 7 drop) — a matcher that drops a correct-FAIL note fails the suite.
+ * closed-set, and are validated against all 49 recovered real notes (36 keep /
+ * 13 drop) — a matcher that drops a correct-FAIL note fails the suite.
  *
  * WHAT THIS MODULE MUST NEVER DO:
  *  - Execute anything. `verifiers` and every other string in `plan.json` are
@@ -79,6 +79,13 @@ const SECOND_NEGATION = /\b(?:but|however|although|though|yet)\b|\bcontains?\s+n
 const SUBJECT_LEAD =
   /^\s*(?:(?:the|a|an|file|directory|folder|and|or|nor|no|missing)\s+)*([\w.-]*(?:\/[\w.-]+)+\/?|[\w-]+\/(?![\w.-])|[\w-]+\.(?:md|json|jsx|tsx|ts|js|css|html|ya?ml|toml|txt))(?![\w.-])/i
 
+/**
+ * A clause that merely states what follows FROM the absence, rather than
+ * making a second claim. Shared with rule 2b's sentence-level check.
+ */
+const CLAUSE_CONSEQUENCE =
+  /^\s*(?:cannot|can't|unable\s+to|so\b|therefore|hence|which\s+means|no\s+way\s+to|nothing\s+to)\b/i
+
 /** The clause led with an absence WORD before the path ("No src/App.tsx"). */
 const LEADING_ABSENCE_LEAD = /^\s*(?:(?:the|a|an|file|directory|folder|and|or|nor)\s+)*(?:no|missing)\s+/i
 
@@ -90,7 +97,7 @@ const LEADING_ABSENCE_LEAD = /^\s*(?:(?:the|a|an|file|directory|folder|and|or|no
  * finding the harness must not touch.
  */
 const ABSENCE_TAIL =
-  /^[\s:,-]*(?:no\s+such\s+file\b|(?:(?:is|are|was|were|does|do|did|has|have|had|seems?|appears?|still|apparently|actually|simply|entirely|completely|currently|now|also|even|file|directory|dir|folder|path|itself)\s+)*(?:(?:not|never)\s+)?(?:exists?|present|found|missing|absent)\b)/i
+  /^[\s:,-]*(?:no\s+such\s+file|(?:(?:is|are|was|were|does|do|did|has|have|had|seems?|appears?|still|apparently|actually|simply|entirely|completely|currently|now|also|even|file|directory|dir|folder|path|itself)\s+)*(?:(?:not|never)\s+)?(?:exists?|present|found|missing|absent))(?:\s+(?:on\s+disk|from\s+disk|in\s+the\s+worktree|on\s+the\s+filesystem|anywhere|at\s+all|yet))*(?:\s*\([^)]*\))?[\s.!?;:,-]*$/i
 
 export interface PathClaim {
   /** Every path the note asserts to be absent. Empty when this is not a path claim. */
@@ -164,8 +171,16 @@ export function parsePathAbsenceClaim(note: string): PathClaim {
   PATH_TOKEN.lastIndex = 0
   const bareForSubject = bare
 
-  // Rule 1b: the absence must be predicated OF the path, not of something the
-  // path contains. Skipped for the LEADING form ("missing research/x.md"),
+  // Rule 1b. NOTE (CRIT-2, grill round 3): this is now a cheap early exit,
+  // NOT the guarantee. `ABSENCE_TAIL` is end-anchored, so "x.md is missing its
+  // Sources section" fails there regardless. It had to stop being the
+  // guarantee: it required `\s+` after a closed list of verbs, so `,` `:` `!`
+  // and `?` all walked past it ("research/x.md is missing, the KPI values are
+  // fabricated" was dropped), and `absent` / `no such file` were not in the
+  // list at all ("src/pages/Renewable.jsx is absent the recharts import" — a
+  // near-verbatim paraphrase of corpus note N32, a CORRECT judge failure —
+  // was dropped).
+  // Skipped for the LEADING form ("missing research/x.md"),
   // where the absence word precedes its path: TRAILING_QUALIFIER reads the
   // path itself as the qualifier and rejected every note of that shape.
   if (!LEADING_ABSENCE_LEAD.test(note) && TRAILING_QUALIFIER.test(note)) {
@@ -202,6 +217,17 @@ export function parsePathAbsenceClaim(note: string): PathClaim {
   for (const clause of clauses) {
     const lead = SUBJECT_LEAD.exec(clause)
     if (!lead) {
+      // CRIT-2: a clause carrying no path is only harmless when it is a
+      // CONSEQUENCE of the absence ("cannot verify cited sources" — 5 real
+      // corpus notes take that shape). Anything else is a second, independent
+      // claim, and the harness cannot drop half an item. The clause splitter
+      // separates "x.md is missing" from ", the KPI values are fabricated",
+      // so without this the second claim simply vanished from consideration
+      // and the item was dropped on the strength of the first.
+      if (!CLAUSE_CONSEQUENCE.test(clause)) {
+        mixed = true
+        continue
+      }
       // No path leads this clause. If it nonetheless asserts an absence, the
       // absence is of something the harness cannot check — a section, a
       // skeleton, a capability. Corpus note N-"No src/App.tsx, src/App.jsx,

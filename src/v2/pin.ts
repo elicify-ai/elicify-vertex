@@ -380,7 +380,20 @@ export class PinStore {
       }
     }
 
-    const lock = acquireStateLock(this.stateDir)
+    // Same fail-open violation as `story.ts`'s `archiveV1IfPresent` (M8), and
+    // on a hotter path: `gc` is called unguarded from `chat.message` on EVERY
+    // activated turn, and `acquireStateLock` throws on contention. A peer
+    // instance holding the lock therefore rejected the hook — aborting the
+    // turn after `resetTurnState` had already run but before intake
+    // classification. Garbage collection is best-effort by definition; if the
+    // lock is busy, the next turn collects.
+    let lock: { release(): void }
+    try {
+      lock = acquireStateLock(this.stateDir)
+    } catch (error) {
+      this.logger("pins:gc-deferred", { reason: error instanceof Error ? error.message : String(error) })
+      return
+    }
     try {
       if (!fsIO.existsSync(this.pinsPath)) return
       let parsed: unknown

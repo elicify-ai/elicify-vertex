@@ -198,9 +198,26 @@ export function storyCompletionFinding(opts: { instanceId: string; nextStory: St
  * what makes the continuation constructive ("S2 not delivered — A3, A4
  * still missing") instead of a generic "keep going".
  */
+/**
+ * Is this stamp a verdict the harness actually ACTED ON?
+ *
+ * A `judge.unapplied` stamp of `"unverified"` (FR-014: the judge answered
+ * without observing the worktree) or `"contradictory"` (FR-005: `pass:false`
+ * with every item met) records a verdict the harness rejected as unusable.
+ * Rendering its items as a prescription hands the model the very fabricated
+ * notes those rules exist to discard — "fix exactly those" pointed at claims
+ * nothing verified. `"capped"` is different: that verdict WAS usable, the
+ * harness merely stopped re-opening the story, so its detail still stands.
+ */
+function judgeVerdictIsActionable(story: StoryV2): boolean {
+  const stamp = story.judge
+  if (!stamp || stamp.pass) return false
+  return stamp.unapplied !== "unverified" && stamp.unapplied !== "contradictory"
+}
+
 function activeStoryPrescription(story: StoryV2): string {
   const judgeNote =
-    story.judge && !story.judge.pass
+    judgeVerdictIsActionable(story) && story.judge
       ? `The completion judge's last audit of ${story.id} FAILED — "${story.judge.summary}". ` +
         `Items it found unmet: ${listWithOverflow(
           story.judge.items.filter((i) => !i.met).map((i) => `${i.itemId} (${i.note})`),
@@ -272,7 +289,7 @@ export function incompletePlanFinding(opts: {
   const roster = listWithOverflow(
     incomplete.map((story) => {
       const judgeDetail =
-        story.judge && !story.judge.pass
+        judgeVerdictIsActionable(story) && story.judge
           ? `, judge: ${listWithOverflow(
               story.judge.items.filter((i) => !i.met).map((i) => i.itemId),
               MAX_LISTED_ITEMS,

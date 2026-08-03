@@ -49,8 +49,10 @@ export interface V2SessionState {
    * C2: the settled-but-never-audited escalation has already been dispatched
    * for this plan. It fires from `handleJudgeAudit`'s early return, which runs
    * on every subsequent idle, so without this it would repeat forever.
-   * Per-session rather than per-plan because a new plan resets the session
-   * state alongside it.
+   * Reset by `resetTurnState` (MAJ-4): it was previously initialised only in
+   * `freshSessionState`, so a SECOND unaudited plan in the same session found
+   * the flag already spent and ended in total silence. The doc here used to
+   * claim a new plan reset it; nothing did.
    */
   unauditedEscalated: boolean
   /** True between `experimental.session.compacting` and the matching `session.compacted`. */
@@ -194,6 +196,13 @@ export function resetTurnState(state: V2SessionState): void {
   // A real user message is the turn boundary that genuinely ends any
   // outstanding continuation.
   state.idleContinuationInFlight = false
+  state.lastContinuationText = null
+  // MAJ-4: the once-only settled-but-unaudited escalation is per PLAN, not
+  // per session. It was only ever initialised in `freshSessionState`, so a
+  // second unaudited plan in the same session found it already spent and the
+  // run ended in silence. A real user message is the right boundary: it is
+  // what precedes a new plan.
+  state.unauditedEscalated = false
   state.markerAtLastContinuation = -1
   state.consecutiveNoProgress = 0
   state.stallPaused = false

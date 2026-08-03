@@ -907,3 +907,34 @@ encodes them as intentional:
   back. Rolling back would discard the change in the common recoverable case.
 - Schema-invalid entries at the current version are still discarded. Only a
   future `schemaVersion` is preserved.
+
+
+---
+
+## Round-4 corrections (second re-review, 2026-08-03)
+
+The round-3 re-review returned BLOCK. Every finding below was reproduced
+before being fixed.
+
+| # | Finding | Resolution |
+|---|---------|------------|
+| CRIT-1 | C4 was MOVED, not closed. `FILESYSTEM_PREDICATE_RUNNERS` omitted `[[`, so the original false receipt survived verbatim (`[[ -d research ]]` credited by `[[ -d src ]]`). Worse, `test -n research` — a string test that touches no filesystem and always exits 0 — credited `test -d research`. Four of the six set members (`ls`, `stat`, `readlink`, `realpath`) were inert: the runner-word loop eats their bare operand before the new code runs. And `test -d "research"` no longer matched its own unquoted spelling. | Set narrowed to what actually works, `[[` added, a FILE-TEST-operator requirement added, and quotes stripped from targets. 8/8 probe cases correct. |
+| CRIT-2 | M1 was MOVED. `ABSENCE_TAIL` was a PREFIX test; the "nothing else in the clause" guarantee rested on `TRAILING_QUALIFIER`, a closed verb list requiring whitespace after the verb. `,` `:` `!` `?` all walked past it, and `absent` / `no such file` were not in the list — so "src/pages/Renewable.jsx is absent the recharts import", a paraphrase of a CORRECT judge failure, was dropped. | `ABSENCE_TAIL` is end-anchored, and every clause must now account for itself (absence claim, coordinated path, or consequence). 0/8 escapes. |
+| MAJ-1 | M10/M11 were reported closed but never wired: `consumeWriteAbort` had one call site. | `plan_create` and `plan_clear` now surface `persisted: false`. |
+| MAJ-2 | New, from C3: `writeAborted` is session-keyed, so an aborted reopen made the NEXT (successful) checkpoint report a lost write. | Cleared at the start of each mutation. |
+| MAJ-3 | C2's close-out guard had no test — reverting it left the suite green. | Tested via the reachable production path (FR-014 batch sweep + a later clean re-audit); the mutant now dies. |
+| MAJ-4 | The escalation flag was set before dispatch (a refused dispatch burned it) and never reset (a second unaudited plan ended in silence). | Spent only on a dispatch that happened; reset in `resetTurnState`. |
+| MAJ-5 | **C1's fix introduced an unbounded cascade.** The >=12-char/2-class bar matched `Authorization`, `createPlanRequest`, `snake_case_var_1`; each dropped line implicated its neighbour, so a 40-char git SHA — a documented false positive, no real secret — emptied a whole field, re-creating FR-006a. The repo's own guard test was vacuous (a trailing space made the predicate unreachable). | Bar is now structural (`looksLikeWord` + a pure-hex rule), and the action is to strip the offending TOKEN, not drop the unit — so a cascade is structurally impossible. 0 leaks / 10840 split probes; all innocent lines survive. |
+| MAJ-6 | M8 fixed the lock acquisition but not the archive BODY (`mkdirSync`/`renameSync`), still throwing into four synchronous tool handlers. | Whole body wrapped; logs `story:v1-archive-failed`. |
+| MAJ-7 | M5 residual: `resolve.ts` tier 1 still `&&`-joins, so a multi-verifier story's verify-gap could never be marked complied. | The compliance join credits any part of an `&&` chain. Receipts still require full coverage. |
+| MAJ-8 | M7 patched two call sites but not the root: `createPlan` never type-checked `verifiers` elements. | Validated at the boundary, like `dependsOn`. |
+| MAJ-9 | M4 matched the echo by `text.includes(...)`; a host that normalises the prompt would release the guard, and the log said "real user message" either way. | One-shot consume (v1's behaviour); text is now corroborating, not the test. |
+| Minors | `foreignEntries` survived an early return and resurrected a deleted plan; M9 excluded the own-session case that the audit actually observed; FR-003's doc contradicted C3; `findings.ts` rendered rejected verdicts as directives; two test-project type errors. | All fixed. |
+| Out of scope | `PinStore.gc()` takes the lock unguarded and is called from `chat.message` every activated turn — the same fail-open violation as M8, on a hotter path. | Fixed, since the class was in scope even though the line was not. |
+
+### Residual, stated rather than closed
+
+- **Three-way secret splits** where no two consecutive pieces reach 32 chars still leak (unchanged from round 3).
+- **`looksLikeSecretFragment` keeps word-shaped fragments by design.** A key whose split leaves "xQabcdefghijklmn" survives as a fragment. Random key material does not contain long alphabetic runs; judge evidence is made of nothing else, and deleting evidence is the failure that has actually occurred in production.
+- **`grep`/`wc`-style runners** still lose bare-word operands (`grep -q foo Makefile` is credited by `grep -q bar Dockerfile`). Pre-existing and unchanged by C4; fixing it needs per-runner argument grammar, since the operand could be the pattern rather than the path.
+- **The 49-note corpus does not exercise the M1 machinery at all** — measured: all 36 `keep` notes are decided by the two cheap pre-filters. A test now pins that fact so the coverage claim cannot be overread again.

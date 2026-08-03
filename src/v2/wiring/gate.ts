@@ -936,9 +936,6 @@ async function emitUnauditedEscalation(
   const disputed = plan.stories.filter((s2) => s2.judge?.unapplied === "capped")
   const unaudited = [...unverified, ...disputed].map((story) => story.id)
   if (unaudited.length === 0) return false
-  // Once only: this runs on EVERY idle after the plan settles, and repeating
-  // the escalation each time would be its own loop.
-  state.unauditedEscalated = true
   ctx.logger("judge:unaudited-escalation", { sessionID: sid, stories: unaudited })
   const clauses: string[] = []
   if (unverified.length > 0) {
@@ -953,7 +950,7 @@ async function emitUnauditedEscalation(
         "the harness stopped re-opening them — those stories are DISPUTED, not confirmed",
     )
   }
-  return dispatchContinuation(
+  const dispatched = await dispatchContinuation(
     ctx,
     sid,
     state,
@@ -961,6 +958,12 @@ async function emitUnauditedEscalation(
       `the commands you ran and the results you observed, state explicitly that ${unaudited.join(", ")} did not pass ` +
       "audit, then stop.",
   )
+  // MAJ-4 (grill round 3): spend the once-only flag ONLY on a dispatch that
+  // actually happened. Setting it beforehand meant a stall-paused or refused
+  // dispatch burned the single escalation and the run ended in silence — the
+  // very outcome this branch exists to prevent.
+  if (dispatched) state.unauditedEscalated = true
+  return dispatched
 }
 
 async function handleJudgeAudit(ctx: GateContext, sid: string, state: V2SessionState): Promise<boolean> {
