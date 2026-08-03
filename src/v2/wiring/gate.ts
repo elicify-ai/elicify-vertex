@@ -103,6 +103,10 @@ export interface GateContext {
   }
 }
 
+/** MIN-006: per-session dispatch counter so a late-settling prompt cannot
+ * release a newer continuation's in-flight guard. */
+const continuationTicket = new Map<string, number>()
+
 const CONTINUATION_TIMEOUT_MS = 30_000
 const CONTINUATION_TIMEOUT_ERROR = "vertex-v2-continuation-timeout"
 
@@ -127,6 +131,11 @@ async function promptContinuation(
     return
   }
   const state = ctx.states.get(sid)
+  // MIN-006 (code review): a prompt that timed out and settles LATER must not
+  // release the guard of a newer continuation. Each dispatch takes a ticket;
+  // the late settler only releases if its ticket is still the current one.
+  const ticket = (continuationTicket.get(sid) ?? 0) + 1
+  continuationTicket.set(sid, ticket)
   if (state) state.idleContinuationInFlight = true
 
   // A dispatched continuation is a fresh prompt, so it opens a new turn in
@@ -180,7 +189,8 @@ async function promptContinuation(
   let settled = false
   const release = (): void => {
     settled = true
-    if (state) state.idleContinuationInFlight = false
+    // Only the CURRENT dispatch may clear the flag (MIN-006).
+    if (state && continuationTicket.get(sid) === ticket) state.idleContinuationInFlight = false
   }
   try {
     const timeoutPromise = new Promise<never>((_, reject) => {
@@ -238,7 +248,7 @@ async function promptContinuation(
     // echoing itself — see `handleSessionIdle`). Every other exit released it
     // above, and `resetTurnState` clears it on the next real user message so
     // a never-settling prompt cannot wedge the session forever.
-    if (settled && state) state.idleContinuationInFlight = false
+    if (settled && state && continuationTicket.get(sid) === ticket) state.idleContinuationInFlight = false
   }
 }
 
@@ -736,6 +746,12 @@ function formatJudgeReverts(plan: PlanV2, verdicts: readonly JudgeStoryVerdict[]
 function reaudits(state: V2SessionState, storyId: string): number {
   return state.storyReaudits?.[storyId] ?? 0
 }
+function clearReaudit(state: V2SessionState, storyId: string): void {
+  if (!state.storyReaudits?.[storyId]) return
+  const next = { ...state.storyReaudits }
+  delete next[storyId]
+  state.storyReaudits = next
+}
 function bumpReaudit(state: V2SessionState, storyId: string): void {
   state.storyReaudits = { ...(state.storyReaudits ?? {}), [storyId]: reaudits(state, storyId) + 1 }
 }
@@ -972,7 +988,11 @@ async function handleJudgeAudit(ctx: GateContext, sid: string, state: V2SessionS
       })
       continue
     }
-    if (!verdict.pass) bumpReaudit(state, verdict.storyId)
+    // MIN-004: the cap is on CONSECUTIVE reverts, so a pass clears the streak.
+    // Without this it was cumulative-per-turn and would escalate a story that
+    // had recovered in between.
+    if (verdict.pass) clearReaudit(state, verdict.storyId)
+    else bumpReaudit(state, verdict.storyId)
     applicable.push(verdict)
   }
   if (applicable.length === 0) return false

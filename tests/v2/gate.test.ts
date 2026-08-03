@@ -15,7 +15,7 @@ import { SelfCreatedSessions } from "../../src/v2/subturn.js"
 import type { OpencodeClient } from "../../src/v2/types.js"
 import { handleSessionIdle, type GateContext } from "../../src/v2/wiring/gate.js"
 import { ManifestCache } from "../../src/v2/wiring/manifest.js"
-import { freshSessionState } from "../../src/v2/wiring/state.js"
+import { freshSessionState, resetTurnState } from "../../src/v2/wiring/state.js"
 import { DelegationTracker } from "../../src/v2/wiring/watchdog.js"
 
 const roots: string[] = []
@@ -1066,5 +1066,121 @@ describe("handleJudgeAudit — verdict reconciliation", () => {
 
     expect(loggedEventTypes(h.logger)).toContain("judge:reaudit-capped")
     expect(h.storyEngine.getPlan(sid)!.stories[0].status).toBe("complete") // not reverted again
+  })
+})
+
+// ===========================================================================
+// FR-012 — continuation delivery classification and the in-flight guard.
+//
+// MAJ-009 (code review): this requirement shipped with zero tests, and its
+// implementation produced CRIT-002 (a session that could be wedged forever).
+// These pin both halves.
+// ===========================================================================
+describe("promptContinuation — FR-012 delivery classification", () => {
+  it("a slow (still-streaming) turn is NOT reported as a delivery failure", async () => {
+    const h = harness()
+    const sid = "s1"
+    quietSession(h, sid)
+    createSixStoryStylePlan(h, sid)
+    // A prompt that never settles models the real host: session.prompt
+    // resolves only when the whole assistant turn ends.
+    const session = h.ctx.client.session as unknown as Record<string, unknown>
+    session.prompt = vi.fn(() => new Promise(() => {}))
+
+    vi.useFakeTimers()
+    try {
+      const idle = handleSessionIdle(h.ctx, sid)
+      await vi.advanceTimersByTimeAsync(31_000)
+      await idle
+    } finally {
+      vi.useRealTimers()
+    }
+
+    expect(loggedEventTypes(h.logger)).toContain("gate:continuation-slow")
+    expect(loggedEventTypes(h.logger)).not.toContain("gate:continuation-failed")
+  })
+
+  it("a genuine rejection IS reported as a delivery failure", async () => {
+    const h = harness()
+    const sid = "s1"
+    quietSession(h, sid)
+    createSixStoryStylePlan(h, sid)
+    const session = h.ctx.client.session as unknown as Record<string, unknown>
+    session.prompt = vi.fn(async () => {
+      throw new Error("host refused")
+    })
+
+    await handleSessionIdle(h.ctx, sid)
+
+    expect(loggedEventTypes(h.logger)).toContain("gate:continuation-failed")
+    expect(loggedEventTypes(h.logger)).not.toContain("gate:continuation-slow")
+  })
+
+  // CRIT-002 regression: the defect that made this requirement dangerous.
+  it("a SYNCHRONOUS throw from session.prompt does not wedge the session", async () => {
+    const h = harness()
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    createSixStoryStylePlan(h, sid)
+    const session = h.ctx.client.session as unknown as Record<string, unknown>
+    session.prompt = vi.fn(() => {
+      throw new Error("sync throw")
+    })
+
+    await handleSessionIdle(h.ctx, sid)
+
+    // Before the fix this stayed true forever, and plugin.ts's chat.message
+    // returns early while it is set — the whole harness went inert.
+    expect(state.idleContinuationInFlight).toBe(false)
+    expect(loggedEventTypes(h.logger)).toContain("gate:continuation-failed")
+  })
+
+  it("a real user message clears a guard held by a never-settling prompt", async () => {
+    const h = harness()
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    createSixStoryStylePlan(h, sid)
+    const session = h.ctx.client.session as unknown as Record<string, unknown>
+    session.prompt = vi.fn(() => new Promise(() => {}))
+
+    vi.useFakeTimers()
+    try {
+      const idle = handleSessionIdle(h.ctx, sid)
+      await vi.advanceTimersByTimeAsync(31_000)
+      await idle
+    } finally {
+      vi.useRealTimers()
+    }
+    // The timeout path deliberately HOLDS the guard (the turn is still
+    // streaming and it is the only defence against a continuation echoing
+    // itself) — but the next real user message must release it.
+    expect(state.idleContinuationInFlight).toBe(true)
+    resetTurnState(state)
+    expect(state.idleContinuationInFlight).toBe(false)
+  })
+})
+
+describe("judge re-audit counter — MIN-004", () => {
+  it("a PASSING verdict clears that story's consecutive-revert streak", async () => {
+    const h = harness({ judgeEnabled: true, maxStoryReaudits: 2 })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid)
+
+    // Revert once.
+    stubJudge(h, {
+      stories: [{ storyId: "S1", pass: false, summary: "not done", items: [{ itemId: "A1", met: false, note: "no sources cited" }] }],
+    })
+    await handleSessionIdle(h.ctx, sid)
+    expect(state.storyReaudits.S1).toBe(1)
+
+    // Now it passes: the streak must reset, not accumulate.
+    h.storyEngine.checkpoint(sid, "S1.T1", "complete")
+    stubJudge(h, { stories: [{ storyId: "S1", pass: true, summary: "delivered", items: [{ itemId: "A1", met: true, note: "verified" }] }] })
+    await handleSessionIdle(h.ctx, sid)
+
+    expect(state.storyReaudits.S1).toBeUndefined()
   })
 })
