@@ -101,6 +101,12 @@ export interface V2SessionState {
   /** Cap reached: the gate goes silent until the next real user message. */
   stallPaused: boolean
 
+  /** FR-007: consecutive judge reverts per story id. Process-local by
+   * design — persisting it would mean a `StoryV2` schema change, and the cap
+   * is a courtesy bound (stop the loop) rather than a safety control. Reset
+   * by `resetTurnState` when a real user message re-engages. */
+  storyReaudits: Record<string, number>
+
   /** Last completed assistant text (mirrors v1's `lastAssistantText`, used nowhere safety-critical in v2 wiring today but kept for parity / future use). */
   lastAssistantText: string | null
 
@@ -137,6 +143,7 @@ export function freshSessionState(workspaceRoot: string): V2SessionState {
     markerAtLastContinuation: -1,
     consecutiveNoProgress: 0,
     stallPaused: false,
+    storyReaudits: {},
     lastAssistantText: null,
     instanceCounter: 0,
   }
@@ -165,6 +172,7 @@ export function resetTurnState(state: V2SessionState): void {
   state.markerAtLastContinuation = -1
   state.consecutiveNoProgress = 0
   state.stallPaused = false
+  state.storyReaudits = {}
   // Per-turn criteria idle-gate replay cap (FR-015 "criteria pinned" branch)
   // — v1 parity: EvidenceLedger.reset() zeroes stopBlocks on every
   // chat.message, so its cap is 3 blocks PER TURN, not 3 ever. Without this

@@ -123,7 +123,6 @@ describe("applyV2Config", () => {
     const tools = buildPlanTools({
       storyEngine: new StoryEngine({ stateDir, logger }),
       pinStore: new PinStore({ stateDir, logger }),
-      verificationReceipts: { get: () => undefined } as never,
       client: { session: { messages: vi.fn(async () => ({ data: [], error: undefined })) } } as unknown as OpencodeClient,
       states: new Map(),
       phaseEngine: new PhaseEngine(logger),
@@ -156,7 +155,6 @@ describe("elicify_vertex_plan_clear tool", () => {
     const tools = buildPlanTools({
       storyEngine,
       pinStore,
-      verificationReceipts: { get: () => undefined } as never,
       client,
       states: new Map(),
       phaseEngine,

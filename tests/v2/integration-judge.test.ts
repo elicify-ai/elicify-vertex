@@ -601,7 +601,6 @@ describe("judge close-out fires once every story has passed audit, across stagge
         }
       },
     })
-    const recordSpy = vi.spyOn(VerificationReceiptStore.prototype, "record")
     const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
     const sid = "judge-staggered-session"
     await activate(hooks, sid, "fix a typo in the readme", { providerID: "anthropic", id: "claude-fable-5" })

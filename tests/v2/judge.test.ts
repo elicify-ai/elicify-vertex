@@ -66,6 +66,33 @@ const PASS_VERDICT = {
   ],
 }
 
+/**
+ * FR-006 fixtures: a realistic, secret-free plan digest of an EXACT length,
+ * so the measured 7518-char raw digest (spec round-2 finding m-19) and the
+ * new cap's +1 boundary can both be exercised as real numbers rather than
+ * approximations. Shaped like `renderPlanDigest`'s output (story header,
+ * acceptance items, declared verifiers) and deliberately free of any
+ * adjacent-line pair whose no-separator join could reach 32 characters — the
+ * FR-006a mechanism is tested separately, and must not be smuggled into a
+ * cap test.
+ */
+function makePlanDigestOfLength(totalChars: number): string {
+  const lines: string[] = []
+  let length = 0
+  for (let i = 1; length < totalChars; i++) {
+    for (const line of [
+      `S${i} (complete): "Story ${i} of the audited plan"`,
+      `  - [A1] the deliverable for story ${i} exists on disk`,
+      `  - [A2] the deliverable for story ${i} cites its sources`,
+      `  verifiers: test -f out/s${i}.md`,
+    ]) {
+      lines.push(line)
+      length += line.length + 1
+    }
+  }
+  return lines.join("\n").slice(0, totalChars)
+}
+
 function makeClient(): OpencodeClient {
   return {
     app: { agents: vi.fn() },
@@ -667,19 +694,196 @@ describe("buildJudgePayload", () => {
     expect(logger).toHaveBeenCalledWith("judge:field-dropped", { field: "plan" })
   })
 
-  it("point 4: an oversized clean plan is truncated to its own 4000-char cap (C-9 scan-then-truncate), not the 2000 field cap", () => {
+  it("point 4 / FR-006: an oversized clean plan is truncated to its own 16000-char cap (C-9 scan-then-truncate), not the 2000 field cap", () => {
     const logger = vi.fn()
-    const longPlan = "story line ok\n".repeat(400) // 5600 chars, past 4000, no secrets
+    // Cap raised 4000 -> 16000 by FR-006 (measured raw digest = 7518 chars),
+    // so the oversize fixture is re-sized to stay ABOVE the cap: this test's
+    // subject is "the plan field has its OWN, larger cap", not the number.
+    const longPlan = "story line ok\n".repeat(1400) // 19600 chars, past 16000, no secrets
     const raw = { criteria: [], diffSummary: "", verifierSummaries: [], lastResponse: "", recentTranscript: "", plan: longPlan }
     const payload = buildJudgePayload(raw, logger)
     expect(payload.plan).toBeDefined()
-    expect(payload.plan!.length).toBeLessThanOrEqual(4000)
-    expect(payload.plan!.length).toBeGreaterThan(2000) // proves the 2000 field cap was NOT applied
+    expect(payload.plan!.length).toBeLessThanOrEqual(16000)
+    expect(payload.plan!.length).toBeGreaterThan(4000) // proves neither the 2000 field cap nor the old 4000 plan cap was applied
     expect(logger).toHaveBeenCalledWith("judge:field-truncated", {
       field: "plan",
       originalLength: longPlan.length,
-      cap: 4000,
+      cap: 16000,
     })
+  })
+
+  // =========================================================================
+  // FR-006 / FR-006a — docs/JUDGE-RELIABILITY-FIXES-SPEC.md, User Story 6.
+  //
+  // Both requirements exist because of ONE observed production failure mode:
+  // the judge FAILing delivered stories while citing the very plan content
+  // the payload pipeline had silently removed before it ever saw it
+  // ("the verifier command is incomplete in the digest", "S5 has no
+  // independent verifier set in the digest"). Two independent mechanisms did
+  // the removing — the 4000-char cap (11 `judge:field-truncated`) and the
+  // no-separator adjacent-pair join (11 `judge:field-partial-drop`) — so
+  // there are two sets of tests.
+  // =========================================================================
+
+  it("FR-006a / SC-006b: two clean plan-digest lines whose no-separator join manufactures a high-entropy token are BOTH KEPT", () => {
+    const logger = vi.fn()
+    // The REAL reproduced pair (spec round-2 finding M-10). Joined with no
+    // separator these fuse into `research/space-exploration.jsonS2` — 33
+    // chars, 4.044 bits/char, over the 3.95 effective entropy threshold —
+    // while NEITHER line trips anything on its own (the path token alone is
+    // 31 chars, under ENTROPY_MIN_TOKEN_LENGTH, and measures 3.889). Before
+    // FR-006a both lines were dropped, which is exactly how S1/S2/S3 lost
+    // their `verifiers:` lines 11 times in the audited session.
+    const verifiersLine =
+      "  verifiers: test -f research/space-exploration.json && jq -e '.kpis | length >= 3' research/space-exploration.json"
+    const nextStoryLine = 'S2 (active): "Research Wave B — space exploration briefing"'
+    const planDigest = ["S1 (complete): \"Research Wave A\"", verifiersLine, nextStoryLine].join("\n")
+
+    const raw = { criteria: [], diffSummary: "", verifierSummaries: [], lastResponse: "", recentTranscript: "", plan: planDigest }
+    const payload = buildJudgePayload(raw, logger)
+
+    expect(payload.plan).toBe(planDigest)
+    expect(payload.plan).toContain(verifiersLine)
+    expect(payload.plan).toContain(nextStoryLine)
+    expect(logger).not.toHaveBeenCalledWith("judge:field-partial-drop", expect.anything())
+    expect(logger).not.toHaveBeenCalled()
+  })
+
+  it("FR-006a: the same manufactured-token pair is kept in every scanned field, not just `plan` (no per-field exemption)", () => {
+    // FR-006a forbids fixing this by exempting the plan digest (that would
+    // contradict US6 AS3 — a secret in the digest must still be redacted), so
+    // the fix lives in scanUnits and must be observable through the line
+    // fields and the prose fields alike.
+    const a = "  verifiers: jq -e '.kpis | length >= 3' research/space-exploration.json"
+    const b = 'S2 (active): "Research Wave B"'
+
+    const lineLogger = vi.fn()
+    const linePayload = buildJudgePayload(
+      { criteria: [a, b], diffSummary: "", verifierSummaries: [a, b], lastResponse: "", recentTranscript: "", plan: "" },
+      lineLogger,
+    )
+    expect(linePayload.criteria).toEqual([a, b])
+    expect(linePayload.verifierSummaries).toEqual([a, b])
+
+    const proseLogger = vi.fn()
+    const prosePayload = buildJudgePayload(
+      {
+        criteria: [],
+        diffSummary: "",
+        verifierSummaries: [],
+        lastResponse: [a, b].join("\n"),
+        recentTranscript: [a, b].join("\n"),
+        plan: "",
+      },
+      proseLogger,
+    )
+    expect(prosePayload.lastResponse).toBe([a, b].join("\n"))
+    expect(prosePayload.recentTranscript).toBe([a, b].join("\n"))
+
+    expect(lineLogger).not.toHaveBeenCalled()
+    expect(proseLogger).not.toHaveBeenCalled()
+  })
+
+  it("FR-006a regression (C-9 MUST still hold): a pattern-shaped secret genuinely wrapped across two plan lines is still dropped as a pair", () => {
+    const logger = vi.fn()
+    // The straddling case: the connection string is one token that a hard
+    // line break bisected. Neither half trips alone; the reassembled match
+    // crosses the join, so the pair MUST still be dropped.
+    const raw = {
+      criteria: [],
+      diffSummary: "",
+      verifierSummaries: [],
+      lastResponse: "",
+      recentTranscript: "",
+      plan: ["S1 (complete): deploy", "  verifiers: psql postgres://user:sec", 'retpass@dbhost:5432/mydb -c "select 1"'].join("\n"),
+    }
+    const payload = buildJudgePayload(raw, logger)
+    expect(payload.plan).toBe("S1 (complete): deploy")
+    expect(payload.plan).not.toContain("retpass")
+    expect(logger).toHaveBeenCalledWith("judge:field-partial-drop", { field: "plan", kept: 1, dropped: 2 })
+  })
+
+  it("FR-006a regression (C-9 MUST still hold): a hex secret wrapped across two lines is still dropped as a pair", () => {
+    const logger = vi.fn()
+    // 40-char hex run split 20/20 — under the 32-char minimum on each side,
+    // so it is invisible to the per-unit scan and only the join can catch it.
+    const raw = {
+      criteria: ["build hash 4702a3465c59e203", "612b5411f9dc37870f86aebd recorded", "3 passed, 0 failed"],
+      diffSummary: "",
+      verifierSummaries: [],
+      lastResponse: "",
+      recentTranscript: "",
+      plan: "",
+    }
+    const payload = buildJudgePayload(raw, logger)
+    expect(payload.criteria).toEqual(["3 passed, 0 failed"])
+    expect(logger).toHaveBeenCalledWith("judge:field-partial-drop", { field: "criteria", kept: 1, dropped: 2 })
+  })
+
+  it("FR-006a regression (C-9 MUST still hold): an entropy-only secret wrapped across two lines is still dropped as a pair", () => {
+    const logger = vi.fn()
+    // Neither a SECRET_PATTERNS shape nor a hex run: a 40-char mixed-alphabet
+    // token split 20/20. Only the entropy rule can catch it, and only across
+    // the join — this is the case FR-006a's fragment bar must NOT sacrifice
+    // while it protects the digest lines above (each side contributes 20
+    // chars, far over ENTROPY_PAIR_MIN_FRAGMENT_CHARS).
+    const raw = {
+      criteria: [],
+      diffSummary: "",
+      verifierSummaries: [],
+      lastResponse: "",
+      recentTranscript: ["assistant: the deploy token is kJ8vQz3XmR7wLp2NcT9y", "Bf4HdG6sVe1AoZ5rUiWx and it worked", "user: thanks"].join("\n"),
+      plan: "",
+    }
+    const payload = buildJudgePayload(raw, logger)
+    expect(payload.recentTranscript).toBe("user: thanks")
+    expect(payload.recentTranscript).not.toContain("kJ8vQz3XmR7wLp2NcT9y")
+    expect(logger).toHaveBeenCalledWith("judge:field-partial-drop", { field: "recentTranscript", kept: 1, dropped: 2 })
+  })
+
+  it("FR-006 / SC-006: the measured 7518-char raw plan digest transmits whole — no truncation, no partial drop", () => {
+    const logger = vi.fn()
+    // Dataset: Plan digest row 1 — the measured RAW digest of the audited
+    // 6-story plan (spec round-2 finding m-19; the originalLength 6411-6425
+    // seen in the session's events is the POST-scan number). Under the old
+    // 4000-char cap this fired judge:field-truncated on all 9 audit runs.
+    const planDigest = makePlanDigestOfLength(7518)
+    expect(planDigest.length).toBe(7518)
+
+    const raw = { criteria: [], diffSummary: "", verifierSummaries: [], lastResponse: "", recentTranscript: "", plan: planDigest }
+    const payload = buildJudgePayload(raw, logger)
+
+    expect(payload.plan).toBe(planDigest)
+    expect(logger).not.toHaveBeenCalledWith("judge:field-truncated", expect.anything())
+    expect(logger).not.toHaveBeenCalledWith("judge:field-partial-drop", expect.anything())
+    expect(logger).not.toHaveBeenCalled()
+  })
+
+  it("FR-006 / US6 AS2: a digest above the raised cap is STILL truncated and STILL logged (the bound is raised, not removed)", () => {
+    const logger = vi.fn()
+    const planDigest = makePlanDigestOfLength(16001) // new cap + 1
+    const raw = { criteria: [], diffSummary: "", verifierSummaries: [], lastResponse: "", recentTranscript: "", plan: planDigest }
+    const payload = buildJudgePayload(raw, logger)
+
+    expect(payload.plan!.length).toBe(16000)
+    expect(logger).toHaveBeenCalledWith("judge:field-truncated", { field: "plan", originalLength: 16001, cap: 16000 })
+  })
+
+  it("FR-006 / US6 AS3: raising the cap does not weaken redaction — a secret past the OLD 4000-char cap is still dropped", () => {
+    const logger = vi.fn()
+    // Pre-C-9 (truncate-then-scan) this secret would never have been scanned
+    // at all; post-C-9 with a 4000 cap it was scanned then cut. With the
+    // 16000 cap it is scanned AND transmitted-adjacent, so the scan is the
+    // only thing standing between it and the judge. It must still drop.
+    const secret = "sk-live-abc123def456ghi789jkl012mno345pqr"
+    const planDigest = `${makePlanDigestOfLength(6000)}\n  A9: deployed with key ${secret}`
+    const raw = { criteria: [], diffSummary: "", verifierSummaries: [], lastResponse: "", recentTranscript: "", plan: planDigest }
+    const payload = buildJudgePayload(raw, logger)
+
+    expect(payload.plan).toBeDefined()
+    expect(payload.plan).not.toContain(secret)
+    expect(JSON.stringify(payload)).not.toContain("sk-live")
+    expect(logger).toHaveBeenCalledWith("judge:field-partial-drop", { field: "plan", kept: expect.any(Number), dropped: 1 })
   })
 })
 
@@ -858,6 +1062,122 @@ describe("runJudge", () => {
     // HANDOVER.md point 3: the allow-aware tool map from the probe is
     // threaded through verbatim as the subturn's `tools` field.
     expect(req.tools).toEqual(JUDGE_TOOLS_MAP)
+  })
+
+  // =========================================================================
+  // FR-011 (P0 — docs/JUDGE-RELIABILITY-FIXES-SPEC.md, User Story 9).
+  //
+  // Probe P1 reproduced the production failure in 9.8 s: given only the
+  // payload, the judge answered `pass:false` with "research/x.json does not
+  // exist ... ls shows no research/ directory" for a file that existed.
+  // Probe P2/P3, same bytes but a prompt that named what to check, made 2
+  // real tool calls and returned a correct verdict. The prompt's only
+  // observation obligation was attached to CREDITING a claim
+  // ("Read the files a claim references before crediting it"), leaving the
+  // negative direction — the one that reverts delivered work — unconstrained.
+  //
+  // These assert on the prompt actually handed to the subturn, not on an
+  // exported constant, so they fail if the sentence exists but is not wired
+  // through.
+  // =========================================================================
+
+  async function assembledJudgeSystemPrompt(): Promise<string> {
+    await runJudge(
+      makeClient(),
+      { selfCreated: new SelfCreatedSessions(), logger: vi.fn() },
+      {
+        parentSessionID: "parent-1",
+        sessionModel: { providerID: "minimax", modelID: "MiniMax-M3" },
+        payload: basePayload,
+      },
+    )
+    return mockRunSubturn.mock.calls[0][3].system as string
+  }
+
+  it("FR-011: the assembled system prompt forbids a met:false file claim that was not observed first", async () => {
+    const system = await assembledJudgeSystemPrompt()
+    // The negative-direction obligation, its trigger, and the tools that
+    // discharge it must all be present in the text the model receives.
+    expect(system).toMatch(/must not report an item as "met": false/i)
+    expect(system).toMatch(/missing, empty, or lacks some content/i)
+    expect(system).toMatch(/unless you have just observed that yourself/i)
+    expect(system).toMatch(/read, glob, grep or bash/i)
+    // ...and the payload must be explicitly disqualified as evidence of
+    // absence — this is the exact inference P1 made.
+    expect(system).toMatch(/payload is never evidence that something is absent/i)
+  })
+
+  it("FR-011: the prompt gives the judge a compliant way to express doubt instead of asserting absence", async () => {
+    const system = await assembledJudgeSystemPrompt()
+    expect(system).toMatch(/if you cannot make that observation/i)
+    expect(system).toMatch(/could not verify/i)
+    expect(system).toMatch(/instead of claiming the file or its content does not exist/i)
+  })
+
+  it("FR-011: the pre-existing positive-direction instruction is kept, not replaced", async () => {
+    const system = await assembledJudgeSystemPrompt()
+    expect(system).toContain("Read the files a claim references before crediting it.")
+    // Still one flat sentence-joined string (the `.join(" ")` shape), not a
+    // list or a multi-line block that a host might reformat.
+    expect(system).not.toContain("\n")
+  })
+
+  // =========================================================================
+  // FR-014 (docs/JUDGE-RELIABILITY-FIXES-SPEC.md, User Story 12): the gate
+  // needs the judge child session's id to apply the tool-call floor — a
+  // verdict produced with zero tool calls may not revert a story. runJudge
+  // cannot read it from runSubturn's return value (it isn't there) and must
+  // not edit subturn.ts, so it observes the SelfCreatedSessions recorder.
+  // =========================================================================
+
+  it("FR-014: a successful run reports the child session id the subturn created", async () => {
+    const selfCreated = new SelfCreatedSessions()
+    mockRunSubturn.mockImplementation(async (_client, registry, _logger, req) => {
+      registry.record("ses_judge_child_1", req.parentSessionID)
+      return { ok: true, text: JSON.stringify(PASS_VERDICT) }
+    })
+
+    const result = await runJudge(
+      makeClient(),
+      { selfCreated, logger: vi.fn() },
+      {
+        parentSessionID: "parent-1",
+        sessionModel: { providerID: "minimax", modelID: "MiniMax-M3" },
+        payload: basePayload,
+      },
+    )
+
+    expect(result.verdict).toEqual(PASS_VERDICT)
+    expect(result.childSessionID).toBe("ses_judge_child_1")
+    // FR-036 must not regress: the CALLER's registry — not a private copy
+    // inside the observing wrapper — has to recognise the child, or the
+    // harness hooks would start firing on the judge's own session.
+    expect(selfCreated.isSelfCreated("ses_judge_child_1", () => null)).toBe(true)
+  })
+
+  it("FR-014: a malformed or unavailable run still reports the child id (a child WAS created), and a failed probe reports none", async () => {
+    mockRunSubturn.mockImplementation(async (_client, registry, _logger, req) => {
+      registry.record("ses_judge_child_2", req.parentSessionID)
+      return { ok: true, text: "not json at all" }
+    })
+    const malformed = await runJudge(
+      makeClient(),
+      { selfCreated: new SelfCreatedSessions(), logger: vi.fn() },
+      { parentSessionID: "p", sessionModel: { providerID: "minimax", modelID: "MiniMax-M3" }, payload: basePayload },
+    )
+    expect(malformed).toEqual({ verdict: null, reason: "malformed", childSessionID: "ses_judge_child_2" })
+
+    // A refused probe never reaches runSubturn, so there is no child to name
+    // and the key must be ABSENT (not an explicit undefined) — the gate reads
+    // "no id" as inconclusive and fails open.
+    mockProbeCapabilityBounded.mockResolvedValue({ ok: false, cause: "probe", reason: "agent not registered" })
+    const unsupported = await runJudge(
+      makeClient(),
+      { selfCreated: new SelfCreatedSessions(), logger: vi.fn() },
+      { parentSessionID: "p", sessionModel: { providerID: "minimax", modelID: "MiniMax-M3" }, payload: basePayload },
+    )
+    expect(unsupported).toEqual({ verdict: null, reason: "unsupported" })
+    expect("childSessionID" in unsupported).toBe(false)
   })
 
   it('BDD "Configured judgeModel failure falls back to the session model": retry uses session model within the shared 5s budget', async () => {

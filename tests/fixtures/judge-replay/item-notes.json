@@ -39,37 +39,37 @@
     "id": "N07",
     "itemId": "A1",
     "note": "research/renewable-energy.json does not exist on disk (ls research/ returned no such file); cannot verify structured KPIs or chart-ready arrays.",
-    "expected": "keep"
+    "expected": "drop"
   },
   {
     "id": "N08",
     "itemId": "A2",
     "note": "research/renewable-energy.md does not exist on disk; cannot verify cited sources / URLs.",
-    "expected": "keep"
+    "expected": "drop"
   },
   {
     "id": "N09",
     "itemId": "A3",
     "note": "research/ai-breakthroughs.json does not exist on disk; cannot verify structured KPIs.",
-    "expected": "keep"
+    "expected": "drop"
   },
   {
     "id": "N10",
     "itemId": "A4",
     "note": "research/ai-breakthroughs.md does not exist on disk; cannot verify cited sources.",
-    "expected": "keep"
+    "expected": "drop"
   },
   {
     "id": "N11",
     "itemId": "A5",
     "note": "research/space-exploration.json does not exist on disk; cannot verify structured KPIs.",
-    "expected": "keep"
+    "expected": "drop"
   },
   {
     "id": "N12",
     "itemId": "A6",
     "note": "research/space-exploration.md does not exist on disk; cannot verify cited sources.",
-    "expected": "keep"
+    "expected": "drop"
   },
   {
     "id": "N13",
@@ -111,7 +111,7 @@
     "id": "N19",
     "itemId": "A1",
     "note": "package.json not present (ls -la shows only AGENTS.md); node_modules absent. Declared verifier `test -f package.json && ... && test -d node_modules` would fail on first check.",
-    "expected": "drop"
+    "expected": "keep"
   },
   {
     "id": "N20",
@@ -123,7 +123,7 @@
     "id": "N21",
     "itemId": "A3",
     "note": "No src/App.tsx, src/App.jsx, src/main.tsx, or src/main.jsx; layout shell / routing skeleton not present.",
-    "expected": "drop"
+    "expected": "keep"
   },
   {
     "id": "N22",
@@ -231,7 +231,7 @@
     "id": "N39",
     "itemId": "A6",
     "note": "research/space-exploration.md does not exist on disk",
-    "expected": "keep"
+    "expected": "drop"
   },
   {
     "id": "N40",
@@ -273,7 +273,7 @@
     "id": "N46",
     "itemId": "A6",
     "note": "research/space-exploration.md does NOT exist on disk.",
-    "expected": "keep"
+    "expected": "drop"
   },
   {
     "id": "N47",

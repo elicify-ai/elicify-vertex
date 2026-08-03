@@ -34,6 +34,9 @@
  * (It was later ported anyway — see `handlePromiseNoAct` — and the
  * redesign keeps it.)
  */
+import { existsSync } from "node:fs"
+import { resolve as resolvePath, sep } from "node:path"
+
 import { detectPromiseNoAct, shouldBlockPromiseNoAct } from "../../index.js"
 import type { EvidenceLedger } from "../../index.js"
 import { classifyFileKind, formatChangedPathsForReason, formatGateContinuationText } from "../../index.js"
@@ -52,6 +55,7 @@ import type { ManifestCache } from "./manifest.js"
 import { incompletePlanFinding } from "./findings.js"
 import { bindSession } from "./logger.js"
 import { nextInstanceId, type V2SessionState } from "./state.js"
+import { parsePathAbsenceClaim } from "./pathClaim.js"
 import { evaluateStall, hasBusyChildren, type DelegationTracker } from "./watchdog.js"
 
 export interface GateContext {
@@ -89,6 +93,8 @@ export interface GateContext {
   /** Redesign point 9: pause auto-continuations after this many consecutive
    * continuations produced no observable activity. <= 0 disables. */
   maxNoProgressTurns: number
+  /** FR-007: cap consecutive judge reverts per story, then escalate. <=0 disables. */
+  maxStoryReaudits: number
   /** FR-060/FR-061: surfaces gate fires and health signals to the operator.
    * Optional so existing callers and tests need no change; when absent the
    * gate simply reports nothing, exactly as before. */
@@ -151,35 +157,70 @@ async function promptContinuation(
     variant: "warning",
   })
   let timeoutHandle: ReturnType<typeof setTimeout> | undefined
+  // FR-012: a timeout here is NOT a delivery failure.
+  //
+  // `session.prompt` resolves only when the whole assistant turn ENDS, so any
+  // continuation that provokes real work necessarily outruns a 30s race. In
+  // the audited session this fired 9 times — once per judge audit — and every
+  // one was logged `gate:continuation-failed`, yet the transcript shows each
+  // continuation arriving as a user message the agent then reacted to. The
+  // directives were delivered; the harness was mis-reporting its own success
+  // as an outage, which would mask a real one.
+  //
+  // Two consequences are fixed here:
+  //  1. A timeout is logged as `gate:continuation-slow` (informational) and
+  //     raises no health alarm. A genuine rejection still logs
+  //     `gate:continuation-failed`.
+  //  2. `idleContinuationInFlight` is NOT cleared on the timeout path. That
+  //     flag is documented in `handleSessionIdle` as "the only thing standing
+  //     between a continuation and its own echo"; releasing it at 30s while
+  //     the turn is still streaming re-opens the gate mid-flight. It is now
+  //     cleared only when the prompt actually settles — and by the next real
+  //     `chat.message`, which is the turn boundary that genuinely ends it.
+  let settled = false
   try {
     const timeoutPromise = new Promise<never>((_, reject) => {
       timeoutHandle = setTimeout(() => reject(new Error(CONTINUATION_TIMEOUT_ERROR)), CONTINUATION_TIMEOUT_MS)
     })
-    await Promise.race([
-      ctx.client.session.prompt({
-        path: { id: sid },
-        body: { parts: [{ type: "text", text }] },
-      } as never),
-      timeoutPromise,
-    ])
+    const prompt = ctx.client.session
+      .prompt({ path: { id: sid }, body: { parts: [{ type: "text", text }] } } as never)
+      // The prompt keeps running past a timeout; clear the guard whenever it
+      // eventually settles so a stalled session cannot stay wedged forever.
+      .then(
+        (value: unknown) => {
+          settled = true
+          if (state) state.idleContinuationInFlight = false
+          return value
+        },
+        (err: unknown) => {
+          settled = true
+          if (state) state.idleContinuationInFlight = false
+          throw err
+        },
+      )
+    await Promise.race([prompt, timeoutPromise])
   } catch (err) {
-    // Fail-open (v1 invariant): missing/failed prompt never throws into the
-    // host — but, mirroring attemptGateContinuation, the failure is always
-    // logged (with a reason distinguishing timeout from any other failure)
-    // and echoed to stderr before we swallow it.
     const isTimeout = err instanceof Error && err.message === CONTINUATION_TIMEOUT_ERROR
-    const reason = isTimeout ? CONTINUATION_TIMEOUT_ERROR : "session.prompt failed"
-    ctx.logger("gate:continuation-failed", { sessionID: sid, reason })
-    void ctx.visibility?.notify("health", {
-      sessionID: sid,
-      family: "gate:continuation-failed",
-      message: `the idle gate could not dispatch its continuation: ${reason}`,
-      variant: "error",
-    })
-    console.error("[vertex-v2] session.prompt", err)
+    if (isTimeout) {
+      ctx.logger("gate:continuation-slow", { sessionID: sid, afterMs: CONTINUATION_TIMEOUT_MS })
+    } else {
+      // Fail-open (v1 invariant): a failed prompt never throws into the host,
+      // but a genuine failure is always logged and echoed to stderr.
+      ctx.logger("gate:continuation-failed", { sessionID: sid, reason: "session.prompt failed" })
+      void ctx.visibility?.notify("health", {
+        sessionID: sid,
+        family: "gate:continuation-failed",
+        message: "the idle gate could not dispatch its continuation: session.prompt failed",
+        variant: "error",
+      })
+      console.error("[vertex-v2] session.prompt", err)
+    }
   } finally {
     if (timeoutHandle) clearTimeout(timeoutHandle)
-    if (state) state.idleContinuationInFlight = false
+    // Only release the guard when the prompt actually settled. On the timeout
+    // path the turn is still streaming, so the `.then`/`.catch` above owns the
+    // release (see FR-012 note).
+    if (settled && state) state.idleContinuationInFlight = false
   }
 }
 
@@ -670,6 +711,112 @@ function formatJudgeReverts(plan: PlanV2, verdicts: readonly JudgeStoryVerdict[]
  * so a judged-and-passed plan never re-audits, and a re-claimed story
  * always does.
  */
+/** FR-007 — per-story consecutive-revert counter, process-local in
+ * `V2SessionState` (deliberately NOT in `plan.json`: that would be a
+ * `StoryV2` schema change, and the cap is a courtesy bound, not a safety
+ * control). Reset by `resetTurnState` on a real user message. */
+function reaudits(state: V2SessionState, storyId: string): number {
+  return state.storyReaudits?.[storyId] ?? 0
+}
+function bumpReaudit(state: V2SessionState, storyId: string): void {
+  state.storyReaudits = { ...(state.storyReaudits ?? {}), [storyId]: reaudits(state, storyId) + 1 }
+}
+
+/**
+ * FR-014 — did the judge actually look at anything before failing a story?
+ *
+ * Reads the judge child session's persisted parts for a tool call. Returns
+ * `null` when it cannot tell (no child id, fetch failure, session already
+ * deleted) — the caller treats `null` as "apply the verdict", preserving the
+ * fail-open convention. Only an explicit `false` (parts readable, zero tool
+ * calls) suppresses.
+ *
+ * The child is deleted in `subturn.ts`'s `finally`, so this is best-effort by
+ * construction; `runJudge` surfaces the id so the read can happen before that
+ * cleanup where the host allows it.
+ */
+async function judgeObservedSomething(
+  ctx: GateContext,
+  sid: string,
+  childSessionID: string | undefined,
+): Promise<boolean | null> {
+  if (!childSessionID) return null
+  try {
+    const raw = await ctx.client.session.messages({ path: { id: childSessionID } } as never)
+    const list = isFieldsStyle(raw) ? raw.data : raw
+    if (!Array.isArray(list)) return null
+    let sawPart = false
+    for (const entry of list as Array<{ parts?: Array<{ type?: string }> }>) {
+      for (const part of entry.parts ?? []) {
+        sawPart = true
+        if (part?.type === "tool") return true
+      }
+    }
+    return sawPart ? false : null
+  } catch {
+    void sid
+    return null
+  }
+}
+
+/**
+ * FR-001 — drop the individual `met:false` items whose note asserts a path is
+ * absent when that path demonstrably exists inside the worktree.
+ *
+ * Deliberately item-level and path-only. A story-level "all verifiers passed"
+ * veto was withdrawn (grill round 2, C-2) because a story's verifiers can pass
+ * while its acceptance items are genuinely unmet — S1's `test -f *.md` passes
+ * on a sourceless stub, and "missing `## Sources`" was a CORRECT failure. A
+ * path check can only ever contradict a path claim, so this cannot suppress a
+ * content finding. Nothing is executed (FR-001a): `verifiers` and every other
+ * plan.json string are LLM-authored, so the check is `fs.existsSync` on a
+ * root-confined path and nothing else.
+ */
+function applyPathVeto(
+  ctx: GateContext,
+  sid: string,
+  state: V2SessionState,
+  verdict: JudgeStoryVerdict,
+): { verdict: JudgeStoryVerdict; contradicted: string[] } {
+  if (verdict.pass) return { verdict, contradicted: [] }
+  const root = state.workspaceRoot
+  const contradicted: string[] = []
+
+  const items = verdict.items.map((item) => {
+    if (item.met) return item
+    const { paths } = parsePathAbsenceClaim(item.note)
+    if (paths.length === 0) return item
+    // C-3 rule 4: a multi-path note is only contradicted when EVERY named
+    // path exists — "No src/App.tsx, src/App.jsx, …" with two present and two
+    // absent is a true claim about the absent ones.
+    let allExist = true
+    for (const candidate of paths) {
+      const resolved = resolvePath(root, candidate)
+      // Never check outside the worktree: a `..` escape or absolute path is
+      // ignored, not followed.
+      if (!resolved.startsWith(resolvePath(root) + sep) && resolved !== resolvePath(root)) {
+        allExist = false
+        break
+      }
+      if (!existsSync(resolved)) {
+        allExist = false
+        break
+      }
+    }
+    if (!allExist) return item
+    contradicted.push(item.itemId)
+    ctx.logger("judge:contradicted", { sessionID: sid, storyId: verdict.storyId, itemId: item.itemId, paths })
+    return { ...item, met: true }
+  })
+
+  if (contradicted.length === 0) return { verdict, contradicted }
+  // FR-001 AS2: every failing item was individually disproven, so the story's
+  // pass is re-derived — but FR-001b requires the result stay distinguishable
+  // from a genuine judge pass (see `applyJudgeVerdicts`'s `contradictedItemIds`).
+  const stillFailing = items.some((i) => !i.met)
+  return { verdict: { ...verdict, items, pass: !stillFailing }, contradicted }
+}
+
 async function handleJudgeAudit(ctx: GateContext, sid: string, state: V2SessionState): Promise<boolean> {
   if (!ctx.judgeEnabled) return false
   const plan = ctx.storyEngine.getPlan(sid)
@@ -723,8 +870,8 @@ async function handleJudgeAudit(ctx: GateContext, sid: string, state: V2SessionS
   // Verdicts for stories outside the audit set are dropped, not applied —
   // the judge was told what to audit; anything else it chose to opine on is
   // not grounded in this run's payload.
-  const verdicts = result.verdict.stories.filter((v) => auditIds.has(v.storyId))
-  if (verdicts.length === 0) {
+  const onTarget = result.verdict.stories.filter((v) => auditIds.has(v.storyId))
+  if (onTarget.length === 0) {
     ctx.logger("judge:off-target", {
       sessionID: sid,
       requested: [...auditIds],
@@ -733,10 +880,72 @@ async function handleJudgeAudit(ctx: GateContext, sid: string, state: V2SessionS
     return false
   }
 
-  const applied = ctx.storyEngine.applyJudgeVerdicts(sid, verdicts)
+  // FR-014 — the tool-call floor. The audited session's judge fabricated
+  // filesystem claims it never looked at; a live probe reproduced it in 9.8s
+  // and showed that when the judge DOES observe, it is right. A `met:false`
+  // the judge produced without a single tool call is therefore unverified,
+  // not evidence — and unlike FR-001 this covers CONTENT claims too (29 of
+  // the 49 recovered real notes are content-only, the class no path check can
+  // ever contradict). Fail-open: an unreadable child session applies the
+  // verdict exactly as before.
+  const observed = await judgeObservedSomething(ctx, sid, result.childSessionID)
+  if (observed === false && onTarget.some((v) => v.items.some((i) => !i.met))) {
+    ctx.logger("judge:unverified", { sessionID: sid, stories: onTarget.map((v) => v.storyId) })
+    void ctx.visibility?.notify("health", {
+      sessionID: sid,
+      family: "judge:unverified",
+      message: "the completion judge failed stories without observing the worktree — verdict not applied",
+      variant: "warning",
+    })
+    return false
+  }
+
+  // FR-001 + FR-005 — reconcile each verdict against deterministic fact
+  // BEFORE applying it. Both rules are per story so one bad verdict can never
+  // discard a sibling's correct finding (grill round 2, M-9).
+  const reconciled: JudgeStoryVerdict[] = []
+  const contradictedByStory = new Map<string, string[]>()
+  for (const verdict of onTarget) {
+    // FR-005: `pass:false` while every listed item is `met:true` is
+    // self-contradictory. Drop THIS story's verdict (never repair it into a
+    // pass the judge did not give), leave the story untouched, and let the
+    // re-audit cap bound the retry.
+    if (!verdict.pass && verdict.items.length > 0 && verdict.items.every((i) => i.met)) {
+      ctx.logger("judge:verdict-contradictory", { sessionID: sid, storyId: verdict.storyId })
+      bumpReaudit(state, verdict.storyId)
+      continue
+    }
+
+    const { verdict: checked, contradicted } = applyPathVeto(ctx, sid, state, verdict)
+    if (contradicted.length > 0) contradictedByStory.set(verdict.storyId, contradicted)
+    reconciled.push(checked)
+  }
+  if (reconciled.length === 0) return false
+
+  // FR-007 — cap consecutive reverts per story. A disputed story is escalated
+  // to the operator instead of looping: the audited session ran 9 audit
+  // cycles and 82 checkpoints over 10 tasks with no exit.
+  const applicable: JudgeStoryVerdict[] = []
+  for (const verdict of reconciled) {
+    if (!verdict.pass && reaudits(state, verdict.storyId) >= ctx.maxStoryReaudits && ctx.maxStoryReaudits > 0) {
+      ctx.logger("judge:reaudit-capped", { sessionID: sid, storyId: verdict.storyId, reverts: reaudits(state, verdict.storyId) })
+      void ctx.visibility?.notify("health", {
+        sessionID: sid,
+        family: "judge:reaudit-capped",
+        message: `story ${verdict.storyId} has been re-opened by the judge ${reaudits(state, verdict.storyId)} times — not reverting again; resolve it or amend the story`,
+        variant: "error",
+      })
+      continue
+    }
+    if (!verdict.pass) bumpReaudit(state, verdict.storyId)
+    applicable.push(verdict)
+  }
+  if (applicable.length === 0) return false
+
+  const applied = ctx.storyEngine.applyJudgeVerdicts(sid, applicable, contradictedByStory)
 
   if (applied.reverted.length > 0) {
-    return dispatchContinuation(ctx, sid, state, formatGateContinuationText(formatJudgeReverts(plan, verdicts)))
+    return dispatchContinuation(ctx, sid, state, formatGateContinuationText(formatJudgeReverts(plan, applicable)))
   }
 
   // Close-out fires when the WHOLE plan is settled and EVERY story carries a
@@ -752,13 +961,20 @@ async function handleJudgeAudit(ctx: GateContext, sid: string, state: V2SessionS
   const settled = plan.stories.every((story) => story.status === "complete")
   const allPassed = plan.stories.every((story) => story.judge?.pass === true)
   if (settled && allPassed) {
-    return dispatchContinuation(
-      ctx,
-      sid,
-      state,
-      "[vertex:judge] The completion judge independently verified every story of the plan against the worktree — " +
-        "all claims passed audit. Report what was delivered, the commands you ran and the results you observed, then stop.",
-    )
+    // FR-001b: a pass the HARNESS re-derived (by contradicting the judge's
+    // path claims) must not be reported as "the judge independently
+    // verified" — that would launder a harness override into an audit
+    // result. Name those stories instead.
+    const vetoed = plan.stories.filter((s2) => (s2.judge?.contradictedItemIds?.length ?? 0) > 0).map((s2) => s2.id)
+    const line =
+      vetoed.length === 0
+        ? "[vertex:judge] The completion judge independently verified every story of the plan against the worktree — " +
+          "all claims passed audit. Report what was delivered, the commands you ran and the results you observed, then stop."
+        : "[vertex:judge] Every story of the plan is complete. The judge verified all of them except " +
+          `${vetoed.join(", ")}, where the harness overruled a judge claim that a file was missing when it demonstrably exists ` +
+          "(those items were not independently confirmed by the judge). Report what was delivered, the commands you ran and " +
+          "the results you observed, then stop."
+    return dispatchContinuation(ctx, sid, state, line)
   }
   return false
 }

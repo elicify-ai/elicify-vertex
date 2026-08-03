@@ -31,7 +31,17 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
 })
 
-function harness(opts: { maxCriteriaBlocks?: number; judgeEnabled?: boolean; maxNoProgressTurns?: number; busyChildren?: boolean } = {}) {
+function harness(opts: {
+  maxCriteriaBlocks?: number
+  judgeEnabled?: boolean
+  maxNoProgressTurns?: number
+  busyChildren?: boolean
+  maxStoryReaudits?: number
+  /** FR-014: parts returned for the judge child session (a `tool` part = the judge observed something). */
+  childParts?: Array<{ type: string }>
+  /** The verdict the stubbed judge subturn returns. */
+  judgeVerdict?: unknown
+} = {}) {
   const stateDir = temporaryRoot()
   const logger = vi.fn()
   const composer = new InjectionComposer({ logger })
@@ -81,6 +91,7 @@ function harness(opts: { maxCriteriaBlocks?: number; judgeEnabled?: boolean; max
     // tests below).
     delegation: new DelegationTracker(),
     maxNoProgressTurns: opts.maxNoProgressTurns ?? 999,
+    maxStoryReaudits: opts.maxStoryReaudits ?? 999,
   }
   return {
     ctx,
@@ -829,7 +840,7 @@ describe("handleSessionIdle — watchdog: delegation deferral + stall pause", ()
     createSixStoryStylePlan(h, sid)
     // Controllable busy-children probe: the child is busy until the
     // delegation's tool.execute.after fires.
-    const session = h.ctx.client.session as Record<string, unknown>
+    const session = h.ctx.client.session as unknown as Record<string, unknown>
     let childBusy = true
     session.children = vi.fn(async () => ({ data: [{ id: "child-1" }] }))
     session.status = vi.fn(async () => ({ data: { "child-1": childBusy ? { type: "busy" } : { type: "idle" } } }))
@@ -879,5 +890,173 @@ describe("handleSessionIdle — watchdog: delegation deferral + stall pause", ()
     expect(continuations(h.prompt)).toHaveLength(3)
     expect(state.stallPaused).toBe(false)
     expect(loggedEventTypes(h.logger)).not.toContain("gate:stall-paused")
+  })
+})
+
+// ===========================================================================
+// Judge-verdict reconciliation (FR-001 / FR-001b / FR-005 / FR-007 / FR-014).
+//
+// These drive the REAL `handleJudgeAudit` with a stubbed judge subturn, so the
+// assertions are about what the gate DOES with a verdict, not about the model.
+// Every fixture is grounded in the audited session
+// (`ses_04dc77bdaffej8SFJvYm5yO0CW`): the notes are real shapes the judge
+// actually produced.
+// ===========================================================================
+
+/** Stub the judge subturn end to end: probe passes, verdict is `verdict`, and
+ * the child session reports `childParts` (a `tool` part = the judge looked). */
+function stubJudge(
+  h: ReturnType<typeof harness>,
+  verdict: unknown,
+  childParts: Array<{ type: string }> = [{ type: "tool" }],
+): void {
+  const session = h.ctx.client.session as unknown as Record<string, unknown>
+  session.create = vi.fn(async () => ({ data: { id: "judge-child-1" }, error: undefined }))
+  session.delete = vi.fn(async () => ({ data: {}, error: undefined }))
+  session.messages = vi.fn(async (args: { path?: { id?: string } }) =>
+    args?.path?.id === "judge-child-1"
+      ? { data: [{ info: { role: "assistant" }, parts: childParts }], error: undefined }
+      : { data: [], error: undefined },
+  )
+  const prompt = session.prompt as ReturnType<typeof vi.fn>
+  session.prompt = vi.fn(async (args: { body?: { agent?: string } }) => {
+    if (args?.body?.agent === "vertex-judge") {
+      return { data: { info: {}, parts: [{ type: "text", text: JSON.stringify(verdict) }] }, error: undefined }
+    }
+    return prompt(args as never)
+  })
+  const appAgents = vi.fn(async () => ({
+    data: [
+      {
+        name: "vertex-judge",
+        mode: "subagent",
+        builtIn: false,
+        permission: { edit: "deny", write: "deny", bash: { "*": "deny" }, webfetch: "deny", task: "deny" },
+        tools: { bash: true, read: true, glob: true, grep: true, list: true, edit: false, write: false, task: false, "*": false },
+        options: {},
+      },
+    ],
+    error: undefined,
+  }))
+  ;(h.ctx.client as unknown as Record<string, unknown>).app = { agents: appAgents }
+  ;(h.ctx.client as unknown as Record<string, unknown>).tool = {
+    ids: vi.fn(async () => ({ data: ["bash", "read", "glob", "grep", "list", "edit", "write", "task"], error: undefined })),
+  }
+}
+
+/** A single-story plan whose only task is already claimed complete. */
+function claimedStory(h: ReturnType<typeof harness>, sid: string, verifiers: string[] = []): void {
+  h.storyEngine.createPlan(sid, [
+    { text: "Research wave", acceptanceItems: ["x.md has cited sources"], scopeGlobs: [], verifiers, tasks: [{ text: "write it" }] },
+  ])
+  h.storyEngine.checkpoint(sid, "S1.T1", "complete")
+}
+
+describe("handleJudgeAudit — verdict reconciliation", () => {
+  it("FR-001: a false 'file is missing' claim is contradicted and the story is NOT reverted", async () => {
+    const h = harness({ judgeEnabled: true })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    // The worktree for this session is the temp stateDir; create the file the
+    // judge will (falsely) claim is absent.
+    writeFileSync(join(h.stateDir, "present.md"), "# real content\n", "utf8")
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid)
+    stubJudge(h, {
+      stories: [{ storyId: "S1", pass: false, summary: "missing file", items: [{ itemId: "A1", met: false, note: "present.md does not exist on disk" }] }],
+    })
+
+    await handleSessionIdle(h.ctx, sid)
+
+    expect(loggedEventTypes(h.logger)).toContain("judge:contradicted")
+    expect(h.storyEngine.getPlan(sid)!.stories[0].status).toBe("complete")
+    // FR-001b: the pass is harness-derived, so it must be marked as such.
+    expect(h.storyEngine.getPlan(sid)!.stories[0].judge?.contradictedItemIds).toEqual(["A1"])
+  })
+
+  it("FR-001: a CONTENT claim about an existing file is never contradicted — the story still reverts", async () => {
+    const h = harness({ judgeEnabled: true })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    writeFileSync(join(h.stateDir, "present.md"), "# stub\n", "utf8")
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid)
+    // The REAL correct-FAIL shape from the audited session.
+    stubJudge(h, {
+      stories: [
+        {
+          storyId: "S1",
+          pass: false,
+          summary: "no sources",
+          items: [{ itemId: "A1", met: false, note: "present.md exists (1046 bytes) but contains no URLs or Sources section" }],
+        },
+      ],
+    })
+
+    await handleSessionIdle(h.ctx, sid)
+
+    expect(loggedEventTypes(h.logger)).not.toContain("judge:contradicted")
+    expect(h.storyEngine.getPlan(sid)!.stories[0].status).toBe("active") // reverted, correctly
+  })
+
+  it("FR-014: a verdict produced with ZERO tool calls is not applied", async () => {
+    const h = harness({ judgeEnabled: true })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid)
+    stubJudge(
+      h,
+      { stories: [{ storyId: "S1", pass: false, summary: "nope", items: [{ itemId: "A1", met: false, note: "not delivered" }] }] },
+      [{ type: "text" }], // the judge answered without observing anything
+    )
+
+    await handleSessionIdle(h.ctx, sid)
+
+    expect(loggedEventTypes(h.logger)).toContain("judge:unverified")
+    expect(h.storyEngine.getPlan(sid)!.stories[0].status).toBe("complete") // claim stands
+  })
+
+  it("FR-005: pass:false with every item met is dropped per story, leaving the story untouched", async () => {
+    const h = harness({ judgeEnabled: true })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid)
+    // The real S2 stamp shape: pass:false while every item is met:true.
+    stubJudge(h, {
+      stories: [{ storyId: "S1", pass: false, summary: "contradictory", items: [{ itemId: "A1", met: true, note: "all good" }] }],
+    })
+
+    await handleSessionIdle(h.ctx, sid)
+
+    expect(loggedEventTypes(h.logger)).toContain("judge:verdict-contradictory")
+    expect(h.storyEngine.getPlan(sid)!.stories[0].status).toBe("complete")
+  })
+
+  it("FR-007: past the re-audit cap the story is escalated, not reverted again", async () => {
+    const h = harness({ judgeEnabled: true, maxStoryReaudits: 1 })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid)
+    stubJudge(h, {
+      stories: [{ storyId: "S1", pass: false, summary: "still not done", items: [{ itemId: "A1", met: false, note: "no sources cited" }] }],
+    })
+
+    await handleSessionIdle(h.ctx, sid) // revert 1 of 1
+    expect(h.storyEngine.getPlan(sid)!.stories[0].status).toBe("active")
+
+    // Re-claim and audit again: the cap is now reached.
+    h.storyEngine.checkpoint(sid, "S1.T1", "complete")
+    await handleSessionIdle(h.ctx, sid)
+
+    expect(loggedEventTypes(h.logger)).toContain("judge:reaudit-capped")
+    expect(h.storyEngine.getPlan(sid)!.stories[0].status).toBe("complete") // not reverted again
   })
 })

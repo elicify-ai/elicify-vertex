@@ -12,6 +12,7 @@ import {
   TRIVIAL_ASK_RE,
   classifyMultiStory,
   classifyMultiStoryHeuristic,
+  lockIO,
 } from "../../src/v2/story.js"
 import { SelfCreatedSessions } from "../../src/v2/subturn.js"
 import type { OpencodeClient } from "../../src/v2/types.js"
@@ -643,6 +644,7 @@ describe("checkpoint operates on a TASK (2026-07-30)", () => {
     const [s1t1] = plan.stories[0].tasks
     const s2 = plan.stories[1].tasks
     const s3 = plan.stories[2].tasks
+    void s3
 
     // Complete S1.T1 → promote S2's whole level (b,c) together.
     se.checkpoint("s1", s1t1.id, "complete")
@@ -1405,6 +1407,612 @@ describe("plan.json round-trip with redesign fields", () => {
     }
     writeFileSync(join(stateDir, "plan.json"), JSON.stringify({ s1: badPlan }))
 
+    const { engine: se } = engine(stateDir)
+    expect(se.getPlan("s1")).toBeNull()
+  })
+})
+
+// ===========================================================================
+// 2026-08-03 judge-reliability fixes (docs/JUDGE-RELIABILITY-FIXES-SPEC.md).
+//
+// Every case below is anchored to evidence from the audited live session
+// `ses_04dc77bdaffej8SFJvYm5yO0CW`, not to a hypothetical:
+//   FR-002 — a judge stamp provably written at 10:26:28 is ABSENT from the
+//            final plan.json, and S6 carries no stamp at all, because two
+//            plugin instances drove one session and the second one's stale
+//            cache overwrote the first one's write.
+//   FR-003 — 23 of 82 checkpoint calls died on "it is not active" while the
+//            harness's own revert directive was ordering the model to
+//            "checkpoint each reverted task complete again".
+//   FR-004 — `story:reopened {previousStatus: "complete", newStatus:
+//            "complete"}` fired 3x; each of those stories became invisible
+//            to the judge forever after.
+//   FR-001b — a pass the HARNESS derived by contradicting the judge must not
+//            be reported as one the judge independently reached.
+// ===========================================================================
+
+/** The gate's audit selector, `src/v2/wiring/gate.ts:794`, transcribed so
+ * these tests assert the property that actually decides whether the judge
+ * ever sees a story again — rather than a proxy for it. */
+function isAuditEligible(story: { status: string; completedAt?: string; judge?: { judgedAt: string } }): boolean {
+  return (
+    story.status === "complete" &&
+    (!story.judge || (story.completedAt !== undefined && story.judge.judgedAt < story.completedAt))
+  )
+}
+
+function readPlanFile(stateDir: string): Record<string, any> {
+  return JSON.parse(readFileSync(join(stateDir, "plan.json"), "utf8")) as Record<string, any>
+}
+
+describe("FR-002: concurrent plugin instances do not destroy each other's writes", () => {
+  it("two engines over one stateDir: A stamps S1, B (stale cache) stamps S2 — BOTH survive on disk", () => {
+    const stateDir = temporaryRoot()
+    const { engine: a } = engine(stateDir)
+    const { engine: b, logger: bLog } = engine(stateDir)
+
+    a.createPlan("s1", [story({ text: "story one" }), story({ text: "story two" })])
+    // B loads the plan (revision 1) — this is the stale cache the second
+    // plugin instance held in the audited session.
+    expect(b.getPlan("s1")).not.toBeNull()
+
+    // A stamps S1 and persists (revision 2). B never sees this write.
+    a.applyJudgeVerdicts("s1", [{ storyId: "S1", pass: true, summary: "S1 audited", items: [] }])
+    // B stamps S2 from its stale cache. Pre-fix this wrote B's whole cached
+    // plan over the file and S1's stamp vanished — the 10:26:28 data loss.
+    b.applyJudgeVerdicts("s1", [{ storyId: "S2", pass: true, summary: "S2 audited", items: [] }])
+
+    const onDisk = readPlanFile(stateDir).s1
+    expect(onDisk.stories[0].judge?.summary).toBe("S1 audited")
+    expect(onDisk.stories[1].judge?.summary).toBe("S2 audited")
+    expect(bLog).toHaveBeenCalledWith("plan:concurrent-merge", expect.objectContaining({ sessionID: "s1" }))
+  })
+
+  it("does not log plan:concurrent-merge when nothing concurrent happened", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se, logger } = engine(stateDir)
+    const plan = se.createPlan("s1", [story()])
+    se.checkpoint("s1", plan.stories[0].tasks[0].id, "complete")
+    se.applyJudgeVerdicts("s1", [{ storyId: "S1", pass: true, summary: "ok", items: [] }])
+    expect(logger).not.toHaveBeenCalledWith("plan:concurrent-merge", expect.anything())
+  })
+
+  it("preserves OBJECT IDENTITY across a reconciling mutate (gate.ts:742-753 depends on it)", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const { engine: peer } = engine(stateDir)
+    const created = se.createPlan("s1", [story({ text: "one" }), story({ text: "two" })])
+
+    // The reference a caller (the gate closure) holds across the mutation.
+    const held = se.getPlan("s1")!
+    const heldStory = held.stories[0]
+    const heldTask = heldStory.tasks[0]
+    expect(held).toBe(created)
+
+    // A peer writes something this engine has never seen, so the mutate below
+    // genuinely takes the reconcile path rather than trivially passing.
+    peer.getPlan("s1")
+    peer.applyJudgeVerdicts("s1", [{ storyId: "S2", pass: true, summary: "peer stamped S2", items: [] }])
+
+    se.checkpoint("s1", heldTask.id, "complete")
+
+    // Same objects, not replacements — a swap here silently breaks the plan
+    // close-out, which reads `plan.stories` off this very reference.
+    expect(se.getPlan("s1")).toBe(held)
+    expect(held.stories[0]).toBe(heldStory)
+    expect(heldStory.tasks[0]).toBe(heldTask)
+    // ...and the held reference sees BOTH the local mutation and the peer's.
+    expect(heldTask.status).toBe("complete")
+    expect(held.stories[1].judge?.summary).toBe("peer stamped S2")
+  })
+
+  it("a corrupt plan.json still aborts the write — and now leaves the in-memory plan unmutated too", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se, logger } = engine(stateDir)
+    const plan = se.createPlan("s1", [story()])
+    const taskId = plan.stories[0].tasks[0].id
+    const planPath = join(stateDir, "plan.json")
+    const corruptBytes = "{ not json at all"
+    writeFileSync(planPath, corruptBytes)
+
+    expect(() => se.checkpoint("s1", taskId, "complete")).toThrow(/corrupt/i)
+    expect(readFileSync(planPath, "utf8")).toBe(corruptBytes)
+    expect(logger).toHaveBeenCalledWith("story:disk-corrupt", expect.objectContaining({ sessionID: "s1" }))
+    // The re-read happens BEFORE the mutation now, so the claim was never
+    // applied in memory either (pre-fix it was, and only the write failed).
+    expect(se.getPlan("s1")!.stories[0].tasks[0].status).toBe("active")
+  })
+})
+
+describe("FR-002a: merge modes never resurrect a cleared or replaced plan", () => {
+  it("clearPlan removes the entry even when disk holds a NEWER revision (no merge-back)", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const { engine: peer } = engine(stateDir)
+    se.createPlan("s1", [story({ text: "doomed" })])
+    se.createPlan("other", [story({ text: "someone else's plan" })])
+
+    // Peer advances the on-disk revision for the SAME session.
+    peer.getPlan("s1")
+    peer.applyJudgeVerdicts("s1", [{ storyId: "S1", pass: true, summary: "peer stamp", items: [] }])
+
+    expect(se.clearPlan("s1")).toBe(true)
+
+    const file = readPlanFile(stateDir)
+    expect(file.s1).toBeUndefined() // NOT resurrected by the reconcile
+    expect(file.other).toBeDefined() // other sessions untouched
+    expect(se.getPlan("s1")).toBeNull()
+    // ...and the clear is still reversible: an archive copy exists.
+    expect(readdirSync(join(stateDir, "archive")).some((f) => f.startsWith("plan.s1."))).toBe(true)
+  })
+
+  it("createPlan's replace path does not re-animate the stories it replaced", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const { engine: peer } = engine(stateDir)
+    se.createPlan("s1", [story({ text: "one" }), story({ text: "two" }), story({ text: "three" })])
+
+    peer.getPlan("s1")
+    peer.applyJudgeVerdicts("s1", [{ storyId: "S3", pass: true, summary: "peer stamp", items: [] }])
+
+    se.createPlan("s1", [story({ text: "the only story now" })])
+
+    const file = readPlanFile(stateDir)
+    expect(file.s1.stories).toHaveLength(1)
+    expect(file.s1.stories[0].text).toBe("the only story now")
+    expect(se.getPlan("s1")!.stories).toHaveLength(1)
+  })
+
+  it("keeps `revision` monotonic across a replace (a rolled-back counter would hide a real conflict)", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    se.createPlan("s1", [story()])
+    const t1 = se.getPlan("s1")!.stories[0].tasks[0].id
+    se.checkpoint("s1", t1, "complete")
+    const beforeReplace = readPlanFile(stateDir).s1.revision as number
+    expect(beforeReplace).toBeGreaterThan(1)
+
+    se.createPlan("s1", [story({ text: "fresh" })])
+    expect(readPlanFile(stateDir).s1.revision).toBeGreaterThan(beforeReplace)
+  })
+})
+
+describe("FR-002b: the archival lock is never re-entered", () => {
+  it("checkpoint does not deadlock when archiveV1IfPresent has to archive a v1 goals.json", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se, logger } = engine(stateDir)
+    const plan = se.createPlan("s1", [story()])
+    const taskId = plan.stories[0].tasks[0].id
+
+    // A v1 file appears AFTER the plan exists, so it is `checkpoint`'s own
+    // archiveV1IfPresent call — the one that takes the same non-reentrant
+    // lock `mutate` takes — that has to run.
+    const goalsPath = join(stateDir, "goals.json")
+    writeFileSync(goalsPath, JSON.stringify({ schemaVersion: 1, stories: [] }))
+
+    expect(() => se.checkpoint("s1", taskId, "complete")).not.toThrow()
+
+    expect(logger).toHaveBeenCalledWith("story:v1-archived", expect.anything())
+    expect(existsSync(goalsPath)).toBe(false)
+    expect(se.getPlan("s1")!.stories[0].tasks[0].status).toBe("complete")
+    expect(readPlanFile(stateDir).s1.stories[0].tasks[0].status).toBe("complete")
+    // The lock is released, not leaked, so the next mutation still works.
+    expect(existsSync(join(stateDir, "state.lock"))).toBe(false)
+    expect(() => se.reopenStory("s1", "S1", { reason: "still usable" })).not.toThrow()
+  })
+})
+
+describe("FR-002c/FR-010: lock contention retries, then aborts the write without throwing", () => {
+  it("retries a bounded number of times and degrades instead of throwing into the host", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se, logger } = engine(stateDir)
+    const plan = se.createPlan("s1", [story()])
+    const taskId = plan.stories[0].tasks[0].id
+    const planPath = join(stateDir, "plan.json")
+    const before = readFileSync(planPath)
+
+    const sleep = vi.spyOn(lockIO, "sleep").mockImplementation(() => {})
+    const acquire = vi.spyOn(lockIO, "acquire").mockImplementation(() => {
+      throw new Error("elicify-vertex state directory is locked by another process")
+    })
+
+    expect(() => se.checkpoint("s1", taskId, "complete")).not.toThrow()
+
+    expect(acquire).toHaveBeenCalledTimes(6) // 1 attempt + 5 bounded retries
+    expect(sleep).toHaveBeenCalledTimes(5) // jittered backoff between them
+    for (const [ms] of sleep.mock.calls) expect(ms).toBeGreaterThan(0)
+    expect(logger).toHaveBeenCalledWith("plan:lock-contended", expect.objectContaining({ sessionID: "s1" }))
+    expect(logger).toHaveBeenCalledWith("plan:write-aborted", expect.objectContaining({ sessionID: "s1" }))
+    // The WRITE is what aborts; the session keeps working in memory.
+    expect(readFileSync(planPath).equals(before)).toBe(true)
+    expect(se.getPlan("s1")!.stories[0].tasks[0].status).toBe("complete")
+  })
+
+  it("a transient lock failure that clears within the retry budget still writes", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se, logger } = engine(stateDir)
+    const plan = se.createPlan("s1", [story()])
+    const taskId = plan.stories[0].tasks[0].id
+
+    vi.spyOn(lockIO, "sleep").mockImplementation(() => {})
+    const real = lockIO.acquire.bind(lockIO)
+    let failures = 2
+    vi.spyOn(lockIO, "acquire").mockImplementation((dir: string) => {
+      if (failures-- > 0) throw new Error("locked by another process")
+      return real(dir)
+    })
+
+    se.checkpoint("s1", taskId, "complete")
+
+    expect(logger).not.toHaveBeenCalledWith("plan:write-aborted", expect.anything())
+    expect(readPlanFile(stateDir).s1.stories[0].tasks[0].status).toBe("complete")
+  })
+})
+
+describe("FR-002d: the revision counter is back-compatible", () => {
+  it("a revision-less plan.json (every file written before 2026-08-03) still loads", () => {
+    const stateDir = temporaryRoot()
+    mkdirSync(stateDir, { recursive: true })
+    const legacyPlan = {
+      schemaVersion: 2,
+      stories: [
+        {
+          id: "S1",
+          text: "written by a pre-revision engine",
+          acceptanceItems: [{ id: "A1", text: "works", evidence: null }],
+          scopeGlobs: [],
+          verifiers: [],
+          assumptions: [],
+          rejectedAlternatives: [],
+          amendments: [],
+          dependsOn: [],
+          status: "active",
+          tasks: [{ id: "S1.T1", text: "do it", dependsOn: [], status: "active" }],
+        },
+      ],
+      finalStoryId: "S1",
+      createdAt: new Date().toISOString(),
+      // NOTE: no `revision` key at all.
+    }
+    writeFileSync(join(stateDir, "plan.json"), JSON.stringify({ s1: legacyPlan }))
+
+    const { engine: se } = engine(stateDir)
+    const plan = se.getPlan("s1")
+    expect(plan).not.toBeNull()
+    expect(plan!.revision).toBe(0) // coerced at the disk boundary, like dependsOn
+    // ...and the first write by a current engine starts the counter.
+    se.checkpoint("s1", "S1.T1", "complete")
+    expect(readPlanFile(stateDir).s1.revision).toBe(1)
+  })
+
+  it("rejects a present-but-wrong-shaped revision (same discrimination as the other optional fields)", () => {
+    const stateDir = temporaryRoot()
+    mkdirSync(stateDir, { recursive: true })
+    const badPlan = {
+      schemaVersion: 2,
+      stories: [
+        {
+          id: "S1",
+          text: "bad revision",
+          acceptanceItems: [{ id: "A1", text: "works", evidence: null }],
+          scopeGlobs: [],
+          verifiers: [],
+          assumptions: [],
+          rejectedAlternatives: [],
+          amendments: [],
+          dependsOn: [],
+          status: "active",
+          tasks: [{ id: "S1.T1", text: "do it", dependsOn: [], status: "active" }],
+        },
+      ],
+      finalStoryId: "S1",
+      createdAt: new Date().toISOString(),
+      revision: "seven",
+    }
+    writeFileSync(join(stateDir, "plan.json"), JSON.stringify({ s1: badPlan }))
+    const { engine: se } = engine(stateDir)
+    expect(se.getPlan("s1")).toBeNull()
+  })
+})
+
+describe("FR-003: re-checkpointing an already-complete task is an idempotent no-op", () => {
+  it("succeeds without mutating the plan, logs checkpoint:idempotent-noop, and reports the active tasks", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se, logger } = engine(stateDir)
+    const plan = se.createPlan("s1", [story({ text: "one" }), story({ text: "two" })])
+    const t1 = plan.stories[0].tasks[0].id
+    const t2 = plan.stories[1].tasks[0].id
+
+    const first = se.checkpoint("s1", t1, "complete")
+    expect(first.idempotent).toBe(false)
+
+    const planPath = join(stateDir, "plan.json")
+    const bytesBefore = readFileSync(planPath)
+    const entryBefore = readPlanFile(stateDir).s1
+
+    const second = se.checkpoint("s1", t1, "complete")
+
+    expect(second.idempotent).toBe(true)
+    // The thrown error's "(currently active: …)" tail was the ONLY corrective
+    // signal the model got; the no-op has to keep carrying it (round-2 m-16).
+    expect(second.activeTaskIds).toEqual([t2])
+    expect(logger).toHaveBeenCalledWith(
+      "checkpoint:idempotent-noop",
+      expect.objectContaining({ sessionID: "s1", taskId: t1, storyId: "S1" }),
+    )
+    // No mutation AND no write: the file is byte-identical, so the session
+    // entry is trivially deep-equal (spec regression requirement 2).
+    expect(readFileSync(planPath).equals(bytesBefore)).toBe(true)
+    expect(readPlanFile(stateDir).s1).toEqual(entryBefore)
+  })
+
+  it("re-completing every already-complete task of a plan throws 0 errors (SC-004: was 23 of 82)", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [
+      story({ text: "one", tasks: [{ text: "a" }, { text: "b" }] }),
+      story({ text: "two", tasks: [{ text: "c" }, { text: "d" }] }),
+    ])
+    const ids = plan.stories.flatMap((s) => s.tasks.map((t) => t.id))
+    for (const id of ids) se.checkpoint("s1", id, "complete")
+
+    let thrown = 0
+    for (const id of ids) {
+      try {
+        const result = se.checkpoint("s1", id, "complete")
+        expect(result.idempotent).toBe(true)
+      } catch {
+        thrown += 1
+      }
+    }
+    expect(thrown).toBe(0)
+  })
+
+  it("E8: the no-op does NOT launder a failing judge stamp or advance completedAt", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [story()])
+    const t1 = plan.stories[0].tasks[0].id
+
+    se.checkpoint("s1", t1, "complete")
+    // A failing audit reverts the story; the model re-claims the task, so the
+    // task is complete again while the FAILING stamp still stands. This is
+    // exactly the state a laundering re-claim would attack.
+    se.applyJudgeVerdicts("s1", [
+      { storyId: "S1", pass: false, summary: "A1 unmet", items: [{ itemId: "A1", met: false, note: "no sources" }] },
+    ])
+    se.checkpoint("s1", t1, "complete")
+
+    const before = se.getPlan("s1")!.stories[0]
+    const stampBefore = JSON.parse(JSON.stringify(before.judge))
+    const storyCompletedAt = before.completedAt
+    const taskCompletedAt = before.tasks[0].completedAt
+
+    se.checkpoint("s1", t1, "complete") // the re-claim
+
+    const after = se.getPlan("s1")!.stories[0]
+    expect(after.judge).toEqual(stampBefore)
+    expect(after.judge!.pass).toBe(false)
+    expect(after.completedAt).toBe(storyCompletedAt)
+    expect(after.tasks[0].completedAt).toBe(taskCompletedAt)
+  })
+
+  it("a PENDING task still throws — an out-of-order claim is not a re-claim", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [
+      story({ tasks: [{ text: "first" }, { text: "second", dependsOn: ["S1.T1"] }] }),
+    ])
+    const pending = plan.stories[0].tasks[1].id
+    expect(plan.stories[0].tasks[1].status).toBe("pending")
+    expect(() => se.checkpoint("s1", pending, "complete")).toThrow(/it is not active/)
+  })
+
+  it("a BLOCKED task still throws — it must be reopened first", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [story()])
+    const t1 = plan.stories[0].tasks[0].id
+    se.checkpoint("s1", t1, "blocked", { reason: "upstream missing" })
+    expect(() => se.checkpoint("s1", t1, "complete")).toThrow(/it is not active/)
+  })
+
+  it("a FAILED task still throws — it must be reopened first", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [story()])
+    const t1 = plan.stories[0].tasks[0].id
+    se.checkpoint("s1", t1, "failed", { reason: "blew up" })
+    expect(() => se.checkpoint("s1", t1, "complete")).toThrow(/it is not active/)
+  })
+})
+
+describe("FR-004: a story reopened while complete is audit-eligible again immediately", () => {
+  it("stamps a FRESH completedAt when every task is already complete (no further checkpoint needed)", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [story({ tasks: [{ text: "a" }, { text: "b" }] })])
+    for (const task of plan.stories[0].tasks) se.checkpoint("s1", task.id, "complete")
+    se.applyJudgeVerdicts("s1", [{ storyId: "S1", pass: true, summary: "looked fine", items: [] }])
+
+    const beforeReopen = se.getPlan("s1")!.stories[0]
+    expect(beforeReopen.status).toBe("complete")
+    expect(isAuditEligible(beforeReopen)).toBe(false) // already judged — nothing to do
+
+    // The observed case: previousStatus complete -> newStatus complete. There
+    // is no incomplete task to re-checkpoint, so FR-003's no-op cannot be the
+    // mechanism; reopenStory itself has to make the story visible again.
+    se.reopenStory("s1", "S1", { reason: "the audit was wrong, re-audit it" })
+
+    const story1 = se.getPlan("s1")!.stories[0]
+    expect(story1.status).toBe("complete")
+    expect(story1.completedAt).toBeDefined()
+    expect(story1.judge!.judgedAt < story1.completedAt!).toBe(true)
+    expect(isAuditEligible(story1)).toBe(true)
+    // ...and it is durable, not just an in-memory nicety.
+    expect(readPlanFile(stateDir).s1.stories[0].completedAt).toBe(story1.completedAt)
+  })
+
+  it("is eligible even when the reopen lands in the same millisecond as the stamp", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [story()])
+    se.checkpoint("s1", plan.stories[0].tasks[0].id, "complete")
+    se.applyJudgeVerdicts("s1", [{ storyId: "S1", pass: true, summary: "ok", items: [] }])
+
+    // Freeze the clock at the judge stamp's own timestamp: an equal
+    // `completedAt` would read as "not re-claimed" and hide the story again.
+    const judgedAt = se.getPlan("s1")!.stories[0].judge!.judgedAt
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(judgedAt))
+    se.reopenStory("s1", "S1", { reason: "same-ms re-audit" })
+    vi.useRealTimers()
+
+    expect(isAuditEligible(se.getPlan("s1")!.stories[0])).toBe(true)
+  })
+
+  it("a reopened-then-BLOCKED story is not audit-eligible (the fresh stamp is not a blanket pass)", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [story()])
+    const t1 = plan.stories[0].tasks[0].id
+    se.checkpoint("s1", t1, "complete")
+    se.applyJudgeVerdicts("s1", [{ storyId: "S1", pass: true, summary: "ok", items: [] }])
+    se.reopenStory("s1", "S1", { reason: "re-audit" })
+    se.checkpoint("s1", t1, "blocked", { reason: "actually broken" })
+
+    const story1 = se.getPlan("s1")!.stories[0]
+    expect(story1.status).toBe("blocked")
+    expect(story1.completedAt).toBeUndefined()
+    expect(isAuditEligible(story1)).toBe(false)
+  })
+
+  it("reopening an incomplete story still clears completedAt (no spurious eligibility)", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [story({ tasks: [{ text: "a" }, { text: "b" }] })])
+    se.checkpoint("s1", plan.stories[0].tasks[0].id, "complete")
+    se.reopenStory("s1", "S1", { reason: "resume" })
+
+    const story1 = se.getPlan("s1")!.stories[0]
+    expect(story1.status).toBe("active")
+    expect(story1.completedAt).toBeUndefined()
+    expect(isAuditEligible(story1)).toBe(false)
+  })
+})
+
+describe("FR-001b: a harness-derived pass stays distinguishable from a judge pass", () => {
+  const contradicted = new Map([["S1", ["A1"]]])
+
+  it("records contradictedItemIds on the stamp when the harness overruled items", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [story()])
+    se.checkpoint("s1", plan.stories[0].tasks[0].id, "complete")
+
+    se.applyJudgeVerdicts(
+      "s1",
+      [{ storyId: "S1", pass: true, summary: "re-derived", items: [{ itemId: "A1", met: false, note: "x.md is missing" }] }],
+      contradicted,
+    )
+
+    const stamp = se.getPlan("s1")!.stories[0].judge!
+    expect(stamp.contradictedItemIds).toEqual(["A1"])
+    // The ORIGINAL items are retained alongside it — the record must still
+    // show what the judge actually claimed.
+    expect(stamp.items).toEqual([{ itemId: "A1", met: false, note: "x.md is missing" }])
+    expect(readPlanFile(stateDir).s1.stories[0].judge.contradictedItemIds).toEqual(["A1"])
+  })
+
+  it("leaves the field ABSENT for an ordinary two-argument call (a genuine judge verdict)", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [story()])
+    se.checkpoint("s1", plan.stories[0].tasks[0].id, "complete")
+
+    se.applyJudgeVerdicts("s1", [{ storyId: "S1", pass: true, summary: "genuine", items: [] }])
+
+    const stamp = se.getPlan("s1")!.stories[0].judge!
+    expect(stamp.contradictedItemIds).toBeUndefined()
+    expect("contradictedItemIds" in readPlanFile(stateDir).s1.stories[0].judge).toBe(false)
+  })
+
+  it("applies the map per story — a sibling verdict in the same call is untouched", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    se.createPlan("s1", [story({ text: "one" }), story({ text: "two" })])
+    se.applyJudgeVerdicts(
+      "s1",
+      [
+        { storyId: "S1", pass: true, summary: "re-derived", items: [] },
+        { storyId: "S2", pass: false, summary: "genuinely failed", items: [] },
+      ],
+      contradicted,
+    )
+    const stories = se.getPlan("s1")!.stories
+    expect(stories[0].judge!.contradictedItemIds).toEqual(["A1"])
+    expect(stories[1].judge!.contradictedItemIds).toBeUndefined()
+  })
+
+  it("a plan.json whose judge stamp predates the field still validates and loads", () => {
+    const stateDir = temporaryRoot()
+    mkdirSync(stateDir, { recursive: true })
+    const oldPlan = {
+      schemaVersion: 2,
+      stories: [
+        {
+          id: "S1",
+          text: "stamped before FR-001b existed",
+          acceptanceItems: [{ id: "A1", text: "works", evidence: null }],
+          scopeGlobs: [],
+          verifiers: [],
+          assumptions: [],
+          rejectedAlternatives: [],
+          amendments: [],
+          dependsOn: [],
+          status: "complete",
+          completedAt: new Date().toISOString(),
+          judge: { pass: true, summary: "ok", items: [], judgedAt: new Date().toISOString() },
+          tasks: [{ id: "S1.T1", text: "do it", dependsOn: [], status: "complete" }],
+        },
+      ],
+      finalStoryId: "S1",
+      createdAt: new Date().toISOString(),
+    }
+    writeFileSync(join(stateDir, "plan.json"), JSON.stringify({ s1: oldPlan }))
+
+    const { engine: se } = engine(stateDir)
+    const loaded = se.getPlan("s1")
+    expect(loaded).not.toBeNull()
+    expect(loaded!.stories[0].judge!.pass).toBe(true)
+    expect(loaded!.stories[0].judge!.contradictedItemIds).toBeUndefined()
+  })
+
+  it("rejects a present-but-wrong-shaped contradictedItemIds", () => {
+    const stateDir = temporaryRoot()
+    mkdirSync(stateDir, { recursive: true })
+    const badPlan = {
+      schemaVersion: 2,
+      stories: [
+        {
+          id: "S1",
+          text: "bad stamp",
+          acceptanceItems: [{ id: "A1", text: "works", evidence: null }],
+          scopeGlobs: [],
+          verifiers: [],
+          assumptions: [],
+          rejectedAlternatives: [],
+          amendments: [],
+          dependsOn: [],
+          status: "complete",
+          judge: { pass: true, summary: "ok", items: [], judgedAt: new Date().toISOString(), contradictedItemIds: "A1" },
+          tasks: [{ id: "S1.T1", text: "do it", dependsOn: [], status: "complete" }],
+        },
+      ],
+      finalStoryId: "S1",
+      createdAt: new Date().toISOString(),
+    }
+    writeFileSync(join(stateDir, "plan.json"), JSON.stringify({ s1: badPlan }))
     const { engine: se } = engine(stateDir)
     expect(se.getPlan("s1")).toBeNull()
   })

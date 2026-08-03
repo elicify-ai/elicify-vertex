@@ -148,13 +148,35 @@ const JUDGE_PAYLOAD_FIELD_CHAR_CAP = 2000
 const JUDGE_TRANSCRIPT_FIELD_CHAR_CAP = 4000
 
 /**
- * HANDOVER.md point 4: the `plan` field's cap, set to the same 4000 chars
- * as `recentTranscript` — a plan digest carries multiple stories' worth of
- * acceptance items and verifier commands, the same "several turns of
- * nuance" sizing argument as the transcript window. Kept as its own named
- * constant so it can be tuned without touching the other caps.
+ * HANDOVER.md point 4: the `plan` field's cap. Originally 4000 chars, copied
+ * from `recentTranscript` on a "several turns of nuance" sizing argument —
+ * i.e. a guess, never measured against a real digest.
+ *
+ * FR-006 (docs/JUDGE-RELIABILITY-FIXES-SPEC.md, User Story 6) raises it to
+ * 16000 from a MEASUREMENT, not taste. In the audited live session
+ * (`ses_04dc77bdaffej8SFJvYm5yO0CW`) `judge:field-truncated {plan,
+ * originalLength: 6411-6425, cap: 4000}` fired on all 9 audit runs, and the
+ * judge then FAILed stories citing exactly the content the cap had removed
+ * ("the verifier command is incomplete in the digest", "S5 has no
+ * independent verifier set in the digest") — a self-inflicted false FAIL.
+ * The `originalLength` in those events is the POST-scan length; the RAW
+ * digest for that 6-story plan measures **7518 chars** (spec round-2 finding
+ * m-19). 16000 is ~2.1x the measured raw digest: headroom for a plan roughly
+ * twice as large before truncation re-engages, rather than a bound that
+ * already binds on the very plan that motivated it.
+ *
+ * Raising the cap does NOT unbound cost or weaken redaction:
+ *  - `JUDGE_PAYLOAD_RAW_FIELD_SAFETY_CAP` (100_000) still drops a
+ *    pathological raw field WHOLE before scanning, so scan cost stays
+ *    bounded (US6 AS2's "the bound is raised, not removed").
+ *  - the scan still runs on the full reassembled field BEFORE truncation
+ *    (C-9 order), so a secret anywhere in the digest is still dropped
+ *    (US6 AS3) — a bigger cap only means less scanned-clean text is thrown
+ *    away afterward.
+ *  - truncation above 16000 still happens and still logs
+ *    `judge:field-truncated`.
  */
-const JUDGE_PLAN_FIELD_CHAR_CAP = 4000
+const JUDGE_PLAN_FIELD_CHAR_CAP = 16000
 
 /**
  * C-9 follow-up, cost regression (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md):
@@ -312,6 +334,167 @@ function unitTrips(text: string): boolean {
   return tripsPatternScan(text) || tripsEntropyScan(text) || tripsHexRunScan(text)
 }
 
+// ---------------------------------------------------------------------------
+// FR-006a — the adjacent-pair check must find the offending match ON the join
+// ---------------------------------------------------------------------------
+
+/**
+ * FR-006a (docs/JUDGE-RELIABILITY-FIXES-SPEC.md, round-2 finding M-10 —
+ * ROOT CAUSE REPRODUCED). `scanUnits`' second pass concatenates adjacent
+ * units with NO separator and drops BOTH when the concatenation trips. That
+ * is correct for a secret hard-wrapped across a line break (C-9, dataset
+ * rows 4/6) and catastrophic for everything else, because Shannon entropy is
+ * not compositional: gluing two ordinary tokens can manufacture a token that
+ * clears the entropy rule when neither side comes close.
+ *
+ * Reproduced exactly against the audited session's real plan digest — these
+ * two adjacent digest lines
+ *
+ *   "  verifiers: ... jq -e '.kpis | length >= 3' research/space-exploration.json"
+ *   "S2 (active): \"Research Wave B — ...\""
+ *
+ * fuse into the 33-char token `research/space-exploration.jsonS2`. Measured:
+ * the path token alone is 31 chars (under `ENTROPY_MIN_TOKEN_LENGTH`, never
+ * even scanned) at 3.889 bits/char; appending `S2` adds two symbols the left
+ * side does not contain, lifting the fused token to **4.044 bits/char** —
+ * over the 3.95 effective threshold. Neither line trips alone. In the audited
+ * session this fired 11x on the `plan` field (`judge:field-partial-drop
+ * {plan, kept:51, dropped:4}`), deleting S1/S2/S3's `verifiers:` lines, after
+ * which the judge FAILed those stories for having no verifiers in the digest.
+ *
+ * The fix is to require the offending match to actually live ON the join.
+ * Two things had to be established to make that a real constraint rather
+ * than a no-op:
+ *
+ *  1. A straddle test alone is VACUOUS for all three scans. The pair check
+ *     only runs when neither unit trips alone, and under that precondition
+ *     every possible match necessarily crosses the boundary: the entropy
+ *     scan's token set changes by exactly one token (the fused one, since
+ *     `/\s+/` splitting is local); a `SECRET_PATTERNS` match or a hex run
+ *     lying wholly inside one unit would have matched that unit alone (none
+ *     of the patterns use lookaround, and a leading/trailing `\b` is
+ *     satisfied at a string end, so concatenation can only DESTROY such a
+ *     match, never create one). Measured on the real digest: the offending
+ *     token `research/space-exploration.jsonS2` does straddle the join, so a
+ *     literal "does it straddle?" check leaves the production bug in place.
+ *     It is still implemented below — exactly, per match kind — because it
+ *     is the correct invariant and it stops being vacuous the moment
+ *     `redaction.ts` grows a pattern with lookaround.
+ *  2. What actually separates the two classes is WHICH scan trips and HOW
+ *     MUCH of the match each side contributes:
+ *      - pattern / hex-run matches are shape-specific. Two ordinary prose or
+ *        path tokens cannot glue into `postgres://user:pass@host` or a
+ *        32-char pure-hex run. A straddling match of either kind is
+ *        therefore sufficient to drop the pair (this is what keeps C-9's
+ *        dataset rows 4/6 caught).
+ *      - an entropy match is a heuristic over a token that, on a join, the
+ *        source text never actually contained. It is admitted only when the
+ *        split is a plausible mid-token WRAP: each side must contribute at
+ *        least `ENTROPY_PAIR_MIN_FRAGMENT_CHARS`. `S2` contributes 2 of 33
+ *        characters (6%) and flips the verdict; a wrapped secret contributes
+ *        a substantial run of the same random material to both sides.
+ *
+ * Why a fragment-LENGTH bar and not a fragment-ENTROPY bar: measured, an
+ * entropy bar cannot separate the classes at all. 20,000-sample Monte Carlo
+ * of random fragments gives mean 3.36 bits/char for 20-char hex and 4.04 for
+ * 20-char base64, while the ordinary path token `research/space-exploration.json`
+ * measures 3.889 — i.e. real secret fragments routinely score LOWER than the
+ * innocent path token this fix exists to protect, so any bar that keeps the
+ * production false positive also throws away genuine wrapped hex. Length is
+ * the discriminator that survives measurement.
+ *
+ * Residual risk, accepted and stated: two adjacent lines where the first ends
+ * with and the second begins with a >=16-char high-entropy-ish token (e.g.
+ * `...space-exploration.json` + `data/renewable-energy.json`, fusing to 57
+ * chars at 4.09 bits/char) still drop as a pair. That is far narrower than
+ * the reproduced class (which needs only a short next word) and errs toward
+ * redaction, which is the correct direction for a payload leaving the
+ * process. Exempting the `plan` field instead is explicitly forbidden by
+ * FR-006a (it would contradict US6 AS3, "a secret in the plan digest is
+ * still redacted").
+ */
+const ENTROPY_PAIR_MIN_FRAGMENT_CHARS = ENTROPY_MIN_TOKEN_LENGTH / 2
+
+/**
+ * Does a `SECRET_PATTERNS` match cross `joinIdx`?
+ *
+ * `SECRET_PATTERNS` is private to `redaction.ts` (see `tripsPatternScan`),
+ * so match offsets are recovered by diffing the redacted string against the
+ * original: the common prefix and common suffix bound every changed region.
+ * That window is a superset of the individual matches — with matches on both
+ * sides of the join but none crossing it, the window would straddle and this
+ * returns true. Deliberately left as-is: that configuration is unreachable
+ * from `scanUnits` (a match wholly inside one unit means that unit trips
+ * alone and the pair is never considered), and erring toward redaction is
+ * the safe direction if it ever becomes reachable.
+ */
+function patternMatchStraddles(joined: string, joinIdx: number): boolean {
+  const redacted = redactSecrets(joined)
+  if (redacted === joined) return false
+  let prefix = 0
+  while (prefix < joined.length && prefix < redacted.length && joined[prefix] === redacted[prefix]) prefix++
+  let suffix = 0
+  while (
+    suffix < joined.length - prefix &&
+    suffix < redacted.length - prefix &&
+    joined[joined.length - 1 - suffix] === redacted[redacted.length - 1 - suffix]
+  ) {
+    suffix++
+  }
+  return prefix < joinIdx && joined.length - suffix > joinIdx
+}
+
+/** Does a 32+ character hex run (the C-15 backstop) cross `joinIdx`? */
+function hexRunStraddles(joined: string, joinIdx: number): boolean {
+  const re = new RegExp(HEX_RUN_RE.source, "g")
+  let match: RegExpExecArray | null
+  while ((match = re.exec(joined)) !== null) {
+    if (match.index < joinIdx && match.index + match[0].length > joinIdx) return true
+  }
+  return false
+}
+
+/**
+ * Does a high-entropy token cross `joinIdx` with a substantial contribution
+ * from BOTH sides — i.e. does the join look like a hard-wrapped token rather
+ * than two complete tokens glued together? See
+ * `ENTROPY_PAIR_MIN_FRAGMENT_CHARS`' comment for the measurements behind the
+ * fragment bar.
+ */
+function entropyTokenStraddles(joined: string, joinIdx: number): boolean {
+  const re = /\S+/g
+  let match: RegExpExecArray | null
+  while ((match = re.exec(joined)) !== null) {
+    const token = match[0]
+    const start = match.index
+    const end = start + token.length
+    if (token.length < ENTROPY_MIN_TOKEN_LENGTH) continue
+    if (!(start < joinIdx && end > joinIdx)) continue
+    if (joinIdx - start < ENTROPY_PAIR_MIN_FRAGMENT_CHARS) continue
+    if (end - joinIdx < ENTROPY_PAIR_MIN_FRAGMENT_CHARS) continue
+    if (shannonEntropyBitsPerChar(token) >= ENTROPY_EFFECTIVE_THRESHOLD_BITS) return true
+  }
+  return false
+}
+
+/**
+ * FR-006a gate for the adjacent-pair pass: the concatenation tripped, but may
+ * the pair be dropped for it? Only when the offending match is genuinely a
+ * boundary phenomenon (see `ENTROPY_PAIR_MIN_FRAGMENT_CHARS`).
+ *
+ * Offsets are computed in DEWRAPPED space because that is the space every
+ * scan matches in (`dewrap` strips `\n` only, so
+ * `dewrap(a + b) === dewrap(a) + dewrap(b)` and the join index is exactly
+ * `dewrap(a).length`).
+ */
+function pairTripsOnJoin(a: string, b: string): boolean {
+  const left = dewrap(a)
+  const joined = left + dewrap(b)
+  const joinIdx = left.length
+  if (joinIdx === 0 || joinIdx === joined.length) return false
+  return patternMatchStraddles(joined, joinIdx) || hexRunStraddles(joined, joinIdx) || entropyTokenStraddles(joined, joinIdx)
+}
+
 /**
  * Given the ordered removal units of a field (hunks for diffSummary, lines
  * for criteria/verifierSummaries), determine which units to drop.
@@ -325,7 +508,10 @@ function unitTrips(text: string): boolean {
  *     considered (not arbitrary N-way spans): every hygiene dataset row
  *     tests a single two-way split, and bounding the reassembly window to
  *     one boundary at a time keeps the algorithm linear and its behavior
- *     easy to reason about.
+ *     easy to reason about. FR-006a: a pair may only be dropped when the
+ *     offending match is genuinely ON the join — see `pairTripsOnJoin`,
+ *     whose doc comment carries the reproduced production failure this
+ *     second condition exists to stop.
  *
  * A unit already dropped individually is excluded from pairwise
  * consideration so an innocent neighbor of a standalone secret is never
@@ -342,7 +528,9 @@ function scanUnits(units: string[]): { kept: string[]; anyDropped: boolean } {
 
   for (let i = 0; i + 1 < units.length; i++) {
     if (toDrop.has(i) || toDrop.has(i + 1)) continue
-    if (unitTrips(units[i] + units[i + 1])) {
+    // Cheap gate first (unchanged), then FR-006a's join-locality check —
+    // which only ever runs on the rare pair that already tripped.
+    if (unitTrips(units[i] + units[i + 1]) && pairTripsOnJoin(units[i], units[i + 1])) {
       toDrop.add(i)
       toDrop.add(i + 1)
     }
@@ -659,8 +847,26 @@ type ModelRef = { providerID: string; modelID: string }
  * `subturn.ts` already established for `subturn:cleanup-failed` (the module
  * that detects a condition logs it, rather than deferring to a caller that
  * would have to re-derive the same classification from the reason string).
+ *
+ * FR-014 (docs/JUDGE-RELIABILITY-FIXES-SPEC.md, User Story 12) adds
+ * `childSessionID`: the id of the subturn session the LAST attempt created,
+ * so the gate can apply the tool-call floor — a `met:false` may not be
+ * applied unless the judge child session actually made >= 1 tool call. This
+ * is the only deterministic protection for CONTENT claims (29 of the 49
+ * recovered item notes), which FR-001's path check cannot touch by
+ * construction.
+ *
+ * Absent whenever no child session was created (a failed probe returns
+ * before `runSubturn` is ever reached) — and present-but-already-deleted is
+ * the normal case, since `runSubturn`'s `finally` deletes the child before
+ * returning. The gate must therefore treat an unreadable child session as
+ * INCONCLUSIVE and fail open (apply the verdict, log the skip), per US12
+ * AS3; this field surfaces the id, it does not promise the session still
+ * exists.
  */
-export type JudgeRunResult = { verdict: JudgeVerdict } | { verdict: null; reason: "unsupported" | "unavailable" | "malformed" }
+export type JudgeRunResult =
+  | { verdict: JudgeVerdict; childSessionID?: string }
+  | { verdict: null; reason: "unsupported" | "unavailable" | "malformed"; childSessionID?: string }
 
 const JUDGE_AGENT_NAME = "vertex-judge"
 
@@ -733,12 +939,39 @@ export const JUDGE_TOTAL_BUDGET_MS = resolveJudgeBudgetMs()
  *  - structured per-item output (point 4): one story entry per audited
  *    story, one item entry per acceptance item, pass requires every item
  *    met — machine-checkable enough to drive per-story continuations.
+ *
+ * FR-011 (docs/JUDGE-RELIABILITY-FIXES-SPEC.md, User Story 9 — P0, the
+ * primary root-cause fix) adds a fourth: **observation is required in the
+ * NEGATIVE direction too**. The prompt above said only "Read the files a
+ * claim references before crediting it" — an obligation attached to
+ * `met:true` and nothing else, leaving the far more damaging direction
+ * completely unconstrained. The live probe isolated exactly that gap: given
+ * only the payload, `runJudge` returned `pass:false` in **9.8 s** with the
+ * note *"research/x.json does not exist ... ls shows no research/
+ * directory"* for a file that existed (probe P1). The same agent, on the
+ * same bytes, given a prompt that named what to check, called `bash ls -la`
+ * and `read` and returned a correct verdict (P2/P3: 3 steps, 2 real tool
+ * calls). Identical bytes, opposite verdicts, differing only in what the
+ * prompt demanded — so the defect is the prompt, not the tool wiring
+ * (`maxSteps` was disproven, Findings/FR-008). In the audited session 6 of 9
+ * audits reverted delivered stories on this class of claim.
+ *
+ * The two sentences added below are deliberately absolute and name the
+ * escape hatch, because "verify, don't trust" plainly did not bind: an
+ * absence claim REQUIRES a prior read/glob/grep/bash observation, and when
+ * the judge cannot observe it must SAY so in the note rather than assert
+ * absence. Without the second sentence, a judge that cannot run a tool has
+ * no compliant way to express doubt and will reach for the fabrication
+ * again.
  */
 const JUDGE_SYSTEM_PROMPT = [
   "You are an independent completion auditor for a coding plan whose stories have been claimed complete.",
   "You receive a plan digest (stories, their acceptance items, and the verifier commands each story declares), a diff summary, verifier output summaries, and the parent agent's last response plus a short recent transcript, as a JSON object.",
   "Do not trust the transcript or the parent's claims — verify them yourself with your read-only tools (read, grep, glob, list, bash).",
   "Read the files a claim references before crediting it.",
+  'The same rule binds in the opposite direction and binds harder: you must not report an item as "met": false on the grounds that a file or directory is missing, empty, or lacks some content unless you have just observed that yourself in this session with read, glob, grep or bash.',
+  "The payload is never evidence that something is absent — only that it was not quoted to you.",
+  'If you cannot make that observation, say exactly that in the item\'s note (for example "could not verify: no observation of research/x.json") instead of claiming the file or its content does not exist.',
   'Where a story declares verifiers, re-run them with bash when that is feasible within your budget: run each verifier as a standalone command, never chained with ";" and never piped, so its exit code is reliable.',
   "You must not modify anything: you have no write or edit capability, and bash is for running verifiers and read-only inspection only.",
   'Respond with exactly one JSON object and nothing else, matching this shape: {"stories": [{"storyId": "S1", "pass": true|false, "summary": "...", "items": [{"itemId": "A1", "met": true|false, "note": "..."}]}]}.',
@@ -861,6 +1094,39 @@ function isJudgeVerdictShape(value: unknown): value is JudgeVerdict {
 }
 
 /**
+ * FR-014 plumbing: learn which child session the subturn created, WITHOUT
+ * changing `subturn.ts`.
+ *
+ * `runSubturn` creates the child, calls `selfCreated.record(childID,
+ * parentID)`, and deletes it in a `finally` — the id never appears in its
+ * return value. The gate needs it to apply the tool-call floor (US12), so
+ * this wraps the caller's registry in a delegating view whose `record` also
+ * writes the id into `sink`.
+ *
+ * Why `Object.create` and not a subclass: `SelfCreatedSessions` owns its
+ * `ids` Set per instance, so a subclass instance would record child ids into
+ * a SECOND registry and the caller's registry would no longer recognise the
+ * judge's own child sessions — breaking FR-036 (all five hooks must return
+ * early for harness-created sessions), which is a live-session correctness
+ * property, not a test detail. Prototype delegation keeps exactly one
+ * registry: the override shadows only `record`, forwards to the real
+ * instance, and every other member resolves through the prototype chain to
+ * the caller's object.
+ */
+function observeChildSessionID(
+  selfCreated: SelfCreatedSessions,
+  sink: { childSessionID?: string },
+): SelfCreatedSessions {
+  const view = Object.create(selfCreated) as SelfCreatedSessions
+  const record: SelfCreatedSessions["record"] = (sessionID, parentID) => {
+    sink.childSessionID = sessionID
+    selfCreated.record(sessionID, parentID)
+  }
+  Object.defineProperty(view, "record", { value: record, writable: true, configurable: true })
+  return view
+}
+
+/**
  * FR-030/FR-030a/FR-030b/FR-032: runs the judge subturn.
  *
  * 0. CRITICAL fix: the `JUDGE_TOTAL_BUDGET_MS` budget clock (`start`) now
@@ -897,6 +1163,11 @@ function isJudgeVerdictShape(value: unknown): value is JudgeVerdict {
  *    point 4); anything else — including BOTH superseded shapes
  *    (`{fit, summary, gaps}` and `{fit, notes}`) — is `"malformed"`, not
  *    thrown.
+ * 4. FR-014: every result — success or failure — carries the id of the child
+ *    session the last attempt created (`childSessionID`), so the gate can
+ *    apply the tool-call floor. See `observeChildSessionID` for why it is
+ *    captured by observing the recorder rather than by changing
+ *    `runSubturn`'s return type.
  */
 export async function runJudge(
   client: OpencodeClient,
@@ -910,6 +1181,9 @@ export async function runJudge(
 ): Promise<JudgeRunResult> {
   const { selfCreated, logger } = deps
   const { parentSessionID, sessionModel, judgeModelOverride, payload } = opts
+
+  const observed: { childSessionID?: string } = {}
+  const recordingSelfCreated = observeChildSessionID(selfCreated, observed)
 
   const start = Date.now()
 
@@ -938,7 +1212,7 @@ export async function runJudge(
       last = { ok: false, reason: "timeout" }
       break
     }
-    last = await runSubturn(client, selfCreated, logger, {
+    last = await runSubturn(client, recordingSelfCreated, logger, {
       parentSessionID,
       agent: JUDGE_AGENT_NAME,
       model,
@@ -950,21 +1224,28 @@ export async function runJudge(
     if (last.ok) break
   }
 
+  // FR-014: `observed.childSessionID` is undefined when no child was ever
+  // created (e.g. `session.create` itself failed, or the budget was already
+  // spent), and spreading an object with an undefined value would still add
+  // the key — so it is spread conditionally, keeping "no child" as an ABSENT
+  // key rather than an explicitly-undefined one.
+  const child = observed.childSessionID === undefined ? {} : { childSessionID: observed.childSessionID }
+
   if (!last || !last.ok) {
     logger("judge:unavailable", { reason: last?.reason ?? "unknown" })
-    return { verdict: null, reason: "unavailable" }
+    return { verdict: null, reason: "unavailable", ...child }
   }
 
   const parsed = parseJudgeResponse(last.text)
   if (parsed === undefined) {
     logger("judge:malformed", { reason: "response is not valid JSON" })
-    return { verdict: null, reason: "malformed" }
+    return { verdict: null, reason: "malformed", ...child }
   }
 
   if (!isJudgeVerdictShape(parsed)) {
     logger("judge:malformed", { reason: "response does not match {stories: [{storyId, pass, summary, items}]} shape" })
-    return { verdict: null, reason: "malformed" }
+    return { verdict: null, reason: "malformed", ...child }
   }
 
-  return { verdict: parsed }
+  return { verdict: parsed, ...child }
 }

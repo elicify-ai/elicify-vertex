@@ -41,7 +41,7 @@ function denyAllAgent(name: string, overrides: Partial<Agent> = {}): Agent {
     tools: { bash: false, edit: false, write: false, webfetch: false, read: false, "*": false },
     options: {},
     ...overrides,
-  } as Agent
+  } as unknown as Agent
 }
 
 interface StubOpts {
@@ -442,7 +442,14 @@ describe("probeCapabilityBounded", () => {
 /** The judge's resolved shape under config.ts's JUDGE_PERMISSION +
  * buildJudgeToolsMap: allowlisted tools true, everything else false, with
  * explicit deny rules for edit/write/webfetch/task. */
-function judgePolicyAgent(name: string, overrides: Partial<Agent> = {}): Agent {
+/**
+ * The bundled SDK types `Agent.permission` as a narrow object that has no
+ * `write`/`task` keys, but the LIVE host resolves and honours both (see
+ * `subturn.ts`'s `permissionDenied`, which accepts the real array shape as
+ * well). Tests must be able to express the shapes the host actually returns,
+ * so the override bag is deliberately loose here rather than `Partial<Agent>`.
+ */
+function judgePolicyAgent(name: string, overrides: Record<string, unknown> = {}): Agent {
   return {
     name,
     mode: "subagent",
@@ -462,7 +469,7 @@ function judgePolicyAgent(name: string, overrides: Partial<Agent> = {}): Agent {
     },
     options: {},
     ...overrides,
-  } as Agent
+  } as unknown as Agent
 }
 
 describe("ProbePolicy (HANDOVER.md point 3)", () => {

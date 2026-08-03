@@ -99,6 +99,61 @@
  * final story that depends on its siblings cannot have all tasks complete
  * until those siblings are done), so no redundant guard is kept.
  * ---------------------------------------------------------------------
+ * 2026-08-03 judge-reliability fixes (docs/JUDGE-RELIABILITY-FIXES-SPEC.md,
+ * FR-002/002a-d, FR-003, FR-004). All three are grounded in one audited live
+ * session (`ses_04dc77bdaffej8SFJvYm5yO0CW`):
+ *
+ *  - FR-002 (concurrent-write data loss). Two plugin runtimes drove that
+ *    session and both wrote `plan.json`; a judge stamp provably written at
+ *    10:26:28 is ABSENT from the final file, and S6 carries no stamp at all.
+ *    Cause: `getPlan` cached the session's plan forever, mutations were
+ *    applied to that cached object, and `persistPlan` then did
+ *    `file = {...file, [sessionID]: current}` under a lock that protected
+ *    only the WRITE — so a stale cache silently overwrote a peer's stamp.
+ *    Every mutation now routes through the private `mutate` seam below,
+ *    which takes the lock ONCE, re-reads `plan.json`, reconciles the disk
+ *    state into the cached object **in place**, runs the mutation, writes,
+ *    and releases. Four constraints two grill rounds established, each of
+ *    which kills the naive version of this fix:
+ *      C4  — re-hydrating inside `persistPlan` would DISCARD the caller's
+ *            own mutation (mutations are applied before persist is called),
+ *            so the re-read must happen BEFORE the mutation, not after.
+ *      M-5 — `acquireStateLock` is NOT reentrant (it throws on EEXIST) and
+ *            `archiveV1IfPresent` takes the SAME lock at the top of
+ *            `createPlan`/`checkScope`/`checkpoint`; every such call is
+ *            therefore hoisted ABOVE its `mutate`, and `archiveV1IfPresent`
+ *            additionally skips re-acquiring when this engine already holds
+ *            the lock (`lockHeld`), so the deadlock-throw is structurally
+ *            impossible rather than merely avoided by call ordering.
+ *      M-5 — merging on-disk state into a CLEARED or REPLACED plan would
+ *            resurrect deleted stories, hence the three `mutate` modes
+ *            (`merge` | `replace` | `delete`); only `merge` reconciles.
+ *      gate.ts:742-753 documents a load-bearing OBJECT IDENTITY assumption
+ *            (`applyJudgeVerdicts` stamps in place on the plan object the
+ *            gate closure already holds, and the close-out then re-reads
+ *            `plan.stories`). Reconciliation therefore assigns field-by-
+ *            field into the existing plan/story/task objects and splices
+ *            arrays in place — it never swaps a reference.
+ *  - FR-002c/FR-010: `acquireStateLock` throws rather than waits, so
+ *    `mutate` retries with bounded jittered backoff and, on exhaustion,
+ *    logs and ABORTS THE WRITE. It never throws into the host.
+ *  - FR-002d: `PlanV2.revision` is a per-session monotonic write counter —
+ *    the signal that defines when `plan:concurrent-merge` fires. Coerced at
+ *    the disk boundary for revision-less files exactly like `dependsOn`.
+ *  - FR-003 (checkpoint idempotency). 23 of 82 checkpoint calls in the
+ *    audited session failed with "cannot complete task X: it is not active"
+ *    because the harness's own revert directive orders "checkpoint each
+ *    reverted task complete again". Re-completing an ALREADY-COMPLETE task
+ *    is now a logged no-op that mutates nothing (and skips the disk write
+ *    entirely); pending/blocked/failed still throw — those are genuine
+ *    out-of-order claims, not re-claims.
+ *  - FR-004 (a reopened story can be re-audited). `reopenStory` cleared
+ *    `story.completedAt` while the gate's audit filter (gate.ts:794)
+ *    requires `completedAt !== undefined` — so a story reopened while
+ *    `complete` (observed 3x: `previousStatus: complete -> newStatus:
+ *    complete`) became permanently invisible to the judge. It now stamps a
+ *    FRESH `completedAt` whenever the derived status is still `complete`.
+ * ---------------------------------------------------------------------
  */
 
 import { randomUUID } from "node:crypto"
@@ -123,6 +178,51 @@ export const fsIO = {
   chmodSync: fsNode.chmodSync,
   unlinkSync: fsNode.unlinkSync,
 }
+
+/**
+ * FR-002c seam (same rationale as `fsIO`): the lock acquisition and the
+ * backoff sleep `mutate` performs, behind an injectable indirection so a
+ * test can force contention without racing a real second process, and can
+ * collapse the backoff to zero instead of spending real wall-clock seconds.
+ * `archiveV1IfPresent` deliberately does NOT go through this seam — its lock
+ * is a different concern (an atomic rename of a v1 file) and keeping it on
+ * the raw import lets a contention test isolate `mutate`.
+ */
+export const lockIO = {
+  acquire(stateDir: string): { release(): void } {
+    return acquireStateLock(stateDir)
+  },
+  /**
+   * Synchronous sleep. Everything on this path is synchronous (the story
+   * tools are sync, and `plan.json` is written from inside `checkpoint`), so
+   * a promise-based delay is not available; `Atomics.wait` on a throwaway
+   * `SharedArrayBuffer` is the standard way to block a Node main thread for
+   * a bounded time. If it is unavailable for any reason the retry simply
+   * happens immediately rather than failing — a degraded retry beats a
+   * thrown error (FR-010).
+   */
+  sleep(ms: number): void {
+    if (!(ms > 0)) return
+    try {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+    } catch {
+      /* no blocking primitive available — retry without waiting */
+    }
+  },
+}
+
+/**
+ * FR-002c: `acquireStateLock` THROWS on contention (EEXIST) rather than
+ * waiting, and a peer's critical section is a couple of milliseconds of
+ * read-modify-write, so a short bounded retry converts almost every real
+ * collision into a successful write. Spec wording: "bounded jittered retry
+ * (5 x 100ms), then log and abort the write — NEVER throw into the host".
+ * One initial attempt plus `MUTATE_LOCK_RETRIES` retries, each preceded by
+ * a jittered `0.5x..1.5x` backoff, so the worst case is ~750ms and the
+ * common case is one uncontended attempt with no sleep at all.
+ */
+const MUTATE_LOCK_RETRIES = 5
+const MUTATE_LOCK_BACKOFF_MS = 100
 
 // ---------------------------------------------------------------------------
 // Public types (module-contracts.md §9)
@@ -163,6 +263,21 @@ export interface StoryJudgeStamp {
   summary: string
   items: JudgeItemNote[]
   judgedAt: string
+  /**
+   * FR-001b (2026-08-03): the ids of `met:false` items the HARNESS overruled
+   * before this verdict was applied — the gate's path-existence cross-check
+   * drops an item whose note claims a file is missing when that file
+   * demonstrably exists, and re-derives `pass: true` when EVERY failing item
+   * of the story was individually disproven.
+   *
+   * Absent (or empty) therefore means "a genuine, unmodified judge verdict".
+   * The distinction is load-bearing: the plan close-out must never claim the
+   * judge "independently verified" a story whose pass the harness derived —
+   * the judge actually failed it and was overruled on deterministic grounds.
+   * Optional on disk so plans written before this field existed still load
+   * (mirrors `dependsOn`/`revision`).
+   */
+  contradictedItemIds?: string[]
 }
 
 /**
@@ -268,6 +383,25 @@ export interface PlanV2 {
   stories: StoryV2[]
   finalStoryId: string
   createdAt: string
+  /**
+   * ADDED (FR-002d, 2026-08-03): a per-session MONOTONIC write counter,
+   * bumped by exactly one on every successful `plan.json` write for this
+   * session. It exists to answer one question the old code could not ask at
+   * all: "did somebody else write this session's entry since I last read
+   * it?" — the trigger condition for `plan:concurrent-merge`. Comparing
+   * whole plan bodies would be both expensive and wrong (a peer can write a
+   * body identical to ours), and mtimes are shared by every session in the
+   * one file.
+   *
+   * OPTIONAL in the in-memory type, unlike `StoryV2.dependsOn` (which the
+   * spec names as the coercion precedent): the coercion at the disk boundary
+   * is identical (absent → `0` in `coerceLoadedPlan`) and the engine always
+   * writes the field, but a REQUIRED field would break the externally
+   * constructed `PlanV2` literals that already exist outside this module
+   * (`tests/v2/gate.test.ts:276`) for no behavioral gain. Every read inside
+   * this module therefore goes through `?? 0`.
+   */
+  revision?: number
 }
 
 // ---------------------------------------------------------------------------
@@ -319,6 +453,9 @@ function isStoryJudgeStamp(value: unknown): value is StoryJudgeStamp {
   if (typeof value.summary !== "string") return false
   if (!Array.isArray(value.items) || !value.items.every(isJudgeItemNote)) return false
   if (typeof value.judgedAt !== "string") return false
+  // FR-001b: optional on disk (stamps written before the field existed must
+  // still load); reject only a PRESENT-but-wrong-shaped value.
+  if (value.contradictedItemIds !== undefined && !isStringArray(value.contradictedItemIds)) return false
   return true
 }
 
@@ -375,7 +512,108 @@ function isPlanV2(value: unknown): value is PlanV2 {
   if (ids.size !== stories.length) return false
   if (typeof value.finalStoryId !== "string" || !ids.has(value.finalStoryId)) return false
   if (typeof value.createdAt !== "string") return false
+  // FR-002d: `revision` is optional on disk (every plan.json written before
+  // 2026-08-03 lacks it and MUST still load — `coerceLoadedPlan` fills the
+  // absent case with 0 at the disk boundary). Reject only a PRESENT-but-
+  // wrong-shaped value, same discrimination the story-level `dependsOn`,
+  // `startedAt`, `completedAt` and `judge` fields already get.
+  if (value.revision !== undefined && (typeof value.revision !== "number" || !Number.isFinite(value.revision))) {
+    return false
+  }
   return true
+}
+
+/**
+ * FR-002d back-compat coercion, applied at the ONE place a pre-2026-08-03
+ * on-disk shape can reach memory (`hydrateFromDisk` and `mutate`'s re-read
+ * both funnel through here). Mirrors the story-level `dependsOn` coercion
+ * this file already performed: the validators ACCEPT the field's absence,
+ * and the boundary fills it, so nothing downstream has to know that older
+ * files exist. A revision-less plan reads as revision 0, so the very first
+ * write by a current engine takes it to 1 and conflict detection starts
+ * working from that moment on — no migration, no rewrite-on-read.
+ */
+function coerceLoadedPlan(plan: PlanV2): PlanV2 {
+  for (const story of plan.stories) {
+    if (story.dependsOn === undefined) story.dependsOn = []
+  }
+  if (typeof plan.revision !== "number" || !Number.isFinite(plan.revision)) plan.revision = 0
+  return plan
+}
+
+// ---------------------------------------------------------------------------
+// FR-002: in-place reconciliation (object identity is load-bearing)
+//
+// `gate.ts:742-753` holds the plan object across `applyJudgeVerdicts` and
+// then re-reads `plan.stories` to decide the close-out. A reconciliation
+// that REPLACED the cached plan with the freshly-parsed disk copy would
+// silently break that close-out, so these helpers copy the disk state
+// FIELD-BY-FIELD into the objects that already exist and splice the arrays
+// in place. Matching by id (not index) keeps a story/task object stable even
+// when a peer inserted or removed a sibling. Disk order wins for the array
+// order; objects that exist only on disk are adopted as-is.
+// ---------------------------------------------------------------------------
+
+/**
+ * FR-004 helper: an ISO-8601 completion stamp guaranteed to sort STRICTLY
+ * after an existing judge stamp. The gate's audit filter is a string
+ * comparison (`story.judge.judgedAt < story.completedAt`, `gate.ts:794`), and
+ * ISO-8601 UTC strings sort lexicographically, so an equal timestamp — which
+ * a same-millisecond audit-then-reopen produces — reads as "not re-claimed"
+ * and hides the story from the judge again. Falls back to `now` whenever
+ * there is no prior stamp or it cannot be parsed (never throws, never
+ * produces `Invalid Date`).
+ */
+function freshCompletionStamp(now: string, judgedAt: string | undefined): string {
+  if (judgedAt === undefined || now > judgedAt) return now
+  const parsed = Date.parse(judgedAt)
+  if (!Number.isFinite(parsed)) return now
+  return new Date(parsed + 1).toISOString()
+}
+
+function assignTaskInPlace(target: Task, source: Task): void {
+  target.text = source.text
+  target.dependsOn = source.dependsOn
+  target.status = source.status
+  target.startedAt = source.startedAt
+  target.completedAt = source.completedAt
+}
+
+function assignStoryInPlace(target: StoryV2, source: StoryV2): void {
+  target.text = source.text
+  target.acceptanceItems = source.acceptanceItems
+  target.scopeGlobs = source.scopeGlobs
+  target.verifiers = source.verifiers
+  target.assumptions = source.assumptions
+  target.rejectedAlternatives = source.rejectedAlternatives
+  target.amendments = source.amendments
+  target.status = source.status
+  target.startedAt = source.startedAt
+  target.completedAt = source.completedAt
+  target.judge = source.judge
+  target.dependsOn = source.dependsOn ?? []
+  const existingById = new Map(target.tasks.map((task) => [task.id, task]))
+  const merged = source.tasks.map((incoming) => {
+    const existing = existingById.get(incoming.id)
+    if (!existing) return incoming
+    assignTaskInPlace(existing, incoming)
+    return existing
+  })
+  target.tasks.splice(0, target.tasks.length, ...merged)
+}
+
+function assignPlanInPlace(target: PlanV2, source: PlanV2): void {
+  target.finalStoryId = source.finalStoryId
+  target.createdAt = source.createdAt
+  target.revision = source.revision ?? 0
+  const existingById = new Map(target.stories.map((story) => [story.id, story]))
+  const merged = source.stories.map((incoming) => {
+    const existing = existingById.get(incoming.id)
+    if (!existing) return incoming
+    assignStoryInPlace(existing, incoming)
+    return existing
+  })
+  target.stories.splice(0, target.stories.length, ...merged)
 }
 
 function requireNonBlank(value: string, name: string): string {
@@ -450,6 +688,45 @@ function matchesGlob(path: string, glob: string): boolean {
 // StoryEngine
 // ---------------------------------------------------------------------------
 
+/**
+ * FR-003: what a `checkpoint` call reports back. Before this existed the
+ * ONLY corrective signal the model received was the thrown error's
+ * "(currently active: …)" tail; making the already-complete case succeed
+ * would have removed that signal entirely, so it moves here and is reported
+ * on every call, thrown or not.
+ */
+export interface CheckpointResult {
+  /** `true` when the call was an already-complete re-claim: no plan
+   * mutation, no disk write, `checkpoint:idempotent-noop` logged. */
+  idempotent: boolean
+  /** The task ids active AFTER this call — i.e. what the model should be
+   * working on now, including anything the level-promotion just activated. */
+  activeTaskIds: string[]
+}
+
+/**
+ * FR-002a. Which reconciliation a mutation wants:
+ *  - `merge`   (default) — re-read `plan.json` and fold a peer's changes
+ *    into the cached plan IN PLACE before applying this mutation. The
+ *    ordering matters and is the round-1 C4 finding: reconciling AFTER the
+ *    mutation (e.g. inside `persistPlan`) would discard the caller's own
+ *    write, which is why "re-hydrate in persistPlan" was rejected.
+ *  - `replace` (`createPlan`) — this session's entry is being overwritten
+ *    wholesale; folding the disk copy in would resurrect the very stories
+ *    the create is replacing.
+ *  - `delete`  (`clearPlan`) — this session's entry is being removed;
+ *    folding the disk copy in would resurrect the cleared plan.
+ */
+type MutateMode = "merge" | "replace" | "delete"
+
+/** What a `mutate` callback reports: its own return value, plus whether it
+ * actually changed anything. `changed: false` skips the disk write entirely
+ * (FR-003 — an idempotent no-op must leave the file untouched). */
+interface MutateOutcome<T> {
+  changed: boolean
+  result: T
+}
+
 export class StoryEngine {
   private readonly stateDir: string
   private readonly planPath: string
@@ -457,6 +734,19 @@ export class StoryEngine {
   private readonly archiveDir: string
   private readonly logger: EventLogger
   private readonly plans = new Map<string, PlanV2>()
+  /**
+   * FR-002b: `acquireStateLock` is NOT reentrant — a second acquisition from
+   * the same process throws `state directory is locked by another process`,
+   * which would surface as a spurious hard failure inside `checkpoint`. This
+   * flag records that THIS engine is already inside its own critical
+   * section, so the two paths that can be reached from within one
+   * (`archiveV1IfPresent`, and a nested `mutate`) run lock-free instead of
+   * deadlock-throwing. It is not a substitute for hoisting the archival call
+   * above `mutate` — both are in force, because the hoist is the contract
+   * and this is the guard that keeps a future call-order change from
+   * re-introducing the bug.
+   */
+  private lockHeld = false
 
   constructor(opts: { stateDir: string; logger: EventLogger }) {
     this.stateDir = opts.stateDir
@@ -481,6 +771,13 @@ export class StoryEngine {
    * standalone so wiring can call it eagerly (e.g. at session activation)
    * to word the "a new plan is required" response itself; this module
    * only reports the boolean, it does not compose that user-facing text.
+   *
+   * FR-002b: this method takes the SAME non-reentrant lock `mutate` takes.
+   * Every caller inside this class keeps it hoisted ABOVE its `mutate` call,
+   * and — belt and braces — it skips the acquisition entirely when this
+   * engine already holds the lock, which is the "lock-free inner variant"
+   * the spec offers as the alternative. Without one of the two, wrapping
+   * `checkpoint` in a lock would deadlock-throw straight into the host.
    */
   archiveV1IfPresent(): boolean {
     if (!fsIO.existsSync(this.goalsPath)) return false
@@ -500,7 +797,7 @@ export class StoryEngine {
     }
     if (schemaVersion !== undefined && schemaVersion !== 1) return false // a v2+ file: not ours to touch
 
-    const lock = acquireStateLock(this.stateDir)
+    const lock = this.lockHeld ? null : acquireStateLock(this.stateDir)
     try {
       if (!fsIO.existsSync(this.goalsPath)) return false // raced away by another process
       fsIO.mkdirSync(this.archiveDir, { recursive: true, mode: 0o700 })
@@ -520,7 +817,7 @@ export class StoryEngine {
       this.logger("story:v1-archived", { archivePath })
       return true
     } finally {
-      lock.release()
+      lock?.release()
     }
   }
 
@@ -655,25 +952,35 @@ export class StoryEngine {
 
     if (!isPlanV2(plan)) throw new Error("internal error: constructed plan failed schema validation")
 
-    // Archive an existing plan before replacing it. `createPlan` used to
-    // overwrite unconditionally while `clearPlan` archived — so a second
-    // `elicify_vertex_plan_create` call silently discarded the user's stories,
-    // their acceptance items AND their attached evidence, with no log and
-    // nothing to recover. Losing a contract is exactly as bad as losing the
-    // evidence for it.
-    const existing = this.plans.get(sessionID) ?? null
-    if (existing && existing.stories.length > 0) {
-      this.logger("plan:replaced", {
-        sessionID,
-        replacedStories: existing.stories.length,
-        replacedStatuses: existing.stories.map((story) => story.status).join(","),
-      })
-      this.archivePlan(sessionID, existing)
-    }
-
-    this.plans.set(sessionID, plan)
-    this.persistPlan(sessionID)
-    return plan
+    // FR-002a: mode `"replace"`. A create REPLACES this session's entry
+    // wholesale, so `mutate` must NOT reconcile the on-disk copy into it —
+    // merging would resurrect exactly the stories this call is discarding
+    // (and which the archive below is the recovery path for). Note the
+    // `archiveV1IfPresent` call at the top of this method is already above
+    // the lock (FR-002b).
+    return this.mutate(
+      sessionID,
+      () => {
+        // Archive an existing plan before replacing it. `createPlan` used to
+        // overwrite unconditionally while `clearPlan` archived — so a second
+        // `elicify_vertex_plan_create` call silently discarded the user's
+        // stories, their acceptance items AND their attached evidence, with
+        // no log and nothing to recover. Losing a contract is exactly as bad
+        // as losing the evidence for it.
+        const existing = this.plans.get(sessionID) ?? null
+        if (existing && existing.stories.length > 0) {
+          this.logger("plan:replaced", {
+            sessionID,
+            replacedStories: existing.stories.length,
+            replacedStatuses: existing.stories.map((story) => story.status).join(","),
+          })
+          this.archivePlan(sessionID, existing)
+        }
+        this.plans.set(sessionID, plan)
+        return { changed: true, result: plan }
+      },
+      "replace",
+    )
   }
 
   getPlan(sessionID: string): PlanV2 | null {
@@ -727,14 +1034,17 @@ export class StoryEngine {
    * through memory and disk; new wiring should not call it.
    */
   attachEvidence(sessionID: string, storyId: string, itemId: string, evidence: AcceptanceItem["evidence"]): void {
-    const plan = this.getPlan(sessionID)
-    if (!plan) return
-    const story = plan.stories.find((candidate) => candidate.id === storyId)
-    if (!story) return
-    const item = story.acceptanceItems.find((candidate) => candidate.id === itemId)
-    if (!item) return
-    item.evidence = evidence
-    this.persistPlan(sessionID)
+    if (!this.getPlan(sessionID)) return
+    // FR-002: the lookups run INSIDE `mutate` so they see the reconciled
+    // plan, not a cache a peer instance has already moved past. An unknown
+    // story/item reports `changed: false`, which skips the disk write.
+    this.mutate(sessionID, (plan) => {
+      const story = plan?.stories.find((candidate) => candidate.id === storyId)
+      const item = story?.acceptanceItems.find((candidate) => candidate.id === itemId)
+      if (!item) return { changed: false, result: undefined }
+      item.evidence = evidence
+      return { changed: true, result: undefined }
+    })
   }
 
   /**
@@ -744,16 +1054,17 @@ export class StoryEngine {
    * `verifiers`. Throws on an unknown session/story.
    */
   amendStory(sessionID: string, storyId: string, opts: { reason: string; scopeGlobs?: string[]; verifiers?: string[] }): void {
-    const plan = this.getPlan(sessionID)
-    if (!plan) throw new Error(`no story plan for session ${sessionID}`)
-    const story = plan.stories.find((candidate) => candidate.id === storyId)
-    if (!story) throw new Error(`unknown story: ${storyId}`)
+    if (!this.getPlan(sessionID)) throw new Error(`no story plan for session ${sessionID}`)
+    this.mutate(sessionID, (plan) => {
+      const story = plan?.stories.find((candidate) => candidate.id === storyId)
+      if (!story) throw new Error(`unknown story: ${storyId}`)
 
-    const reason = requireNonBlank(opts.reason, "amendment reason")
-    story.amendments.push({ reason, ts: new Date().toISOString() })
-    if (opts.scopeGlobs) story.scopeGlobs = [...opts.scopeGlobs]
-    if (opts.verifiers) story.verifiers = [...opts.verifiers]
-    this.persistPlan(sessionID)
+      const reason = requireNonBlank(opts.reason, "amendment reason")
+      story.amendments.push({ reason, ts: new Date().toISOString() })
+      if (opts.scopeGlobs) story.scopeGlobs = [...opts.scopeGlobs]
+      if (opts.verifiers) story.verifiers = [...opts.verifiers]
+      return { changed: true, result: undefined }
+    })
   }
 
   /**
@@ -778,48 +1089,72 @@ export class StoryEngine {
    * item `evidence` is deliberately NOT reset (deprecated, superseded by
    * `StoryV2.judge`). Throws on an unknown session/story; never a silent
    * no-op.
+   *
+   * FR-004 (2026-08-03) — a reopened story can be RE-AUDITED. Observed 3x in
+   * the audited session: `story:reopened {previousStatus: "complete",
+   * newStatus: "complete"}`. When every task is already complete this loop
+   * changes nothing (complete tasks are skipped by design), the derived
+   * status stays `"complete"`, and `recomputeStoryStatuses` will NOT restamp
+   * `completedAt` because it only stamps on a `prev !== complete -> complete`
+   * TRANSITION. The story was therefore left `complete` with
+   * `completedAt: undefined`, and the gate's audit filter (`gate.ts:794`)
+   * requires `completedAt !== undefined` — the story became permanently
+   * invisible to the judge. FR-003's idempotent no-op is explicitly NOT the
+   * mechanism here: there is no incomplete task left to re-checkpoint. So a
+   * still-`complete` story gets a FRESH `completedAt` stamped below, which
+   * makes it audit-eligible immediately with no further checkpoint.
    */
   reopenStory(sessionID: string, storyId: string, opts: { reason: string }): void {
-    const plan = this.getPlan(sessionID)
-    if (!plan) throw new Error(`no story plan for session ${sessionID}`)
-    const story = plan.stories.find((candidate) => candidate.id === storyId)
-    if (!story) throw new Error(`unknown story: ${storyId}`)
+    if (!this.getPlan(sessionID)) throw new Error(`no story plan for session ${sessionID}`)
 
-    const reason = requireNonBlank(opts.reason, "reopen reason")
-    const previousStatus = story.status
-    const graph = this.buildGraph(plan)
-    const now = new Date().toISOString()
+    this.mutate(sessionID, (plan) => {
+      const story = plan?.stories.find((candidate) => candidate.id === storyId)
+      if (!plan || !story) throw new Error(`unknown story: ${storyId}`)
 
-    for (const task of story.tasks) {
-      // Complete tasks stay complete — re-audit re-opens them via
-      // applyJudgeVerdicts, not here.
-      if (task.status === "complete") continue
-      const deps = graph.deps.get(task.id) ?? new Set<string>()
-      let allDepsComplete = true
-      for (const depId of deps) {
-        if (this.taskStatus(plan, depId) !== "complete") {
-          allDepsComplete = false
-          break
+      const reason = requireNonBlank(opts.reason, "reopen reason")
+      const previousStatus = story.status
+      const graph = this.buildGraph(plan)
+      const now = new Date().toISOString()
+
+      for (const task of story.tasks) {
+        // Complete tasks stay complete — re-audit re-opens them via
+        // applyJudgeVerdicts, not here.
+        if (task.status === "complete") continue
+        const deps = graph.deps.get(task.id) ?? new Set<string>()
+        let allDepsComplete = true
+        for (const depId of deps) {
+          if (this.taskStatus(plan, depId) !== "complete") {
+            allDepsComplete = false
+            break
+          }
+        }
+        if (allDepsComplete) {
+          task.status = "active"
+          task.startedAt = now
+          task.completedAt = undefined
+        } else {
+          // A predecessor task/story is still incomplete — rejoin the queue
+          // and let checkpoint's level-promotion activate it in order.
+          task.status = "pending"
+          task.startedAt = undefined
+          task.completedAt = undefined
         }
       }
-      if (allDepsComplete) {
-        task.status = "active"
-        task.startedAt = now
-        task.completedAt = undefined
-      } else {
-        // A predecessor task/story is still incomplete — rejoin the queue
-        // and let checkpoint's level-promotion activate it in order.
-        task.status = "pending"
-        task.startedAt = undefined
-        task.completedAt = undefined
-      }
-    }
 
-    story.completedAt = undefined
-    story.amendments.push({ reason: `reopened from ${previousStatus}: ${reason}`, ts: now })
-    this.recomputeStoryStatuses(plan, { activationTs: now })
-    this.logger("story:reopened", { sessionID, storyId, previousStatus, newStatus: story.status })
-    this.persistPlan(sessionID)
+      story.completedAt = undefined
+      story.amendments.push({ reason: `reopened from ${previousStatus}: ${reason}`, ts: now })
+      this.recomputeStoryStatuses(plan, { activationTs: now })
+      // FR-004: nothing was re-activated (every task was already complete),
+      // so the story is still `complete` — re-stamp `completedAt` so the
+      // audit filter selects it again on the very next idle. The stamp must
+      // also be strictly LATER than any existing judge stamp, because that
+      // filter is `judge.judgedAt < completedAt`: the audit and the reopen
+      // can land inside the same millisecond, and an equal timestamp would
+      // silently reproduce the bug this requirement exists to kill.
+      if (story.status === "complete") story.completedAt = freshCompletionStamp(now, story.judge?.judgedAt)
+      this.logger("story:reopened", { sessionID, storyId, previousStatus, newStatus: story.status })
+      return { changed: true, result: undefined }
+    })
   }
 
   // -- FR-021: scope watchdog -----------------------------------------------
@@ -888,71 +1223,104 @@ export class StoryEngine {
    * the DAG levels, so promotion by level honours them automatically — no
    * separate C-11 final-story guard is needed (a final story that depends
    * on its siblings cannot have all tasks complete until they are).
+   *
+   * FR-003 (2026-08-03) — IDEMPOTENCY. 23 of the audited session's 82
+   * checkpoint calls died on `cannot complete task X: it is not active`,
+   * because the harness's own revert directive orders the model to
+   * "checkpoint each reverted task complete again" and a peer instance (or
+   * the model's own retry) had already done so. Re-completing a task that is
+   * ALREADY `"complete"` is therefore a no-op success: nothing mutates, no
+   * disk write happens at all, and `checkpoint:idempotent-noop` is logged.
+   * The three genuinely out-of-order claims still throw — a `"pending"`
+   * task never activated, and a `"blocked"`/`"failed"` task must be reopened
+   * first. E8: the no-op deliberately touches NEITHER the task's/story's
+   * `completedAt` NOR the judge stamp, so a failed audit cannot be laundered
+   * by re-claiming the task.
+   *
+   * Returns the task ids that are active AFTER the call (FR-003 / round-2
+   * m-16): the thrown error string used to be the ONLY channel telling the
+   * model what it should be working on instead, so the no-op has to carry
+   * that information some other way.
    */
   checkpoint(
     sessionID: string,
     taskId: string,
     status: "complete" | "failed" | "blocked",
     opts?: { reason?: string },
-  ): void {
+  ): CheckpointResult {
+    // FR-002b: hoisted ABOVE `mutate` — it takes the same non-reentrant lock.
     this.archiveV1IfPresent()
-    const plan = this.getPlan(sessionID)
-    if (!plan) throw new Error(`no story plan for session ${sessionID}`)
+    if (!this.getPlan(sessionID)) throw new Error(`no story plan for session ${sessionID}`)
 
-    let targetTask: Task | undefined
-    let targetStory: StoryV2 | undefined
-    for (const story of plan.stories) {
-      const task = story.tasks.find((candidate) => candidate.id === taskId)
-      if (task) {
-        targetTask = task
-        targetStory = story
-        break
+    return this.mutate<CheckpointResult>(sessionID, (plan) => {
+      if (!plan) throw new Error(`no story plan for session ${sessionID}`)
+
+      let targetTask: Task | undefined
+      let targetStory: StoryV2 | undefined
+      for (const story of plan.stories) {
+        const task = story.tasks.find((candidate) => candidate.id === taskId)
+        if (task) {
+          targetTask = task
+          targetStory = story
+          break
+        }
       }
-    }
-    if (!targetTask || !targetStory) throw new Error(`unknown task: ${taskId}`)
+      if (!targetTask || !targetStory) throw new Error(`unknown task: ${taskId}`)
 
-    if (status === "complete") {
-      // Completing a non-active task would silently strand the DAG's
-      // activation bookkeeping — the task would skip its level's activation
-      // while real active tasks stay active elsewhere.
-      if (targetTask.status !== "active") {
-        const activeIds = this.activeTaskIds(plan)
-        throw new Error(
-          `cannot complete task ${taskId}: it is not active ` +
-            `(currently active: ${activeIds.length > 0 ? activeIds.join(", ") : "none"})`,
-        )
+      if (status === "complete") {
+        // FR-003: an already-complete task is a RE-CLAIM, not an
+        // out-of-order claim. Succeed without mutating anything — this
+        // branch must stay ABOVE the not-active throw below, since
+        // `"complete"` is itself a non-active status.
+        if (targetTask.status === "complete") {
+          this.logger("checkpoint:idempotent-noop", { sessionID, taskId, storyId: targetStory.id })
+          return {
+            changed: false,
+            result: { idempotent: true, activeTaskIds: this.activeTaskIds(plan) },
+          }
+        }
+        // Completing a non-active task would silently strand the DAG's
+        // activation bookkeeping — the task would skip its level's activation
+        // while real active tasks stay active elsewhere.
+        if (targetTask.status !== "active") {
+          const activeIds = this.activeTaskIds(plan)
+          throw new Error(
+            `cannot complete task ${taskId}: it is not active ` +
+              `(currently active: ${activeIds.length > 0 ? activeIds.join(", ") : "none"})`,
+          )
+        }
       }
-    }
 
-    // --- All validation passed; mutate. ---
-    targetTask.status = status
-    if (status === "complete") {
-      targetTask.completedAt = new Date().toISOString()
-    } else {
-      // A non-complete outcome withdraws any earlier completion claim.
-      targetTask.completedAt = undefined
-      if (opts?.reason) {
-        targetStory.amendments.push({ reason: `${status}: ${opts.reason}`, ts: new Date().toISOString() })
+      // --- All validation passed; mutate. ---
+      targetTask.status = status
+      if (status === "complete") {
+        targetTask.completedAt = new Date().toISOString()
+      } else {
+        // A non-complete outcome withdraws any earlier completion claim.
+        targetTask.completedAt = undefined
+        if (opts?.reason) {
+          targetStory.amendments.push({ reason: `${status}: ${opts.reason}`, ts: new Date().toISOString() })
+        }
       }
-    }
 
-    // Recompute the affected story (the checkpointed task's parent) so a
-    // story whose last task just completed reads "complete" immediately.
-    this.recomputeStoryStatuses(plan)
+      // Recompute the affected story (the checkpointed task's parent) so a
+      // story whose last task just completed reads "complete" immediately.
+      this.recomputeStoryStatuses(plan)
 
-    // Level-promotion (the task analog of the old wave-promotion): whenever
-    // NO task remains active anywhere — for any reason (complete / blocked
-    // / failed) — activate every pending task at the next-lowest pending
-    // topological level. All such tasks are independent by construction
-    // (same level), so activating them together IS the parallel wave.
-    if (!this.anyActiveTask(plan)) {
-      const activationTs = this.promoteNextLevel(plan)
-      if (activationTs !== null) {
-        this.recomputeStoryStatuses(plan, { activationTs })
+      // Level-promotion (the task analog of the old wave-promotion): whenever
+      // NO task remains active anywhere — for any reason (complete / blocked
+      // / failed) — activate every pending task at the next-lowest pending
+      // topological level. All such tasks are independent by construction
+      // (same level), so activating them together IS the parallel wave.
+      if (!this.anyActiveTask(plan)) {
+        const activationTs = this.promoteNextLevel(plan)
+        if (activationTs !== null) {
+          this.recomputeStoryStatuses(plan, { activationTs })
+        }
       }
-    }
 
-    this.persistPlan(sessionID)
+      return { changed: true, result: { idempotent: false, activeTaskIds: this.activeTaskIds(plan) } }
+    })
   }
 
   /**
@@ -973,56 +1341,89 @@ export class StoryEngine {
    * Unknown story ids are collected into `unknown` and NEVER throw. Persists
    * once at the end and logs `story:judge-audit`. Throws only when the
    * session has no plan at all.
+   *
+   * FR-001b (2026-08-03): `contradictedByStory` carries, per story id, the
+   * ids of `met:false` items the HARNESS overruled — the gate's
+   * path-existence cross-check drops an item claiming a file is missing when
+   * that file demonstrably exists, and re-derives `pass: true` when every
+   * failing item of a story was disproven that way. Those ids are recorded
+   * on the stamp so a harness-derived pass stays distinguishable from a
+   * genuine judge pass forever after (the close-out must not claim the judge
+   * "independently verified" a story it actually failed). The parameter is
+   * OPTIONAL: two-argument callers are unchanged and their stamps carry no
+   * `contradictedItemIds` at all, which is exactly the "genuine verdict"
+   * encoding.
+   *
+   * FR-002: the whole loop runs inside `mutate`, so a peer instance's stamps
+   * written since this engine last read `plan.json` are folded in first
+   * rather than overwritten — the audited session lost a stamp written at
+   * 10:26:28 precisely here. Object identity is preserved across that
+   * reconciliation because `gate.ts:742-753` holds this plan object and
+   * re-reads `plan.stories` after this call returns.
    */
   applyJudgeVerdicts(
     sessionID: string,
     verdicts: Array<{ storyId: string; pass: boolean; summary: string; items: JudgeItemNote[] }>,
+    contradictedByStory?: ReadonlyMap<string, string[]>,
   ): { reverted: string[]; passed: string[]; unknown: string[] } {
-    const plan = this.getPlan(sessionID)
-    if (!plan) throw new Error(`no story plan for session ${sessionID}`)
+    if (!this.getPlan(sessionID)) throw new Error(`no story plan for session ${sessionID}`)
 
-    const reverted: string[] = []
-    const passed: string[] = []
-    const unknown: string[] = []
-    const judgedAt = new Date().toISOString()
+    const outcome = this.mutate(sessionID, (plan) => {
+      if (!plan) throw new Error(`no story plan for session ${sessionID}`)
 
-    for (const verdict of verdicts) {
-      const story = plan.stories.find((candidate) => candidate.id === verdict.storyId)
-      if (!story) {
-        unknown.push(verdict.storyId)
-        continue
-      }
-      // Copy the items defensively — the stamp becomes part of the
-      // persisted plan and must not alias the judge module's array.
-      story.judge = {
-        pass: verdict.pass,
-        summary: verdict.summary,
-        items: verdict.items.map((item) => ({ ...item })),
-        judgedAt,
-      }
-      if (verdict.pass && story.status === "complete") {
-        passed.push(story.id)
-      } else if (!verdict.pass && story.status === "complete") {
-        // 2026-07-30: re-open the story's complete TASKS too — re-audit
-        // requires re-doing the work, so a reverted claim withdraws the
-        // task-level completion as well as the story-level one.
-        story.status = "active"
-        story.startedAt = judgedAt
-        story.completedAt = undefined
-        for (const task of story.tasks) {
-          if (task.status === "complete") {
-            task.status = "active"
-            task.startedAt = judgedAt
-            task.completedAt = undefined
-          }
+      const reverted: string[] = []
+      const passed: string[] = []
+      const unknown: string[] = []
+      const judgedAt = new Date().toISOString()
+      let stamped = 0
+
+      for (const verdict of verdicts) {
+        const story = plan.stories.find((candidate) => candidate.id === verdict.storyId)
+        if (!story) {
+          unknown.push(verdict.storyId)
+          continue
         }
-        reverted.push(story.id)
+        // Copy the items defensively — the stamp becomes part of the
+        // persisted plan and must not alias the judge module's array.
+        const contradicted = contradictedByStory?.get(verdict.storyId)
+        story.judge = {
+          pass: verdict.pass,
+          summary: verdict.summary,
+          items: verdict.items.map((item) => ({ ...item })),
+          judgedAt,
+          // Absent (not `[]`) when the harness overruled nothing, so the
+          // on-disk shape of an untouched verdict is byte-identical to what
+          // pre-FR-001b engines wrote.
+          ...(contradicted && contradicted.length > 0 ? { contradictedItemIds: [...contradicted] } : {}),
+        }
+        stamped += 1
+        if (verdict.pass && story.status === "complete") {
+          passed.push(story.id)
+        } else if (!verdict.pass && story.status === "complete") {
+          // 2026-07-30: re-open the story's complete TASKS too — re-audit
+          // requires re-doing the work, so a reverted claim withdraws the
+          // task-level completion as well as the story-level one.
+          story.status = "active"
+          story.startedAt = judgedAt
+          story.completedAt = undefined
+          for (const task of story.tasks) {
+            if (task.status === "complete") {
+              task.status = "active"
+              task.startedAt = judgedAt
+              task.completedAt = undefined
+            }
+          }
+          reverted.push(story.id)
+        }
       }
-    }
 
-    this.persistPlan(sessionID)
-    this.logger("story:judge-audit", { sessionID, passed, reverted, unknown })
-    return { reverted, passed, unknown }
+      // Every verdict named an unknown story (or there were none): nothing
+      // was stamped, so there is nothing to write.
+      return { changed: stamped > 0, result: { reverted, passed, unknown } }
+    })
+
+    this.logger("story:judge-audit", { sessionID, ...outcome })
+    return outcome
   }
 
   // -- DAG / level machinery (2026-07-30) ----------------------------------
@@ -1295,49 +1696,53 @@ export class StoryEngine {
     const plan = this.getPlan(sessionID)
     if (!plan) return false
 
-    const lock = acquireStateLock(this.stateDir)
-    try {
-      fsIO.mkdirSync(this.archiveDir, { recursive: true, mode: 0o700 })
-      const timestamp = new Date().toISOString().replace(/[:.]/g, "-")
-      let archivePath = join(this.archiveDir, `plan.${sessionID}.${timestamp}.json`)
-      let suffix = 0
-      while (fsIO.existsSync(archivePath)) {
-        suffix += 1
-        archivePath = join(this.archiveDir, `plan.${sessionID}.${timestamp}-${suffix}.json`)
-      }
-      fsIO.writeFileSync(archivePath, `${JSON.stringify(redactForDisk(plan), null, 2)}\n`, {
-        encoding: "utf8",
-        flag: "wx",
-        mode: 0o600,
-      })
-    } finally {
-      lock.release()
-    }
-
-    this.plans.delete(sessionID)
-    this.persistPlan(sessionID)
+    // FR-002a: mode `"delete"`. The archive copy and the entry removal now
+    // happen under ONE lock acquisition instead of two (the old code took
+    // the lock for the archive, released it, then `persistPlan` took it
+    // again — a window in which a peer could re-write the entry we are about
+    // to drop). Reconciliation is skipped: folding the disk copy back into a
+    // plan we are deleting is exactly the "resurrect a cleared plan" case.
+    // The archive write stays INLINE (rather than delegating to the
+    // best-effort `archivePlan`) because a failed copy must abort the clear:
+    // this method's contract is "reversibly archives, never deletes".
+    this.mutate(
+      sessionID,
+      () => {
+        this.writeArchiveCopy(sessionID, plan)
+        this.plans.delete(sessionID)
+        return { changed: true, result: undefined }
+      },
+      "delete",
+    )
     this.logger("story:plan-cleared", { sessionID })
     return true
   }
 
-  /** Write a plan to `archive/plan.<session>.<ts>.json`. Shared by
-   * `clearPlan` and by `createPlan`'s replace path — a plan discarded by a
-   * second create is exactly as unrecoverable as one that was cleared. */
+  /** Write a plan to `archive/plan.<session>.<ts>.json`, never overwriting an
+   * existing file (`wx` + a numeric suffix). Throws on failure; callers that
+   * must not be blocked by a failed copy go through `archivePlan`. */
+  private writeArchiveCopy(sessionID: string, plan: PlanV2): void {
+    fsIO.mkdirSync(this.archiveDir, { recursive: true, mode: 0o700 })
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-")
+    let archivePath = join(this.archiveDir, `plan.${sessionID}.${timestamp}.json`)
+    let suffix = 0
+    while (fsIO.existsSync(archivePath)) {
+      suffix += 1
+      archivePath = join(this.archiveDir, `plan.${sessionID}.${timestamp}-${suffix}.json`)
+    }
+    fsIO.writeFileSync(archivePath, `${JSON.stringify(redactForDisk(plan), null, 2)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600,
+    })
+  }
+
+  /** Best-effort archive used by `createPlan`'s replace path — a plan
+   * discarded by a second create is exactly as unrecoverable as one that was
+   * cleared, but failing to keep the copy must not fail the create. */
   private archivePlan(sessionID: string, plan: PlanV2): void {
     try {
-      fsIO.mkdirSync(this.archiveDir, { recursive: true, mode: 0o700 })
-      const timestamp = new Date().toISOString().replace(/[:.]/g, "-")
-      let archivePath = join(this.archiveDir, `plan.${sessionID}.${timestamp}.json`)
-      let suffix = 0
-      while (fsIO.existsSync(archivePath)) {
-        suffix += 1
-        archivePath = join(this.archiveDir, `plan.${sessionID}.${timestamp}-${suffix}.json`)
-      }
-      fsIO.writeFileSync(archivePath, `${JSON.stringify(redactForDisk(plan), null, 2)}\n`, {
-        encoding: "utf8",
-        flag: "wx",
-        mode: 0o600,
-      })
+      this.writeArchiveCopy(sessionID, plan)
     } catch (error) {
       // Best-effort: failing to keep a copy must not block the caller, but it
       // must not be silent either.
@@ -1364,66 +1769,199 @@ export class StoryEngine {
     if (!isRecord(parsed)) return
     const entry = parsed[sessionID]
     if (!isPlanV2(entry)) return
-    // Back-compat coercion: a story-level `dependsOn` is OPTIONAL on disk
-    // (plans written before the 2026-07-30 task/DAG redesign predate the
-    // field and must still load). The in-memory type requires it, so fill
-    // the absent case to [] at the disk boundary — the one place a
-    // pre-redesign shape can reach memory. (Task `dependsOn` is NOT coerced:
-    // tasks ship with this redesign, so an absent task dependsOn is a
-    // malformed task and already rejected by isTask above.)
-    for (const story of entry.stories) {
-      if (story.dependsOn === undefined) story.dependsOn = []
-    }
-    this.plans.set(sessionID, entry)
+    // Back-compat coercion at the disk boundary: a story-level `dependsOn`
+    // is OPTIONAL on disk (plans written before the 2026-07-30 task/DAG
+    // redesign predate the field), and so is `revision` (FR-002d — plans
+    // written before 2026-08-03). `coerceLoadedPlan` fills both. (Task
+    // `dependsOn` is NOT coerced: tasks ship with the DAG redesign, so an
+    // absent task dependsOn is a malformed task and already rejected by
+    // isTask above.)
+    this.plans.set(sessionID, coerceLoadedPlan(entry))
   }
 
-  private persistPlan(sessionID: string): void {
-    const lock = acquireStateLock(this.stateDir)
+  // -- FR-002: the single read-modify-write seam ---------------------------
+
+  /**
+   * FR-002. THE one path through which every plan mutation reaches disk.
+   *
+   * Acquires the shared state lock ONCE (with the FR-002c bounded retry),
+   * re-reads `plan.json`, reconciles the on-disk state into the cached plan
+   * IN PLACE, runs `fn`, writes, releases. The ordering is the entire point:
+   * the audited session lost a judge stamp because the mutation happened
+   * first and the lock only ever covered the write, so a stale cache
+   * clobbered a peer's entry. Round-1 C4 also rules out the obvious
+   * alternative — re-hydrating inside `persistPlan` (i.e. after the
+   * mutation) would discard the caller's own change.
+   *
+   * Failure posture (FR-010, no new throw reaches the host):
+   *  - lock contention exhausted → apply the mutation in memory so this
+   *    session keeps working, ABORT the write, log `plan:write-aborted`;
+   *  - `plan.json` unparseable → unchanged pre-fix behavior (log
+   *    `story:disk-corrupt` and throw before `fn` runs, so nothing is
+   *    mutated and no other session's entry is destroyed);
+   *  - `fn` throws (an invalid checkpoint, an unknown story) → the throw
+   *    propagates exactly as before and no write happens, preserving the
+   *    "a rejected call leaves the plan entry unchanged" invariant;
+   *  - `fn` reports `changed: false` → no write at all (FR-003).
+   */
+  private mutate<T>(sessionID: string, fn: (plan: PlanV2 | null) => MutateOutcome<T>, mode: MutateMode = "merge"): T {
+    // FR-002b: already inside this engine's critical section — re-acquiring
+    // the non-reentrant lock would throw. Run the same read-modify-write
+    // body under the lock we already hold.
+    if (this.lockHeld) return this.runMutation(sessionID, fn, mode)
+
+    const lock = this.acquireLockWithRetry(sessionID)
+    if (!lock) {
+      const outcome = fn(this.plans.get(sessionID) ?? null)
+      if (outcome.changed) {
+        this.logger("plan:write-aborted", { sessionID, reason: "state lock contended", retries: MUTATE_LOCK_RETRIES })
+      }
+      return outcome.result
+    }
+    this.lockHeld = true
     try {
-      let file: Record<string, PlanV2> = {}
-      if (fsIO.existsSync(this.planPath)) {
-        const raw = fsIO.readFileSync(this.planPath, "utf8")
-        let parsed: unknown
-        try {
-          parsed = JSON.parse(raw)
-        } catch (error) {
-          // Genuinely unparseable JSON (NOT merely schema-invalid) — this
-          // file may hold every OTHER session's plan. Proceeding from an
-          // empty base here (the old behavior) would silently overwrite all
-          // of them with just this session's own plan on the write below,
-          // with zero log and zero error. Log distinctly and abort: unlike
-          // `pin.ts`'s `persist()`, nothing here catches this, so it
-          // propagates straight out of the calling `checkpoint()` /
-          // `createPlan()` / `attachEvidence()` / `amendStory()` call —
-          // failing loudly is exactly what we want, since destroying other
-          // sessions' data is worse than a failed write for this one.
-          this.logger("story:disk-corrupt", { sessionID, path: this.planPath, reason: describeParseError(error) })
-          throw new Error(
-            `plan.json is corrupt (unparseable JSON) — aborting write to avoid destroying other sessions' data: ${describeParseError(error)}`,
-          )
-        }
-        // Parseable but schema-invalid (per-key): a shape this module
-        // understands and can safely disregard entry-by-entry (not
-        // "someone else's unreadable data") — degrade gracefully, same as
-        // before.
-        if (isRecord(parsed)) {
-          for (const [sid, value] of Object.entries(parsed)) {
-            if (isPlanV2(value)) file[sid] = value
-          }
-        }
-      }
-      const current = this.plans.get(sessionID)
-      if (current) {
-        file = { ...file, [sessionID]: current }
-      } else if (sessionID in file) {
-        const rest = { ...file }
-        delete rest[sessionID]
-        file = rest
-      }
-      this.atomicWrite(file)
+      return this.runMutation(sessionID, fn, mode)
     } finally {
+      this.lockHeld = false
       lock.release()
     }
+  }
+
+  /** The lock-free body of `mutate` (see that method for the contract). */
+  private runMutation<T>(sessionID: string, fn: (plan: PlanV2 | null) => MutateOutcome<T>, mode: MutateMode): T {
+    const file = this.readPlanFile(sessionID)
+    if (mode === "merge") this.reconcileWithDisk(sessionID, file[sessionID])
+    const outcome = fn(this.plans.get(sessionID) ?? null)
+    if (!outcome.changed) return outcome.result
+    this.persistPlan(sessionID, file)
+    return outcome.result
+  }
+
+  /**
+   * FR-002c. `acquireStateLock` throws on contention instead of waiting, so
+   * a peer's few-millisecond critical section would otherwise surface as a
+   * hard failure inside `checkpoint`. Retry a bounded number of times with
+   * jittered backoff (the jitter keeps two colliding instances from
+   * re-colliding in lockstep); return `null` — never throw — when the budget
+   * is spent, leaving the caller to abort the write.
+   */
+  private acquireLockWithRetry(sessionID: string): { release(): void } | null {
+    for (let attempt = 0; attempt <= MUTATE_LOCK_RETRIES; attempt += 1) {
+      try {
+        return lockIO.acquire(this.stateDir)
+      } catch (error) {
+        if (attempt === MUTATE_LOCK_RETRIES) {
+          this.logger("plan:lock-contended", {
+            sessionID,
+            attempts: attempt + 1,
+            reason: error instanceof Error ? error.message : String(error),
+          })
+          return null
+        }
+        lockIO.sleep(MUTATE_LOCK_BACKOFF_MS * (0.5 + Math.random()))
+      }
+    }
+    return null
+  }
+
+  /**
+   * Reads and validates the whole `plan.json`, entry by entry. Lock-free:
+   * only ever called from inside `mutate`'s critical section (or from
+   * `runMutation` under a lock the caller already holds).
+   */
+  private readPlanFile(sessionID: string): Record<string, PlanV2> {
+    const file: Record<string, PlanV2> = {}
+    if (!fsIO.existsSync(this.planPath)) return file
+    const raw = fsIO.readFileSync(this.planPath, "utf8")
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(raw)
+    } catch (error) {
+      // Genuinely unparseable JSON (NOT merely schema-invalid) — this file
+      // may hold every OTHER session's plan. Proceeding from an empty base
+      // here (the pre-2026-07 behavior) would silently overwrite all of them
+      // with just this session's own plan on the write below, with zero log
+      // and zero error. Log distinctly and abort: unlike `pin.ts`'s
+      // `persist()`, nothing here catches this, so it propagates straight
+      // out of the calling `checkpoint()` / `createPlan()` /
+      // `attachEvidence()` / `amendStory()` call — failing loudly is exactly
+      // what we want, since destroying other sessions' data is worse than a
+      // failed write for this one. Because the read now happens BEFORE the
+      // mutation runs, the in-memory plan is left untouched too.
+      this.logger("story:disk-corrupt", { sessionID, path: this.planPath, reason: describeParseError(error) })
+      throw new Error(
+        `plan.json is corrupt (unparseable JSON) — aborting write to avoid destroying other sessions' data: ${describeParseError(error)}`,
+      )
+    }
+    // Parseable but schema-invalid (per-key): a shape this module understands
+    // and can safely disregard entry-by-entry (not "someone else's unreadable
+    // data") — degrade gracefully, same as before.
+    if (isRecord(parsed)) {
+      for (const [sid, value] of Object.entries(parsed)) {
+        if (isPlanV2(value)) file[sid] = coerceLoadedPlan(value)
+      }
+    }
+    return file
+  }
+
+  /**
+   * FR-002 (merge mode only): fold the on-disk entry into the cached plan
+   * BEFORE the mutation runs.
+   *
+   * The trigger is `revision` (FR-002d), not a body comparison: a strictly
+   * higher on-disk revision means somebody else wrote this session's entry
+   * since we last did, which is precisely the condition the audited session
+   * hit and silently lost a stamp to. An EQUAL revision is our own last
+   * write (nothing to do), and a LOWER one means our cache is ahead — which
+   * happens legitimately after a contention-aborted write — so the disk copy
+   * must not be allowed to roll us back.
+   *
+   * The assignment is field-by-field into the existing objects (see
+   * `assignPlanInPlace`): `gate.ts:742-753` holds this plan object across
+   * `applyJudgeVerdicts` and re-reads `plan.stories` afterwards, so swapping
+   * the reference would silently break the plan close-out.
+   */
+  private reconcileWithDisk(sessionID: string, onDisk: PlanV2 | undefined): void {
+    if (!onDisk) return
+    const cached = this.plans.get(sessionID)
+    if (!cached) {
+      // Not hydrated yet — adopt the disk copy wholesale. Nobody can hold a
+      // reference to a plan this engine has never handed out, and this is
+      // not a conflict, so no `plan:concurrent-merge`.
+      this.plans.set(sessionID, onDisk)
+      return
+    }
+    if (cached === onDisk) return
+    const cachedRevision = cached.revision ?? 0
+    const diskRevision = onDisk.revision ?? 0
+    if (diskRevision <= cachedRevision) return
+    assignPlanInPlace(cached, onDisk)
+    this.logger("plan:concurrent-merge", {
+      sessionID,
+      cachedRevision,
+      diskRevision,
+      stories: cached.stories.length,
+    })
+  }
+
+  /**
+   * FR-002: the LOCK-FREE inner write, called only by `runMutation` (which
+   * holds the lock and supplies the `file` it already read). Bumps this
+   * session's `revision` past both its own and the on-disk value so the
+   * counter stays monotonic even across a `replace` that discarded a
+   * higher-revision entry.
+   */
+  private persistPlan(sessionID: string, file: Record<string, PlanV2>): void {
+    let next = file
+    const current = this.plans.get(sessionID)
+    if (current) {
+      current.revision = Math.max(current.revision ?? 0, file[sessionID]?.revision ?? 0) + 1
+      next = { ...file, [sessionID]: current }
+    } else if (sessionID in file) {
+      next = { ...file }
+      delete next[sessionID]
+    }
+    this.atomicWrite(next)
   }
 
   /** Atomic write: `wx` temp file + rename, mode 0600 (pattern reference: `src/goals.ts`, `pin.ts`). */

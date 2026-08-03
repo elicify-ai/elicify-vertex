@@ -90,6 +90,12 @@ export interface ElicifyVertexV2Options {
    * consecutive continuations produced no observable tool activity
    * (default 3; <= 0 disables). `VERTEX_MAX_NO_PROGRESS_TURNS` overrides. */
   readonly maxNoProgressTurns?: number
+  /** FR-007: cap consecutive judge reverts per story, then escalate to the
+   * operator instead of reverting again (default 3; <= 0 disables).
+   * `VERTEX_MAX_STORY_REAUDITS` overrides. Evidence: the audited session ran
+   * 9 audit cycles / 82 checkpoints over 10 tasks with no exit; one story was
+   * reverted 7 consecutive times. */
+  readonly maxStoryReaudits?: number
   /** Consumed by `src/plugin.ts`'s kill switch; harmless if also present here. */
   readonly engine?: string
 }
@@ -230,6 +236,7 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
     visibility: userOpts.visibility,
     maxToastsPerMinute: userOpts.maxToastsPerMinute,
     maxNoProgressTurns: Number(process.env.VERTEX_MAX_NO_PROGRESS_TURNS) || userOpts.maxNoProgressTurns || 3,
+    maxStoryReaudits: Number(process.env.VERTEX_MAX_STORY_REAUDITS) || userOpts.maxStoryReaudits || 3,
   }
   const activateCommandName = opts.activeSkillTrigger.replace(/^\//, "")
 
@@ -409,6 +416,7 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
     visibility,
     delegation: delegationTracker,
     maxNoProgressTurns: opts.maxNoProgressTurns,
+    maxStoryReaudits: opts.maxStoryReaudits,
   }
 
   function formatChangedPathsSummary(paths: readonly string[]): string {
@@ -893,7 +901,22 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
               { readManifest: () => manifest },
             ).command
           } else if (storyVerifiers && storyVerifiers.length > 0) {
-            prescribed = storyVerifiers.join(" && ")
+            // FR-013: credit a story's verifiers INDIVIDUALLY. This used to be
+            // `storyVerifiers.join(" && ")`, which — combined with
+            // `observedCoversPrescribed`'s `prescribedParts.every(...)` —
+            // demanded that ONE observed command cover ALL of a story's
+            // verifiers at once. A 6-verifier story could then only mint a
+            // receipt if the agent ran all six in a single command, which no
+            // agent does. Measured consequence in the audited session
+            // (ses_04dc77bdaffej8SFJvYm5yO0CW): 146 `verify:relevance-gap`
+            // events and ZERO receipts minted, even though the agent WAS
+            // running the stories' own declared verifiers one at a time
+            // (observed `test -f .../crispr-gene-editing.md` vs prescribed
+            // `test -f research/renewable-energy.json && ...`). That empty
+            // receipt store is also why the receipt-based judge cross-check
+            // had no data to use. Any single declared verifier the observed
+            // command covers is now sufficient.
+            prescribed = storyVerifiers.find((verifier) => observedCoversPrescribed(verifier, command)) ?? storyVerifiers[0]
           }
 
           if (prescribed && !observedCoversPrescribed(prescribed, command)) {
