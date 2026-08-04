@@ -545,6 +545,17 @@ function armPauseJudge(ctx: GateContext, sid: string, state: V2SessionState): bo
   if (pauseTimers.has(sid)) return false
 
   const armedAtMarker = state.activityMarker
+  try {
+    armTimer(ctx, sid, state, armedAtMarker)
+  } catch {
+    // `handleSessionIdle` is awaited unguarded by the event hook, so anything
+    // thrown here reaches the host. Arming is best-effort: losing one pause
+    // judgement is invisible, breaking the idle tree is not.
+  }
+  return false // arming is not a continuation; the rest of the idle tree runs
+}
+
+function armTimer(ctx: GateContext, sid: string, state: V2SessionState, armedAtMarker: number): void {
   const timer = setTimeout(() => {
     pauseTimers.delete(sid)
     void runPauseJudge(ctx, sid, state, armedAtMarker)
@@ -553,7 +564,6 @@ function armPauseJudge(ctx: GateContext, sid: string, state: V2SessionState): bo
   if (typeof timer.unref === "function") timer.unref()
   pauseTimers.set(sid, timer)
   ctx.logger("pause:armed", { sessionID: sid, afterMs: PAUSE_JUDGE_DELAY_MS })
-  return false // arming is not a continuation; the rest of the idle tree runs
 }
 
 /** Timers are per session and cancelled by any activity — see `cancelPauseJudge`. */
