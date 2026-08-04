@@ -356,7 +356,7 @@ const TEST_RUNNER_WORDS: ReadonlySet<string> = new Set([
 ])
 
 /**
- * Does this command run tests? Judged on the runner only — flags and targets
+ * Does this command run tests? Decided on the runner only — flags and targets
  * are irrelevant to the question.
  */
 export function isTestRunnerCommand(command: string): boolean {
@@ -674,8 +674,8 @@ function joinDir(base: string, next: string): string {
  * Consequence in the audited session (`ses_04dc77bdaffej8SFJvYm5yO0CW`):
  * **146 `verify:relevance-gap` events and ZERO receipts minted**, while the
  * agent was in fact running the stories' own declared verifiers one at a time.
- * An empty receipt store then starved the judge's cross-check of any data,
- * which is how a path-matching detail became a judge-reliability defect.
+ * An empty receipt store then starved the verifier's cross-check of any data,
+ * which is how a path-matching detail became a verifier-reliability defect.
  *
  * ## Why it stays fail-closed
  *

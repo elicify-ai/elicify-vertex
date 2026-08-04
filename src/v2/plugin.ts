@@ -2,7 +2,7 @@
  * elicify-vertex v2 — phase-aware guidance harness plugin entry.
  * --------------------------------------------------------------------------
  * Wires the ten `src/v2/*` modules (phase.ts, pin.ts, story.ts, composer.ts,
- * resolve.ts, dosing.ts, artifacts.ts, subturn.ts, judge.ts) plus the
+ * resolve.ts, dosing.ts, artifacts.ts, subturn.ts, verifier.ts) plus the
  * `src/v2/wiring/*` support modules into the OpenCode `Hooks` surface, per
  * `docs/vertex2-spec.md`'s "Relevant Execution Flows" table and Functional
  * Requirements.
@@ -78,7 +78,7 @@ export interface ElicifyVertexV2Options {
   readonly activeSkillTrigger?: string
   readonly maxCriteriaBlocks?: number
   readonly intakeSubturnMax?: number
-  readonly judgeModel?: string
+  readonly verifierModel?: string
   readonly dosingOverrides?: Record<string, Profile>
   readonly familyCaps?: Record<string, number>
   readonly cooldowns?: Record<string, number>
@@ -90,7 +90,7 @@ export interface ElicifyVertexV2Options {
    * consecutive continuations produced no observable tool activity
    * (default 3; <= 0 disables). `VERTEX_MAX_NO_PROGRESS_TURNS` overrides. */
   readonly maxNoProgressTurns?: number
-  /** FR-007: cap consecutive judge reverts per story, then escalate to the
+  /** FR-007: cap consecutive verifier reverts per story, then escalate to the
    * operator instead of reverting again (default 3; <= 0 disables).
    * `VERTEX_MAX_STORY_REAUDITS` overrides. Evidence: the audited session ran
    * 9 audit cycles / 82 checkpoints over 10 tasks with no exit; one story was
@@ -137,7 +137,7 @@ function firstLine(text: string): string {
 }
 
 /**
- * FIX #1 (review CRITICAL — "judge subsystem is unreachable"): `getActiveStory`
+ * FIX #1 (review CRITICAL — "verifier subsystem is unreachable"): `getActiveStory`
  * returns `null` once the plan's final story is checkpointed `"complete"` —
  * nothing is "active" anymore. Every `tool.execute.after` call site that fed
  * `phaseEngine.onMutation`/`onVerifierOutcome` a bare
@@ -153,15 +153,15 @@ function resolveStoryIdForPhase(storyEngine: StoryEngine, sessionID: string): st
 }
 
 /**
- * FIX #7 (judge payload richness): a bounded `git diff --stat` for the
- * currently changed paths, invoked at judge-invocation time only
+ * FIX #7 (verifier payload richness): a bounded `git diff --stat` for the
+ * currently changed paths, invoked at verifier-invocation time only
  * (`session.idle`, which FR-009 does NOT list among the prohibited hot
  * paths — only `tool.execute.after`/`system.transform` are). Never throws:
  * a missing `git` binary, a non-repo `cwd`, or a timeout all degrade to the
  * empty string so the caller can fall back to the old changed-paths label.
  *
  * This is a `--stat` summary, not full hunks — a size-capped full `git diff`
- * for the changed paths is a reasonable follow-up if the judge needs more
+ * for the changed paths is a reasonable follow-up if the verifier needs more
  * than file-level shape, but is not implemented here (documented in the
  * final report, not silently claimed as solved).
  */
@@ -212,8 +212,8 @@ function computeBoundedDiffStat(cwd: string, changedPaths: readonly string[]): s
  * (`subturn.ts`) already calls `SelfCreatedSessions.record(childID,
  * parentID)` on the SAME shared instance this plugin passes to both
  * `classifyMultiStory` (intake) and, via `GateContext.selfCreated`,
- * `runJudge` (judge, `wiring/gate.ts`) — but neither `subturn.ts` nor
- * `story.ts`/`judge.ts` ever surfaces the created child session id back to
+ * `runVerifier` (verifier, `wiring/gate.ts`) — but neither `subturn.ts` nor
+ * `story.ts`/`verifier.ts` ever surfaces the created child session id back to
  * the caller (`ClassifyResult`/`SubturnResult` carry no session id field,
  * and `runSubturn`'s own `finally` block has already deleted the child
  * session by the time its promise resolves), so there is no id available at
@@ -221,13 +221,13 @@ function computeBoundedDiffStat(cwd: string, changedPaths: readonly string[]): s
  * `SelfCreatedGuard.record` — attempting one would mean guessing an id we
  * were never given. Subclassing `SelfCreatedSessions` and mirroring its own
  * `record()` call into the guard is the one seam available without editing
- * subturn.ts/story.ts/judge.ts (none owned by this fix): it captures the
+ * subturn.ts/story.ts/verifier.ts (none owned by this fix): it captures the
  * REAL child/parent ids at the exact moment `runSubturn` records them,
  * exactly matching `wiring/state.ts`'s own doc comment for `SelfCreatedGuard`
  * ("populated at the moment wiring records a subturn"). Because `plugin.ts`
  * constructs ONE `selfCreated` instance shared by both the intake subturn
- * (this file) and the judge subturn (`wiring/gate.ts`, sibling-owned), this
- * also happens to close the equivalent gap at the judge call site as a
+ * (this file) and the verifier subturn (`wiring/gate.ts`, sibling-owned), this
+ * also happens to close the equivalent gap at the verifier call site as a
  * side effect — see the final report.
  */
 class TrackingSelfCreatedSessions extends SelfCreatedSessions {
@@ -250,7 +250,7 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
     activeSkillTrigger: userOpts.activeSkillTrigger ?? "/elicify-vertex",
     maxCriteriaBlocks: userOpts.maxCriteriaBlocks ?? 3,
     intakeSubturnMax: Number(process.env.VERTEX_INTAKE_SUBTURN_MAX) || userOpts.intakeSubturnMax || 3,
-    judgeModel: userOpts.judgeModel,
+    verifierModel: userOpts.verifierModel,
     dosingOverrides: userOpts.dosingOverrides,
     familyCaps: userOpts.familyCaps,
     cooldowns: userOpts.cooldowns,
@@ -339,7 +339,7 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
   const delegationTracker = new DelegationTracker()
   const commandActivatedSessions = new Set<string>()
   // FIX #7: most recent verifier command's real output text per session
-  // (bounded), for the judge payload's verifierSummaries — not part of
+  // (bounded), for the verifier payload's verifierSummaries — not part of
   // V2SessionState (wiring/state.ts is not owned by this fix), kept here
   // instead as plugin-local per-session bookkeeping (same pattern as
   // commandActivatedSessions above).
@@ -403,13 +403,13 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
     states,
     activeSessionIDs: () => [...states.entries()].filter(([, s]) => s.active).map(([id]) => id),
     maxCriteriaBlocks: opts.maxCriteriaBlocks,
-    // FR-030 was opt-in (VERTEX_JUDGE=1); flipped to opt-out per operator
-    // request — the judge now runs by default at every final-story
-    // checkpoint, disabled only by explicit VERTEX_JUDGE=0. It remains
+    // FR-030 was opt-in (VERTEX_VERIFIER=1); flipped to opt-out per operator
+    // request — the verifier now runs by default at every final-story
+    // checkpoint, disabled only by explicit VERTEX_VERIFIER=0. It remains
     // strictly advisory/non-gating (FR-030) and fails open via the FR-030b
     // capability probe regardless of this flag.
-    judgeEnabled: process.env.VERTEX_JUDGE !== "0",
-    judgeModelOverride: parseModelRef(opts.judgeModel ?? null) ?? undefined,
+    verifierEnabled: process.env.VERTEX_VERIFIER !== "0",
+    verifierModelOverride: parseModelRef(opts.verifierModel ?? null) ?? undefined,
     isValidReceipt: (sessionID, receiptID) => {
       // Unlike `isFreshReceipt` (wiring/tools.ts) this had NO workspace check, so
       // a receipt naming a different `workspaceRoot` was accepted -- and stayed
@@ -770,7 +770,7 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       // "task" is not a write tool, so that gate would otherwise skip right
       // past this branch. Inject and return immediately; the write-protection
       // logic below does not apply to a `task` call. No `isSelf` re-check
-      // needed here: the judge and intake subturns are created directly via
+      // needed here: the verifier and intake subturns are created directly via
       // `runSubturn` (`client.session.create` + `client.session.prompt`),
       // never through the `task` tool, so they never reach this branch.
       if (toolInput.tool === "task") {
@@ -999,7 +999,7 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
             // running the stories' own declared verifiers one at a time
             // (observed `test -f .../crispr-gene-editing.md` vs prescribed
             // `test -f research/renewable-energy.json && ...`). That empty
-            // receipt store is also why the receipt-based judge cross-check
+            // receipt store is also why the receipt-based verifier cross-check
             // had no data to use. Any single declared verifier the observed
             // command covers is now sufficient.
             //
@@ -1056,7 +1056,7 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
         if (success) state.everVerifiedThisTurn = true
 
         // FIX #7: keep the most recent verifier command's real output text
-        // (bounded) for the judge payload — see gateCtx.recentVerifierSummaries.
+        // (bounded) for the verifier payload — see gateCtx.recentVerifierSummaries.
         lastVerifierOutputBySession.set(sid, (out || "").slice(-2000))
 
         if (success && exitCode === 0) {

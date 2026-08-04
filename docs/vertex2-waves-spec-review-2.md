@@ -63,11 +63,11 @@ the cited lines.
 ### MAJOR
 
 All 21 stand unchanged. Spot-verified: MAJ-001 (Behavioral Contract lines 436-437 and
-Ambiguity #6 line 1846 still state the pre-FR-038 judge policy; Assumption line 1911 repeats
+Ambiguity #6 line 1846 still state the pre-FR-038 verifier policy; Assumption line 1911 repeats
 it); MAJ-002 (FR-001…FR-038 still collide with `docs/vertex2-spec.md`, and the FR range has
 *grown* to FR-081); MAJ-003 (Cluster Placement line 101 still says "does **not** touch the
-receipt, redaction, judge, or measurement clusters" — now false three times over, since
-FR-080 adds a *third* judge-payload change); MAJ-009 (FR-044 line 1659 lists four reasons
+receipt, redaction, verifier, or measurement clusters" — now false three times over, since
+FR-080 adds a *third* verifier-payload change); MAJ-009 (FR-044 line 1659 lists four reasons
 including `timeout`, SC-013 line 1730 lists `unsupported`/`timeout`/`malformed`, and the real
 API returns `unsupported`/`unavailable`/`malformed`); MAJ-013 (**nothing** in the document
 creates or stores an intake record, or defines "the proposal" whose timestamp FR-068 compares
@@ -155,21 +155,21 @@ state, `harnessAuthoredIds`, now on the security-critical path), MAJ-013, MAJ-02
   Therefore: *the existence of a valid `confirmedByMessageId` is definitionally sufficient to
   classify the session `interactive`.* Every session in which `plan_create` can succeed is
   interactive. `autonomous` sessions can never create a plan, so FR-080's resolution path
-  ("surviving unknowns resolve as `ASSUMED` … and are included in the judge payload at close")
+  ("surviving unknowns resolve as `ASSUMED` … and are included in the verifier payload at close")
   leads nowhere — there is no plan, so there is nothing to close, and FR-038a forbids invoking
-  the judge when no plan exists.
+  the verifier when no plan exists.
 - **Impact**: CRIT-007 is not fixed; it is relabelled. The first review's core objection —
   "the intake gate makes the autonomous multi-story operation this feature exists to enable
   structurally impossible" — is now *encoded in the requirements themselves* rather than merely
   implied by them. Test 83 `autonomous_assumes_without_asking` can only ever assert the
   negative half ("no question tool call"); the half that matters ("and work proceeds") is
-  unreachable. AS-12's "those assumptions are included in the judge payload at close" is
+  unreachable. AS-12's "those assumptions are included in the verifier payload at close" is
   untestable for the same reason.
 - **Recommendation**: Decide and state, as an FR, what an autonomous session is permitted to
   do. The minimum coherent version: "In an `autonomous` session, `createPlan` MUST accept an
   intake record with no `confirmedByMessageId` when every `UNKNOWNS` entry is `ASSUMED` with a
   recorded grounding attempt and a stated risk; the plan MUST record `confirmationMode:
-  "assumed"` and every such assumption MUST be surfaced in `plan_status` and in the judge
+  "assumed"` and every such assumption MUST be surfaced in `plan_status` and in the verifier
   payload." Then make FR-067's confirmation requirement explicitly conditional on FR-077's
   classification, and re-derive the Scenario Outline at line 1312 (its four rows currently
   assert unconditional rejection).
@@ -269,7 +269,7 @@ state, `harnessAuthoredIds`, now on the security-critical path), MAJ-013, MAJ-02
   NOT be accepted unless ≥1 `read`/`grep`/`glob`/`webfetch` tool call has been observed in this
   session since the intake record was opened, and the entry MUST cite at least one observed
   call." Keep the free-text "what it yielded" as documentation, not as the gate. If the observed
-  call set is judged too coarse to attribute per-unknown, say so explicitly and drop FR-076 to a
+  call set is verifierd too coarse to attribute per-unknown, say so explicitly and drop FR-076 to a
   directive rather than a validator rule — an unenforceable MUST is worse than an honest SHOULD.
 
 #### [M2-002] The "evidence frozen at checkpoint" decision is **not in the spec** — CRIT-005 and CRIT-006 are wholly unaddressed
@@ -400,7 +400,7 @@ state, `harnessAuthoredIds`, now on the security-critical path), MAJ-013, MAJ-02
   explicitly disqualifies as confirmation. In any session where the human has stopped replying
   (C2-003's case), the loop is: continuation → agent calls `plan_create` → rejected for want of a
   confirming user message → idle → continuation → … three times, then nothing. No plan exists, so
-  FR-046/FR-048 have nothing to drive and FR-038a keeps the judge uninvoked. MAJ-010 is unfixed,
+  FR-046/FR-048 have nothing to drive and FR-038a keeps the verifier uninvoked. MAJ-010 is unfixed,
   so no event, toast or `plan_status` field records that the session gave up.
 - **Impact**: D3 — "a long autonomous run ends silently at 20% completion" — reproduced exactly,
   now reached through the new gate rather than around it.
@@ -558,7 +558,7 @@ state, `harnessAuthoredIds`, now on the security-critical path), MAJ-013, MAJ-02
 | **Spoofing** (harness message accepted as human confirmation) | **STILL OPEN** | FR-067a records the assistant id, not the user id (C2-001). Additional bypass across restart (M2-003) and across the 30 s continuation race (C2-001). |
 | **Tampering** (intake record altered after confirmation) | **OPEN** | No requirement makes the record immutable or tamper-evident after `confirmedByMessageId` is bound. Unchanged from the first review. |
 | **Repudiation** (no audit of what was confirmed) | **OPEN** | No event is specified for "intake confirmed by message X", "unknown resolved ASSUMED", or "session classified interactive/autonomous". FR-077's classification drives two gates and is never logged. |
-| **Information disclosure** | ok | Intake content flows to the model and the judge, both already redacted paths — though FR-080 routes assumptions into the judge payload with no redaction requirement stated (see MAJ-003, judge.ts still absent from the impact assessment). |
+| **Information disclosure** | ok | Intake content flows to the model and the verifier, both already redacted paths — though FR-080 routes assumptions into the verifier payload with no redaction requirement stated (see MAJ-003, verifier.ts still absent from the impact assessment). |
 | **Denial of service** | **WORSENED** | Previously: `isUserMessage` fails closed on client error, blocking planning (CRIT-007). Now additionally: an unanswered `question` blocks `plan_create` **and** the model's turn, with FR-081 explicitly refusing a release (C2-003). Self-inflicted, deterministic, no kill switch (MAJ-019 unfixed). |
 | **Elevation of privilege** (planning without understanding) | **OPEN** | One unrelated question, or a self-declared empty `UNKNOWNS` list, satisfies the gate (C2-004); a self-asserted grounding string satisfies FR-076 (M2-001). |
 

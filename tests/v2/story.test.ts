@@ -784,11 +784,11 @@ describe("checkpoint operates on a TASK (2026-07-30)", () => {
 })
 
 // ---------------------------------------------------------------------------
-// applyJudgeVerdicts — a failed verdict reverts a complete story AND re-opens
+// applyVerifierVerdicts — a failed verdict reverts a complete story AND re-opens
 // its complete tasks (re-audit requires re-doing the work).
 // ---------------------------------------------------------------------------
 
-describe("applyJudgeVerdicts re-opens a reverted story's tasks (2026-07-30)", () => {
+describe("applyVerifierVerdicts re-opens a reverted story's tasks (2026-07-30)", () => {
   const items = [
     { itemId: "A1", met: true, note: "verified via make check" },
     { itemId: "A2", met: false, note: "no such export exists" },
@@ -802,15 +802,15 @@ describe("applyJudgeVerdicts re-opens a reverted story's tasks (2026-07-30)", ()
     const taskId = plan.stories[0].tasks[0].id
     se.checkpoint("s1", taskId, "complete")
 
-    const result = se.applyJudgeVerdicts("s1", [{ storyId, pass: true, summary: "all good", items }])
+    const result = se.applyVerifierVerdicts("s1", [{ storyId, pass: true, summary: "all good", items }])
 
     expect(result).toEqual({ reverted: [], passed: [storyId], unknown: [] })
     const after = se.getPlan("s1")!.stories[0]
     expect(after.status).toBe("complete")
     expect(after.completedAt).toBeDefined()
-    expect(after.judge).toMatchObject({ pass: true, summary: "all good", items })
-    expect(typeof after.judge!.judgedAt).toBe("string")
-    expect(logger).toHaveBeenCalledWith("story:judge-audit", { sessionID: "s1", passed: [storyId], reverted: [], unknown: [] })
+    expect(after.verifier).toMatchObject({ pass: true, summary: "all good", items })
+    expect(typeof after.verifier!.verifiedAt).toBe("string")
+    expect(logger).toHaveBeenCalledWith("story:verifier-audit", { sessionID: "s1", passed: [storyId], reverted: [], unknown: [] })
   })
 
   it("a failing verdict on a complete story REVERTS it: tasks re-opened to active, fresh startedAt, completedAt cleared", () => {
@@ -824,7 +824,7 @@ describe("applyJudgeVerdicts re-opens a reverted story's tasks (2026-07-30)", ()
     expect(se.getPlan("s1")!.stories[0].status).toBe("complete")
 
     const before = Date.now()
-    const result = se.applyJudgeVerdicts("s1", [{ storyId, pass: false, summary: "A2 not delivered", items }])
+    const result = se.applyVerifierVerdicts("s1", [{ storyId, pass: false, summary: "A2 not delivered", items }])
     const after = Date.now()
 
     expect(result.reverted).toEqual([storyId])
@@ -836,7 +836,7 @@ describe("applyJudgeVerdicts re-opens a reverted story's tasks (2026-07-30)", ()
     expect(reverted.tasks.every((t) => t.completedAt === undefined)).toBe(true)
     expect(reverted.tasks.every((t) => typeof t.startedAt === "string")).toBe(true)
     expect(reverted.tasks.every((t) => Date.parse(t.startedAt!) >= before && Date.parse(t.startedAt!) <= after)).toBe(true)
-    expect(reverted.judge).toMatchObject({ pass: false, summary: "A2 not delivered" })
+    expect(reverted.verifier).toMatchObject({ pass: false, summary: "A2 not delivered" })
   })
 
   it("a verdict on a non-complete story records the stamp but changes no status", () => {
@@ -848,7 +848,7 @@ describe("applyJudgeVerdicts re-opens a reverted story's tasks (2026-07-30)", ()
     ])
     const [s1, s2] = plan.stories.map((s) => s.id)
 
-    const result = se.applyJudgeVerdicts("s1", [
+    const result = se.applyVerifierVerdicts("s1", [
       { storyId: s1, pass: false, summary: "active story audited early", items: [] },
       { storyId: s2, pass: true, summary: "pending story audited early", items: [] },
     ])
@@ -856,9 +856,9 @@ describe("applyJudgeVerdicts re-opens a reverted story's tasks (2026-07-30)", ()
     expect(result).toEqual({ reverted: [], passed: [], unknown: [] })
     const after = se.getPlan("s1")!
     expect(after.stories[0].status).toBe("active")
-    expect(after.stories[0].judge).toMatchObject({ pass: false })
+    expect(after.stories[0].verifier).toMatchObject({ pass: false })
     expect(after.stories[1].status).toBe("pending")
-    expect(after.stories[1].judge).toMatchObject({ pass: true })
+    expect(after.stories[1].verifier).toMatchObject({ pass: true })
   })
 
   it("unknown story ids are collected into `unknown` and never throw", () => {
@@ -868,7 +868,7 @@ describe("applyJudgeVerdicts re-opens a reverted story's tasks (2026-07-30)", ()
     const storyId = plan.stories[0].id
     se.checkpoint("s1", plan.stories[0].tasks[0].id, "complete")
 
-    const result = se.applyJudgeVerdicts("s1", [
+    const result = se.applyVerifierVerdicts("s1", [
       { storyId: "S99", pass: false, summary: "ghost", items: [] },
       { storyId, pass: true, summary: "real", items: [] },
     ])
@@ -879,10 +879,10 @@ describe("applyJudgeVerdicts re-opens a reverted story's tasks (2026-07-30)", ()
   it("throws when the session has no plan", () => {
     const stateDir = temporaryRoot()
     const { engine: se } = engine(stateDir)
-    expect(() => se.applyJudgeVerdicts("no-plan", [])).toThrow(/no story plan/)
+    expect(() => se.applyVerifierVerdicts("no-plan", [])).toThrow(/no story plan/)
   })
 
-  it("a reverted story's tasks can be recompleted and rejudged — the full claim/audit/reclaim cycle", () => {
+  it("a reverted story's tasks can be recompleted and re-verified — the full claim/audit/reclaim cycle", () => {
     const stateDir = temporaryRoot()
     const { engine: se } = engine(stateDir)
     const plan = se.createPlan("s1", [story({ tasks: [{ text: "a" }] })])
@@ -890,14 +890,14 @@ describe("applyJudgeVerdicts re-opens a reverted story's tasks (2026-07-30)", ()
     const taskId = plan.stories[0].tasks[0].id
 
     se.checkpoint("s1", taskId, "complete")
-    se.applyJudgeVerdicts("s1", [{ storyId, pass: false, summary: "not real", items }])
+    se.applyVerifierVerdicts("s1", [{ storyId, pass: false, summary: "not real", items }])
     expect(se.getPlan("s1")!.stories[0].status).toBe("active")
 
     se.checkpoint("s1", taskId, "complete")
-    const result = se.applyJudgeVerdicts("s1", [{ storyId, pass: true, summary: "now real", items: [] }])
+    const result = se.applyVerifierVerdicts("s1", [{ storyId, pass: true, summary: "now real", items: [] }])
     expect(result.passed).toEqual([storyId])
     expect(se.getPlan("s1")!.stories[0].status).toBe("complete")
-    expect(se.getPlan("s1")!.stories[0].judge!.pass).toBe(true)
+    expect(se.getPlan("s1")!.stories[0].verifier!.pass).toBe(true)
   })
 
   it("stamps and reversions survive a restart (fresh StoryEngine instance)", () => {
@@ -906,14 +906,14 @@ describe("applyJudgeVerdicts re-opens a reverted story's tasks (2026-07-30)", ()
     const plan = se.createPlan("s1", [story({ acceptanceItems: ["A1", "A2"], tasks: [{ text: "a" }] })])
     const storyId = plan.stories[0].id
     se.checkpoint("s1", plan.stories[0].tasks[0].id, "complete")
-    se.applyJudgeVerdicts("s1", [{ storyId, pass: false, summary: "A2 missing", items }])
+    se.applyVerifierVerdicts("s1", [{ storyId, pass: false, summary: "A2 missing", items }])
 
     const restarted = new StoryEngine({ stateDir, logger: vi.fn() })
     const reloaded = restarted.getPlan("s1")!.stories[0]
     expect(reloaded.status).toBe("active")
     expect(reloaded.completedAt).toBeUndefined()
     expect(reloaded.tasks[0].status).toBe("active")
-    expect(reloaded.judge).toMatchObject({ pass: false, summary: "A2 missing", items })
+    expect(reloaded.verifier).toMatchObject({ pass: false, summary: "A2 missing", items })
   })
 })
 
@@ -968,7 +968,7 @@ describe("reopenStory re-activates tasks per the DAG rule", () => {
     expect(reopened.status).toBe("pending")
   })
 
-  it("reopen leaves complete tasks complete (re-audit re-opens those via applyJudgeVerdicts, not here)", () => {
+  it("reopen leaves complete tasks complete (re-audit re-opens those via applyVerifierVerdicts, not here)", () => {
     const stateDir = temporaryRoot()
     const { engine: se } = engine(stateDir)
     const plan = se.createPlan("s1", [
@@ -1008,7 +1008,7 @@ describe("reopenStory re-activates tasks per the DAG rule", () => {
     expect(() => se.reopenStory("s1", "S99", { reason: "x" })).toThrow(/unknown story/)
   })
 
-  it("does NOT reset acceptance-item evidence on reopen (deprecated field, judge stamps supersede it)", () => {
+  it("does NOT reset acceptance-item evidence on reopen (deprecated field, verifier stamps supersede it)", () => {
     const stateDir = temporaryRoot()
     const { engine: se } = engine(stateDir)
     const plan = se.createPlan("s1", [story({ acceptanceItems: ["A1"], tasks: [{ text: "a" }] })])
@@ -1238,13 +1238,13 @@ describe("createPlan archives the plan it replaces", () => {
 
 // ---------------------------------------------------------------------------
 // plan.json round-trip with the redesign fields: tasks (required),
-// dependsOn, completedAt, judge accepted when well-formed, rejected when
+// dependsOn, completedAt, verifier accepted when well-formed, rejected when
 // malformed; old plans lacking tasks entirely now FAIL validation (hard
 // cutover — tasks ship with this redesign).
 // ---------------------------------------------------------------------------
 
 describe("plan.json round-trip with redesign fields", () => {
-  it("tasks, dependsOn, completedAt and a judge stamp persist and survive a fresh StoryEngine instance", () => {
+  it("tasks, dependsOn, completedAt and a verifier stamp persist and survive a fresh StoryEngine instance", () => {
     const stateDir = temporaryRoot()
     const { engine: se } = engine(stateDir)
     const plan = se.createPlan("s1", [
@@ -1257,7 +1257,7 @@ describe("plan.json round-trip with redesign fields", () => {
     const storyId = plan.stories[0].id
     const taskId = plan.stories[0].tasks[0].id
     se.checkpoint("s1", taskId, "complete")
-    se.applyJudgeVerdicts("s1", [{ storyId, pass: true, summary: "verified", items: [{ itemId: "A1", met: true, note: "ok" }] }])
+    se.applyVerifierVerdicts("s1", [{ storyId, pass: true, summary: "verified", items: [{ itemId: "A1", met: true, note: "ok" }] }])
 
     const restarted = new StoryEngine({ stateDir, logger: vi.fn() })
     const reloaded = restarted.getPlan("s1")!.stories[0]
@@ -1266,7 +1266,7 @@ describe("plan.json round-trip with redesign fields", () => {
     expect(reloaded.dependsOn).toEqual([])
     expect(reloaded.status).toBe("complete")
     expect(typeof reloaded.completedAt).toBe("string")
-    expect(reloaded.judge).toMatchObject({ pass: true, summary: "verified", items: [{ itemId: "A1", met: true, note: "ok" }] })
+    expect(reloaded.verifier).toMatchObject({ pass: true, summary: "verified", items: [{ itemId: "A1", met: true, note: "ok" }] })
   })
 
   it("rejects a plan whose story has NO tasks (hard cutover: tasks are required)", () => {
@@ -1354,7 +1354,7 @@ describe("plan.json round-trip with redesign fields", () => {
     expect(se.getPlan("s1")).toBeNull()
   })
 
-  it("rejects a malformed judge stamp (present but wrong shape)", () => {
+  it("rejects a malformed verifier stamp (present but wrong shape)", () => {
     const stateDir = temporaryRoot()
     mkdirSync(stateDir, { recursive: true })
     const badPlan = {
@@ -1362,7 +1362,7 @@ describe("plan.json round-trip with redesign fields", () => {
       stories: [
         {
           id: "S1",
-          text: "bad judge",
+          text: "bad verifier",
           acceptanceItems: [],
           scopeGlobs: [],
           verifiers: [],
@@ -1371,7 +1371,7 @@ describe("plan.json round-trip with redesign fields", () => {
           amendments: [],
           status: "complete",
           tasks: [{ id: "S1.T1", text: "ok", dependsOn: [], status: "complete" }],
-          judge: { pass: "yes", summary: 42, items: "nope", judgedAt: 123 },
+          verifier: { pass: "yes", summary: 42, items: "nope", verifiedAt: 123 },
         },
       ],
       finalStoryId: "S1",
@@ -1413,11 +1413,11 @@ describe("plan.json round-trip with redesign fields", () => {
 })
 
 // ===========================================================================
-// 2026-08-03 judge-reliability fixes (docs/JUDGE-RELIABILITY-FIXES-SPEC.md).
+// 2026-08-03 verifier-reliability fixes (docs/VERIFIER-RELIABILITY-FIXES-SPEC.md).
 //
 // Every case below is anchored to evidence from the audited live session
 // `ses_04dc77bdaffej8SFJvYm5yO0CW`, not to a hypothetical:
-//   FR-002 — a judge stamp provably written at 10:26:28 is ABSENT from the
+//   FR-002 — a verifier stamp provably written at 10:26:28 is ABSENT from the
 //            final plan.json, and S6 carries no stamp at all, because two
 //            plugin instances drove one session and the second one's stale
 //            cache overwrote the first one's write.
@@ -1426,18 +1426,18 @@ describe("plan.json round-trip with redesign fields", () => {
 //            "checkpoint each reverted task complete again".
 //   FR-004 — `story:reopened {previousStatus: "complete", newStatus:
 //            "complete"}` fired 3x; each of those stories became invisible
-//            to the judge forever after.
-//   FR-001b — a pass the HARNESS derived by contradicting the judge must not
-//            be reported as one the judge independently reached.
+//            to the verifier forever after.
+//   FR-001b — a pass the HARNESS derived by contradicting the verifier must not
+//            be reported as one the verifier independently reached.
 // ===========================================================================
 
 /** The gate's audit selector, `src/v2/wiring/gate.ts:794`, transcribed so
- * these tests assert the property that actually decides whether the judge
+ * these tests assert the property that actually decides whether the verifier
  * ever sees a story again — rather than a proxy for it. */
-function isAuditEligible(story: { status: string; completedAt?: string; judge?: { judgedAt: string } }): boolean {
+function isAuditEligible(story: { status: string; completedAt?: string; verifier?: { verifiedAt: string } }): boolean {
   return (
     story.status === "complete" &&
-    (!story.judge || (story.completedAt !== undefined && story.judge.judgedAt < story.completedAt))
+    (!story.verifier || (story.completedAt !== undefined && story.verifier.verifiedAt < story.completedAt))
   )
 }
 
@@ -1457,14 +1457,14 @@ describe("FR-002: concurrent plugin instances do not destroy each other's writes
     expect(b.getPlan("s1")).not.toBeNull()
 
     // A stamps S1 and persists (revision 2). B never sees this write.
-    a.applyJudgeVerdicts("s1", [{ storyId: "S1", pass: true, summary: "S1 audited", items: [] }])
+    a.applyVerifierVerdicts("s1", [{ storyId: "S1", pass: true, summary: "S1 audited", items: [] }])
     // B stamps S2 from its stale cache. Pre-fix this wrote B's whole cached
     // plan over the file and S1's stamp vanished — the 10:26:28 data loss.
-    b.applyJudgeVerdicts("s1", [{ storyId: "S2", pass: true, summary: "S2 audited", items: [] }])
+    b.applyVerifierVerdicts("s1", [{ storyId: "S2", pass: true, summary: "S2 audited", items: [] }])
 
     const onDisk = readPlanFile(stateDir).s1
-    expect(onDisk.stories[0].judge?.summary).toBe("S1 audited")
-    expect(onDisk.stories[1].judge?.summary).toBe("S2 audited")
+    expect(onDisk.stories[0].verifier?.summary).toBe("S1 audited")
+    expect(onDisk.stories[1].verifier?.summary).toBe("S2 audited")
     expect(bLog).toHaveBeenCalledWith("plan:concurrent-merge", expect.objectContaining({ sessionID: "s1" }))
   })
 
@@ -1473,7 +1473,7 @@ describe("FR-002: concurrent plugin instances do not destroy each other's writes
     const { engine: se, logger } = engine(stateDir)
     const plan = se.createPlan("s1", [story()])
     se.checkpoint("s1", plan.stories[0].tasks[0].id, "complete")
-    se.applyJudgeVerdicts("s1", [{ storyId: "S1", pass: true, summary: "ok", items: [] }])
+    se.applyVerifierVerdicts("s1", [{ storyId: "S1", pass: true, summary: "ok", items: [] }])
     expect(logger).not.toHaveBeenCalledWith("plan:concurrent-merge", expect.anything())
   })
 
@@ -1492,7 +1492,7 @@ describe("FR-002: concurrent plugin instances do not destroy each other's writes
     // A peer writes something this engine has never seen, so the mutate below
     // genuinely takes the reconcile path rather than trivially passing.
     peer.getPlan("s1")
-    peer.applyJudgeVerdicts("s1", [{ storyId: "S2", pass: true, summary: "peer stamped S2", items: [] }])
+    peer.applyVerifierVerdicts("s1", [{ storyId: "S2", pass: true, summary: "peer stamped S2", items: [] }])
 
     se.checkpoint("s1", heldTask.id, "complete")
 
@@ -1503,7 +1503,7 @@ describe("FR-002: concurrent plugin instances do not destroy each other's writes
     expect(heldStory.tasks[0]).toBe(heldTask)
     // ...and the held reference sees BOTH the local mutation and the peer's.
     expect(heldTask.status).toBe("complete")
-    expect(held.stories[1].judge?.summary).toBe("peer stamped S2")
+    expect(held.stories[1].verifier?.summary).toBe("peer stamped S2")
   })
 
   it("a corrupt plan.json still aborts the write — and now leaves the in-memory plan unmutated too", () => {
@@ -1534,7 +1534,7 @@ describe("FR-002a: merge modes never resurrect a cleared or replaced plan", () =
 
     // Peer advances the on-disk revision for the SAME session.
     peer.getPlan("s1")
-    peer.applyJudgeVerdicts("s1", [{ storyId: "S1", pass: true, summary: "peer stamp", items: [] }])
+    peer.applyVerifierVerdicts("s1", [{ storyId: "S1", pass: true, summary: "peer stamp", items: [] }])
 
     expect(se.clearPlan("s1")).toBe(true)
 
@@ -1553,7 +1553,7 @@ describe("FR-002a: merge modes never resurrect a cleared or replaced plan", () =
     se.createPlan("s1", [story({ text: "one" }), story({ text: "two" }), story({ text: "three" })])
 
     peer.getPlan("s1")
-    peer.applyJudgeVerdicts("s1", [{ storyId: "S3", pass: true, summary: "peer stamp", items: [] }])
+    peer.applyVerifierVerdicts("s1", [{ storyId: "S3", pass: true, summary: "peer stamp", items: [] }])
 
     se.createPlan("s1", [story({ text: "the only story now" })])
 
@@ -1677,7 +1677,7 @@ describe("FR-002c/FR-010: lock contention retries, then aborts the write without
     expect(JSON.parse(readFileSync(planPath, "utf8")).s1.stories[0].tasks[0].status).toBe("complete")
   })
 
-  // The measured 7-12% judge-stamp loss: a peer writes while our change is
+  // The measured 7-12% verifier-stamp loss: a peer writes while our change is
   // still only in memory, and `reconcileWithDisk` overwrites it. That IS
   // allowed to happen — what must not happen is it being indistinguishable
   // from an ordinary merge.
@@ -1918,7 +1918,7 @@ describe("FR-003: re-checkpointing an already-complete task is an idempotent no-
     expect(thrown).toBe(0)
   })
 
-  it("E8: the no-op does NOT launder a failing judge stamp or advance completedAt", () => {
+  it("E8: the no-op does NOT launder a failing verifier stamp or advance completedAt", () => {
     const stateDir = temporaryRoot()
     const { engine: se } = engine(stateDir)
     const plan = se.createPlan("s1", [story()])
@@ -1928,21 +1928,21 @@ describe("FR-003: re-checkpointing an already-complete task is an idempotent no-
     // A failing audit reverts the story; the model re-claims the task, so the
     // task is complete again while the FAILING stamp still stands. This is
     // exactly the state a laundering re-claim would attack.
-    se.applyJudgeVerdicts("s1", [
+    se.applyVerifierVerdicts("s1", [
       { storyId: "S1", pass: false, summary: "A1 unmet", items: [{ itemId: "A1", met: false, note: "no sources" }] },
     ])
     se.checkpoint("s1", t1, "complete")
 
     const before = se.getPlan("s1")!.stories[0]
-    const stampBefore = JSON.parse(JSON.stringify(before.judge))
+    const stampBefore = JSON.parse(JSON.stringify(before.verifier))
     const storyCompletedAt = before.completedAt
     const taskCompletedAt = before.tasks[0].completedAt
 
     se.checkpoint("s1", t1, "complete") // the re-claim
 
     const after = se.getPlan("s1")!.stories[0]
-    expect(after.judge).toEqual(stampBefore)
-    expect(after.judge!.pass).toBe(false)
+    expect(after.verifier).toEqual(stampBefore)
+    expect(after.verifier!.pass).toBe(false)
     expect(after.completedAt).toBe(storyCompletedAt)
     expect(after.tasks[0].completedAt).toBe(taskCompletedAt)
   })
@@ -1983,11 +1983,11 @@ describe("FR-004: a story reopened while complete is audit-eligible again immedi
     const { engine: se } = engine(stateDir)
     const plan = se.createPlan("s1", [story({ tasks: [{ text: "a" }, { text: "b" }] })])
     for (const task of plan.stories[0].tasks) se.checkpoint("s1", task.id, "complete")
-    se.applyJudgeVerdicts("s1", [{ storyId: "S1", pass: true, summary: "looked fine", items: [] }])
+    se.applyVerifierVerdicts("s1", [{ storyId: "S1", pass: true, summary: "looked fine", items: [] }])
 
     const beforeReopen = se.getPlan("s1")!.stories[0]
     expect(beforeReopen.status).toBe("complete")
-    expect(isAuditEligible(beforeReopen)).toBe(false) // already judged — nothing to do
+    expect(isAuditEligible(beforeReopen)).toBe(false) // already verifierd — nothing to do
 
     // The observed case: previousStatus complete -> newStatus complete. There
     // is no incomplete task to re-checkpoint, so FR-003's no-op cannot be the
@@ -1997,7 +1997,7 @@ describe("FR-004: a story reopened while complete is audit-eligible again immedi
     const story1 = se.getPlan("s1")!.stories[0]
     expect(story1.status).toBe("complete")
     expect(story1.completedAt).toBeDefined()
-    expect(story1.judge!.judgedAt < story1.completedAt!).toBe(true)
+    expect(story1.verifier!.verifiedAt < story1.completedAt!).toBe(true)
     expect(isAuditEligible(story1)).toBe(true)
     // ...and it is durable, not just an in-memory nicety.
     expect(readPlanFile(stateDir).s1.stories[0].completedAt).toBe(story1.completedAt)
@@ -2008,13 +2008,13 @@ describe("FR-004: a story reopened while complete is audit-eligible again immedi
     const { engine: se } = engine(stateDir)
     const plan = se.createPlan("s1", [story()])
     se.checkpoint("s1", plan.stories[0].tasks[0].id, "complete")
-    se.applyJudgeVerdicts("s1", [{ storyId: "S1", pass: true, summary: "ok", items: [] }])
+    se.applyVerifierVerdicts("s1", [{ storyId: "S1", pass: true, summary: "ok", items: [] }])
 
-    // Freeze the clock at the judge stamp's own timestamp: an equal
+    // Freeze the clock at the verifier stamp's own timestamp: an equal
     // `completedAt` would read as "not re-claimed" and hide the story again.
-    const judgedAt = se.getPlan("s1")!.stories[0].judge!.judgedAt
+    const verifiedAt = se.getPlan("s1")!.stories[0].verifier!.verifiedAt
     vi.useFakeTimers()
-    vi.setSystemTime(new Date(judgedAt))
+    vi.setSystemTime(new Date(verifiedAt))
     se.reopenStory("s1", "S1", { reason: "same-ms re-audit" })
     vi.useRealTimers()
 
@@ -2022,11 +2022,11 @@ describe("FR-004: a story reopened while complete is audit-eligible again immedi
   })
 
   // The SECOND site. `freshCompletionStamp` was wired into `reopenStory` only,
-  // but the path that actually runs after a judge revert is `checkpoint` — the
+  // but the path that actually runs after a verifier revert is `checkpoint` — the
   // revert directive orders the model to re-checkpoint the reverted tasks. It
   // used to stamp a raw `now`, so a revert and the re-checkpoint that followed
   // could share a millisecond and the story became permanently invisible to
-  // the judge. Surfaced as a 2-in-8 full-suite flake, pinned deterministically
+  // the verifier. Surfaced as a 2-in-8 full-suite flake, pinned deterministically
   // here with a frozen clock.
   it("re-CHECKPOINTING a reverted task in the same millisecond as the verdict stays audit-eligible", () => {
     const stateDir = temporaryRoot()
@@ -2036,21 +2036,21 @@ describe("FR-004: a story reopened while complete is audit-eligible again immedi
     se.checkpoint("s1", t1, "complete")
 
     // A FAILING verdict reverts the story and its task back to active.
-    se.applyJudgeVerdicts("s1", [
+    se.applyVerifierVerdicts("s1", [
       { storyId: "S1", pass: false, summary: "not done", items: [{ itemId: "A1", met: false, note: "no sources" }] },
     ])
-    const judgedAt = se.getPlan("s1")!.stories[0].judge!.judgedAt
+    const verifiedAt = se.getPlan("s1")!.stories[0].verifier!.verifiedAt
     expect(se.getPlan("s1")!.stories[0].status).toBe("active")
 
     // The model obeys the revert directive within the same millisecond.
     vi.useFakeTimers()
-    vi.setSystemTime(new Date(judgedAt))
+    vi.setSystemTime(new Date(verifiedAt))
     se.checkpoint("s1", t1, "complete")
     vi.useRealTimers()
 
     const story1 = se.getPlan("s1")!.stories[0]
     expect(story1.status).toBe("complete")
-    expect(story1.judge!.judgedAt < story1.completedAt!).toBe(true)
+    expect(story1.verifier!.verifiedAt < story1.completedAt!).toBe(true)
     expect(isAuditEligible(story1)).toBe(true)
   })
 
@@ -2060,7 +2060,7 @@ describe("FR-004: a story reopened while complete is audit-eligible again immedi
     const plan = se.createPlan("s1", [story()])
     const t1 = plan.stories[0].tasks[0].id
     se.checkpoint("s1", t1, "complete")
-    se.applyJudgeVerdicts("s1", [{ storyId: "S1", pass: true, summary: "ok", items: [] }])
+    se.applyVerifierVerdicts("s1", [{ storyId: "S1", pass: true, summary: "ok", items: [] }])
     se.reopenStory("s1", "S1", { reason: "re-audit" })
     se.checkpoint("s1", t1, "blocked", { reason: "actually broken" })
 
@@ -2084,7 +2084,7 @@ describe("FR-004: a story reopened while complete is audit-eligible again immedi
   })
 })
 
-describe("FR-001b: a harness-derived pass stays distinguishable from a judge pass", () => {
+describe("FR-001b: a harness-derived pass stays distinguishable from a verifier pass", () => {
   const contradicted = new Map([["S1", ["A1"]]])
 
   it("records contradictedItemIds on the stamp when the harness overruled items", () => {
@@ -2093,38 +2093,38 @@ describe("FR-001b: a harness-derived pass stays distinguishable from a judge pas
     const plan = se.createPlan("s1", [story()])
     se.checkpoint("s1", plan.stories[0].tasks[0].id, "complete")
 
-    se.applyJudgeVerdicts(
+    se.applyVerifierVerdicts(
       "s1",
       [{ storyId: "S1", pass: true, summary: "re-derived", items: [{ itemId: "A1", met: false, note: "x.md is missing" }] }],
       contradicted,
     )
 
-    const stamp = se.getPlan("s1")!.stories[0].judge!
+    const stamp = se.getPlan("s1")!.stories[0].verifier!
     expect(stamp.contradictedItemIds).toEqual(["A1"])
     // The ORIGINAL items are retained alongside it — the record must still
-    // show what the judge actually claimed.
+    // show what the verifier actually claimed.
     expect(stamp.items).toEqual([{ itemId: "A1", met: false, note: "x.md is missing" }])
-    expect(readPlanFile(stateDir).s1.stories[0].judge.contradictedItemIds).toEqual(["A1"])
+    expect(readPlanFile(stateDir).s1.stories[0].verifier.contradictedItemIds).toEqual(["A1"])
   })
 
-  it("leaves the field ABSENT for an ordinary two-argument call (a genuine judge verdict)", () => {
+  it("leaves the field ABSENT for an ordinary two-argument call (a genuine verifier verdict)", () => {
     const stateDir = temporaryRoot()
     const { engine: se } = engine(stateDir)
     const plan = se.createPlan("s1", [story()])
     se.checkpoint("s1", plan.stories[0].tasks[0].id, "complete")
 
-    se.applyJudgeVerdicts("s1", [{ storyId: "S1", pass: true, summary: "genuine", items: [] }])
+    se.applyVerifierVerdicts("s1", [{ storyId: "S1", pass: true, summary: "genuine", items: [] }])
 
-    const stamp = se.getPlan("s1")!.stories[0].judge!
+    const stamp = se.getPlan("s1")!.stories[0].verifier!
     expect(stamp.contradictedItemIds).toBeUndefined()
-    expect("contradictedItemIds" in readPlanFile(stateDir).s1.stories[0].judge).toBe(false)
+    expect("contradictedItemIds" in readPlanFile(stateDir).s1.stories[0].verifier).toBe(false)
   })
 
   it("applies the map per story — a sibling verdict in the same call is untouched", () => {
     const stateDir = temporaryRoot()
     const { engine: se } = engine(stateDir)
     se.createPlan("s1", [story({ text: "one" }), story({ text: "two" })])
-    se.applyJudgeVerdicts(
+    se.applyVerifierVerdicts(
       "s1",
       [
         { storyId: "S1", pass: true, summary: "re-derived", items: [] },
@@ -2133,11 +2133,11 @@ describe("FR-001b: a harness-derived pass stays distinguishable from a judge pas
       contradicted,
     )
     const stories = se.getPlan("s1")!.stories
-    expect(stories[0].judge!.contradictedItemIds).toEqual(["A1"])
-    expect(stories[1].judge!.contradictedItemIds).toBeUndefined()
+    expect(stories[0].verifier!.contradictedItemIds).toEqual(["A1"])
+    expect(stories[1].verifier!.contradictedItemIds).toBeUndefined()
   })
 
-  it("a plan.json whose judge stamp predates the field still validates and loads", () => {
+  it("a plan.json whose verifier stamp predates the field still validates and loads", () => {
     const stateDir = temporaryRoot()
     mkdirSync(stateDir, { recursive: true })
     const oldPlan = {
@@ -2155,7 +2155,7 @@ describe("FR-001b: a harness-derived pass stays distinguishable from a judge pas
           dependsOn: [],
           status: "complete",
           completedAt: new Date().toISOString(),
-          judge: { pass: true, summary: "ok", items: [], judgedAt: new Date().toISOString() },
+          verifier: { pass: true, summary: "ok", items: [], verifiedAt: new Date().toISOString() },
           tasks: [{ id: "S1.T1", text: "do it", dependsOn: [], status: "complete" }],
         },
       ],
@@ -2167,8 +2167,8 @@ describe("FR-001b: a harness-derived pass stays distinguishable from a judge pas
     const { engine: se } = engine(stateDir)
     const loaded = se.getPlan("s1")
     expect(loaded).not.toBeNull()
-    expect(loaded!.stories[0].judge!.pass).toBe(true)
-    expect(loaded!.stories[0].judge!.contradictedItemIds).toBeUndefined()
+    expect(loaded!.stories[0].verifier!.pass).toBe(true)
+    expect(loaded!.stories[0].verifier!.contradictedItemIds).toBeUndefined()
   })
 
   it("rejects a present-but-wrong-shaped contradictedItemIds", () => {
@@ -2188,7 +2188,7 @@ describe("FR-001b: a harness-derived pass stays distinguishable from a judge pas
           amendments: [],
           dependsOn: [],
           status: "complete",
-          judge: { pass: true, summary: "ok", items: [], judgedAt: new Date().toISOString(), contradictedItemIds: "A1" },
+          verifier: { pass: true, summary: "ok", items: [], verifiedAt: new Date().toISOString(), contradictedItemIds: "A1" },
           tasks: [{ id: "S1.T1", text: "do it", dependsOn: [], status: "complete" }],
         },
       ],
@@ -2609,30 +2609,30 @@ describe("MIN-005: mutate's synchronous backoff is budget-capped", () => {
 
 // ---------------------------------------------------------------------------
 // MAJ-008 / FR-009: a verdict that enforces nothing is still visible in the
-// log. `handleJudgeAudit` selects only COMPLETE stories, so a verdict landing
+// log. `handleVerifierAudit` selects only COMPLETE stories, so a verdict landing
 // on a non-complete one means a peer instance / reopen / blocked checkpoint
 // moved it in between — previously that produced an audit summary naming the
-// story nowhere at all, indistinguishable from "the judge returned nothing".
+// story nowhere at all, indistinguishable from "the verifier returned nothing".
 // ---------------------------------------------------------------------------
 
 describe("MAJ-008: a stamped-but-unenforced verdict is logged", () => {
   const items = [{ itemId: "A1", met: false, note: "not delivered" }]
 
-  it("logs judge:verdict-not-enforced when the verdict's story is no longer complete", () => {
+  it("logs verifier:verdict-not-enforced when the verdict's story is no longer complete", () => {
     const stateDir = temporaryRoot()
     const { engine: se, logger } = engine(stateDir)
     const plan = se.createPlan("s1", [story({ acceptanceItems: ["A1"], tasks: [{ text: "a" }] })])
     const storyId = plan.stories[0].id
 
     // The story is `active` (its only task was never checkpointed complete).
-    const result = se.applyJudgeVerdicts("s1", [{ storyId, pass: false, summary: "A1 missing", items }])
+    const result = se.applyVerifierVerdicts("s1", [{ storyId, pass: false, summary: "A1 missing", items }])
 
     expect(result).toEqual({ reverted: [], passed: [], unknown: [] })
     // The stamp is still recorded — the verdict is audit information even
     // when it transitions nothing.
-    expect(se.getPlan("s1")!.stories[0].judge).toMatchObject({ pass: false, summary: "A1 missing" })
+    expect(se.getPlan("s1")!.stories[0].verifier).toMatchObject({ pass: false, summary: "A1 missing" })
     expect(logger).toHaveBeenCalledWith(
-      "judge:verdict-not-enforced",
+      "verifier:verdict-not-enforced",
       expect.objectContaining({ sessionID: "s1", storyId, status: "active", pass: false }),
     )
   })
@@ -2644,10 +2644,10 @@ describe("MAJ-008: a stamped-but-unenforced verdict is logged", () => {
     const storyId = plan.stories[0].id
     se.checkpoint("s1", plan.stories[0].tasks[0].id, "complete")
 
-    se.applyJudgeVerdicts("s1", [{ storyId, pass: false, summary: "A1 missing", items }])
+    se.applyVerifierVerdicts("s1", [{ storyId, pass: false, summary: "A1 missing", items }])
 
     expect(se.getPlan("s1")!.stories[0].status).toBe("active") // reverted
-    expect(logger).not.toHaveBeenCalledWith("judge:verdict-not-enforced", expect.anything())
+    expect(logger).not.toHaveBeenCalledWith("verifier:verdict-not-enforced", expect.anything())
   })
 
   it("an unknown story id stays on the existing `unknown` channel, not the new event", () => {
@@ -2655,11 +2655,11 @@ describe("MAJ-008: a stamped-but-unenforced verdict is logged", () => {
     const { engine: se, logger } = engine(stateDir)
     se.createPlan("s1", [story()])
 
-    const result = se.applyJudgeVerdicts("s1", [{ storyId: "S-nope", pass: false, summary: "?", items }])
+    const result = se.applyVerifierVerdicts("s1", [{ storyId: "S-nope", pass: false, summary: "?", items }])
 
     expect(result.unknown).toEqual(["S-nope"])
-    expect(logger).not.toHaveBeenCalledWith("judge:verdict-not-enforced", expect.anything())
-    expect(logger).toHaveBeenCalledWith("story:judge-audit", {
+    expect(logger).not.toHaveBeenCalledWith("verifier:verdict-not-enforced", expect.anything())
+    expect(logger).toHaveBeenCalledWith("story:verifier-audit", {
       sessionID: "s1",
       passed: [],
       reverted: [],

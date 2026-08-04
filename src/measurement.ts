@@ -74,10 +74,10 @@ export type V2EventType =
   | "intake:classify-capped"
   | "intake:classify-unsupported"
   | "subturn:cleanup-failed"
-  | "judge:unavailable"
-  | "judge:malformed"
-  | "judge:unsupported"
-  | "judge:field-dropped"
+  | "verifier:unavailable"
+  | "verifier:malformed"
+  | "verifier:unsupported"
+  | "verifier:field-dropped"
   | "criteria:re-pinned"
   | "criteria:truncated"
   | "expect:absent"
@@ -638,33 +638,33 @@ export function logSubturnCleanupFailed(input: SubturnCleanupFailedInput, path?:
   return logV2Event("subturn:cleanup-failed", input, path)
 }
 
-export interface JudgeUnavailableInput extends V2EventInput {
+export interface VerifierUnavailableInput extends V2EventInput {
   reason?: string
 }
-export function logJudgeUnavailable(input: JudgeUnavailableInput, path?: string): MeasurementEvent {
-  return logV2Event("judge:unavailable", input, path)
+export function logVerifierUnavailable(input: VerifierUnavailableInput, path?: string): MeasurementEvent {
+  return logV2Event("verifier:unavailable", input, path)
 }
 
-export interface JudgeMalformedInput extends V2EventInput {
+export interface VerifierMalformedInput extends V2EventInput {
   reason?: string
 }
-export function logJudgeMalformed(input: JudgeMalformedInput, path?: string): MeasurementEvent {
-  return logV2Event("judge:malformed", input, path)
+export function logVerifierMalformed(input: VerifierMalformedInput, path?: string): MeasurementEvent {
+  return logV2Event("verifier:malformed", input, path)
 }
 
-export interface JudgeUnsupportedInput extends V2EventInput {
+export interface VerifierUnsupportedInput extends V2EventInput {
   reason?: string
 }
-export function logJudgeUnsupported(input: JudgeUnsupportedInput, path?: string): MeasurementEvent {
-  return logV2Event("judge:unsupported", input, path)
+export function logVerifierUnsupported(input: VerifierUnsupportedInput, path?: string): MeasurementEvent {
+  return logV2Event("verifier:unsupported", input, path)
 }
 
-export interface JudgeFieldDroppedInput extends V2EventInput {
+export interface VerifierFieldDroppedInput extends V2EventInput {
   field: "criteria" | "diffSummary" | "verifierSummaries"
   reason?: string
 }
-export function logJudgeFieldDropped(input: JudgeFieldDroppedInput, path?: string): MeasurementEvent {
-  return logV2Event("judge:field-dropped", input, path)
+export function logVerifierFieldDropped(input: VerifierFieldDroppedInput, path?: string): MeasurementEvent {
+  return logV2Event("verifier:field-dropped", input, path)
 }
 
 export interface CriteriaRePinnedInput extends V2EventInput {

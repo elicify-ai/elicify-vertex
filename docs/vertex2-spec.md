@@ -14,7 +14,7 @@
 |---|---|
 | Spec scope | Full Vertex 2 in one spec; P0–P2 priorities encode the migration order |
 | Delivery | Evolve in-repo as the next major version of `@elicify-ai/elicify-vertex` |
-| Tier-3 LLM judge | **In scope** as P2 |
+| Tier-3 LLM verifier | **In scope** as P2 |
 | v1 user surface | **Breaking changes allowed** (tool names, slash commands, goals.json schema) |
 | Performance | Prefer in-process resolution; bounded subprocess fallback allowed where correctness requires it. "A well-working solution" outranks purity |
 | Human evaluation | Scripted live-session review (basis for holdout scenarios) |
@@ -31,7 +31,7 @@ No `docs/reference/` directory exists in this project. The v1 implementation its
 | `src/index.ts` | `isMutatingBashCommand` / `changedPathsFromTool` shell segmentation | Reused as-is by the scope watchdog (US-5) |
 | `src/goals.ts` | Atomic write (`wx` temp + rename, mode 0600), lock file, archive-on-replace | Reused by the v2 store (US-5); schema is replaced |
 | `src/measurement.ts` | JSONL event sink + holdout arm | Extended, not replaced (US-10) |
-| `src/redaction.ts` | `redactSecrets` / `redactForDisk` | Applied to all new artifacts (EXPECT lines, criteria, judge payloads) |
+| `src/redaction.ts` | `redactSecrets` / `redactForDisk` | Applied to all new artifacts (EXPECT lines, criteria, verifier payloads) |
 
 ---
 
@@ -57,7 +57,7 @@ No `docs/reference/` directory exists in this project. The v1 implementation its
 | `formatDirectives`, `formatGateContinuationText` | kept | Envelope + redaction unchanged |
 | `EvidenceLedger.shouldBlockStop` | **kept as the zero-criteria fallback** | Rev 3: v1's unverified-changes trigger is preserved inside the v2 gate, not replaced (FR-015) |
 | `gateContinuationSessions` (src/index.ts) | **generalised → `selfCreatedSessions`** | Rev 3: v1 already excludes its own continuation sessions from `chat.message`; v2 adds two more `session.prompt` call sites, so the exclusion becomes a first-class rule across five hooks (FR-036) |
-| `redactSecrets` (src/redaction.ts) | kept + **wrapped** | Allowlist of labelled/vendor patterns with no entropy rule; FR-031's strict scan adds one on top for judge payloads |
+| `redactSecrets` (src/redaction.ts) | kept + **wrapped** | Allowlist of labelled/vendor patterns with no entropy rule; FR-031's strict scan adds one on top for verifier payloads |
 
 ### Impact Assessment
 
@@ -83,7 +83,7 @@ No `docs/reference/` directory exists in this project. The v1 implementation its
 
 ### Cluster Placement
 
-Single-package plugin. New modules: `src/phase.ts`, `src/composer.ts`, `src/resolve.ts`, `src/pin.ts`, `src/story.ts`, `src/artifacts.ts`, `src/dosing.ts`, `src/judge.ts`, `src/subturn.ts` (shared session create/prompt/delete + `selfCreatedSessions` + the FR-030b capability probe). `src/index.ts` shrinks to wiring, plus the `VERTEX_V2=0` branch that returns the v1 hook set untouched.
+Single-package plugin. New modules: `src/phase.ts`, `src/composer.ts`, `src/resolve.ts`, `src/pin.ts`, `src/story.ts`, `src/artifacts.ts`, `src/dosing.ts`, `src/verifier.ts`, `src/subturn.ts` (shared session create/prompt/delete + `selfCreatedSessions` + the FR-030b capability probe). `src/index.ts` shrinks to wiring, plus the `VERTEX_V2=0` branch that returns the v1 hook set untouched.
 
 ---
 
@@ -239,25 +239,25 @@ Directive families are dosed per model class. The plugin reads the model id from
 
 ---
 
-### User Story 9 — Tier-3 judge as an in-loop subturn (Priority: P2)
+### User Story 9 — Tier-3 verifier as an in-loop subturn (Priority: P2)
 
-At the final checkpoint of a deep story plan, the harness runs a judge **subturn inside the same agent loop**: it creates a child session (`session.create({parentID})` — the same mechanism OpenCode uses for subagents), prompts it via `session.prompt` **as the plugin-registered zero-tool `vertex-judge` agent** with a judge system prompt and an evidence-only payload. **By default the subturn runs on the session's own model** — the one already serving the agent, guaranteed configured — so the judge always works with zero extra setup. An optional plugin option `judgeModel: "providerID/modelID"` selects a different host-configured model; any failure of the override falls back to the session model, and any failure of the subturn fails open. The verdict `{fit: pass|concern, notes}` is appended to the close-out report and never gates the checkpoint. The child session is **inert to the harness's own hooks** (FR-036) and is **deleted on every exit path** (FR-038).
+At the final checkpoint of a deep story plan, the harness runs a verifier **subturn inside the same agent loop**: it creates a child session (`session.create({parentID})` — the same mechanism OpenCode uses for subagents), prompts it via `session.prompt` **as the plugin-registered zero-tool `vertex-verifier` agent** with a verifier system prompt and an evidence-only payload. **By default the subturn runs on the session's own model** — the one already serving the agent, guaranteed configured — so the verifier always works with zero extra setup. An optional plugin option `verifierModel: "providerID/modelID"` selects a different host-configured model; any failure of the override falls back to the session model, and any failure of the subturn fails open. The verdict `{fit: pass|concern, notes}` is appended to the close-out report and never gates the checkpoint. The child session is **inert to the harness's own hooks** (FR-036) and is **deleted on every exit path** (FR-038).
 
-> **Rev 3 (review CRIT-001, CRIT-002)**: rev 2 said "tool-calling disabled" and cited `SessionPromptData.body.tools` as verification. That field is a per-tool-**name** boolean map (`{[key: string]: boolean}`) — it expresses a deny *list*, not a deny-*all*, so the claimed capability was not established by the cited type. Rev 3 replaces the prose with a constructed mechanism (FR-030b: a registered zero-tool agent + a deny map enumerated from `client.tool.ids()` + `"*": false`) behind a **capability probe** that refuses to send the subturn at all when zero-tool execution cannot be confirmed. Separately, rev 2 never excluded the plugin's own child sessions from its own hooks — v1's `gateContinuationSessions` set in `src/index.ts` exists precisely because `session.prompt` re-enters `chat.message` — so the judge would have received the harness's activation cue and directive block on top of its "evidence-only" payload. FR-036 closes that.
+> **Rev 3 (review CRIT-001, CRIT-002)**: rev 2 said "tool-calling disabled" and cited `SessionPromptData.body.tools` as verification. That field is a per-tool-**name** boolean map (`{[key: string]: boolean}`) — it expresses a deny *list*, not a deny-*all*, so the claimed capability was not established by the cited type. Rev 3 replaces the prose with a constructed mechanism (FR-030b: a registered zero-tool agent + a deny map enumerated from `client.tool.ids()` + `"*": false`) behind a **capability probe** that refuses to send the subturn at all when zero-tool execution cannot be confirmed. Separately, rev 2 never excluded the plugin's own child sessions from its own hooks — v1's `gateContinuationSessions` set in `src/index.ts` exists precisely because `session.prompt` re-enters `chat.message` — so the verifier would have received the harness's activation cue and directive block on top of its "evidence-only" payload. FR-036 closes that.
 
 **Why this priority**: Escalation tier for the one judgment that cannot be pinned (intent); explicitly non-blocking and degradable.
 
-**Independent Test**: Stub client: `session.create` + `session.prompt` + `session.delete` recorded → close-out contains verdict notes; payload schema-checked (no chat narrative); prompt body asserts `model` = session model by default (override when configured), `agent: "vertex-judge"`, and the exact `tools` deny map; stub throwing/hanging → checkpoint completes, `judge:unavailable` logged, child session still deleted. **Plus an integration test (not stub-only)** that drives the real hook set over a simulated harness-created child session and asserts `output.system` and `output.parts` are untouched.
+**Independent Test**: Stub client: `session.create` + `session.prompt` + `session.delete` recorded → close-out contains verdict notes; payload schema-checked (no chat narrative); prompt body asserts `model` = session model by default (override when configured), `agent: "vertex-verifier"`, and the exact `tools` deny map; stub throwing/hanging → checkpoint completes, `verifier:unavailable` logged, child session still deleted. **Plus an integration test (not stub-only)** that drives the real hook set over a simulated harness-created child session and asserts `output.system` and `output.parts` are untouched.
 
 **Acceptance Scenarios**:
 
-1. **Given** a final verification story checkpointing complete, **When** the judge subturn succeeds, **Then** the close-out report appends the verdict, and the checkpoint result does not depend on it.
-2. **Given** no `judgeModel` configured, **When** the subturn is built, **Then** its prompt uses the current session's `{providerID, modelID}` (read from `experimental.chat.system.transform`, falling back to `chat.message`).
-3. **Given** `judgeModel` is configured but its prompt fails, **When** the subturn retries, **Then** it falls back to the session model before failing open.
-4. **Given** the subturn fails or exceeds the 5 s cap, **When** checkpointing, **Then** the checkpoint completes normally and `judge:unavailable` is logged.
-5. **Given** a judge request is built, **Then** its payload contains criteria, diff summary, and verifier output summaries only — asserted by schema — and **every one of the three fields** is passed through `redactSecrets` and then the strict scan (FR-031).
+1. **Given** a final verification story checkpointing complete, **When** the verifier subturn succeeds, **Then** the close-out report appends the verdict, and the checkpoint result does not depend on it.
+2. **Given** no `verifierModel` configured, **When** the subturn is built, **Then** its prompt uses the current session's `{providerID, modelID}` (read from `experimental.chat.system.transform`, falling back to `chat.message`).
+3. **Given** `verifierModel` is configured but its prompt fails, **When** the subturn retries, **Then** it falls back to the session model before failing open.
+4. **Given** the subturn fails or exceeds the 5 s cap, **When** checkpointing, **Then** the checkpoint completes normally and `verifier:unavailable` is logged.
+5. **Given** a verifier request is built, **Then** its payload contains criteria, diff summary, and verifier output summaries only — asserted by schema — and **every one of the three fields** is passed through `redactSecrets` and then the strict scan (FR-031).
 6. **Given** the harness has created a child session for a subturn, **When** any harness hook (`chat.message`, `experimental.chat.system.transform`, `experimental.text.complete`, `tool.execute.after`, `event(session.idle)`) fires for that session id, **Then** the harness returns early: no activation cue is pushed into `output.parts`, no directive block is appended to `output.system`, no ledger entry is allocated, and no gate runs — asserted over the **delivered** payload, not the built payload.
-7. **Given** the deny-all capability probe cannot confirm that the `vertex-judge` agent resolves to zero enabled tools, **When** a final checkpoint occurs, **Then** no subturn is issued at all, `judge:unsupported` is logged once per process with the probe's reason, and the close-out proceeds deterministically without a verdict.
+7. **Given** the deny-all capability probe cannot confirm that the `vertex-verifier` agent resolves to zero enabled tools, **When** a final checkpoint occurs, **Then** no subturn is issued at all, `verifier:unsupported` is logged once per process with the probe's reason, and the close-out proceeds deterministically without a verdict.
 8. **Given** any subturn exit path (success, malformed verdict, timeout, retry exhaustion, thrown error), **When** the subturn returns, **Then** `session.delete` is called exactly once for its child session; a deletion failure logs `subturn:cleanup-failed` and does not affect the caller.
 
 ---
@@ -280,7 +280,7 @@ The events layer records what users feel: `model` on every event; per-directive 
 
 ### User Story 11 — Rollout safety and rollback (Priority: P0)
 
-v2 rewrites the hook wiring, replaces the directive layer, changes the idle gate's trigger, breaks the plan schema, and renames every tool and slash command. The maintainer (actor: operator shipping the release) needs a single switch that returns any user to v1 behaviour without a downgrade, and an archival step that is reversible by hand. Today the only runtime switches are feature-local (`VERTEX_JUDGE`, `VERTEX_HOLDOUT`, `VERTEX_DATA`, `VERTEX_DEBUG`) — none of them restores v1.
+v2 rewrites the hook wiring, replaces the directive layer, changes the idle gate's trigger, breaks the plan schema, and renames every tool and slash command. The maintainer (actor: operator shipping the release) needs a single switch that returns any user to v1 behaviour without a downgrade, and an archival step that is reversible by hand. Today the only runtime switches are feature-local (`VERTEX_VERIFIER`, `VERTEX_HOLDOUT`, `VERTEX_DATA`, `VERTEX_DEBUG`) — none of them restores v1.
 
 **Why this priority**: This plugin mediates *every* LLM turn. A defect that reaches users degrades every session of every user; without a kill switch the only remedy is pinning the previous major version, and FR-022's archival makes even that lossy. Rollback is a P0 property of the release, not a P3 nicety (review MAJ-012, OPS-03 against the spec's own HIGH-risk `ElicifyVertexPlugin` row).
 
@@ -311,8 +311,8 @@ Error flows:
 - When **no** criteria were ever pinned and a deep session idles with changed files and no successful verification, the system blocks on the v1 unverified-changes trigger and says so.
 - When more than one session is active, the criteria replay renders as advisory and the gate does not block.
 - When a checkpoint lacks evidence pointers, the story engine rejects it naming the criterion.
-- When the judge, session.prompt, or resolution is unavailable, the system fails open, logs the reason, and never fabricates a block or verdict.
-- When the judge's zero-tool capability cannot be confirmed, the system does not send the subturn at all.
+- When the verifier, session.prompt, or resolution is unavailable, the system fails open, logs the reason, and never fabricates a block or verdict.
+- When the verifier's zero-tool capability cannot be confirmed, the system does not send the subturn at all.
 
 Boundary conditions:
 - When the per-invocation budget (2 per `system.transform`) is exceeded, lower-priority findings are dropped, never queued across invocations or turns.
@@ -328,7 +328,7 @@ Boundary conditions:
 ## Edge Cases
 
 - Two sessions active concurrently → all state (phase, criteria, artifacts, doses) is per-session; `file.edited` attribution only when exactly one session is active (v1 rule preserved). **Because attribution is suppressed, evidence cannot accrue, so the criteria gate MUST NOT block in this state** — it renders the replay as advisory and logs `gate:multi-session-advisory` (review MIN-007).
-- Harness-created child session (judge or intake subturn) → the harness is inert for that session: no activation cue, no directives, no gate, no ledger/dosing/review map entry, no recursion into `attemptGateContinuation` (FR-036).
+- Harness-created child session (verifier or intake subturn) → the harness is inert for that session: no activation cue, no directives, no gate, no ledger/dosing/review map entry, no recursion into `attemptGateContinuation` (FR-036).
 - Harness-created child session outlives its subturn → deleted in a `finally` block on every path; failure logs `subturn:cleanup-failed` (FR-038).
 - Deep session idles with changed files and **zero** pinned criteria → v1 unverified-changes gate applies (FR-015 fallback); block text states no criteria were captured.
 - Model writes multiple `CRITERIA:` blocks in one reply → last block wins; earlier ones ignored; event `criteria:re-pinned`.
@@ -338,7 +338,7 @@ Boundary conditions:
 - Story scope globs match nothing (typo) → every mutation is "out of scope"; watchdog fires once per turn max with a hint to amend the scope.
 - Compaction mid-turn → pinned criteria survive (**always disk-backed** in `pins.json`, memory only as a write-failure fallback — review MIN-009), re-injection occurs once on the next transform.
 - Story scope globs stop matching after a branch switch → the scope watchdog's per-turn cap (FR-004 table, 1/turn) bounds the noise; the directive text offers `amend` first when the plan's globs match **zero** files in the worktree (review: unasked question 7).
-- Judge returns malformed JSON → treated as unavailable; logged `judge:malformed`.
+- Verifier returns malformed JSON → treated as unavailable; logged `verifier:malformed`.
 - Unknown model string variants (e.g., provider prefixes) → normalized by suffix match before profile lookup; unmatched → default profile.
 - Prescription command contains user path with secrets → passed through `redactSecrets` before injection (as all directive text already is).
 
@@ -349,13 +349,13 @@ Boundary conditions:
 - The system must not block quick- or normal-mode sessions at idle, because advisory-only modes are a v1 contract that prevents harness-paradox friction.
 - The system must not auto-create a story plan without user confirmation, because plans redirect the whole session and a wrong plan is worse than none.
 - The system must not instruct silent fixing of out-of-scope findings **under any model profile** (propose only), because ungoverned proactivity is the v1 sprawl failure inverted. A `frontier` proactive-fix license is **out of scope for v2.0** — see Assumptions (review MAJ-013: rev 2's `standard`-only qualifier implied an unbounded fix license for `frontier` that no requirement granted and that contradicted FR-021).
-- The system must not send chat narrative, file contents beyond diff summaries, or unredacted text to the judge, because the judge must not inherit coherence bias and must not leak secrets.
-- The system must not let the judge verdict gate or block a checkpoint, because tier 3 is advisory by design.
+- The system must not send chat narrative, file contents beyond diff summaries, or unredacted text to the verifier, because the verifier must not inherit coherence bias and must not leak secrets.
+- The system must not let the verifier verdict gate or block a checkpoint, because tier 3 is advisory by design.
 - The system must not inject more than 2 directives per `system.transform` invocation, exceed any family's per-turn cap, or re-inject a family within `cooldownTurns`, because attention is the scarce resource being managed.
 - The system must not make network calls or spawn subprocesses inside `tool.execute.after`/`system.transform` hot paths except the bounded resolution fallback (≤250 ms, cached, async where the host allows), because hook latency is user-visible.
 - The system must not issue more than one classification subturn per task, because each one is a paid model call on the user's critical path (`chat.message`), and must not issue any model call from `tool.execute.after` or `system.transform` at all.
-- The system must not act on any session it created itself, because the harness governing its own judge would feed the judge the harness's directives and risk unbounded recursion.
-- The system must not send a judge subturn when zero-tool execution is unconfirmed, because a partial deny list is an authorization control that does not hold.
+- The system must not act on any session it created itself, because the harness governing its own verifier would feed the verifier the harness's directives and risk unbounded recursion.
+- The system must not send a verifier subturn when zero-tool execution is unconfirmed, because a partial deny list is an authorization control that does not hold.
 - The system must not persist raw user prompt text in events or plan files (enum flags + redacted summaries only), preserving the v1 privacy posture.
 
 ---
@@ -365,25 +365,25 @@ Boundary conditions:
 ### OpenCode plugin host (`@opencode-ai/plugin` v1 API)
 
 - **Data in**: hook invocations (`chat.message`, `tool.execute.after`, `experimental.chat.system.transform`, `experimental.text.complete`, `event`, `config`), `PluginInput` (client, directory, worktree), model id — **required** on `experimental.chat.system.transform` (`model: Model`), optional on `chat.message` (`model?: {providerID, modelID}`); the agent name on `chat.message` (`agent?: string`). `tool.execute.before` is **not** used.
-- **Data out**: mutated `output.system` arrays, tool results, `session.prompt` continuations, config command registrations, **one agent registration** (`config.agent["vertex-judge"]`, and `config.agent["vertex-intake"]` when the intake subturn is enabled).
+- **Data out**: mutated `output.system` arrays, tool results, `session.prompt` continuations, config command registrations, **one agent registration** (`config.agent["vertex-verifier"]`, and `config.agent["vertex-intake"]` when the intake subturn is enabled).
 - **Contract**: v1 `Hooks` interface; single queue consumer = `system.transform` (v1 invariant preserved). **Every hook returns early for a session id in `selfCreatedSessions`** (FR-036).
 - **On failure**: missing `session.prompt` → allow + `would_block` logging (v1 behavior preserved); hook exceptions caught per-hook, never thrown into the host.
 - **Kill switch**: with `VERTEX_V2=0` the plugin registers the v1 hook set only; no v2 module is constructed and no state file is opened (FR-037).
 - **Development**: simulated host via the existing UAT harness pattern; live via `opencode run`.
 
-### OpenCode SDK client (subturns: judge US-9, intake classification US-5)
+### OpenCode SDK client (subturns: verifier US-9, intake classification US-5)
 
-- **Data in**: `session.create({ body: { parentID: <current session>, title } })` → child session (the same mechanism OpenCode uses for subagent subturns); `session.prompt({ path: { id: childID }, body: { model?: {providerID, modelID}, agent: "vertex-judge" | "vertex-intake", system: <rubric>, tools: <deny map>, parts: [evidence] } })`. Grounded in SDK 1.18.4 (`@opencode-ai/sdk/dist/gen/types.gen.d.ts`): `SessionCreateData.body.parentID` (:1811), `SessionPromptData.body.{model, agent, system, tools, parts}` (:2244–2258), `SessionDeleteData` (:1860), `Config.agent[name]: AgentConfig` (:1112, :835), `client.tool.ids()` → `GET /experimental/tool/ids` returning `Array<string>` (:1705, `ToolIds` :1215), `client.app.agents()` → `Agent[]` each carrying a resolved `tools: {[id]: boolean}` map (:1399–1428).
-- **Tool disabling is constructed, not asserted** (review CRIT-002): `SessionPromptData.body.tools` is a per-tool-**name** map, so "disable tools" is expressed as (a) the plugin-registered zero-tool agent, (b) a deny map enumerated from `client.tool.ids()` with `"*": false` added, and (c) a one-time **capability probe** over `client.app.agents()`. Probe failure ⇒ **no subturn is issued** and `judge:unsupported` / `intake:unsupported` is logged. See FR-030b.
+- **Data in**: `session.create({ body: { parentID: <current session>, title } })` → child session (the same mechanism OpenCode uses for subagent subturns); `session.prompt({ path: { id: childID }, body: { model?: {providerID, modelID}, agent: "vertex-verifier" | "vertex-intake", system: <rubric>, tools: <deny map>, parts: [evidence] } })`. Grounded in SDK 1.18.4 (`@opencode-ai/sdk/dist/gen/types.gen.d.ts`): `SessionCreateData.body.parentID` (:1811), `SessionPromptData.body.{model, agent, system, tools, parts}` (:2244–2258), `SessionDeleteData` (:1860), `Config.agent[name]: AgentConfig` (:1112, :835), `client.tool.ids()` → `GET /experimental/tool/ids` returning `Array<string>` (:1705, `ToolIds` :1215), `client.app.agents()` → `Agent[]` each carrying a resolved `tools: {[id]: boolean}` map (:1399–1428).
+- **Tool disabling is constructed, not asserted** (review CRIT-002): `SessionPromptData.body.tools` is a per-tool-**name** map, so "disable tools" is expressed as (a) the plugin-registered zero-tool agent, (b) a deny map enumerated from `client.tool.ids()` with `"*": false` added, and (c) a one-time **capability probe** over `client.app.agents()`. Probe failure ⇒ **no subturn is issued** and `verifier:unsupported` / `intake:unsupported` is logged. See FR-030b.
 - **Self-created sessions**: every id returned by `session.create` is recorded in `selfCreatedSessions`; all harness hooks return early for those ids (FR-036). Each subturn passes an explicit `agent` that is never `opts.activeAgent`.
 - **Cleanup**: `session.delete` in a `finally` block on every path (FR-038).
 - **Pre-filter (intake classification only)**: a **cost** gate, not a scope gate — the subturn is issued at most once per task and never for asks matching `TRIVIAL_ASK_RE`; skipped asks log `intake:classify-skipped` (review MAJ-006 replaced rev 2's character-length gate, which provably missed short multi-story asks such as "refactor auth end-to-end").
-- **Payload hygiene**: **all three** payload fields — pinned criteria, diff summary, verifier output summaries — pass `redactSecrets` and then the strict scan (FR-031), applied to the reassembled field rather than per chunk; a field that trips the scan has the offending hunk/line removed, and an emptied field is omitted with `judge:field-dropped` logged (review MAJ-009).
-- **Model selection**: default = the current session's `{providerID, modelID}` (from `system.transform`, else `chat.message`) — always configured because it is already serving the agent. Optional plugin option `judgeModel: "providerID/modelID"`; on override failure, fall back to session model, then fail open.
-- **Data out**: JSON verdict `{fit, notes}` (judge) / `{multiStory: boolean, outcomes: string[]}` (intake classification).
-- **Contract**: one prompt per subturn, `Promise.race` **5 s total including the retry** (v1 gate-continuation pattern reused), JSON-parse with schema check. Judge fires only at final-story checkpoint of a deep plan; intake classification fires only from `chat.message`, ≤1 per task and ≤ `VERTEX_INTAKE_SUBTURN_MAX` (3) per session.
-- **On failure**: judge → `judge:unavailable`, close-out proceeds deterministically; intake classification → heuristic fallback (`SEQUENCING_WORDS` / `IMPERATIVE_VERBS`, FR-018), logged `intake:classify-fallback`, no second attempt after the 5 s budget expires.
-- **Development**: stubbed client in unit tests **plus one integration test that exercises the real hook set over a simulated child session** (stub-only tests cannot detect host-side injection); live behind `VERTEX_JUDGE=1`.
+- **Payload hygiene**: **all three** payload fields — pinned criteria, diff summary, verifier output summaries — pass `redactSecrets` and then the strict scan (FR-031), applied to the reassembled field rather than per chunk; a field that trips the scan has the offending hunk/line removed, and an emptied field is omitted with `verifier:field-dropped` logged (review MAJ-009).
+- **Model selection**: default = the current session's `{providerID, modelID}` (from `system.transform`, else `chat.message`) — always configured because it is already serving the agent. Optional plugin option `verifierModel: "providerID/modelID"`; on override failure, fall back to session model, then fail open.
+- **Data out**: JSON verdict `{fit, notes}` (verifier) / `{multiStory: boolean, outcomes: string[]}` (intake classification).
+- **Contract**: one prompt per subturn, `Promise.race` **5 s total including the retry** (v1 gate-continuation pattern reused), JSON-parse with schema check. Verifier fires only at final-story checkpoint of a deep plan; intake classification fires only from `chat.message`, ≤1 per task and ≤ `VERTEX_INTAKE_SUBTURN_MAX` (3) per session.
+- **On failure**: verifier → `verifier:unavailable`, close-out proceeds deterministically; intake classification → heuristic fallback (`SEQUENCING_WORDS` / `IMPERATIVE_VERBS`, FR-018), logged `intake:classify-fallback`, no second attempt after the 5 s budget expires.
+- **Development**: stubbed client in unit tests **plus one integration test that exercises the real hook set over a simulated child session** (stub-only tests cannot detect host-side injection); live behind `VERTEX_VERIFIER=1`.
 
 ### Filesystem state (`<project>/.elicify-vertex/`)
 
@@ -408,8 +408,8 @@ Rev 3 records the spec's own threat posture so the claims are auditable. `risk` 
 
 | Component | S | T | R | I | D | E | Notes |
 |---|---|---|---|---|---|---|---|
-| Judge subturn (child session) | ok | ok | ok | ok | ok | **risk** | I/S/D addressed by FR-036 (no harness injection), FR-031 (three-field strict scan), FR-038 (cleanup), FR-030/FR-030b (5 s cap, one subturn per checkpoint). **E remains `risk` until the FR-030b capability probe is verified against a running OpenCode host** — the deny-all semantics of `tools` are not established by the type surface (CRIT-002); until then the probe's refusal path is the control, not the deny map |
-| Intake classification subturn | ok | ok | ok | ok | ok | **risk** | Same probe dependency as the judge (`vertex-intake` agent). Frequency and cost bounded by FR-018b (≤1/task, ≤3/session, 5 s total); user-ask payload passes `redactSecrets` (FR-031's rule extended to the intake payload) |
+| Verifier subturn (child session) | ok | ok | ok | ok | ok | **risk** | I/S/D addressed by FR-036 (no harness injection), FR-031 (three-field strict scan), FR-038 (cleanup), FR-030/FR-030b (5 s cap, one subturn per checkpoint). **E remains `risk` until the FR-030b capability probe is verified against a running OpenCode host** — the deny-all semantics of `tools` are not established by the type surface (CRIT-002); until then the probe's refusal path is the control, not the deny map |
+| Intake classification subturn | ok | ok | ok | ok | ok | **risk** | Same probe dependency as the verifier (`vertex-intake` agent). Frequency and cost bounded by FR-018b (≤1/task, ≤3/session, 5 s total); user-ask payload passes `redactSecrets` (FR-031's rule extended to the intake payload) |
 | Injection composer / `system.transform` | ok | ok | ok | ok | ok | ok | Budget starvation resolved by FR-004's per-invocation budget + per-family caps; `redactSecrets` per FR-007 |
 | Idle gate + `session.prompt` continuation | ok | ok | ok | ok | ok | ok | Recursion closed by FR-036 (self-created sessions never reach the gate); caps preserved from v1; zero-criteria fallback (FR-015) restores v1's protection |
 | Filesystem state (`plan.json`) | ok | ok | ok | ok | ok | ok | v1 mechanisms (0600, `wx`+rename, 30 s stale lock) verified in `src/goals.ts` |
@@ -771,50 +771,50 @@ Rev 3 records the spec's own threat posture so the claims are auditable. `risk` 
 - **Then** profile `standard` applies
 - **And** `dosing:unknown-model` is logged containing the raw string `someprovider/new-model-x`
 
-### Feature: Judge (US-9)
+### Feature: Verifier (US-9)
 
-#### Scenario: Judge verdict appended without gating the checkpoint
+#### Scenario: Verifier verdict appended without gating the checkpoint
 **Traces to**: User Story 9, Acceptance Scenario 1
 **Category**: Happy Path
-- **Given** a configured judge stub returning `{fit: "concern", notes: "criterion 2 evidence is type-only"}`
+- **Given** a configured verifier stub returning `{fit: "concern", notes: "criterion 2 evidence is type-only"}`
 - **When** the final story checkpoints complete with a valid receipt
 - **Then** the checkpoint succeeds
-- **And** the close-out report contains the judge notes
+- **And** the close-out report contains the verifier notes
 
-#### Scenario: Judge subturn uses the session model by default
+#### Scenario: Verifier subturn uses the session model by default
 **Traces to**: User Story 9, Acceptance Scenario 2
 **Category**: Happy Path
-- **Given** no `judgeModel` option and a session served by `minimax/MiniMax-M3`
-- **When** the judge subturn prompt is built
+- **Given** no `verifierModel` option and a session served by `minimax/MiniMax-M3`
+- **When** the verifier subturn prompt is built
 - **Then** the prompt body's model is `{providerID: "minimax", modelID: "MiniMax-M3"}`
 - **And** the prompt targets a child session created with the current session as parent
 
-#### Scenario: Configured judgeModel failure falls back to the session model
+#### Scenario: Configured verifierModel failure falls back to the session model
 **Traces to**: User Story 9, Acceptance Scenario 3
 **Category**: Error Path
-- **Given** `judgeModel: "provider-x/model-y"` whose prompt rejects
+- **Given** `verifierModel: "provider-x/model-y"` whose prompt rejects
 - **When** the subturn retries
 - **Then** the retry prompt uses the session model
 - **And** on success the verdict is appended to the close-out report
 
-#### Scenario: Judge timeout fails open
+#### Scenario: Verifier timeout fails open
 **Traces to**: User Story 9, Acceptance Scenario 4
 **Category**: Error Path
-- **Given** a judge stub that never resolves
+- **Given** a verifier stub that never resolves
 - **When** the final checkpoint executes
 - **Then** it completes within the 5 s cap plus overhead
-- **And** `judge:unavailable` is logged
+- **And** `verifier:unavailable` is logged
 
-#### Scenario: Judge payload carries evidence only
+#### Scenario: Verifier payload carries evidence only
 **Traces to**: User Story 9, Acceptance Scenario 5
 **Category**: Edge Case
 - **Given** a session containing chat text with the marker string `NARRATIVE_CANARY`
-- **When** the judge request is built
+- **When** the verifier request is built
 - **Then** the payload contains criteria, diff summary, and verifier summaries
 - **And** all three fields have passed `redactSecrets` and the strict scan on the reassembled field
 - **But** does not contain `NARRATIVE_CANARY`
 
-#### Scenario: Judge subturn receives no harness injection
+#### Scenario: Verifier subturn receives no harness injection
 **Traces to**: User Story 9, Acceptance Scenario 6
 **Category**: Error Path
 - **Given** the harness has created a child session `S-child` and recorded it in `selfCreatedSessions`
@@ -824,13 +824,13 @@ Rev 3 records the spec's own threat posture so the claims are auditable. `risk` 
 - **And** no entry is allocated in the ledger, task-mode, review, goal-root or cue maps for `S-child`
 - **And** no gate evaluation and therefore no `session.prompt` continuation occurs for `S-child`
 
-#### Scenario: Judge subturn is refused when tools cannot be disabled
+#### Scenario: Verifier subturn is refused when tools cannot be disabled
 **Traces to**: User Story 9, Acceptance Scenario 7
 **Category**: Error Path
-- **Given** a host where the deny-all capability probe reports at least one enabled tool on the resolved `vertex-judge` agent (or `client.tool.ids()` is unavailable)
-- **When** a final story checkpoints complete with `VERTEX_JUDGE=1`
+- **Given** a host where the deny-all capability probe reports at least one enabled tool on the resolved `vertex-verifier` agent (or `client.tool.ids()` is unavailable)
+- **When** a final story checkpoints complete with `VERTEX_VERIFIER=1`
 - **Then** no `session.create` and no `session.prompt` call is made
-- **And** `judge:unsupported` is logged once per process with the probe reason
+- **And** `verifier:unsupported` is logged once per process with the probe reason
 - **And** the checkpoint completes and the close-out renders without a verdict
 
 #### Scenario: Subturn child session is deleted on every path
@@ -895,7 +895,7 @@ Rev 3 records the spec's own threat posture so the claims are auditable. `risk` 
 
 | Level | Scope | Purpose |
 |---|---|---|
-| Unit | phase machine, composer, resolver, artifact parser, story engine, dosing table, judge payload builder | Logic in isolation, fixture-driven |
+| Unit | phase machine, composer, resolver, artifact parser, story engine, dosing table, verifier payload builder | Logic in isolation, fixture-driven |
 | Integration | plugin hooks wired together (v1 harness pattern: synthetic hook calls) | Components cooperate across a turn lifecycle |
 | E2E | UAT harness scenarios + scripted live `opencode run` | Full behavior under the real/simulated host |
 
@@ -920,7 +920,7 @@ Rev 3 records the spec's own threat posture so the claims are auditable. `risk` 
 | 15 | `story_final_receipt_gate` | Unit | Final story completion requires observed receipt | receipt binding (v1 semantics) |
 | 16 | `dosing_profile_resolution` | Unit | Unknown model falls back; **Resolved profile is stamped on session init and on every subsequent event** | suffix normalization + default + event-stream assertion that every emitted event carries the profile |
 | 17 | `dosing_render_matrix` | Unit | Scenario Outline: Same finding, different profile | 5-family × 2-profile form matrix (FR-029) |
-| 18 | `judge_payload_evidence_only` | Unit | Judge payload carries evidence only | schema + canary + redaction across all three fields |
+| 18 | `verifier_payload_evidence_only` | Unit | Verifier payload carries evidence only | schema + canary + redaction across all three fields |
 | 19 | `intake_scaffold_repeats_until_captured` | Integration | Intake scaffold repeats until criteria are captured | injects on each of three consecutive turns with no `CRITERIA:` block, then suppresses permanently once one is captured (rev 3: the rev-2 name `intake_scaffold_once` contradicted FR-011's "every turn until captured") |
 | 20 | `criteria_idle_block_names_unmet` | Integration | Idle block quotes the unmet criterion; **Multi-session activity renders the criteria replay as advisory** | teachable gate + cap + two-active-session advisory row |
 | 21 | `criteria_compaction_reinjection` | Integration | Criteria re-injected once after compaction | compacted event path |
@@ -931,29 +931,29 @@ Rev 3 records the spec's own threat posture so the claims are auditable. `risk` 
 | 26 | `elevate_once_per_turn` | Integration | Green bound verifier triggers elevate once | dedupe + docs-only negative + **three-story fixture asserting no elevate on an intermediate green** |
 | 27 | `plan_propose_confirm_create` | Integration | Multi-story scope triggers proposed plan | no write before tool call |
 | 28 | `scope_directive_no_block` | Integration | Out-of-scope mutation guides without blocking | idle stays green |
-| 29 | `judge_async_fail_open` | Integration | Judge timeout fails open | 5 s cap, checkpoint unaffected, `session.delete` called exactly once on the timeout path |
+| 29 | `verifier_async_fail_open` | Integration | Verifier timeout fails open | 5 s cap, checkpoint unaffected, `session.delete` called exactly once on the timeout path |
 | 30 | `directive_compliance_join` | Integration | Prescription compliance joined by instance id | rendered→complied join |
 | 31 | `family_holdout_suppression` | Integration | Directive-family holdout suppresses | arm hashing + event |
 | 32 | `uat_v2_core_loop` | E2E | multiple (US-1..4 happy paths) | UAT harness: scripted turn walk. **Carries SC-004**: a mutated session with an unmet criterion must produce a block quoting the criterion and containing a runnable command, and the following simulated green turn must close the session with no further block |
 | 33 | `uat_v2_story_lifecycle` | E2E | plan propose → checkpoints → final gate | UAT harness |
 | 34 | `uat_v2_anomaly_and_elevate` | E2E | EXPECT interrupt + elevate | UAT harness |
 | 35 | `live_scripted_session` | E2E | Behavioral Contract (all primary flows) | **Maintainer-run locally; skipped in headless CI unless `OPENCODE_LIVE_TEST=1`** (review F-07 — CI lacks provider keys) |
-| 36 | `judge_model_selection_and_fallback` | Integration | Judge subturn uses the session model by default; Configured judgeModel failure falls back | default model, override, fallback chain, child-session parentID, `session.delete` called exactly once per attempt path |
+| 36 | `verifier_model_selection_and_fallback` | Integration | Verifier subturn uses the session model by default; Configured verifierModel failure falls back | default model, override, fallback chain, child-session parentID, `session.delete` called exactly once per attempt path |
 | 37 | `story_lock_file_stale_recovery` | Unit | (coverage gap — state-directory write concurrency) | concurrent `plan.json`/`pins.json` write under the shared directory lock: second writer sees lock and throws; lock older than 30 s is reclaimed; no partial file left |
 | 38 | `intake_prefilter_and_heuristics` | Unit | Trivial ask skips the classification subturn; Short multi-story ask still reaches the classifier | `TRIVIAL_ASK_RE` matrix, `SEQUENCING_WORDS` / `IMPERATIVE_VERBS` matrix (incl. Korean, code-fence, attachment rows); asserts no client call on skip and a call on every non-trivial row |
-| 39 | `judge_payload_secret_scan` | Unit | Judge payload carries evidence only | strict scan over **all three** fields on the reassembled field; unlabelled 40-hex token, entropy rule, line-wrapped token, base64 in criteria; `judge:field-dropped` when a field empties |
+| 39 | `verifier_payload_secret_scan` | Unit | Verifier payload carries evidence only | strict scan over **all three** fields on the reassembled field; unlabelled 40-hex token, entropy rule, line-wrapped token, base64 in criteria; `verifier:field-dropped` when a field empties |
 | 40 | `pins_write_fault_and_retry` | Unit | Pins write fault falls back to memory and recovers | injected `EACCES`/`ENOSPC`: memory fallback + `pins:disk-fallback-memory`; next update writes + `pins:disk-recovered`; 3 consecutive failures ⇒ `pins:disk-unavailable`, retries stop |
 | 41 | `criteria_absent_falls_back_to_v1_gate` | Integration | Deep session with no pinned criteria still blocks on unverified changes | zero pins × changed files × deep ⇒ block; caps/holdout/docs-only honoured; block text states no criteria captured |
 | 42 | `event_invariants_property` | Unit (property) | Every emitted event carries model and session id | fast-check over every FR-033 event type: `session_id` non-empty, `model` string or `"unknown"`, no raw prompt text |
-| 43 | `self_created_session_is_inert` | **Integration** | Judge subturn receives no harness injection | drives the real hook set over a simulated child session; asserts `output.system` / `output.parts` untouched, no map entries, no gate, no continuation. **Must not use a stub-only client** — a stub asserts what the plugin builds, not what the host delivers |
-| 44 | `judge_tools_denied_or_refused` | Unit | Judge subturn is refused when tools cannot be disabled | asserts the exact `tools` deny map and `agent: "vertex-judge"` on the happy path; asserts **zero** `session.create`/`session.prompt` calls and one `judge:unsupported` when the probe fails |
+| 43 | `self_created_session_is_inert` | **Integration** | Verifier subturn receives no harness injection | drives the real hook set over a simulated child session; asserts `output.system` / `output.parts` untouched, no map entries, no gate, no continuation. **Must not use a stub-only client** — a stub asserts what the plugin builds, not what the host delivers |
+| 44 | `verifier_tools_denied_or_refused` | Unit | Verifier subturn is refused when tools cannot be disabled | asserts the exact `tools` deny map and `agent: "vertex-verifier"` on the happy path; asserts **zero** `session.create`/`session.prompt` calls and one `verifier:unsupported` when the probe fails |
 | 45 | `idle_all_criteria_evidenced_closes` | Integration | Idle with all criteria evidenced closes without blocking | `elevate → close` arc; no continuation, no `would_block` |
 | 46 | `precommitment_prompt_on_execute_entry` | Integration | Pre-commitment prompt renders on execute entry | first `system.transform` after entering `execute`; once per turn; suppressed when an EXPECT artifact exists |
 | 47 | `subturn_session_cleanup` | Integration | Subturn child session is deleted on every path | success / malformed / timeout / throw ⇒ exactly one `session.delete` each; rejecting delete ⇒ `subturn:cleanup-failed`, caller unaffected |
 | 48 | `composer_budget_multi_transform` | Unit | Anomaly interrupt survives a turn whose budget went to corrections | ≥3 `system.transform` invocations in one turn; per-family per-turn cap table enforced |
 | 49 | `phase_and_elevate_per_story` | Unit | Active plan scopes the phase to the active story; Intermediate story green does not elevate | three-story fixture: phase follows the active story; elevate only on the final story's verifier |
 | 50 | `intake_subturn_frequency_caps` | Integration | Classification subturn is issued at most once per task | 1/task, `VERTEX_INTAKE_SUBTURN_MAX`=3/session, 5 s total budget incl. retry, `intake:classify-capped` |
-| 51 | `judge_verdict_appended_happy_path` | Integration | Judge verdict appended without gating the checkpoint | stub returns `{fit: concern, notes}`; checkpoint succeeds; close-out contains the notes; result independent of the verdict |
+| 51 | `verifier_verdict_appended_happy_path` | Integration | Verifier verdict appended without gating the checkpoint | stub returns `{fit: concern, notes}`; checkpoint succeeds; close-out contains the notes; result independent of the verdict |
 | 52 | `kill_switch_restores_v1` | E2E | Kill switch restores v1 behaviour for the whole process | `VERTEX_V2=0`: full v1 regression suite passes unchanged; no `.elicify-vertex/` file created/modified/renamed |
 | 53 | `archival_is_reversible` | Unit | Archival is reversible and never destructive | byte-identical archive copy; restore loads under v1; no code path deletes under `archive/` |
 
@@ -1074,19 +1074,19 @@ Rev 3 records the spec's own threat posture so the claims are auditable. `risk` 
 | 4 | `x/tiny-7b` | unknown → standard | full scaffold | Unknown model falls back | default + event with raw id |
 | 5 | absent | unknown → standard | full scaffold | Unknown model falls back | `"unknown"` on events |
 
-#### Dataset: Judge payload hygiene (US-9 / FR-031)
+#### Dataset: Verifier payload hygiene (US-9 / FR-031)
 
 | # | Payload field content | Boundary Type | Expected Output | Traces to | Notes |
 |---|---|---|---|---|---|
-| 1 | criteria + diff summary + verifier summary, all clean | happy | transmitted unchanged | Judge payload carries evidence only | baseline |
-| 2 | chat text containing `NARRATIVE_CANARY` present in session | exclusion | canary absent from payload | Judge payload carries evidence only | schema excludes narrative |
-| 3 | diff hunk containing `sk-live-abc123…` | security | hunk dropped; payload transmitted without it | Judge payload carries evidence only | F-04 secret scan |
-| 4 | diff hunk with a token split across two chunk boundaries | security / boundary | scan concatenates hunk before matching; hunk dropped | Judge payload carries evidence only | F-04 partial-leak case |
-| 5 | verifier stdout containing an **unlabelled** 40-character hex token | security / entropy | entropy rule trips (≥32 chars, ≥4.0 bits/char); line removed from the verifier summary | Judge payload carries evidence only | `redactSecrets` alone misses this (MAJ-009) |
-| 6 | verifier stdout with a connection string wrapped across two terminal lines | security / boundary | scan runs on the reassembled field; both lines removed | Judge payload carries evidence only | verifier field, not just diffs |
-| 7 | criteria line containing a 200-char base64 blob | security / entropy | criteria line removed; if that empties the field, the field is omitted and `judge:field-dropped` logged | Judge payload carries evidence only | third payload field |
-| 8 | all three fields clean but one 4 000-char verifier summary | size boundary | field truncated to the summary cap before scanning; scan runs on the truncated text actually sent | Judge payload carries evidence only | scan the transmitted bytes |
-| 9 | English prose containing a 40-char lowercase word run | false positive | entropy < 4.0 ⇒ not treated as a secret; field transmitted intact | Judge payload carries evidence only | guards against over-redaction |
+| 1 | criteria + diff summary + verifier summary, all clean | happy | transmitted unchanged | Verifier payload carries evidence only | baseline |
+| 2 | chat text containing `NARRATIVE_CANARY` present in session | exclusion | canary absent from payload | Verifier payload carries evidence only | schema excludes narrative |
+| 3 | diff hunk containing `sk-live-abc123…` | security | hunk dropped; payload transmitted without it | Verifier payload carries evidence only | F-04 secret scan |
+| 4 | diff hunk with a token split across two chunk boundaries | security / boundary | scan concatenates hunk before matching; hunk dropped | Verifier payload carries evidence only | F-04 partial-leak case |
+| 5 | verifier stdout containing an **unlabelled** 40-character hex token | security / entropy | entropy rule trips (≥32 chars, ≥4.0 bits/char); line removed from the verifier summary | Verifier payload carries evidence only | `redactSecrets` alone misses this (MAJ-009) |
+| 6 | verifier stdout with a connection string wrapped across two terminal lines | security / boundary | scan runs on the reassembled field; both lines removed | Verifier payload carries evidence only | verifier field, not just diffs |
+| 7 | criteria line containing a 200-char base64 blob | security / entropy | criteria line removed; if that empties the field, the field is omitted and `verifier:field-dropped` logged | Verifier payload carries evidence only | third payload field |
+| 8 | all three fields clean but one 4 000-char verifier summary | size boundary | field truncated to the summary cap before scanning; scan runs on the truncated text actually sent | Verifier payload carries evidence only | scan the transmitted bytes |
+| 9 | English prose containing a 40-char lowercase word run | false positive | entropy < 4.0 ⇒ not treated as a secret; field transmitted intact | Verifier payload carries evidence only | guards against over-redaction |
 
 ### Regression Test Requirements
 
@@ -1212,29 +1212,29 @@ Explicitly **replaced** (tests updated/retired with the change): directive id/te
 
   The `frontier` profile MUST NOT reduce the anomaly-interrupt or falsification families below `full` (floor). Unlisted families are dosed `full` under both profiles.
 
-**Judge (US-9)**
-- **FR-030**: The judge MUST run as an in-loop subturn: child session via `session.create({parentID})`, one `session.prompt` with the judge system prompt and the tool-disabling mechanism of FR-030b, `Promise.race` **5 s total including the retry**; fired only at final-story checkpoint of deep plans when enabled; its verdict MUST NOT gate the checkpoint.
-- **FR-030a**: The subturn's model MUST default to the current session's `{providerID, modelID}`; a `judgeModel: "providerID/modelID"` plugin option MAY override it, with fallback to the session model on override failure.
+**Verifier (US-9)**
+- **FR-030**: The verifier MUST run as an in-loop subturn: child session via `session.create({parentID})`, one `session.prompt` with the verifier system prompt and the tool-disabling mechanism of FR-030b, `Promise.race` **5 s total including the retry**; fired only at final-story checkpoint of deep plans when enabled; its verdict MUST NOT gate the checkpoint.
+- **FR-030a**: The subturn's model MUST default to the current session's `{providerID, modelID}`; a `verifierModel: "providerID/modelID"` plugin option MAY override it, with fallback to the session model on override failure.
 - **FR-030b** (review CRIT-002): "Tool-calling disabled" MUST be **constructed**, not asserted. `SessionPromptData.body.tools` is `{ [toolName: string]: boolean }` — a per-tool-name allow/deny map with no documented deny-all flag — so the capability the spec needs is **not** established by the existence of that field. The system MUST therefore:
-  1. Register a zero-tool subagent through the `config` hook: `config.agent["vertex-judge"] = { mode: "subagent", description, prompt: <rubric>, tools: <deny map>, permission: { edit: "deny", bash: "deny", webfetch: "deny" }, maxSteps: 1 }`, and likewise `config.agent["vertex-intake"]` when the intake subturn is enabled. Grounded in `Config.agent[name]: AgentConfig` (`types.gen.d.ts:1112`, `:835`).
+  1. Register a zero-tool subagent through the `config` hook: `config.agent["vertex-verifier"] = { mode: "subagent", description, prompt: <rubric>, tools: <deny map>, permission: { edit: "deny", bash: "deny", webfetch: "deny" }, maxSteps: 1 }`, and likewise `config.agent["vertex-intake"]` when the intake subturn is enabled. Grounded in `Config.agent[name]: AgentConfig` (`types.gen.d.ts:1112`, `:835`).
   2. Build the **deny map** at plugin init by enumerating the host's tool ids via `client.tool.ids()` (`GET /experimental/tool/ids` → `Array<string>`, `:1705`), setting every id to `false`, and additionally setting the key `"*": false` for hosts that honour a wildcard. Enumeration is at runtime, so installation-specific and MCP-contributed tools are covered.
-  3. Pass **both** `agent: "vertex-judge"` (never `opts.activeAgent`) and that same deny map as `tools` on `session.prompt`.
-  4. Run a **deny-all capability probe once per process**, after registration: read back the resolved agents via `client.app.agents()` (`:1399` — each `Agent` carries a resolved `tools: {[id]: boolean}` map and a `permission` block) and require that the `vertex-judge` entry exists, exposes **no** tool resolving to `true`, and carries `edit`/`bash`/`webfetch` = `deny`.
+  3. Pass **both** `agent: "vertex-verifier"` (never `opts.activeAgent`) and that same deny map as `tools` on `session.prompt`.
+  4. Run a **deny-all capability probe once per process**, after registration: read back the resolved agents via `client.app.agents()` (`:1399` — each `Agent` carries a resolved `tools: {[id]: boolean}` map and a `permission` block) and require that the `vertex-verifier` entry exists, exposes **no** tool resolving to `true`, and carries `edit`/`bash`/`webfetch` = `deny`.
 
-  **If the probe does not pass** — the agent is absent, any tool resolves to `true`, `client.tool.ids()` or `client.app.agents()` is unavailable, or the call throws — the subturn MUST be **disabled for the process**: no `session.create` and no `session.prompt` is issued, `judge:unsupported` (respectively `intake:unsupported`) is logged once with the probe's reason, and callers proceed deterministically. The system MUST NOT send a subturn with a partial deny list. **This mechanism has not been verified against a running OpenCode host from within this spec's authoring session** — only against the SDK type surface — which is why the refusal path, not the deny map, is the control of record; the STRIDE row for both subturns stays at `risk` on Elevation of Privilege until a live verification is recorded (see Open Questions).
-- **FR-031**: The judge payload MUST contain only pinned criteria, diff summary, and verifier output summaries — schema-enforced, no chat narrative. **Every one of the three fields** MUST pass `redactSecrets` and then a **strict scan**, applied to the **reassembled field** rather than per chunk (review MAJ-009 — rev 2 scanned diff summaries only, leaving verifier stdout, the field most likely to echo a credential in the wild, covered by regex redaction alone). The strict scan is defined as `SECRET_PATTERNS` from `src/redaction.ts` **plus** a Shannon-entropy rule: any whitespace-delimited token of ≥32 characters with entropy ≥ 4.0 bits/character is treated as a secret. A field that trips the scan has the offending hunk (diff) or line (criteria, verifier output) removed; if removal empties the field, the field is omitted and `judge:field-dropped` is logged. The scan runs on the **transmitted** bytes, i.e. after any summary truncation.
-- **FR-032**: Judge unavailability or malformed responses MUST fail open with `judge:unavailable`/`judge:malformed` events.
+  **If the probe does not pass** — the agent is absent, any tool resolves to `true`, `client.tool.ids()` or `client.app.agents()` is unavailable, or the call throws — the subturn MUST be **disabled for the process**: no `session.create` and no `session.prompt` is issued, `verifier:unsupported` (respectively `intake:unsupported`) is logged once with the probe's reason, and callers proceed deterministically. The system MUST NOT send a subturn with a partial deny list. **This mechanism has not been verified against a running OpenCode host from within this spec's authoring session** — only against the SDK type surface — which is why the refusal path, not the deny map, is the control of record; the STRIDE row for both subturns stays at `risk` on Elevation of Privilege until a live verification is recorded (see Open Questions).
+- **FR-031**: The verifier payload MUST contain only pinned criteria, diff summary, and verifier output summaries — schema-enforced, no chat narrative. **Every one of the three fields** MUST pass `redactSecrets` and then a **strict scan**, applied to the **reassembled field** rather than per chunk (review MAJ-009 — rev 2 scanned diff summaries only, leaving verifier stdout, the field most likely to echo a credential in the wild, covered by regex redaction alone). The strict scan is defined as `SECRET_PATTERNS` from `src/redaction.ts` **plus** a Shannon-entropy rule: any whitespace-delimited token of ≥32 characters with entropy ≥ 4.0 bits/character is treated as a secret. A field that trips the scan has the offending hunk (diff) or line (criteria, verifier output) removed; if removal empties the field, the field is omitted and `verifier:field-dropped` is logged. The scan runs on the **transmitted** bytes, i.e. after any summary truncation.
+- **FR-032**: Verifier unavailability or malformed responses MUST fail open with `verifier:unavailable`/`verifier:malformed` events.
 
 **Measurement (US-10)**
-- **FR-033**: Every event MUST carry `model` (or `"unknown"`), session id and resolved dosing profile; new event types: `directive_rendered`, `directive_complied`, `calibration`, `phase_transition`, `resolution:none`, `dosing:unknown-model`, `gate:multi-session-advisory`, `pins:disk-*`, `intake:classify-*`, `subturn:cleanup-failed`, `judge:*` statuses. These invariants MUST be enforced by a property test over every event type (test 42), not only by scenario tests.
+- **FR-033**: Every event MUST carry `model` (or `"unknown"`), session id and resolved dosing profile; new event types: `directive_rendered`, `directive_complied`, `calibration`, `phase_transition`, `resolution:none`, `dosing:unknown-model`, `gate:multi-session-advisory`, `pins:disk-*`, `intake:classify-*`, `subturn:cleanup-failed`, `verifier:*` statuses. These invariants MUST be enforced by a property test over every event type (test 42), not only by scenario tests.
 - **FR-033a**: The `events.jsonl` sink MUST be size- and age-bounded: rotate at **32 MB** to `events.<timestamp>.jsonl` and delete rotated files older than **30 days**. v2 widens what lands on disk (directive text, changed-path sets, raw model ids); `redactForDisk` remains the only content control in v2.0 and no per-field classification scheme is specified (accepted risk, see the STRIDE table).
 - **FR-034**: System MUST assign instance ids to rendered prescriptions and log `directive_complied` when the prescribed **or equivalently-resolved** verifier is observed in the same turn. **Two commands are equivalent when the FR-008 resolver returns the same tier and the same target path set for both, after stripping the flags enumerated in `IGNORED_VERIFIER_FLAGS` = `{--reporter=*, --reporters=*, -v, --verbose, --silent, --no-color, --color, --bail, --run, --watch=false}`** (review MIN-008 — compliance rate drives directive ROI and therefore which prescriptions get deleted, so the equivalence relation cannot be left to the implementer). A broader suite (different tier or a superset target path set) is **not** equivalent.
 - **FR-035**: Holdout arms MUST extend to directive families (suppress rendering, log `holdout_suppress` with family), preserving v1 gate holdout behavior.
 
 **Re-entrancy, rollback and subturn lifecycle (US-9, US-11)**
-- **FR-036** (review CRIT-001): The plugin MUST record the id of every session it creates — judge and intake subturns — in a `selfCreatedSessions` set for the process lifetime, and MUST **return early** from `chat.message`, `experimental.chat.system.transform`, `experimental.text.complete`, `tool.execute.after` and `event(session.idle)` for any session id in that set, or whose `parentID` resolves to a session already in it. For such sessions the harness MUST NOT push an activation cue into `output.parts`, MUST NOT append a directive block to `output.system`, MUST NOT allocate an entry in the ledger, task-mode, review, goal-root or activation-cue maps, and MUST NOT run the idle gate (so no `session.prompt` continuation can recurse). Subturn prompts MUST pass an explicit `agent` that is never `opts.activeAgent`. This generalises v1's existing `gateContinuationSessions` branch in `chat.message` (`src/index.ts` ~line 1581), which exists precisely because `client.session.prompt(...)` in `attemptGateContinuation` re-enters `chat.message`; v2 adds two further `session.prompt` call sites, so the exclusion must be a first-class rule rather than a per-call-site special case.
+- **FR-036** (review CRIT-001): The plugin MUST record the id of every session it creates — verifier and intake subturns — in a `selfCreatedSessions` set for the process lifetime, and MUST **return early** from `chat.message`, `experimental.chat.system.transform`, `experimental.text.complete`, `tool.execute.after` and `event(session.idle)` for any session id in that set, or whose `parentID` resolves to a session already in it. For such sessions the harness MUST NOT push an activation cue into `output.parts`, MUST NOT append a directive block to `output.system`, MUST NOT allocate an entry in the ledger, task-mode, review, goal-root or activation-cue maps, and MUST NOT run the idle gate (so no `session.prompt` continuation can recurse). Subturn prompts MUST pass an explicit `agent` that is never `opts.activeAgent`. This generalises v1's existing `gateContinuationSessions` branch in `chat.message` (`src/index.ts` ~line 1581), which exists precisely because `client.session.prompt(...)` in `attemptGateContinuation` re-enters `chat.message`; v2 adds two further `session.prompt` call sites, so the exclusion must be a first-class rule rather than a per-call-site special case.
 - **FR-037** (review MAJ-012): The plugin MUST support **`VERTEX_V2=0`** (equivalently plugin option `engine: "v1"`), which disables every v2 component and restores the v1 composer and gate paths for the process. The flag MUST be read **before any state file is read, written or archived**, so enabling it never mutates `.elicify-vertex/`. Together with FR-022's reversible archival this is the release's rollback path; no other remedy (downgrading the package) restores an archived plan.
-- **FR-038** (review MAJ-014): Every subturn MUST delete its child session via `session.delete` (`SessionDeleteData`, `types.gen.d.ts:1860`) in a `finally` block — including on success, malformed verdict, timeout, retry exhaustion and thrown error. A deletion failure MUST log `subturn:cleanup-failed` and MUST NOT affect the caller's result. Child sessions are user-visible (`session.children`, `:1946`), so an undeleted one is a harness artefact in the user's session list and contradicts the "judge outage is invisible" property.
+- **FR-038** (review MAJ-014): Every subturn MUST delete its child session via `session.delete` (`SessionDeleteData`, `types.gen.d.ts:1860`) in a `finally` block — including on success, malformed verdict, timeout, retry exhaustion and thrown error. A deletion failure MUST log `subturn:cleanup-failed` and MUST NOT affect the caller's result. Child sessions are user-visible (`session.children`, `:1946`), so an undeleted one is a harness artefact in the user's session list and contradicts the "verifier outage is invisible" property.
 
 ---
 
@@ -1248,15 +1248,15 @@ Explicitly **replaced** (tests updated/retired with the change): directive id/te
 - **SC-006**: A story checkpoint with any evidence-less acceptance item is rejected in 100% of validation-test cases; plans on disk are never left schema-invalid (property-checked writer).
 - **SC-007**: Across the full UAT run (harness asserts globally): no `system.transform` invocation injects more than 2 directives, no family exceeds its FR-004 per-turn cap, and no family repeats within its `cooldownTurns` window.
 - **SC-008**: All frozen v1 regression tests (verification parsing, mutation matrix, redaction, promise detector) pass unchanged.
-- **SC-009**: With the judge stub disabled/hanging, 100% of final checkpoints complete within timeout + 500 ms and log `judge:unavailable`.
+- **SC-009**: With the verifier stub disabled/hanging, 100% of final checkpoints complete within timeout + 500 ms and log `verifier:unavailable`.
 - **SC-010**: Events stream is join-complete: every `directive_complied` references an existing `directive_rendered` instance id (validated by a metrics script over UAT output).
 - **SC-011**: Over Dataset: Intake pre-filter and classification heuristics (14 rows), a client-call spy records **0** `session.prompt` classification calls on every `TRIVIAL_ASK_RE` row (each logging `intake:classify-skipped`) and **exactly 1** on every non-trivial row; no task issues more than one subturn and no session more than 3.
-- **SC-012**: Over Dataset: Judge payload hygiene (9 rows), 100% of rows containing a secret — in **any** of the three payload fields, including the boundary-split, unlabelled-token and base64 cases — transmit without the offending hunk/line; 0 rows over-redact the false-positive row; and **zero delivered payloads** contain the narrative canary, harness directives or the activation cue. "Delivered" means the payload observed at the `session.prompt` boundary in test 43's integration harness, not the object the payload builder returned (review CRIT-001 — a stub-client assertion is structurally incapable of detecting host-side injection).
+- **SC-012**: Over Dataset: Verifier payload hygiene (9 rows), 100% of rows containing a secret — in **any** of the three payload fields, including the boundary-split, unlabelled-token and base64 cases — transmit without the offending hunk/line; 0 rows over-redact the false-positive row; and **zero delivered payloads** contain the narrative canary, harness directives or the activation cue. "Delivered" means the payload observed at the `session.prompt` boundary in test 43's integration harness, not the object the payload builder returned (review CRIT-001 — a stub-client assertion is structurally incapable of detecting host-side injection).
 - **SC-013**: In `pins_write_fault_and_retry` (test 40) and Dataset: Pins persistence, a pins write failure is followed by a successful disk write on the next criteria update in 100% of fault-injection rows, and a permanent fault produces exactly one `pins:disk-unavailable` after three attempts.
 - **SC-014**: With `VERTEX_V2=0`, the full v1 regression suite (405 tests) passes unchanged and no file under `.elicify-vertex/` is created, modified or renamed during the run.
 - **SC-015**: Zero deep sessions with changed files and no successful verification close without a block or a warn — **with or without pinned criteria** — across Dataset: Idle gate decision matrix and the UAT run.
 - **SC-016**: In 100% of subturn test paths (success, malformed, timeout, throw), `session.delete` is called exactly once for the child session, and 0 harness-created sessions remain in `session.children` at the end of a UAT run.
-- **SC-017**: When the FR-030b capability probe fails, 0 `session.create` and 0 `session.prompt` calls are issued and exactly one `judge:unsupported` event is logged per process; when it passes, the `tools` value sent equals the enumerated deny map exactly (asserted field-by-field, not by shape).
+- **SC-017**: When the FR-030b capability probe fails, 0 `session.create` and 0 `session.prompt` calls are issued and exactly one `verifier:unsupported` event is logged per process; when it passes, the `tools` value sent equals the enumerated deny map exactly (asserted field-by-field, not by shape).
 
 ---
 
@@ -1298,15 +1298,15 @@ Explicitly **replaced** (tests updated/retired with the change): directive id/te
 | FR-028 | US-8 | unknown model falls back with raw id logged; resolved profile stamped on every event | 16 |
 | FR-029 | US-8 | dosing outline (5 families × 2 profiles) | 17 |
 | FR-030 | US-9 | verdict appended, non-gating; timeout fails open | 29, 51 |
-| FR-030a | US-9 | subturn uses session model; judgeModel fallback | 36 |
-| FR-030b | US-9 | judge subturn is refused when tools cannot be disabled | 44 |
+| FR-030a | US-9 | subturn uses session model; verifierModel fallback | 36 |
+| FR-030b | US-9 | verifier subturn is refused when tools cannot be disabled | 44 |
 | FR-031 | US-9 | payload evidence-only (three fields, strict scan) | 18, 39 |
 | FR-032 | US-9 | timeout fails open | 29 |
 | FR-033 | US-10 | every emitted event carries model and session id | 42, 30, 31 |
 | FR-033a | US-10 | every emitted event carries model and session id (rotation/retention asserted in the same suite) | 42 |
 | FR-034 | US-10 | compliance joined by instance id (equivalence rows 10–11) | 30 |
 | FR-035 | US-10 | family holdout suppresses | 31 |
-| FR-036 | US-9 | judge subturn receives no harness injection | 43 |
+| FR-036 | US-9 | verifier subturn receives no harness injection | 43 |
 | FR-037 | US-11 | kill switch restores v1 behaviour for the whole process | 52 |
 | FR-038 | US-9 | subturn child session is deleted on every path | 47, 29, 36 |
 
@@ -1320,11 +1320,11 @@ Explicitly **replaced** (tests updated/retired with the change): directive id/te
 | Tests in the TDD plan | **53** | 1–53; 26 Unit, 21 Integration, 5 E2E, 1 Unit (property) |
 | Functional requirements | **45** | FR-001…FR-038 plus FR-013a, FR-018a, FR-018b, FR-023a, FR-030a, FR-030b, FR-033a |
 | Success criteria | **18** | SC-001…SC-017 plus SC-004a (manual) |
-| Test datasets | **9** | resolution, artifact parsing, composer budget/cooldown/decay, intake pre-filter, idle gate matrix, pins persistence, checkpoint evidence, dosing profiles, judge payload hygiene |
+| Test datasets | **9** | resolution, artifact parsing, composer budget/cooldown/decay, intake pre-filter, idle gate matrix, pins persistence, checkpoint evidence, dosing profiles, verifier payload hygiene |
 
 Every FR appears in the matrix above. **All 54 acceptance scenarios are covered** — verified by resolving every BDD `Traces to:` line against the acceptance lists, with zero uncovered. Every BDD scenario has ≥1 named test in the TDD plan.
 
-Rev 2's check asserted completeness without counting: the independent review found 41 acceptance scenarios against 34 BDD scenarios, with US-1 AS-3, US-6 AS-1, US-8 AS-1 and US-10 AS-1 uncovered and the judge happy path untested (review MAJ-011). All five gaps are closed by tests 45, 46, 16 (extended), 42 and 51; the E2E tests 32–35 remain cross-story coverage on top of, not instead of, the per-scenario rows.
+Rev 2's check asserted completeness without counting: the independent review found 41 acceptance scenarios against 34 BDD scenarios, with US-1 AS-3, US-6 AS-1, US-8 AS-1 and US-10 AS-1 uncovered and the verifier happy path untested (review MAJ-011). All five gaps are closed by tests 45, 46, 16 (extended), 42 and 51; the E2E tests 32–35 remain cross-story coverage on top of, not instead of, the per-scenario rows.
 
 ---
 
@@ -1336,21 +1336,21 @@ Resolved 2026-07-25 (user review); one item pending:
 |---|---|---|---|
 | 1 | Criteria source when the model never produces a `CRITERIA:` block | **Keep demanding** — scaffold repeats every turn until captured (FR-011) | Resolved |
 | 2 | Multi-story detection for auto-propose | **LLM-classified intake subturn** (session model), heuristic fallback on failure (FR-018). Rev 3 restores this resolution: the pre-filter is a *cost* gate (`TRIVIAL_ASK_RE`, FR-018a), not a scope gate, so the LLM still decides for every non-trivial ask | Resolved |
-| 3 | Dosing profile table source | Plugin options in `opencode.json` + built-in defaults (FR-028); the tunables are `judgeModel`, `engine`, `VERTEX_INTAKE_SUBTURN_MAX` and the per-family `cooldownTurns`/cap overrides — all in the options surface, none hardcoded | Resolved |
+| 3 | Dosing profile table source | Plugin options in `opencode.json` + built-in defaults (FR-028); the tunables are `verifierModel`, `engine`, `VERTEX_INTAKE_SUBTURN_MAX` and the per-family `cooldownTurns`/cap overrides — all in the options surface, none hardcoded | Resolved |
 | 4 | "Turn" boundary | User message → next user message (v1 ledger semantics). A turn contains **many** `system.transform` invocations; the injection budget is per invocation and the caps/cooldowns are per turn (FR-004, FR-005) | Resolved |
-| 5 | Judge model selection | **In-loop subturn on the session's own model by default** (always works, no extra config); optional `judgeModel` plugin option over host-configured providers; grounded in SDK 1.18.4 `session.create({parentID})` + `session.prompt({model, agent, system, tools, parts})` (FR-030/030a). **Rev 3 correction**: the presence of the `tools` field does **not** establish "tool-calling disabled" — see FR-030b and Open Question 1 | Resolved (with a correction) |
+| 5 | Verifier model selection | **In-loop subturn on the session's own model by default** (always works, no extra config); optional `verifierModel` plugin option over host-configured providers; grounded in SDK 1.18.4 `session.create({parentID})` + `session.prompt({model, agent, system, tools, parts})` (FR-030/030a). **Rev 3 correction**: the presence of the `tools` field does **not** establish "tool-calling disabled" — see FR-030b and Open Question 1 | Resolved (with a correction) |
 | 6 | v2 tool/slash naming | `elicify_vertex_plan_*` tools, `/elicify-vertex-plan-*` slash; `goal` names removed | Resolved |
 | 7 | Elevate trigger without a story | Any successful verifier while unverified changes existed; relevance preferred, not required (FR-027) | Resolved |
-| 8 | Automated one-shot-rate labeling in v2.0 | **No in-plugin labeling, ever** — corrective-turn labeling is semantic judgment (tier 3), unreliable deterministically. v2.0 records raw events only (FR-033/034); one-shot rate is computed offline by a future judge script over recorded sessions, out of v2.0 scope | Resolved |
+| 8 | Automated one-shot-rate labeling in v2.0 | **No in-plugin labeling, ever** — corrective-turn labeling is semantic judgment (tier 3), unreliable deterministically. v2.0 records raw events only (FR-033/034); one-shot rate is computed offline by a future verifier script over recorded sessions, out of v2.0 scope | Resolved |
 
-**Item 8 rationale (user, 2026-07-25)**: keyword labeling could not work reliably; only an LLM judge could — therefore it is offline tier-3 tooling, not plugin runtime.
+**Item 8 rationale (user, 2026-07-25)**: keyword labeling could not work reliably; only an LLM verifier could — therefore it is offline tier-3 tooling, not plugin runtime.
 
 Added in rev 3 (decided by the revision pass, not by the user — flagged as such):
 
 | # | What Was Ambiguous | Resolution | Status |
 |---|---|---|---|
-| 9 | Which agent do the subturns run as? | A plugin-registered zero-tool subagent (`vertex-judge` / `vertex-intake`), never `activeAgent` (FR-030b, FR-036) | Resolved |
-| 10 | Cost budget for v2 | ≤1 classification subturn per task, ≤3 per session, ≤1 judge subturn per final checkpoint; no other paid call exists. Token spend is otherwise unbudgeted in v2.0 | Resolved (bounded), see Open Questions |
+| 9 | Which agent do the subturns run as? | A plugin-registered zero-tool subagent (`vertex-verifier` / `vertex-intake`), never `activeAgent` (FR-030b, FR-036) | Resolved |
+| 10 | Cost budget for v2 | ≤1 classification subturn per task, ≤3 per session, ≤1 verifier subturn per final checkpoint; no other paid call exists. Token spend is otherwise unbudgeted in v2.0 | Resolved (bounded), see Open Questions |
 | 11 | "A new task in the same session" vs "a follow-up message" | An explicit new-task signal only: the user invokes a plan slash command, or the user message follows a `close`-phase idle with no pending story. Phase still resets to `intake` on every user message (FR-002), but the intake **scaffold** stops once criteria are captured (FR-011) and classification does not re-fire (FR-018b) | Resolved |
 | 12 | Is `.elicify-vertex/pins.json` project state or session state? | **Session state that happens to be durable** — session-keyed, 7-day TTL, deleted when empty (FR-013a). It is not intended to be committed; `.elicify-vertex/` should be gitignored, as the Assumptions already recommend | Resolved |
 | 13 | Migration for a user with an active v1 plan who does not want it archived | `VERTEX_V2=0` before first contact keeps v1 semantics and touches nothing; if archival already happened, the archived file is byte-identical and can be renamed back (FR-022, FR-037) | Resolved |
@@ -1365,8 +1365,8 @@ Added in rev 3 (decided by the revision pass, not by the user — flagged as suc
 
 | ID | Severity | Disposition | Section(s) changed |
 |---|---|---|---|
-| CRIT-001 | Critical | **Resolved** | New **FR-036** (`selfCreatedSessions` exclusion across all five hooks); US-9 AS-6; BDD "Judge subturn receives no harness injection"; Edge Cases; Integration Boundaries; **integration** test 43 (explicitly not stub-only); SC-012 restated over the **delivered** payload; regression row added |
-| CRIT-002 | Critical | **Partially resolved** — mechanism specified and made refusable, but **not verified against a running host** from within this revision (no live host session was available; only the SDK type surface was checked) | New **FR-030b** (registered zero-tool `vertex-judge` agent + deny map enumerated from `client.tool.ids()` + `"*": false` + one-time capability probe + refuse-and-log `judge:unsupported`); US-9 AS-7; BDD "Judge subturn is refused when tools cannot be disabled"; test 44; SC-017; STRIDE row held at `risk` on Elevation of Privilege; Open Question 1 |
+| CRIT-001 | Critical | **Resolved** | New **FR-036** (`selfCreatedSessions` exclusion across all five hooks); US-9 AS-6; BDD "Verifier subturn receives no harness injection"; Edge Cases; Integration Boundaries; **integration** test 43 (explicitly not stub-only); SC-012 restated over the **delivered** payload; regression row added |
+| CRIT-002 | Critical | **Partially resolved** — mechanism specified and made refusable, but **not verified against a running host** from within this revision (no live host session was available; only the SDK type surface was checked) | New **FR-030b** (registered zero-tool `vertex-verifier` agent + deny map enumerated from `client.tool.ids()` + `"*": false` + one-time capability probe + refuse-and-log `verifier:unsupported`); US-9 AS-7; BDD "Verifier subturn is refused when tools cannot be disabled"; test 44; SC-017; STRIDE row held at `risk` on Elevation of Privilege; Open Question 1 |
 | CRIT-003 | Critical | **Resolved** | **FR-015** zero-criteria fallback to the v1 evidence gate; US-4 AS-6; BDD "Deep session with no pinned criteria still blocks on unverified changes"; test 41; Dataset: Idle gate decision matrix; Regression row "Unverified-changes stop trigger — preserved"; SC-015 |
 | MAJ-001 | Major | **Resolved** | **FR-004** budget re-scoped to per `system.transform` invocation + per-family per-turn cap table (9 families); US-2 narrative + AS-5; BDD "Anomaly interrupt survives a turn whose budget went to corrections"; test 48; Composer dataset rows 7 and 9; SC-007 |
 | MAJ-002 | Major | **Resolved** | **FR-005** rewritten as integer `cooldownTurns` (default 1) over a monotonic turn index; the self-contradicting "resets on each new user message" clause removed; US-2 AS-4; BDD updated; Composer dataset row 8 |
@@ -1376,9 +1376,9 @@ Added in rev 3 (decided by the revision pass, not by the user — flagged as suc
 | MAJ-006 | Major | **Resolved** | **FR-018a** replaces the character-length gate with `TRIVIAL_ASK_RE`, a cost gate; `INTAKE_SUBTURN_MIN_CHARS` deleted from the spec; US-5 AS-6; new BDD "Short multi-story ask still reaches the classifier"; dataset rows 4–6 carry the exact examples the review named |
 | MAJ-007 | Major | **Resolved** | New **FR-018b** (hook site `chat.message`, ≤1/task, ≤`VERTEX_INTAKE_SUBTURN_MAX`=3/session, 5 s total incl. retry); US-5 AS-7; BDD; test 50; SC-003 extended with a `chat.message` budget; Non-Behavior added |
 | MAJ-008 | Major | **Resolved** | New **FR-013a** (session-keyed `pins.json`, shared directory lock, 7-day expiry, delete-when-empty); Integration Boundaries → Filesystem state; new Dataset: Pins persistence (8 rows); test 40; SC-013 retargeted at test 40; test 37 removed from the FR-013 row (OBS-003) |
-| MAJ-009 | Major | **Resolved** | **FR-031** extends the strict scan to all three payload fields on the reassembled field and defines it (`SECRET_PATTERNS` + Shannon entropy ≥4.0 bits/char over ≥32-char tokens), with `judge:field-dropped`; hygiene dataset rows 5–9 (incl. a false-positive row); SC-012 |
+| MAJ-009 | Major | **Resolved** | **FR-031** extends the strict scan to all three payload fields on the reassembled field and defines it (`SECRET_PATTERNS` + Shannon entropy ≥4.0 bits/char over ≥32-char tokens), with `verifier:field-dropped`; hygiene dataset rows 5–9 (incl. a false-positive row); SC-012 |
 | MAJ-010 | Major | **Resolved** | New **FR-023a** (pre-commitment as a phase-entry injection); US-6 AS-1 rewritten; BDD "Pre-commitment prompt renders on execute entry"; test 46; `tool.execute.before` explicitly **not** added to the hook surface |
-| MAJ-011 | Major | **Resolved** | BDD scenarios + tests added for US-1 AS-3 (45), US-6 AS-1 (46), US-8 AS-1 (16 extended), US-10 AS-1 (42) and the judge happy path (51); the Completeness check now states counted numbers |
+| MAJ-011 | Major | **Resolved** | BDD scenarios + tests added for US-1 AS-3 (45), US-6 AS-1 (46), US-8 AS-1 (16 extended), US-10 AS-1 (42) and the verifier happy path (51); the Completeness check now states counted numbers |
 | MAJ-012 | Major | **Resolved** | New **US-11** (P0), **FR-037** (`VERTEX_V2=0` / `engine: "v1"`, read before any state access), **FR-022** reversible archival; BDD ×2; tests 52–53; SC-014; regression row for the whole v1 suite under the flag |
 | MAJ-013 | Major | **Resolved** (license declared out of scope) | Non-Behavior's `standard`-only qualifier removed — propose-only under **all** profiles; the frontier proactive-fix license added to the Assumptions' out-of-scope list; FR-029's dose matrix omits it explicitly |
 | MAJ-014 | Major | **Resolved** | New **FR-038** (`session.delete` in `finally` on every path, `subturn:cleanup-failed`); US-9 AS-8; BDD; test 47; assertions added to tests 29 and 36; SC-016 |
@@ -1391,7 +1391,7 @@ Added in rev 3 (decided by the revision pass, not by the user — flagged as suc
 | MIN-007 | Minor | **Resolved** | FR-015 multi-session advisory clause; US-4 AS-7; BDD; Edge Cases; test 20 extended; gate dataset row 7 |
 | MIN-008 | Minor | **Resolved** | FR-034 defines verifier equivalence (same tier + same target path set, modulo `IGNORED_VERIFIER_FLAGS`); Composer dataset rows 10–11 |
 | MIN-009 | Minor | **Resolved** | FR-013 always persists pins; the plan-conditional dual mode deleted; BDD and Edge Cases updated |
-| OBS-001 | Observation | **Deferred** — `judgeModel` is a recorded user decision (Clarifications 2026-07-25, Ambiguity #5); removing it would reverse a resolved question without the user present. Cost is one option, one AS, one BDD scenario and part of test 36 | No change; recorded here as an accepted carry |
+| OBS-001 | Observation | **Deferred** — `verifierModel` is a recorded user decision (Clarifications 2026-07-25, Ambiguity #5); removing it would reverse a resolved question without the user present. Cost is one option, one AS, one BDD scenario and part of test 36 | No change; recorded here as an accepted carry |
 | OBS-002 | Observation | **Resolved** | FR-029 now carries the five-family × two-profile dose matrix restored from `docs/vertex2-greenfield.html` §05 (minus the fix license, per MAJ-013); the BDD outline and test 17 exercise all ten cells |
 | OBS-003 | Observation | **Resolved** | Test 37 removed from the FR-013 traceability row and re-described as state-directory write concurrency; the pins fault-injection test (40) takes its place |
 | OBS-004 | Observation | **Resolved** | The rev-2 self-review independence caveat is retired and replaced by the provenance note below |
@@ -1404,9 +1404,9 @@ Added in rev 3 (decided by the revision pass, not by the user — flagged as suc
 
 ### Open Questions (rev 3 — not resolved by this pass)
 
-1. **Does the OpenCode host honour a deny-all `tools` map?** FR-030b's mechanism (registered zero-tool agent + enumerated deny map + `"*": false`) is grounded in the SDK type surface but was **not** exercised against a running server. Until a maintainer records a live verification, the capability probe's refusal path is the control, and both subturn STRIDE rows stay at `risk` on Elevation of Privilege. **Action before implementation**: run one judge subturn against a live host with a deliberately tool-inviting payload and assert zero tool calls.
+1. **Does the OpenCode host honour a deny-all `tools` map?** FR-030b's mechanism (registered zero-tool agent + enumerated deny map + `"*": false`) is grounded in the SDK type surface but was **not** exercised against a running server. Until a maintainer records a live verification, the capability probe's refusal path is the control, and both subturn STRIDE rows stay at `risk` on Elevation of Privilege. **Action before implementation**: run one verifier subturn against a live host with a deliberately tool-inviting payload and assert zero tool calls.
 2. **Is `client.tool.ids()` complete?** It is an experimental endpoint (`GET /experimental/tool/ids`). If MCP-contributed tools are registered lazily, the enumerated deny map may be built before they exist. FR-030b's probe re-reads `client.app.agents()`, which should reflect resolution, but this ordering is unverified.
-3. **Does `maxSteps: 1` on the judge agent interact with `Promise.race`?** If the host enforces `maxSteps` by truncating rather than erroring, a truncated verdict may parse as malformed rather than as unavailable. Both fail open, so the behaviour is safe either way, but the event taxonomy would attribute it to the wrong cause.
+3. **Does `maxSteps: 1` on the verifier agent interact with `Promise.race`?** If the host enforces `maxSteps` by truncating rather than erroring, a truncated verdict may parse as malformed rather than as unavailable. Both fail open, so the behaviour is safe either way, but the event taxonomy would attribute it to the wrong cause.
 
 ### Rev 2 — prior round (superseded)
 
@@ -1456,10 +1456,10 @@ Rev 2 applied nine findings (F-01…F-09) as text edits. The independent round f
 - **Expected outcome**: The next assistant message quotes its own expectation, states the falsified belief, and reads a *different* file before editing again; no third repeat of the same fix location.
 - **Category**: Error
 
-### Scenario: Judge outage is invisible to the user
-- **Setup**: `VERTEX_JUDGE=1` with the provider unreachable (network blocked) so the judge subturn cannot complete.
+### Scenario: Verifier outage is invisible to the user
+- **Setup**: `VERTEX_VERIFIER=1` with the provider unreachable (network blocked) so the verifier subturn cannot complete.
 - **Action**: Complete a deep plan's final checkpoint.
-- **Expected outcome**: Checkpoint completes without user-visible delay beyond ~5 s; close-out report renders; events contain `judge:unavailable`; no error surfaces in chat; **the session list contains no leftover harness-created child session**, and the transcript shows no vertex directive addressed to a judge.
+- **Expected outcome**: Checkpoint completes without user-visible delay beyond ~5 s; close-out report renders; events contain `verifier:unavailable`; no error surfaces in chat; **the session list contains no leftover harness-created child session**, and the transcript shows no vertex directive addressed to a verifier.
 - **Category**: Error
 
 ### Scenario: Rapid trivial Q&A stays friction-free
@@ -1488,7 +1488,7 @@ Rev 2 applied nine findings (F-01…F-09) as text edits. The independent round f
 - The host honours plugin-registered agents written into `config.agent` from the `config` hook, and `client.app.agents()` reflects the resolved result. **If it does not, FR-030b's probe fails closed and both subturns are disabled — the spec degrades rather than breaks.**
 - Single OpenCode process per project; cross-process plan safety relies on the existing lock-file mechanism only.
 - vitest remains the project's test framework for v2's own tests; fixture-driven unit tests require no network and no subprocess.
-- The v1 measurement environment variables (`VERTEX_DATA`, `VERTEX_HOLDOUT`, `VERTEX_DEBUG`) carry over; new: `VERTEX_JUDGE` (judge subturn on/off) and **`VERTEX_V2`** (`0` = kill switch, FR-037). New plugin options: `judgeModel`, `engine`, `VERTEX_INTAKE_SUBTURN_MAX`, per-family `cooldownTurns` and per-turn cap overrides.
+- The v1 measurement environment variables (`VERTEX_DATA`, `VERTEX_HOLDOUT`, `VERTEX_DEBUG`) carry over; new: `VERTEX_VERIFIER` (verifier subturn on/off) and **`VERTEX_V2`** (`0` = kill switch, FR-037). New plugin options: `verifierModel`, `engine`, `VERTEX_INTAKE_SUBTURN_MAX`, per-family `cooldownTurns` and per-turn cap overrides.
 - Breaking-change communication (README migration note, major version bump) happens at release; the *technical* rollback path is in scope and specified (US-11, FR-037).
 - Out of scope for v2.0: cross-session/user-level memory, automated one-shot-rate labeling, multi-agent evidence trust-weighting, prompt-technique A/B content variants beyond family holdouts, **a `frontier` proactive-fix license** (review MAJ-013 — propose-only holds under every profile in v2.0), **token/spend budgeting beyond the call-count bounds in FR-018b and FR-030**, and **per-field data classification for the event sink** (FR-033a bounds size and age only).
 - `.elicify-vertex/` state lives in the worktree root and is **not** branch-aware: switching branches leaves `plan.json` in place. Projects wanting branch-scoped plans should add `.elicify-vertex/` to `.gitignore` and re-create plans per branch (review: unasked question 1). v2.0 ships no branch detection.
@@ -1499,7 +1499,7 @@ Rev 2 applied nine findings (F-01…F-09) as text edits. The independent round f
 
 - Q: Spec scope? → A: Full Vertex 2 in one spec; priorities encode migration order.
 - Q: Greenfield package or evolve? → A: Evolve in-repo as next major version.
-- Q: Tier-3 judge in scope? → A: Yes, as P2.
+- Q: Tier-3 verifier in scope? → A: Yes, as P2.
 - Q: Preserve v1 user surface? → A: No — breaking changes allowed (tools, slash commands, goals schema).
 - Q: Subprocess in hot path for resolution? → A: Avoid if possible; correctness of guidance outranks purity → bounded, cached fallback permitted (FR-009).
 - Q: Human evaluation method? → A: Scripted live-session review (holdout scenarios above).
@@ -1510,17 +1510,17 @@ Rev 2 applied nine findings (F-01…F-09) as text edits. The independent round f
 - Q: Multi-story detection? → A: LLM-classified intake subturn; heuristic only as failure fallback.
 - Q: Dosing config? → A: Plugin options + built-in defaults.
 - Q: Turn boundary? → A: User message → user message.
-- Q: Judge model? → A: Must always work; run as a subturn of the agent loop on the session's own model; optional `judgeModel` plugin option for a different host-configured model. Grounded against SDK 1.18.4 (`session.create` supports `parentID`; `session.prompt` supports per-call `model`, `agent`, `system`, `tools`). *Superseded in part by rev 3: the `tools` field is a per-tool-name map, not a disable flag — see FR-030b.*
+- Q: Verifier model? → A: Must always work; run as a subturn of the agent loop on the session's own model; optional `verifierModel` plugin option for a different host-configured model. Grounded against SDK 1.18.4 (`session.create` supports `parentID`; `session.prompt` supports per-call `model`, `agent`, `system`, `tools`). *Superseded in part by rev 3: the `tools` field is a per-tool-name map, not a disable flag — see FR-030b.*
 - Q: Naming? → A: `plan_*`.
 - Q: Elevate trigger without story? → A: Any green verifier.
-- Q: One-shot labeling in v2.0? → A: None in the plugin — labeling is semantic and only reliable via an LLM judge, therefore offline tier-3 tooling out of v2.0 scope; the plugin records raw events only.
+- Q: One-shot labeling in v2.0? → A: None in the plugin — labeling is semantic and only reliable via an LLM verifier, therefore offline tier-3 tooling out of v2.0 scope; the plugin records raw events only.
 
 ### 2026-07-25 — rev 2 (grill-spec revision)
 
 - Q: Do cooldowns reset on wall-clock or turn? → A: Turn (`chat.message`); shared across assistant outputs in the turn (F-01).
 - Q: Does a pins disk failure disable persistence for the session? → A: No — memory fallback, log once, retry next update (F-02).
 - Q: Does the classification subturn run on trivial asks? → A: No — pre-filter at 120 chars or a sequencing word; skip and log (F-03).
-- Q: Could a split credential reach the judge? → A: Scan the reassembled hunk and drop it; not per-chunk (F-04).
+- Q: Could a split credential reach the verifier? → A: Scan the reassembled hunk and drop it; not per-chunk (F-04).
 - Q: Do idle continuations consume the injection budget? → A: No — budget is `system.transform`-scoped (F-05).
 - Q: How are unmapped models discovered? → A: raw id in `dosing:unknown-model` (F-06).
 - Q: Can the live E2E run in CI? → A: Maintainer-run; skipped unless `OPENCODE_LIVE_TEST=1` (F-07).
@@ -1542,7 +1542,7 @@ Rev 2 applied nine findings (F-01…F-09) as text edits. The independent round f
 - Q: Should short asks skip classification? → A: No — trivial asks skip it (`TRIVIAL_ASK_RE`); length is not a scope signal (FR-018a, MAJ-006).
 - Q: Where and how often does classification run? → A: `chat.message`, ≤1 per task, ≤3 per session, 5 s total including the retry (FR-018b, MAJ-007).
 - Q: Does `pins.json` have a lifecycle? → A: Session-keyed, shared directory lock, 7-day TTL, deleted when empty; always persisted (FR-013/013a, MAJ-008, MIN-009).
-- Q: Which judge payload fields are scanned? → A: All three, on the reassembled field, with `SECRET_PATTERNS` + an entropy rule (FR-031, MAJ-009).
+- Q: Which verifier payload fields are scanned? → A: All three, on the reassembled field, with `SECRET_PATTERNS` + an entropy rule (FR-031, MAJ-009).
 - Q: How does the pre-commitment prompt arrive before the verifier? → A: As a phase-entry injection on the first `system.transform` after entering `execute`; `tool.execute.before` stays out of the hook surface (FR-023a, MAJ-010).
 - Q: What is the rollback path? → A: `VERTEX_V2=0`, read before any state access, plus byte-identical reversible archival (US-11, FR-037/FR-022, MAJ-012).
 - Q: Does `frontier` get a silent-fix license? → A: No — propose-only under every profile in v2.0; out of scope (MAJ-013).

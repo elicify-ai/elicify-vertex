@@ -44,10 +44,10 @@ import {
   logIntakeClassifyFallback,
   logIntakeClassifySkipped,
   logIntakeClassifyUnsupported,
-  logJudgeFieldDropped,
-  logJudgeMalformed,
-  logJudgeUnavailable,
-  logJudgeUnsupported,
+  logVerifierFieldDropped,
+  logVerifierMalformed,
+  logVerifierUnavailable,
+  logVerifierUnsupported,
   logPhaseTransition,
   logPinsDiskFallbackMemory,
   logPinsDiskRecovered,
@@ -171,23 +171,23 @@ const WRITER_TABLE: WriterCase[] = [
   },
   {
     type: "subturn:cleanup-failed",
-    call: (input) => logSubturnCleanupFailed({ agent: "vertex-judge", reason: "ECONNRESET", ...input }),
+    call: (input) => logSubturnCleanupFailed({ agent: "vertex-verifier", reason: "ECONNRESET", ...input }),
   },
   {
-    type: "judge:unavailable",
-    call: (input) => logJudgeUnavailable({ reason: "timeout", ...input }),
+    type: "verifier:unavailable",
+    call: (input) => logVerifierUnavailable({ reason: "timeout", ...input }),
   },
   {
-    type: "judge:malformed",
-    call: (input) => logJudgeMalformed({ reason: "invalid JSON", ...input }),
+    type: "verifier:malformed",
+    call: (input) => logVerifierMalformed({ reason: "invalid JSON", ...input }),
   },
   {
-    type: "judge:unsupported",
-    call: (input) => logJudgeUnsupported({ reason: "probe failed", ...input }),
+    type: "verifier:unsupported",
+    call: (input) => logVerifierUnsupported({ reason: "probe failed", ...input }),
   },
   {
-    type: "judge:field-dropped",
-    call: (input) => logJudgeFieldDropped({ field: "diffSummary", reason: "entropy", ...input }),
+    type: "verifier:field-dropped",
+    call: (input) => logVerifierFieldDropped({ field: "diffSummary", reason: "entropy", ...input }),
   },
   {
     type: "criteria:re-pinned",
@@ -232,10 +232,10 @@ describe("test 42: event_invariants_property (all 22 new FR-033 event types)", (
       "intake:classify-capped",
       "intake:classify-unsupported",
       "subturn:cleanup-failed",
-      "judge:unavailable",
-      "judge:malformed",
-      "judge:unsupported",
-      "judge:field-dropped",
+      "verifier:unavailable",
+      "verifier:malformed",
+      "verifier:unsupported",
+      "verifier:field-dropped",
       "criteria:re-pinned",
       "criteria:truncated",
       "expect:absent",
@@ -284,7 +284,7 @@ describe("test 42: event_invariants_property (all 22 new FR-033 event types)", (
       instanceId: "D-9",
       priority: "correction",
     })
-    logJudgeUnavailable({ sessionID: "disk-check", reason: "timeout" })
+    logVerifierUnavailable({ sessionID: "disk-check", reason: "timeout" })
 
     const lines = readFileSync(eventsPath(), "utf8").trim().split("\n")
     expect(lines).toHaveLength(2)
@@ -295,7 +295,7 @@ describe("test 42: event_invariants_property (all 22 new FR-033 event types)", (
       expect(["standard", "frontier"]).toContain(ev.profile)
     }
     expect(JSON.parse(lines[0])).toMatchObject({ event_type: "directive_rendered", model: "anthropic/claude-fable-5" })
-    expect(JSON.parse(lines[1])).toMatchObject({ event_type: "judge:unavailable", model: "unknown", profile: "standard" })
+    expect(JSON.parse(lines[1])).toMatchObject({ event_type: "verifier:unavailable", model: "unknown", profile: "standard" })
     // Regression: `family` must survive into the SERIALIZED payload on disk,
     // not just the in-memory input — makeV2Event previously destructured
     // `family` out for the FR-035 holdout-arm hash and silently dropped it.

@@ -291,7 +291,7 @@ required — this is the injection point), `subagent_type` (string, required),
   `uncertainty` (compressed) — see `docs/SUBAGENT-INJECTION-DRAFT.md` §1 for
   the full section-by-section rationale.
 - Injection is skipped for `isSelf` sessions structurally, with no extra check
-  needed: judge and intake subturns are created via `runSubturn` directly
+  needed: verifier and intake subturns are created via `runSubturn` directly
   (`client.session.create`/`client.session.prompt`), never via the `task`
   tool, so `tool.execute.before`'s `toolInput.tool === "task"` branch never
   sees them.
@@ -326,11 +326,11 @@ independently reproduced three times by three separate reviewers:
 | `"The token refresh logic is now fixed and covered by a test."` | `"The token [REDACTED]"` |
 
 Both sentences are dropped entirely, not just a token inside them —
-`judge.ts`'s `logPartialDrop` (new in this diff, `judge:field-partial-drop`)
+`verifier.ts`'s `logPartialDrop` (new in this diff, `verifier:field-partial-drop`)
 makes this failure mode *observable* rather than fixing it: the event fires
 with the field name and drop count, but the dropped text stays gone.
 `verifierSummaries` has always been exposed to this. What's new in this diff is
-`lastResponse`/`recentTranscript` (`docs/JUDGE-PROMPT.md` §5): free-form
+`lastResponse`/`recentTranscript` (`docs/VERIFIER-PROMPT.md` §5): free-form
 narrative prose is exactly the kind of text a verification-focused assistant
 writes constantly ("no secrets were logged", "the token refresh test now
 passes"), so this pattern triggers far more often against those two fields
@@ -348,7 +348,7 @@ before and after: every case either already has `:`/`=`, or is caught by a
 completely separate dedicated pattern (`gh[pousr]_`/`npm_`/`glpat-`/`xoxb-`/
 `sk-`/`AKIA`/JWT/private-key/Bearer/Basic/URL-credential — none depend on
 `SENSITIVE_ASSIGNMENT_LABEL`). The entropy-based scan
-(`ENTROPY_MIN_TOKEN_LENGTH`/`ENTROPY_THRESHOLD_BITS` in `judge.ts`) remains
+(`ENTROPY_MIN_TOKEN_LENGTH`/`ENTROPY_THRESHOLD_BITS` in `verifier.ts`) remains
 the backstop for a genuine secret phrased without `:`/`=` — confirmed still
 catching an unlabeled high-entropy token in a new test. Both audit-doc
 example sentences now survive `redactSecrets` unchanged.
@@ -358,8 +358,8 @@ example sentences now survive `redactSecrets` unchanged.
 **Severity: medium.** Reproduced against the pre-existing `verifierSummaries`
 field; the new fields extended the same exposure surface.
 
-`judge.ts`'s field pipeline (`truncateField` then `scanUnits`, per
-`buildJudgePayload`'s doc comment) truncates a field to its character cap
+`verifier.ts`'s field pipeline (`truncateField` then `scanUnits`, per
+`buildVerifierPayload`'s doc comment) truncates a field to its character cap
 **before** the secret-pattern/entropy scan ever runs on it. A secret
 positioned to straddle that cap boundary has its tail cut off first — and the
 surviving prefix can fall just short of a pattern's minimum-length
@@ -380,10 +380,10 @@ characters leak verbatim**, unredacted, because the cut happened before the
 scan, not after it.
 
 Reproduces identically against the pre-existing `verifierSummaries` field
-(`JUDGE_PAYLOAD_FIELD_CHAR_CAP` = 2000, same `truncateField` → `scanUnits`
-pipeline in `src/v2/judge.ts`) — not a regression from this diff. The
+(`VERIFIER_PAYLOAD_FIELD_CHAR_CAP` = 2000, same `truncateField` → `scanUnits`
+pipeline in `src/v2/verifier.ts`) — not a regression from this diff. The
 new `lastResponse` (same cap) and `recentTranscript`
-(`JUDGE_TRANSCRIPT_FIELD_CHAR_CAP` = 4000) fields extend the identical
+(`VERIFIER_TRANSCRIPT_FIELD_CHAR_CAP` = 4000) fields extend the identical
 exposure to more, and longer, free-form text.
 
 **Fix, applied: redact-then-truncate ordering.** `scanLineField`/
@@ -398,10 +398,10 @@ codebase's output — `scanUnits` drops whole lines/hunks rather than
 substituting inline markers — so that concern doesn't apply to either fix
 direction here, confirmed by reading the code rather than assumed. New test
 reproduces the exact 40-char JWT-straddling-cap case and confirms full
-redaction, not a 39-character leak. `judge:field-truncated`'s and
-`judge:field-dropped`'s logging semantics shifted accordingly (now mutually
+redaction, not a 39-character leak. `verifier:field-truncated`'s and
+`verifier:field-dropped`'s logging semantics shifted accordingly (now mutually
 exclusive per field per call — a fully-dropped field has nothing left to
-truncate) and are documented in `judge.ts`'s own comments.
+truncate) and are documented in `verifier.ts`'s own comments.
 
 ## C-10 — RESOLVED. Second subagent-injection trigger site
 
@@ -503,15 +503,15 @@ it had before it was blocked. In the narrow case where a story's phase was
 already `"close"` before it blocked, and the harness's own gate-continuation
 prompts are explicitly excluded from the phase reset that a genuine new user
 message would trigger, `onIdle`'s elevate→close transition (which is what
-fires the completion judge) could never re-trigger for that storyId within one
+fires the completion verifier) could never re-trigger for that storyId within one
 long, harness-driven turn — even after the story is genuinely reopened and
 re-completed with fresh evidence.
 
 This never weakened the deterministic evidence gate: Stage-1
 (`handleIncompletePlan`) and `checkpoint`'s own validation are both
 status-driven, not phase-driven, and were unaffected. Only the advisory,
-non-gating completion judge's re-trigger was at risk in this edge case — the
-codebase's own documentation already treats the judge as "advisory, never
+non-gating completion verifier's re-trigger was at risk in this edge case — the
+codebase's own documentation already treats the verifier as "advisory, never
 gating."
 
 **Fix applied:** `reopenTool` (`wiring/tools.ts`) now calls
@@ -577,19 +577,19 @@ a control run sending `agent: "elicify-vertex-agent"` every turn never
 deactivates.
 
 **Resolved, root cause traced, not just patched around.** A live UAT run
-exercising the judge (C-2 above) also sent `agent: "build"` on every turn and
+exercising the verifier (C-2 above) also sent `agent: "build"` on every turn and
 stayed demonstrably active the whole time — this and the direct-probe finding
 seemed to disagree. Reproduced both with one harness against the real host
 (opencode 1.18.8), reusing the original UAT's own leftover session DBs as
 ground truth rather than re-guessing. Both observations were correct; they
-were measuring different **moments** in the session. Querying the judge
+were measuring different **moments** in the session. Querying the verifier
 scenario's real DB showed the model's first turn alone autonomously ran the
 entire `plan_create → ... → checkpoint` lifecycle inside one open-ended
-agentic turn — `session.idle` fired and the judge dispatched (protected from
+agentic turn — `session.idle` fired and the verifier dispatched (protected from
 deactivation by `idleContinuationInFlight`) *before* any later turn
 re-sending `agent: "build"` ever arrived. The reopen scenario's script, by
 contrast, explicitly sent those later mismatched-agent turns — which *did*
-deactivate, correctly, just not in a way the judge scenario's measurement
+deactivate, correctly, just not in a way the verifier scenario's measurement
 ever exposed.
 
 **Root cause:** the deactivation check conflated "agent ≠ the harness's
@@ -628,7 +628,7 @@ activator."
 
 **Severity: high — the exact backstop C-8's own comment cites as covering its
 narrowed pattern.** Found independently by two adversarial re-review agents
-in the same wave, both computing matching entropy values from `judge.ts`'s
+in the same wave, both computing matching entropy values from `verifier.ts`'s
 own formula/thresholds, during the re-review this session's second `/goal`
 requested for C-8/C-9.
 
@@ -638,7 +638,7 @@ near-perfectly-uniform 16-symbol digit distribution. Real random hex strings
 at the scanned lengths essentially never land that close to uniform — a
 20,000-sample Monte Carlo of random 32-char hex found 0/20000 clearing it;
 40-char hex cleared only 4/20000 (0.02%). Concrete, previously-leaking
-examples, fed through the real `buildJudgePayload` pipeline end to end:
+examples, fed through the real `buildVerifierPayload` pipeline end to end:
 `"our client secret ends up being 8f3ac9d2e1b74c0aa9f2d8e7c1b3a4f6"` (3.83
 bits/char) and `"she pasted the password
 hunter2CorrectHorseBatteryStaple99..."` (3.89 bits/char) both survived
@@ -650,16 +650,16 @@ this document's own "V-4 — audit the audit" principle warns about: a claim
 that sounded right and was never independently re-verified against the real
 code.
 
-**Fix applied — hex-run backstop, scoped to `judge.ts` only.** Rather than
+**Fix applied — hex-run backstop, scoped to `verifier.ts` only.** Rather than
 lower the entropy threshold (risking new false positives on ordinary long
 identifiers/camelCase tokens without a large empirical dataset to calibrate a
-safe cutoff), `src/v2/judge.ts` gained a direct, unambiguous character-class
+safe cutoff), `src/v2/verifier.ts` gained a direct, unambiguous character-class
 backstop: `tripsHexRunScan`, a standalone run of 32+ pure-hex characters
 (the length `ENTROPY_MIN_TOKEN_LENGTH` already uses) trips regardless of
 entropy. Natural-language prose does not produce 32+ consecutive
 hex-alphabet characters as one token; the realistic false-positive cost is
 git full-SHA/hash-shaped IDs (also hex, also long) being dropped when they
-appear in evidence text — accepted, since a judge subturn losing one line of
+appear in evidence text — accepted, since a verifier subturn losing one line of
 context is far cheaper than a leaked secret.
 
 **A first attempt at this fix caused a real regression, caught before it
@@ -674,8 +674,8 @@ both, corrupting them on write. 13 tests across `forgery.test.ts`,
 with "genuine receipt must survive: expected null not to be null" the moment
 the full suite ran — caught immediately by this session's own
 verify-before-report discipline, not shipped. **Fix:** moved the hex-run rule
-out of the shared `redaction.ts` module entirely and into `judge.ts`'s local
-`unitTrips`, which is only ever applied to the five free-form judge-payload
+out of the shared `redaction.ts` module entirely and into `verifier.ts`'s local
+`unitTrips`, which is only ever applied to the five free-form verifier-payload
 fields (prose/line arrays), never signed or structured data. A regression-pin
 test (`tests/riskRedaction.test.ts`, "C-15 regression guard") proves
 `redactForDisk` leaves a receipt-shaped object's signature/digest fields
@@ -704,13 +704,13 @@ happened: re-adding the pattern to `SECRET_PATTERNS` turns it red.
 review.** C-9's scan-then-truncate fix requires scanning the FULL untruncated
 field, so scan cost now scales with the raw field size, not the
 post-truncation cap. `criteria`/`verifierSummaries`/`diffSummary` are already
-bounded upstream before they reach `judge.ts`, but `lastResponse`/
+bounded upstream before they reach `verifier.ts`, but `lastResponse`/
 `recentTranscript` are not (`gate.ts`'s own comment on the transcript turn
 window says outright it's "a soft pre-filter, not the real bound"). Measured:
 a 2MB single-line field took ~45ms to scan; a 1.37MB/20,000-line field
-~270ms. **Fix:** `JUDGE_PAYLOAD_RAW_FIELD_SAFETY_CAP` (100,000 chars) — a
+~270ms. **Fix:** `VERIFIER_PAYLOAD_RAW_FIELD_SAFETY_CAP` (100,000 chars) — a
 raw field over this cap is dropped WHOLE, before scanning, logging
-`judge:field-oversized`. This bounds worst-case cost without reintroducing
+`verifier:field-oversized`. This bounds worst-case cost without reintroducing
 C-9's bug: unlike truncating a field's *content* toward its transmission cap
 (which risks bisecting a secret near that boundary), dropping an oversized
 field whole produces no partial/fragmentary text for a bisected secret to
@@ -719,7 +719,7 @@ cap-respecting truncation of the scanned result), or it is entirely omitted.
 Sized far larger than the real transmission caps and than any realistic
 secret token, so it never engages for genuine evidence text.
 
-All five new tests (`tests/v2/judge.test.ts` ×4, `tests/riskRedaction.test.ts`
+All five new tests (`tests/v2/verifier.test.ts` ×4, `tests/riskRedaction.test.ts`
 ×1) mutation-verified: each one confirmed to fail when its corresponding fix
 is reverted, confirmed to pass again once restored, using file-copy backups
 rather than `git checkout` (this session's own established lesson — the
@@ -752,7 +752,7 @@ path.
 working recovery path existed: checkpoint the stranded pending story to
 `"blocked"`, which is an ungated transition, then reopen it again). Revisited
 on the operator's explicit instruction to do the real fix rather than accept
-the workaround, given the risk was judged narrow.
+the workaround, given the risk was verifierd narrow.
 
 **Fix applied.** `checkpoint`'s successor-promotion now fires whenever the
 active slot vacates for ANY reason — `"complete"`, `"blocked"`, or

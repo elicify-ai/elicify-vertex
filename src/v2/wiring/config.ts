@@ -1,23 +1,23 @@
 /**
  * Wave-3 wiring — the `config` hook body: registers the two FR-030b
- * subagents (`vertex-judge`, `vertex-intake`), the `/elicify-vertex`
+ * subagents (`vertex-verifier`, `vertex-intake`), the `/elicify-vertex`
  * activation command, and the `/elicify-vertex-plan-*` slash commands.
  *
  * HANDOVER.md point 3 (user decision, 2026-07-29): the original "both
  * subagents are zero-tool" design is DELIBERATELY REVERSED for
- * `vertex-judge` only. The judge is now the sole arbiter of story/plan
+ * `vertex-verifier` only. The verifier is now the sole arbiter of story/plan
  * completion (HANDOVER.md point 2) and needs to verify claims itself:
  * read/grep/glob/list for inspection plus bash to re-run a story's declared
  * verifier commands — while edit/write/webfetch/task stay hard-denied so it
  * can never modify the work it audits. The reversal is safe to make because
- * the judge runs at session.idle and remains fail-open via the probe
- * (`subturn.ts`'s `JUDGE_PROBE_POLICY`): a host that resolves more
- * capability than the policy allows degrades to "judge disabled"
- * (`judge:unsupported`), never to "judge running with unaudited
+ * the verifier runs at session.idle and remains fail-open via the probe
+ * (`subturn.ts`'s `VERIFIER_PROBE_POLICY`): a host that resolves more
+ * capability than the policy allows degrades to "verifier disabled"
+ * (`verifier:unsupported`), never to "verifier running with unaudited
  * capability". `vertex-intake` remains fully zero-tool under the original
  * `AGENT_PERMISSION` below.
  *
- * For the intake agent (and for the deny half of the judge's registration),
+ * For the intake agent (and for the deny half of the verifier's registration),
  * enforcement is carried ENTIRELY by the `permission` block (specifically
  * its `"*": "deny"` wildcard), NOT by the `tools` map. Live-host testing
  * (opencode 1.18.4, via `opencode debug agent` against throwaway probe
@@ -44,10 +44,10 @@
  * returns, and `config` was waiting on a call that only resolves after
  * bootstrapping finishes.
  *
- * The FR-030b capability PROBE (`judge.ts` / `story.ts`'s
+ * The FR-030b capability PROBE (`verifier.ts` / `story.ts`'s
  * `classifyMultiStory`, each calling `probeCapability` before every real
  * subturn, long after the host is fully up) remains the control of record:
- * it reads the resolution back and refuses (`judge:unsupported` /
+ * it reads the resolution back and refuses (`verifier:unsupported` /
  * `intake:unsupported`) if anything outside the agent's policy is enabled —
  * so a host that honours neither mechanism degrades to "subturn disabled",
  * never to "subturn running with unaudited capability".
@@ -57,7 +57,7 @@ import { planSlashCommands } from "./tools.js"
 
 /**
  * FR-030b zero-tool enforcement — NOW INTAKE-ONLY (HANDOVER.md point 3, user
- * decision: the judge's registration moved to `JUDGE_PERMISSION` below; this
+ * decision: the verifier's registration moved to `VERIFIER_PERMISSION` below; this
  * comment used to claim both agents were zero-tool, and is kept accurate
  * rather than left stale). The `"*": "deny"` wildcard is the load-bearing
  * entry and MUST NOT be removed: live-host testing (opencode 1.18.4,
@@ -79,20 +79,20 @@ const AGENT_PERMISSION = {
 }
 
 /**
- * HANDOVER.md point 3 (user decision, 2026-07-29): the judge's permission
+ * HANDOVER.md point 3 (user decision, 2026-07-29): the verifier's permission
  * block, reversing its previous zero-tool posture. `"*": "deny"` stays as
  * the base so everything unlisted is off; the five read-only tools the
- * judge needs to audit claims independently (read/grep/glob/list for
+ * verifier needs to audit claims independently (read/grep/glob/list for
  * inspection, bash to re-run declared verifier commands) are explicitly
  * allowed; edit/write (must never modify the work it audits), webfetch (no
  * network) and task (no sub-subagents) are explicitly denied — the explicit
- * deny entries are what `JUDGE_PROBE_POLICY`'s `denyPermissions` read back
+ * deny entries are what `VERIFIER_PROBE_POLICY`'s `denyPermissions` read back
  * to prove the denial, exactly as the intake wildcard's explicit entries do
  * for `AGENT_PERMISSION`.
  */
-const JUDGE_ALLOWED_TOOLS = ["read", "grep", "glob", "list", "bash"] as const
+const VERIFIER_ALLOWED_TOOLS = ["read", "grep", "glob", "list", "bash"] as const
 
-const JUDGE_PERMISSION = {
+const VERIFIER_PERMISSION = {
   "*": "deny" as const,
   read: "allow" as const,
   grep: "allow" as const,
@@ -149,15 +149,15 @@ function buildStaticDenyMap(): Record<string, boolean> {
 }
 
 /**
- * HANDOVER.md point 3: the judge's static tools map — the deny map with the
+ * HANDOVER.md point 3: the verifier's static tools map — the deny map with the
  * five allowlisted read-only tools flipped to true. Not the control of
  * record (the host ignores `tools` on registration — see module header);
- * kept consistent with `JUDGE_PERMISSION` so a host that DOES honour it
+ * kept consistent with `VERIFIER_PERMISSION` so a host that DOES honour it
  * resolves the same capability the permission block grants.
  */
-function buildJudgeToolsMap(): Record<string, boolean> {
+function buildVerifierToolsMap(): Record<string, boolean> {
   const map = buildStaticDenyMap()
-  for (const name of JUDGE_ALLOWED_TOOLS) map[name] = true
+  for (const name of VERIFIER_ALLOWED_TOOLS) map[name] = true
   return map
 }
 
@@ -200,7 +200,7 @@ Four of those are gates, not steps:
 - **The plan gate** opens for multi-story implementation only; shut, the three
   steps after it do not apply.
 - **The plan** is recorded only after the user agrees to it.
-- **Each story** is claimed by you but closed only by the completion judge,
+- **Each story** is claimed by you but closed only by the completion verifier,
   which independently verifies your claim against the worktree.
 - **The report** is made only once every story is settled.
 
@@ -301,7 +301,7 @@ them are parallel — do not serialize them.
    ("\`NormalizedTrace\` has fields X/Y/Z", "\`make check\` passes") — \`verifiers\`,
    the exact commands that prove it, and \`tasks\` (each \`{ text, dependsOn? }\`).
    "It works" is not an acceptance criterion; "npm test passes and /health
-   returns 200" is. The completion judge reads these claims and checks them
+   returns 200" is. The completion verifier reads these claims and checks them
    against the real worktree — write them so an independent auditor could
    verify each one without asking you anything.
 
@@ -337,7 +337,7 @@ Where it is real, run the wave in this order:
    isolation is not integration passing.
 7. Checkpoint **each task** with \`elicify_vertex_plan_checkpoint\` (pass the
    \`taskId\`) as it finishes. A story **auto-completes** when all its tasks are
-   done — at which point the completion judge audits its acceptance items
+   done — at which point the completion verifier audits its acceptance items
    against the worktree and re-opens it with named gaps if the claim does not
    hold. The next wave of tasks (those whose dependencies are now complete)
    activates automatically. A checkpoint is a *claim*, not a close.
@@ -415,10 +415,10 @@ Documented tendencies; counteract them.
   \`taskId\`). A story auto-completes when all its tasks are done. Leaving a
   task silently open is not an ending.
 - **Checkpointing a task \`complete\` is a claim, not a close.** Once a story's
-  tasks are all done the completion judge independently audits that story at
+  tasks are all done the completion verifier independently audits that story at
   the next idle — reading the worktree and re-running its declared verifiers
   itself. Claim only what you have genuinely delivered and verified. If the
-  judge re-opens a story, it re-opens its tasks and names the exact acceptance
+  verifier re-opens a story, it re-opens its tasks and names the exact acceptance
   items that failed and why — fix those, verify, and checkpoint the tasks
   again.
 - **\`blocked\`/\`failed\` is not permanent.** Once whatever caused it is resolved,
@@ -542,25 +542,25 @@ export async function applyV2Config(
 
   cfgInput.agent = cfgInput.agent ?? {}
   // Always (re)write the internal subagent registrations (same rationale as
-  // the commands above — the judge's tool grant / maxSteps changed in the
+  // the commands above — the verifier's tool grant / maxSteps changed in the
   // redesign and must not be pinned to a stale persisted entry).
-  cfgInput.agent["vertex-judge"] = {
+  cfgInput.agent["vertex-verifier"] = {
     mode: "subagent",
     description:
-      "elicify-vertex internal judge subturn — read-only completion auditor; verifies claimed stories with read/grep/glob/list/bash; no write/edit.",
-    // HANDOVER.md point 3: allow-aware map + JUDGE_PERMISSION (reverses the
+      "elicify-vertex internal verifier subturn — read-only completion auditor; verifies claimed stories with read/grep/glob/list/bash; no write/edit.",
+    // HANDOVER.md point 3: allow-aware map + VERIFIER_PERMISSION (reverses the
     // old zero-tool registration).
-    tools: buildJudgeToolsMap(),
-    permission: JUDGE_PERMISSION,
+    tools: buildVerifierToolsMap(),
+    permission: VERIFIER_PERMISSION,
     // FR-008 — ADVISORY ONLY: THE HOST IGNORES THIS FIELD. Live probe
     // 2026-08-03 (opencode 1.18.x, spec Findings/FR-008): `opencode debug
     // agent` resolves `maxSteps: None` for this registration, and the same
-    // probe then watched the judge run THREE steps with TWO real tool calls
+    // probe then watched the verifier run THREE steps with TWO real tool calls
     // (`bash ls -la`, `read`; two `step-finish reason:"tool-calls"` rows in
     // the persisted parts). So the number below neither grants nor caps
     // anything — the previous comment here claimed the opposite of what the
     // probe found ("maxSteps 1 made the granted tools useless"; in fact an
-    // unresolved `None` did not make them useless either, and the judge's
+    // unresolved `None` did not make them useless either, and the verifier's
     // real defect was the payload/prompt path, FR-011). Kept rather than
     // deleted for the same reason as the `tools` map above: harmless, and
     // correct per the documented SDK `AgentConfig` type should a host ever
@@ -573,7 +573,7 @@ export async function applyV2Config(
     description: "elicify-vertex internal intake multi-story classification subturn — zero-tool.",
     tools: deny,
     permission: AGENT_PERMISSION,
-    // FR-008 — advisory only, same probe finding as the judge above: the
+    // FR-008 — advisory only, same probe finding as the verifier above: the
     // host resolves `None` here too. Intake's single-shot shape is carried
     // by its zero-tool `permission` block (a subturn with no tools has
     // nothing to spend a second step on), never by this field.

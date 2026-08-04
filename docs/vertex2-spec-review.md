@@ -58,7 +58,7 @@ none deferred" is not accurate as a statement about the underlying defects.
 #### [CRIT-001] Plugin-created child sessions re-enter the plugin's own hooks; no exclusion is specified
 
 - **Lens**: Insecurity / Incorrectness
-- **Affected section**: US-9 / FR-030, US-5 / FR-018, Integration Boundaries → "OpenCode SDK client (subturns: judge US-9, intake classification US-5)"; Edge Cases (no entry covers self-created sessions)
+- **Affected section**: US-9 / FR-030, US-5 / FR-018, Integration Boundaries → "OpenCode SDK client (subturns: verifier US-9, intake classification US-5)"; Edge Cases (no entry covers self-created sessions)
 - **Description**: The spec introduces two mechanisms that call `session.create({parentID})`
   + `session.prompt` from inside the plugin, and never states that the resulting child
   session must be excluded from the plugin's own `chat.message`,
@@ -72,14 +72,14 @@ none deferred" is not accurate as a statement about the underlying defects.
   Whether the harness *activates* on it depends on the child's agent — which the spec never
   specifies for either subturn (`SessionPromptData.body.agent` is optional; omitting it
   yields the host default). If the host default equals `opts.activeAgent` — the expected
-  configuration for this plugin — the gate activates on the judge's own child session.
+  configuration for this plugin — the gate activates on the verifier's own child session.
 - **Impact**: (a) `chat.message` pushes the activation cue directly into `output.parts`
   (`output.parts.push({type:"text", text:"\n"+cue})`, line ~1607) and
   `system.transform` appends the composed directive block to `output.system` — so the
-  judge subturn receives vertex directives and harness narration on top of the
+  verifier subturn receives vertex directives and harness narration on top of the
   "evidence-only" payload, breaking FR-031 and the Non-Behavior "must not send chat
-  narrative … to the judge, because the judge must not inherit coherence bias". (b) The
-  BDD scenario "Judge payload carries evidence only" and test 18/39 use a **stub client**,
+  narrative … to the verifier, because the verifier must not inherit coherence bias". (b) The
+  BDD scenario "Verifier payload carries evidence only" and test 18/39 use a **stub client**,
   so they assert what the plugin *builds* and are structurally incapable of detecting what
   the host+plugin *deliver* — the canary test passes while the leak ships. (c) Every
   subturn allocates entries in `ledger`, `taskModeBySession`, `reviewBySession`,
@@ -89,13 +89,13 @@ none deferred" is not accurate as a statement about the underlying defects.
   evaluates to a block, `attemptGateContinuation` issues another `session.prompt` on the
   child, and the spec defines no recursion depth bound.
 - **Recommendation**: Add **FR-036**: "The plugin MUST record the id of every session it
-  creates (judge and intake subturns) in a `selfCreatedSessions` set for the process
+  creates (verifier and intake subturns) in a `selfCreatedSessions` set for the process
   lifetime, and MUST return early from `chat.message`, `experimental.chat.system.transform`,
   `experimental.text.complete`, `tool.execute.after` and `event(session.idle)` for any
   session id in that set or whose `parentID` resolves to an active harness session. Subturn
   prompts MUST pass an explicit `agent` that is not `activeAgent`." Add an Edge Case row:
   "Harness-created child session → harness is inert for that session; no activation cue, no
-  directives, no gate, no ledger entry." Add BDD scenario "Judge subturn receives no
+  directives, no gate, no ledger entry." Add BDD scenario "Verifier subturn receives no
   harness injection" and an **integration** test (not a stub-only unit test) that drives
   the real hook set over a simulated child session and asserts `output.system` and
   `output.parts` are untouched. SC-012 MUST be restated over the delivered payload, not the
@@ -107,7 +107,7 @@ none deferred" is not accurate as a statement about the underlying defects.
 
 - **Lens**: Infeasibility / Insecurity (Elevation of Privilege)
 - **Affected section**: US-9 ("tool-calling disabled"), FR-030 ("one `session.prompt` with
-  judge system prompt, tool-calling disabled"), Integration Boundaries → "`tools`:
+  verifier system prompt, tool-calling disabled"), Integration Boundaries → "`tools`:
   `<tool-calling disabled>` … Grounded in SDK 1.18.4 … verified in
   `@opencode-ai/sdk/dist/gen/types.gen.d.ts`", STRIDE row "Tools explicitly disabled in
   prompt body"
@@ -120,11 +120,11 @@ none deferred" is not accurate as a statement about the underlying defects.
   built-ins plus every tool contributed by other plugins and by MCP servers, which are
   installation-specific and can change without a release of this plugin. Any name not
   enumerated is, by the shape of the map, not denied.
-- **Impact**: The judge child session runs against the same project directory with the same
-  permission configuration as the parent. A judge prompt containing adversarial content
+- **Impact**: The verifier child session runs against the same project directory with the same
+  permission configuration as the parent. A verifier prompt containing adversarial content
   from a diff summary (an attacker-authored source file is untrusted input that reaches the
   payload by design) could induce a `bash` or `edit` call that the spec believes is
-  impossible. The spec's only stated defence is prose in the judge system prompt, which is
+  impossible. The spec's only stated defence is prose in the verifier system prompt, which is
   not an authorization control. The STRIDE table records this component as **PASS** on
   Elevation of Privilege on the strength of a mechanism that does not exist as described.
 - **Recommendation**: Before implementation, confirm against the OpenCode server (not the
@@ -132,8 +132,8 @@ none deferred" is not accurate as a statement about the underlying defects.
   the prose in FR-030 with the concrete mechanism, e.g. **FR-030b**: "The subturn MUST pass
   `tools: {'*': false}` **and** an explicit `agent` bound to a zero-tool agent definition
   shipped with the plugin. If the host does not honour a deny-all key, the subturn MUST be
-  disabled and `judge:unsupported` logged rather than sent with a partial deny list." Add
-  BDD scenario "Judge subturn is refused when tools cannot be disabled" and a test that
+  disabled and `verifier:unsupported` logged rather than sent with a partial deny list." Add
+  BDD scenario "Verifier subturn is refused when tools cannot be disabled" and a test that
   asserts the exact `tools` value sent, plus a negative test asserting the subturn is not
   issued when the deny-all mechanism is unavailable. Downgrade the STRIDE row to `risk`
   until the mechanism is verified against a running host.
@@ -406,10 +406,10 @@ none deferred" is not accurate as a statement about the underlying defects.
 
 ---
 
-#### [MAJ-009] The judge payload secret scan covers only one of the three payload fields, and the scan itself is undefined
+#### [MAJ-009] The verifier payload secret scan covers only one of the three payload fields, and the scan itself is undefined
 
 - **Lens**: Insecurity (Information Disclosure)
-- **Affected section**: FR-031, US-9 AS-5, Dataset: Judge payload hygiene, SC-012
+- **Affected section**: FR-031, US-9 AS-5, Dataset: Verifier payload hygiene, SC-012
 - **Description**: FR-031 requires every field to pass `redactSecrets` and adds — as the F-04
   fix — that "**diff summaries** MUST additionally pass a strict secret-scanning check on the
   reassembled hunk". The payload has three fields (pinned criteria, diff summary, verifier output
@@ -422,7 +422,7 @@ none deferred" is not accurate as a statement about the underlying defects.
   (`sk-`, `ghp_`, `AKIA…`, JWT, URL userinfo); it has no generic high-entropy-token rule, so a
   bare 40-character hex API key with no label passes through untouched. The spec cites
   `redactSecrets` as the baseline without stating that limitation.
-- **Impact**: SC-012 ("100% of judge-payload dataset rows containing a secret … transmit without
+- **Impact**: SC-012 ("100% of verifier-payload dataset rows containing a secret … transmit without
   the offending hunk") is satisfied by a 4-row dataset whose only secret is `sk-live-abc123…` —
   a string the existing regex already catches. The criterion passes while the actual gap (unlabelled
   tokens, verifier stdout) is untested.
@@ -432,7 +432,7 @@ none deferred" is not accurate as a statement about the underlying defects.
   `src/redaction.ts` **plus** a Shannon-entropy rule: any whitespace-delimited token of ≥32
   characters with entropy ≥ 4.0 bits/char is treated as a secret. A field that trips the scan has
   the offending hunk/line removed; if removal leaves the field empty, the field is omitted and
-  `judge:field-dropped` is logged." Extend the hygiene dataset with rows for an unlabelled 40-hex
+  `verifier:field-dropped` is logged." Extend the hygiene dataset with rows for an unlabelled 40-hex
   token in verifier stdout, a token wrapped across two output lines, and a base64 blob in a criteria
   line.
 
@@ -477,7 +477,7 @@ none deferred" is not accurate as a statement about the underlying defects.
   **US-8 AS-1** (resolved profile recorded on the session *and on every subsequent event*) — test 16
   covers only unknown-model fallback; **US-10 AS-1** (every event carries `model` and `session_id`) —
   the traceability row for FR-033 says "(all event-emitting scenarios) … + harness assert", which
-  names no test. Additionally, the BDD scenario "Judge verdict appended without gating the checkpoint"
+  names no test. Additionally, the BDD scenario "Verifier verdict appended without gating the checkpoint"
   has no test traced to it (test 29 is the timeout path, test 36 is model selection, test 18 is the
   payload). The spec's own "Completeness check" asserts the opposite, and the superseded review
   recorded a 9/9 structural PASS with a scenario count (33 vs 37) that matches neither the spec nor
@@ -488,7 +488,7 @@ none deferred" is not accurate as a statement about the underlying defects.
   closes without blocking" (test 41, Integration), "Pre-commitment prompt renders before the first
   verifier" (MAJ-010), "Resolved profile is stamped on session init and every subsequent event"
   (extend test 16 with an event-stream assertion), "Every emitted event carries model and session id"
-  (property test over the event sink, test 42). Add a test entry for the judge happy path. Correct the
+  (property test over the event sink, test 42). Add a test entry for the verifier happy path. Correct the
   Completeness check to state the counts.
 
 ---
@@ -501,8 +501,8 @@ none deferred" is not accurate as a statement about the underlying defects.
   changes allowed"), Success Criteria (no rollout criterion)
 - **Description**: v2 rewrites the hook wiring, replaces the directive layer, changes the gate's
   trigger condition, breaks the plan schema (archiving v1 plans irreversibly on first contact, FR-022),
-  and renames every tool and slash command. The only runtime switches named anywhere are `VERTEX_JUDGE`
-  (judge only), `VERTEX_HOLDOUT` (measurement arms), `VERTEX_DATA` and `VERTEX_DEBUG`. There is no
+  and renames every tool and slash command. The only runtime switches named anywhere are `VERTEX_VERIFIER`
+  (verifier only), `VERTEX_HOLDOUT` (measurement arms), `VERTEX_DATA` and `VERTEX_DEBUG`. There is no
   switch that returns a user to v1 behaviour, no staged rollout, and no criterion for deciding the
   rollout succeeded. FR-022's archival is one-way, so downgrading the package does not restore a
   working plan. OPS-03 is unmet for the highest-risk symbol the spec's own Impact Assessment
@@ -550,14 +550,14 @@ none deferred" is not accurate as a statement about the underlying defects.
 
 - **Lens**: Incompleteness (data lifecycle) / Inoperability
 - **Affected section**: US-9, FR-030, FR-018, Integration Boundaries → OpenCode SDK client
-- **Description**: Every judge and intake subturn calls `session.create({parentID, title})`. The spec
+- **Description**: Every verifier and intake subturn calls `session.create({parentID, title})`. The spec
   specifies creation and prompting; it never specifies deletion or reuse. The SDK exposes
   `SessionDeleteData` (`types.gen.d.ts:1860`) and `SessionChildrenData` (:1946), so child sessions are
   both deletable and enumerable — i.e. user-visible. With FR-018 firing per qualifying user message
   (MAJ-007), a working day produces dozens of orphan child sessions per project.
 - **Impact**: The user's session list fills with harness artefacts titled by the plugin; storage grows
-  unbounded; the Evaluation Scenario "Judge outage is invisible to the user" is contradicted by a
-  visible trail of judge sessions.
+  unbounded; the Evaluation Scenario "Verifier outage is invisible to the user" is contradicted by a
+  visible trail of verifier sessions.
 - **Recommendation**: Add to FR-030: "The subturn MUST delete its child session via `session.delete`
   in a `finally` block, including on timeout, retry exhaustion and failure; deletion failure MUST be
   logged (`subturn:cleanup-failed`) and MUST NOT affect the caller." Alternatively specify a single
@@ -701,15 +701,15 @@ none deferred" is not accurate as a statement about the underlying defects.
 
 ### Observations
 
-#### [OBS-001] The `judgeModel` override and its fallback chain are configurability without a driver
+#### [OBS-001] The `verifierModel` override and its fallback chain are configurability without a driver
 
 - **Lens**: Overcomplexity
-- **Affected section**: FR-030a, US-9 AS-2/AS-3, BDD "Configured judgeModel failure falls back", test 36
+- **Affected section**: FR-030a, US-9 AS-2/AS-3, BDD "Configured verifierModel failure falls back", test 36
 - **Suggestion**: The spec's own argument for the default is that the session model "always works, no
   extra config". The override adds a plugin option, a two-step fallback chain (override → session model
   → fail open), one acceptance scenario, one BDD scenario and part of a test — for a capability nobody
   has asked for and whose failure path is already covered by fail-open. Consider deferring
-  `judgeModel` to a later version and deleting FR-030a's second sentence, US-9 AS-3 and its BDD
+  `verifierModel` to a later version and deleting FR-030a's second sentence, US-9 AS-3 and its BDD
   scenario. Test 36 then reduces to asserting the session model is used and the child is created with
   `parentID`.
 
@@ -758,7 +758,7 @@ none deferred" is not accurate as a statement about the underlying defects.
 | Every user story has acceptance scenarios | **PASS** | US-1…US-10 each carry 3–6 scenarios (41 total) |
 | Every acceptance scenario has BDD scenarios | **FAIL** | 41 acceptance scenarios vs 34 BDD scenarios; US-1 AS-3, US-6 AS-1, US-8 AS-1, US-10 AS-1 uncovered (MAJ-011) |
 | Every BDD scenario has `Traces to:` reference | **PASS** | All 34 carry `Traces to:` and `Category:` |
-| Every BDD scenario has a test in the TDD plan | **FAIL** | "Judge verdict appended without gating the checkpoint" has no test; tests 29/36/18 cover other paths (MAJ-011) |
+| Every BDD scenario has a test in the TDD plan | **FAIL** | "Verifier verdict appended without gating the checkpoint" has no test; tests 29/36/18 cover other paths (MAJ-011) |
 | Every FR appears in traceability matrix | **PASS** | FR-001…FR-035 plus FR-018a and FR-030a all present |
 | Every BDD scenario appears in traceability matrix | **PASS** | All 34 resolve to a matrix row by shorthand |
 | Test datasets cover boundaries/edges/errors | **FAIL** | No dataset for the intake pre-filter despite SC-011 citing one (MAJ-005); no dataset row for the zero-pinned-criteria gate state (CRIT-003); no dataset for cooldown windows > 1 turn (MAJ-002); no pins fault-injection rows despite SC-013 (MAJ-008) |
@@ -810,7 +810,7 @@ are both contradicted by direct counting.
 |---|---|---|
 | (none exists) Intake pre-filter | Threshold and word-list boundaries | New dataset: 119/120/121 chars; one row per sequencing word; Korean row; sequencing word inside a code fence; short multi-story asks ("refactor auth end-to-end"); message with file attachment |
 | Composer budget / cooldown / decay | Multi-`system.transform` turn; cooldown spanning a user message; five families competing for two slots | Add rows 7–9 |
-| Judge payload hygiene | Unlabelled 40-hex token; secret in verifier stdout; token wrapped across output lines; base64 blob in a criteria line | Add rows 5–8 |
+| Verifier payload hygiene | Unlabelled 40-hex token; secret in verifier stdout; token wrapped across output lines; base64 blob in a criteria line | Add rows 5–8 |
 | Checkpoint evidence validation | Waiver recorded by whom, and whether a waiver can be self-issued by the model | Add a row for a model-issued waiver (must be rejected) |
 | (none exists) Idle gate state matrix | Zero criteria × changed files × mode; two active sessions | New dataset covering the gate's decision table |
 | Narrowest-verifier resolution | Monorepo/workspace root with multiple `package.json` files; changed path outside the worktree | Add rows 9–10 |
@@ -821,7 +821,7 @@ are both contradicted by direct counting.
 
 | Component | S | T | R | I | D | E | Notes |
 |---|---|---|---|---|---|---|---|
-| Judge subturn (child session) | risk | ok | ok | **risk** | risk | **risk** | Tool disabling not expressible (CRIT-002); harness injects its own directives/cue into the payload (CRIT-001); scan covers one of three fields (MAJ-009); no per-session cap on paid calls |
+| Verifier subturn (child session) | risk | ok | ok | **risk** | risk | **risk** | Tool disabling not expressible (CRIT-002); harness injects its own directives/cue into the payload (CRIT-001); scan covers one of three fields (MAJ-009); no per-session cap on paid calls |
 | Intake classification subturn | risk | ok | ok | risk | **risk** | risk | Same re-entrancy and tools exposure; unbounded frequency and no cost budget (MAJ-007); user ask sent to a model with no stated redaction requirement |
 | Injection composer / `system.transform` | ok | ok | ok | ok | risk | ok | Budget starvation silences corrections (MAJ-001); `redactSecrets` applied per FR-007 |
 | Idle gate + `session.prompt` continuation | ok | ok | ok | ok | risk | ok | Fires on harness-created child sessions with no recursion bound (CRIT-001); caps preserved from v1 |
@@ -839,7 +839,7 @@ are both contradicted by direct counting.
 1. Why does the spec read the model id from `chat.message` (where it is `model?` — optional) rather
    than from `experimental.chat.system.transform` (where `model: Model` is **required**)? The latter is
    available on every injection and would make the `dosing:unknown-model` path nearly unreachable.
-2. Which agent do the judge and intake subturns run as? The answer determines whether the harness
+2. Which agent do the verifier and intake subturns run as? The answer determines whether the harness
    activates on its own child sessions (CRIT-001) and whether the subturn inherits the user's agent
    instructions — which would itself violate the evidence-only diet.
 3. What is the cost budget for v2? Two subturn mechanisms issue paid model calls on the user's critical
@@ -874,7 +874,7 @@ block gets a strictly weaker harness than v1 ships today, and no listed test can
 gate scenario begins from pinned criteria. CRIT-001 is grounded in this repository's own v1 code:
 `attemptGateContinuation` exists in its current shape *because* `session.prompt` re-enters
 `chat.message`, and the spec adds two more `session.prompt` call sites without ever excluding the
-sessions it creates — so the judge receives the harness's own directives and activation cue on top of
+sessions it creates — so the verifier receives the harness's own directives and activation cue on top of
 the payload FR-031 promises is evidence-only, and the stub-client test design cannot detect it.
 CRIT-002 is a capability claim the spec presents as verified: `SessionPromptData.body.tools` is a
 per-tool-name boolean map, which does not express "tool-calling disabled", and the STRIDE table records
@@ -906,7 +906,7 @@ dataset and test layers, which is also where the four uncovered acceptance scena
 - [ ] MAJ-008 / MAJ-014 — add FR-013a (pins keying, lock, expiry, deletion) and subturn `session.delete` cleanup; add test 40 and retarget SC-013
 - [ ] MAJ-009 — extend the strict scan to all three payload fields; define the scan; add four hygiene dataset rows
 - [ ] MAJ-010 — move the pre-commitment prompt to a phase-entry injection (FR-023a) with a scenario and test
-- [ ] MAJ-011 — add BDD scenarios and tests for US-1 AS-3, US-6 AS-1, US-8 AS-1, US-10 AS-1 and the judge happy path; correct the Completeness check
+- [ ] MAJ-011 — add BDD scenarios and tests for US-1 AS-3, US-6 AS-1, US-8 AS-1, US-10 AS-1 and the verifier happy path; correct the Completeness check
 - [ ] MAJ-012 — add `VERTEX_V2=0` and reversible archival (FR-036/FR-022); add SC-014
 - [ ] MAJ-013 — decide the frontier proactive-fix license: delete the profile qualifier, or add FR-029a with hard bounds
 - [ ] Fix MIN-001…MIN-009 and answer the ten unasked questions, encoding each decision into the spec

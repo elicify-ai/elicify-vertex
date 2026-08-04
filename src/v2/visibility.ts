@@ -62,7 +62,7 @@ export type VisibilityMode = "off" | "gates" | "all"
  *   - `"gate"` — a gate fired (a tool call was blocked / a precondition
  *     refused). Low volume, high importance.
  *   - `"health"` — a harness health or failure signal: `verify:relevance-gap`,
- *     `judge:unavailable`, a verified command that minted no receipt, or a
+ *     `verifier:unavailable`, a verified command that minted no receipt, or a
  *     turn whose directive drop rate hit ≥90% (FR-061). This is the class of
  *     event whose invisibility cost 94 minutes in the field session.
  */
@@ -187,7 +187,7 @@ function isVisibilityMode(value: string): value is VisibilityMode {
  *   1. `VERTEX_VISIBLE=0` — the kill switch. It wins over *everything*,
  *      including an explicit `visibility: "all"` in plugin options, because
  *      its whole purpose is "make this stop right now" without editing
- *      config. (Same shape as the existing `VERTEX_JUDGE=0` switch in
+ *      config. (Same shape as the existing `VERTEX_VERIFIER=0` switch in
  *      plugin.ts.)
  *   2. An explicit, valid option value.
  *   3. `"all"` — the default. Chosen deliberately: the failure this story
@@ -383,7 +383,7 @@ export class VisibilityNotifier {
    *   1. **mode** — in `"off"` no work happens at all, and no clock is read,
    *      so a disabled notifier is genuinely inert.
    *   2. **window roll** — a stale window is closed (and its roll-up summary
-   *      emitted) before this event is judged, so an event arriving after a
+   *      emitted) before this event is verifierd, so an event arriving after a
    *      quiet minute is measured against a fresh budget.
    *   3. **dedupe** — a duplicate is not an event at all; it must not consume
    *      cap budget nor inflate the suppressed count.

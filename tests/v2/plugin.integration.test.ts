@@ -50,8 +50,8 @@ function denyAllAgent(name: string): Agent {
     mode: "subagent",
     builtIn: false,
     // Deny the UNION of both probe policies so the same stub satisfies the
-    // intake default policy (edit/bash/webfetch) AND the judge's
-    // JUDGE_PROBE_POLICY (edit/write/webfetch/task) — see src/v2/subturn.ts.
+    // intake default policy (edit/bash/webfetch) AND the verifier's
+    // VERIFIER_PROBE_POLICY (edit/write/webfetch/task) — see src/v2/subturn.ts.
     permission: { edit: "deny", write: "deny", bash: { "*": "deny" }, webfetch: "deny", task: "deny" },
     tools: { bash: false, edit: false, write: false, webfetch: false, read: false, task: false, "*": false },
     options: {},
@@ -73,8 +73,8 @@ interface StubClient {
 function makeStubClient(
   opts: {
     promptText?: (agent: string | undefined) => string
-    /** `gate.ts`'s `fetchJudgeTranscriptFields` override — mirrors
-     * `tests/v2/integration-judge.test.ts`'s identical escape hatch. Defaults
+    /** `gate.ts`'s `fetchVerifierTranscriptFields` override — mirrors
+     * `tests/v2/integration-verifier.test.ts`'s identical escape hatch. Defaults
      * to the existing empty-history stub so every test that doesn't care
      * about transcript content is unaffected. */
     messagesImpl?: (args: { path?: { id?: string } }) => Promise<{ data?: unknown; error?: unknown }>
@@ -100,7 +100,7 @@ function makeStubClient(
     return { data: [], error: undefined }
   })
   const appAgents = vi.fn(async () => ({
-    data: [denyAllAgent("vertex-judge"), denyAllAgent("vertex-intake")],
+    data: [denyAllAgent("vertex-verifier"), denyAllAgent("vertex-intake")],
     error: undefined,
   }))
   const toolIds = vi.fn(async () => ({ data: ["bash", "edit", "write", "webfetch", "read"], error: undefined }))
@@ -122,7 +122,7 @@ let savedVertexData: string | undefined
 // this isolation they read/append to the real shared
 // ~/.config/opencode/.vertex-events.jsonl — contaminated by whatever a prior
 // run (in this shared devpod, or a previous test file) left there. Sibling
-// files (integration-judge.test.ts) already isolate via VERTEX_DATA; this one
+// files (integration-verifier.test.ts) already isolate via VERTEX_DATA; this one
 // didn't, and this diff doubled its reliance on readEvents() (5 -> 10 call
 // sites), doubling exposure to the gap.
 beforeEach(() => {
@@ -138,7 +138,7 @@ afterEach(() => {
   if (savedVertexData === undefined) delete process.env.VERTEX_DATA
   else process.env.VERTEX_DATA = savedVertexData
   delete process.env.VERTEX_V2
-  delete process.env.VERTEX_JUDGE
+  delete process.env.VERTEX_VERIFIER
 })
 
 function pluginInput(client: unknown): PluginInput {
@@ -388,12 +388,12 @@ describe("verification receipt surfaced to the model (v1 parity fix)", () => {
     // checkpoint receiptId" — i.e. the OLD elicify_vertex_plan_checkpoint
     // validated per-item receipt/waiver citations (FR-020) and accepted that
     // id. That citation apparatus is GONE: a checkpoint is now a bare CLAIM on
-    // a TASK id, and the completion judge (at idle) is the sole arbiter of
+    // a TASK id, and the completion verifier (at idle) is the sole arbiter of
     // whether the claim holds. The receipt is still minted by
     // tool.execute.after's unchanged verification-recognition path, so the
     // coverage preserved here is its task-model equivalent: the verifier
     // still surfaces a receipt, AND a task-level claim completes the story
-    // WITHOUT quoting any receipt/waiver (the judge audits it later).
+    // WITHOUT quoting any receipt/waiver (the verifier audits it later).
     const client = makeStubClient()
     const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
     const sid = "receipt-checkpoint-session"
@@ -437,7 +437,10 @@ describe("promise-no-act port: stale text cleared by the next tool call", () => 
   function promiseTexts(client: StubClient): string[] {
     return client.session.prompt.mock.calls
       .map((call: unknown[]) => (call[0] as { body?: { parts?: Array<{ text?: string }> } })?.body?.parts?.[0]?.text ?? "")
-      .filter((text: string) => text.includes("vertex:promise-no-act"))
+      // The `[vertex:...]` marker is stripped at dispatch so the model reads
+      // a continuation as an instruction, not as harness output — match the
+      // directive's own wording. The family stays in the event log.
+      .filter((text: string) => text.includes("states an intent to do further work"))
   }
 
   it("does not block on a deferral phrase that predates the latest tool call", async () => {
@@ -650,7 +653,7 @@ describe("turn boundaries: a turn is a prompt, not an agent-loop step", () => {
 // mechanism was real and reachable; a SEPARATE live UAT run that appeared
 // to "stay active the whole time" only avoided it because a real model,
 // given one open-ended tool-calling turn, executed the entire plan
-// lifecycle (create, write, verify, checkpoint, judge) autonomously inside
+// lifecycle (create, write, verify, checkpoint, verifier) autonomously inside
 // that FIRST turn, before any second discrete chat.message ever arrived to
 // exercise the deactivation branch at all -- not because the branch didn't
 // fire once a genuine second turn showed up.
@@ -1406,7 +1409,7 @@ describe("persisted receipts survive a restart and are visible to the gate", () 
     // is the persistence/hydration path itself: the receipt is minted by
     // instance A's tool.execute.after and the hydrated store is observable
     // after a restart, while the task-level claim completes the story with no
-    // citation (the completion judge, not the checkpoint, audits claims).
+    // citation (the completion verifier, not the checkpoint, audits claims).
     const clientA = makeStubClient()
     const hooksA = await ElicifyVertexPluginV2(pluginInput(clientA), undefined)
     const sid = "restart-session"
@@ -1699,33 +1702,33 @@ describe("a verifier unrelated to any work does not evidence criteria", () => {
 })
 
 // ===========================================================================
-// fetchJudgeTranscriptFields (gate.ts) wired through the REAL plugin here too
+// fetchVerifierTranscriptFields (gate.ts) wired through the REAL plugin here too
 // — the fuller property-based coverage (last-assistant-not-last-user, turn
-// window, both response shapes) lives in tests/v2/integration-judge.test.ts;
+// window, both response shapes) lives in tests/v2/integration-verifier.test.ts;
 // this confirms the same `messagesImpl` override on THIS file's own stub
 // client is genuinely wired end to end, not dead code added but never
 // exercised.
 // ===========================================================================
 
-describe("fetchJudgeTranscriptFields: messagesImpl override wired through this file's stub client", () => {
+describe("fetchVerifierTranscriptFields: messagesImpl override wired through this file's stub client", () => {
   it("lastResponse resolves to the parent's last assistant message, fetched via the messagesImpl override", async () => {
-    process.env.VERTEX_JUDGE = "1"
+    process.env.VERTEX_VERIFIER = "1"
     const transcript = [
       { info: { id: "m1", role: "user" }, parts: [{ type: "text", text: "please finish" }] },
-      { info: { id: "m2", role: "assistant" }, parts: [{ type: "text", text: "final assistant answer for the judge to see" }] },
+      { info: { id: "m2", role: "assistant" }, parts: [{ type: "text", text: "final assistant answer for the verifier to see" }] },
     ]
     const client = makeStubClient({
       promptText: (agent) =>
-        agent === "vertex-judge"
+        agent === "vertex-verifier"
           ? '{"stories":[{"storyId":"S1","pass":true,"summary":"ok","items":[{"itemId":"A1","met":true,"note":"observed"}]}]}'
           : '{"multiStory":false}',
       messagesImpl: async () => ({ data: transcript, error: undefined }),
     })
     const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
-    const sid = "plugin-judge-transcript-session"
+    const sid = "plugin-verifier-transcript-session"
 
     // "fix a typo in the readme" matches TRIVIAL_ASK_RE, skipping the intake
-    // classification subturn (see tests/v2/integration-judge.test.ts's
+    // classification subturn (see tests/v2/integration-verifier.test.ts's
     // identical setup helper for the same reasoning).
     await activate(hooks, sid, "fix a typo in the readme", { providerID: "minimax", id: "MiniMax-M3" })
 
@@ -1754,12 +1757,12 @@ describe("fetchJudgeTranscriptFields: messagesImpl override wired through this f
 
     await idle(hooks, sid)
 
-    const judgeCall = client.session.prompt.mock.calls
+    const verifierCall = client.session.prompt.mock.calls
       .map((c) => c[0] as { body?: { agent?: string; parts?: Array<{ text?: string }> } })
-      .find((c) => c.body?.agent === "vertex-judge")
-    expect(judgeCall, "the judge subturn must have been invoked").toBeDefined()
-    const payload = JSON.parse(judgeCall!.body!.parts![0]!.text!) as { lastResponse?: string }
-    expect(payload.lastResponse).toBe("final assistant answer for the judge to see")
+      .find((c) => c.body?.agent === "vertex-verifier")
+    expect(verifierCall, "the verifier subturn must have been invoked").toBeDefined()
+    const payload = JSON.parse(verifierCall!.body!.parts![0]!.text!) as { lastResponse?: string }
+    expect(payload.lastResponse).toBe("final assistant answer for the verifier to see")
   })
 })
 

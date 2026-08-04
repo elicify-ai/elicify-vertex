@@ -4,7 +4,7 @@ End-user install and “how to use” stay in the root [README](../README.md).
 This directory holds developer and power-user detail, grounded in the package source.
 
 Vertex is three mechanisms, not one: a **behavioural contract** before the work,
-**live detection and correction** during it, and an **independent judge** that
+**live detection and correction** during it, and an **independent verifier** that
 rules on the outcome against your repo. [ARCHITECTURE.md](./ARCHITECTURE.md)
 explains how they fit together.
 
@@ -17,7 +17,7 @@ explains how they fit together.
 
 **Package:** `@elicify-ai/elicify-vertex` (see root `package.json`)
 
-**Primary sources:** `src/v2/*` (current harness — plugin, gate, judge, story, coverage), `src/plugin.ts` (host entry), and `src/index.ts`, `src/goals.ts`, `src/measurement.ts`, `src/redaction.ts` (v1 loop and shared primitives)
+**Primary sources:** `src/v2/*` (current harness — plugin, gate, verifier, story, coverage), `src/plugin.ts` (host entry), and `src/index.ts`, `src/goals.ts`, `src/measurement.ts`, `src/redaction.ts` (v1 loop and shared primitives)
 
 ## Governance & legal
 
@@ -35,7 +35,7 @@ explains how they fit together.
 
 | Doc | Purpose |
 |-----|---------|
-| [JUDGE-PROMPT.md](./JUDGE-PROMPT.md) | The completion judge's prompt and contract |
-| [JUDGE-RELIABILITY-FIXES-SPEC.md](./JUDGE-RELIABILITY-FIXES-SPEC.md) | Judge reliability spec + the review rounds behind it |
+| [VERIFIER-PROMPT.md](./VERIFIER-PROMPT.md) | The completion verifier's prompt and contract |
+| [VERIFIER-RELIABILITY-FIXES-SPEC.md](./VERIFIER-RELIABILITY-FIXES-SPEC.md) | Verifier reliability spec + the review rounds behind it |
 | [REQUIREMENTS-INJECTION-VISIBILITY.md](./REQUIREMENTS-INJECTION-VISIBILITY.md) | Operator-agreed visibility of harness inject/steering |
 | [keyword-inject.html](./keyword-inject.html) | Keyword detection → when inject fires |

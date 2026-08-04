@@ -115,20 +115,20 @@ Detection hardening (no regressions vs fablize):
 - Stop-loop: in-flight guard prevents duplicate `session.prompt` on a second idle
 - Prompts: single `[id]` header, no envelope timestamp, "follow these directives; do not quote"; deep/normal advisory no longer instructs the model to ignore it; promise text gives an actually satisfiable escape
 
-## The completion judge
+## The completion verifier
 
 The stop gate above is layer two — it corrects the loop while it runs. Layer
 three decides whether the work is actually **done**.
 
 When you use the plan tools, checkpointing a task is a **claim**, not a close.
 Once every task in a story is complete, at the next idle the harness opens a
-**separate `vertex-judge` session** that:
+**separate `vertex-verifier` session** that:
 
 1. reads the real worktree — files, commands, output — not the model's summary of it;
 2. rules on each of the story's `acceptanceItems` individually;
 3. either confirms the story, or **reverts it** and names the exact items that failed and why.
 
-The session that did the work has no vote. The judge is registered with
+The session that did the work has no vote. The verifier is registered with
 `write`, `edit` and `task` denied and `read`/`grep`/`glob`/`list`/`bash`
 allowed — it can read the tree and run your verifiers, but it has no edit tool
 to quietly "fix" what it is auditing.
@@ -143,14 +143,33 @@ rather than looping.
 | | What it is | How strict |
 |---|---|---|
 | **Technical checks** (`verifiers`, receipts) | Evidence: "this command ran and exited 0" | Loose — any declared verifier the observed command covers counts |
-| **Acceptance criteria** | Whether the story was actually delivered | Settled by **judgement**, against the repo |
+| **Acceptance criteria** | Whether the story was actually delivered | Settled by **verifierment**, against the repo |
 
-A passing check never approves a story. That is the judge's job, and only the
-judge's.
+A passing check never approves a story. That is the verifier's job, and only the
+verifier's.
 
-**Writing acceptance criteria the judge can use.** Write them so an independent
+**Writing acceptance criteria the verifier can use.** Write them so an independent
 auditor could check each one without asking you anything. "It works" is not an
 acceptance criterion; "`npm test` passes and `/health` returns 200" is.
+
+
+## Why harness continuations read as plain instructions
+
+When the harness re-prompts a session (verifier revert, stop-block,
+promise-no-act, plan-incomplete), the message is dispatched through
+`session.prompt` — so it arrives as a **user-role message** and carries the
+same authority as something you typed.
+
+It used to be prefixed `[vertex] completion paused …` / `[vertex:stop-block]`.
+That prefix told the model the message came from an automated harness, which
+is an invitation to discount it. Both markers are now stripped from what the
+model receives.
+
+Nothing is hidden from **you**: every dispatch is recorded as a
+`gate:continuation-dispatched` event in `.vertex-events.jsonl` with its
+`family` (`verifier`, `stop-block`, `promise-no-act`, `plan-incomplete`, …)
+and the first 500 characters of the text. That is how you tell harness
+steering from your own words when reading a transcript.
 
 ## Goals tools
 

@@ -1,45 +1,45 @@
 /**
- * Vertex 2 — Tier-3 judge as an in-loop subturn (US-9, FR-030/FR-030a/FR-031/FR-032;
+ * Vertex 2 — Tier-3 verifier as an in-loop subturn (US-9, FR-030/FR-030a/FR-031/FR-032;
  * redesigned per HANDOVER.md points 2-4, user decision 2026-07-29).
  *
- * The judge is now the SOLE ARBITER of story/plan completion (point 2), run
+ * The verifier is now the SOLE ARBITER of story/plan completion (point 2), run
  * at session.idle over stories that CLAIMED complete. It is no longer a
  * zero-tool evidence-summarizer: it gets read-only tools (read/grep/glob/
- * list/bash, point 3 — `subturn.ts`'s `JUDGE_PROBE_POLICY`) so it can
+ * list/bash, point 3 — `subturn.ts`'s `VERIFIER_PROBE_POLICY`) so it can
  * independently re-run a story's declared verifiers rather than trusting
  * the transcript, and it answers with STRUCTURED per-acceptance-item
  * verdicts (point 4 — `{stories: [{storyId, pass, summary, items:
  * [{itemId, met, note}]}]}`) instead of the old prose `{fit, summary,
  * gaps}`. The motivating evidence: a real 894-message field session ended
  * 5/5 stories blocked with genuinely-completed work the harness could not
- * credit, and the zero-tool judge never fired to rescue it.
+ * credit, and the zero-tool verifier never fired to rescue it.
  *
  * Two responsibilities, kept in one module because they share the same
  * "evidence only, fail open" posture:
  *
- *  - `buildJudgePayload` (FR-031, review MAJ-009; extended by
- *    `docs/JUDGE-PROMPT.md` §5): turns raw criteria/diff/verifier/
+ *  - `buildVerifierPayload` (FR-031, review MAJ-009; extended by
+ *    `docs/VERIFIER-PROMPT.md` §5): turns raw criteria/diff/verifier/
  *    lastResponse/recentTranscript text into the five-field payload sent to
- *    the judge subturn, after a strict scan (secret patterns + a
+ *    the verifier subturn, after a strict scan (secret patterns + a
  *    Shannon-entropy rule, via `redactSecrets`) applied to the *reassembled,
  *    untruncated* field so a secret split across a chunk/line boundary — OR
  *    sitting past where a length cap would otherwise cut — is still caught.
  *    A field emptied by the scan is omitted from the payload entirely. ONLY
  *    AFTER scanning, the surviving (already-scanned) text is truncated to its
- *    cap (`JUDGE_PAYLOAD_FIELD_CHAR_CAP` for four of the five fields;
- *    `JUDGE_TRANSCRIPT_FIELD_CHAR_CAP` for `recentTranscript`) and logs
- *    `judge:field-truncated` (MINOR fix, post-review: this used to be
+ *    cap (`VERIFIER_PAYLOAD_FIELD_CHAR_CAP` for four of the five fields;
+ *    `VERIFIER_TRANSCRIPT_FIELD_CHAR_CAP` for `recentTranscript`) and logs
+ *    `verifier:field-truncated` (MINOR fix, post-review: this used to be
  *    silent, so a verdict built from truncated evidence was
  *    indistinguishable after the fact from one built from the complete
  *    field). C-9 fix (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md): this
  *    scan-then-truncate order is deliberately the reverse of the pipeline's
  *    original truncate-then-scan order — see `truncateField`'s doc comment
  *    for why the old order let a secret straddling the cap boundary leak
- *    almost whole. One consequence: `judge:field-dropped` (the field's scan
- *    removed everything) and `judge:field-truncated` (the surviving text was
+ *    almost whole. One consequence: `verifier:field-dropped` (the field's scan
+ *    removed everything) and `verifier:field-truncated` (the surviving text was
  *    still too long) are now mutually exclusive for a given field within one
  *    call — a fully-dropped field has nothing left to truncate.
- *  - `runJudge` (FR-030/FR-030a/FR-030b/FR-032): gates on `subturn.ts`'s
+ *  - `runVerifier` (FR-030/FR-030a/FR-030b/FR-032): gates on `subturn.ts`'s
  *    `probeCapabilityBounded` (the probe + deny-map build, bounded by the
  *    SAME 5s budget as everything that follows — CRITICAL fix, see that
  *    function's doc comment: the budget clock now starts before the probe,
@@ -49,46 +49,46 @@
  *    ever throwing.
  *
  * Both are fail-open by construction: nothing in this file throws out to a
- * caller on a judge-side problem — every failure mode resolves to a typed
- * "no verdict" result (see the `JudgeRunResult` deviation note below).
+ * caller on a verifier-side problem — every failure mode resolves to a typed
+ * "no verdict" result (see the `VerifierRunResult` deviation note below).
  */
 
 import { redactSecrets } from "../redaction.js"
-import { JUDGE_PROBE_POLICY, probeCapabilityBounded, runSubturn, type SelfCreatedSessions, type SubturnResult } from "./subturn.js"
+import { VERIFIER_PROBE_POLICY, probeCapabilityBounded, runSubturn, type SelfCreatedSessions, type SubturnResult } from "./subturn.js"
 import type { EventLogger, OpencodeClient } from "./types.js"
 
 // ---------------------------------------------------------------------------
-// buildJudgePayload — FR-031
+// buildVerifierPayload — FR-031
 // ---------------------------------------------------------------------------
 
 /**
  * Deviation from `docs/vertex2-module-contracts.md` section 8: the contract
- * declares `interface JudgePayload { criteria: string[]; diffSummary: string;
+ * declares `interface VerifierPayload { criteria: string[]; diffSummary: string;
  * verifierSummaries: string[] }` with all three fields required. FR-031 and
- * Dataset: Judge payload hygiene row 7 both require that a field emptied by
+ * Dataset: Verifier payload hygiene row 7 both require that a field emptied by
  * the strict scan be *omitted* (the key absent, not an empty string/array),
- * which the contract's own required-fields shape cannot express. `JudgePayload`
+ * which the contract's own required-fields shape cannot express. `VerifierPayload`
  * is therefore `Partial` here — every field is optional, present only when
  * it survived scanning with content. Document this prominently: wave-3 wiring
  * must treat all three keys as possibly-absent when rendering the close-out
  * report / subturn prompt.
  *
- * `docs/JUDGE-PROMPT.md` §5 adds two more fields on the same terms —
+ * `docs/VERIFIER-PROMPT.md` §5 adds two more fields on the same terms —
  * `lastResponse` (the parent's last assistant message, verbatim) and
  * `recentTranscript` (a bounded recent window, both roles) — sourced,
  * redacted and capped exactly like the original three (see `gate.ts`'s
- * `appendJudgeCloseOut`, which fetches them via `client.session.messages`
- * and passes them into `buildJudgePayload` alongside the existing three raw
+ * `appendVerifierCloseOut`, which fetches them via `client.session.messages`
+ * and passes them into `buildVerifierPayload` alongside the existing three raw
  * fields). Same absent-when-emptied rule applies.
  *
  * HANDOVER.md point 4 adds a sixth field, `plan`: a rendered plan digest
  * (stories, statuses, acceptance items, declared verifiers) supplied by the
- * caller, so the judge audits against the plan's own claims rather than a
+ * caller, so the verifier audits against the plan's own claims rather than a
  * flattened criteria list. Same pipeline as `recentTranscript`
  * (scan-then-truncate via `scanProseField`), with its own 4000-char cap
- * (`JUDGE_PLAN_FIELD_CHAR_CAP`).
+ * (`VERIFIER_PLAN_FIELD_CHAR_CAP`).
  */
-export interface JudgePayload {
+export interface VerifierPayload {
   criteria?: string[]
   diffSummary?: string
   verifierSummaries?: string[]
@@ -97,7 +97,7 @@ export interface JudgePayload {
   plan?: string
 }
 
-interface RawJudgePayload {
+interface RawVerifierPayload {
   criteria: string[]
   diffSummary: string
   verifierSummaries: string[]
@@ -128,35 +128,35 @@ interface RawJudgePayload {
  * spec for this payload — FR-031's own text only says the scan "runs on the
  * transmitted bytes, i.e. after any summary truncation" without naming the
  * pipeline stage or the number. Judgment call: 2000 chars/field is a generous
- * bound for evidence text (a judge subturn needs a *summary*, not a full
+ * bound for evidence text (a verifier subturn needs a *summary*, not a full
  * transcript) while comfortably exercising the boundary dataset row's
  * 4,000-char oversized input. Applied uniformly to `criteria`,
- * `verifierSummaries`, `diffSummary` and `lastResponse` (`docs/JUDGE-PROMPT.md`
- * §5: "the existing JUDGE_PAYLOAD_FIELD_CHAR_CAP ... same cap as every other
+ * `verifierSummaries`, `diffSummary` and `lastResponse` (`docs/VERIFIER-PROMPT.md`
+ * §5: "the existing VERIFIER_PAYLOAD_FIELD_CHAR_CAP ... same cap as every other
  * field"), even though only the verifier-summary row is tested.
  */
-const JUDGE_PAYLOAD_FIELD_CHAR_CAP = 2000
+const VERIFIER_PAYLOAD_FIELD_CHAR_CAP = 2000
 
 /**
- * `docs/JUDGE-PROMPT.md` §5's proposed cap for `recentTranscript`: "roughly
+ * `docs/VERIFIER-PROMPT.md` §5's proposed cap for `recentTranscript`: "roughly
  * double [the per-field cap], since it carries multiple turns of nuance
  * rather than one fact. Not measured against anything; a real number to
  * argue with, not a claim." Kept as its own named constant (not derived from
- * `JUDGE_PAYLOAD_FIELD_CHAR_CAP * 2`) so it can be tuned independently
+ * `VERIFIER_PAYLOAD_FIELD_CHAR_CAP * 2`) so it can be tuned independently
  * without touching the other four fields' cap.
  */
-const JUDGE_TRANSCRIPT_FIELD_CHAR_CAP = 4000
+const VERIFIER_TRANSCRIPT_FIELD_CHAR_CAP = 4000
 
 /**
  * HANDOVER.md point 4: the `plan` field's cap. Originally 4000 chars, copied
  * from `recentTranscript` on a "several turns of nuance" sizing argument —
  * i.e. a guess, never measured against a real digest.
  *
- * FR-006 (docs/JUDGE-RELIABILITY-FIXES-SPEC.md, User Story 6) raises it to
+ * FR-006 (docs/VERIFIER-RELIABILITY-FIXES-SPEC.md, User Story 6) raises it to
  * 16000 from a MEASUREMENT, not taste. In the audited live session
- * (`ses_04dc77bdaffej8SFJvYm5yO0CW`) `judge:field-truncated {plan,
+ * (`ses_04dc77bdaffej8SFJvYm5yO0CW`) `verifier:field-truncated {plan,
  * originalLength: 6411-6425, cap: 4000}` fired on all 9 audit runs, and the
- * judge then FAILed stories citing exactly the content the cap had removed
+ * verifier then FAILed stories citing exactly the content the cap had removed
  * ("the verifier command is incomplete in the digest", "S5 has no
  * independent verifier set in the digest") — a self-inflicted false FAIL.
  * The `originalLength` in those events is the POST-scan length; the RAW
@@ -166,7 +166,7 @@ const JUDGE_TRANSCRIPT_FIELD_CHAR_CAP = 4000
  * already binds on the very plan that motivated it.
  *
  * Raising the cap does NOT unbound cost or weaken redaction:
- *  - `JUDGE_PAYLOAD_RAW_FIELD_SAFETY_CAP` (100_000) still drops a
+ *  - `VERIFIER_PAYLOAD_RAW_FIELD_SAFETY_CAP` (100_000) still drops a
  *    pathological raw field WHOLE before scanning, so scan cost stays
  *    bounded (US6 AS2's "the bound is raised, not removed").
  *  - the scan still runs on the full reassembled field BEFORE truncation
@@ -174,9 +174,9 @@ const JUDGE_TRANSCRIPT_FIELD_CHAR_CAP = 4000
  *    (US6 AS3) — a bigger cap only means less scanned-clean text is thrown
  *    away afterward.
  *  - truncation above 16000 still happens and still logs
- *    `judge:field-truncated`.
+ *    `verifier:field-truncated`.
  */
-const JUDGE_PLAN_FIELD_CHAR_CAP = 16000
+const VERIFIER_PLAN_FIELD_CHAR_CAP = 16000
 
 /**
  * C-9 follow-up, cost regression (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md):
@@ -186,7 +186,7 @@ const JUDGE_PLAN_FIELD_CHAR_CAP = 16000
  * `verifierSummaries`/`diffSummary` are already bounded upstream
  * (`plugin.ts`'s `.slice(-2000)`, `computeBoundedDiffStat`'s 4000-char cap)
  * before they ever reach here, but `lastResponse`/`recentTranscript` are
- * not — `wiring/gate.ts`'s own comment on `JUDGE_RECENT_TRANSCRIPT_TURN_WINDOW`
+ * not — `wiring/gate.ts`'s own comment on `VERIFIER_RECENT_TRANSCRIPT_TURN_WINDOW`
  * says outright the turn count is "a soft pre-filter, not the real bound."
  * Measured: a 2MB single-line field takes ~45ms to scan; a
  * 1.37MB/20,000-line field ~270ms.
@@ -202,7 +202,7 @@ const JUDGE_PLAN_FIELD_CHAR_CAP = 16000
  * so it never engages for genuine evidence text — only for a pathological or
  * DoS-shaped input.
  */
-const JUDGE_PAYLOAD_RAW_FIELD_SAFETY_CAP = 100_000
+const VERIFIER_PAYLOAD_RAW_FIELD_SAFETY_CAP = 100_000
 
 /**
  * Standard Shannon entropy, bits per character, over the token's own
@@ -239,7 +239,7 @@ const ENTROPY_THRESHOLD_BITS = 4.0
  * tolerance is applied so a near-theoretical-max token (as genuine random
  * hex/base32 secrets are) still trips the rule, while ordinary prose stays
  * safely excluded (row 9's 40-char English word-run measures ~2.99-3.29
- * bits/char in practice — see tests/v2/judge.test.ts — nowhere near this
+ * bits/char in practice — see tests/v2/verifier.test.ts — nowhere near this
  * threshold even with the tolerance applied).
  */
 const ENTROPY_TOLERANCE_BITS = 0.05
@@ -309,10 +309,10 @@ function tripsEntropyScan(text: string): boolean {
  * regardless of entropy. Natural-language prose does not produce 32+
  * consecutive hex-alphabet characters as one token; the realistic
  * false-positive cost is git full-SHA/hash-shaped IDs (also hex, also long)
- * being dropped when they appear in evidence text — accepted, since a judge
+ * being dropped when they appear in evidence text — accepted, since a verifier
  * subturn losing one line of context is far cheaper than a leaked secret.
  *
- * Deliberately kept LOCAL to the judge payload pipeline, not added to
+ * Deliberately kept LOCAL to the verifier payload pipeline, not added to
  * `redaction.ts`'s shared `SECRET_PATTERNS` (which also backs
  * `redactForDisk`, used to persist `VerificationReceipt`s — whose `signature`
  * field is itself a bare 64-char hex HMAC digest, and `scope.worktreeDigest`
@@ -322,7 +322,7 @@ function tripsEntropyScan(text: string): boolean {
  * `verifyReceiptSignature` for every receipt persisted afterward — 13 tests
  * across `forgery.test.ts`/`receipts.test.ts`/`tools.test.ts`/
  * `plugin.integration.test.ts` failed with "genuine receipt must survive:
- * expected null not to be null" once reproduced. The five judge-payload
+ * expected null not to be null" once reproduced. The five verifier-payload
  * fields are all free-form prose/line arrays, never signed/structured data,
  * so the same rule is safe here but not safe as a blanket disk-redaction
  * rule without a schema-aware (key-based) exclusion this fix does not
@@ -346,7 +346,7 @@ function unitTrips(text: string): boolean {
 // ---------------------------------------------------------------------------
 
 /**
- * FR-006a (docs/JUDGE-RELIABILITY-FIXES-SPEC.md, round-2 finding M-10 —
+ * FR-006a (docs/VERIFIER-RELIABILITY-FIXES-SPEC.md, round-2 finding M-10 —
  * ROOT CAUSE REPRODUCED). `scanUnits`' second pass concatenates adjacent
  * units with NO separator and drops BOTH when the concatenation trips. That
  * is correct for a secret hard-wrapped across a line break (C-9, dataset
@@ -365,9 +365,9 @@ function unitTrips(text: string): boolean {
  * even scanned) at 3.889 bits/char; appending `S2` adds two symbols the left
  * side does not contain, lifting the fused token to **4.044 bits/char** —
  * over the 3.95 effective threshold. Neither line trips alone. In the audited
- * session this fired 11x on the `plan` field (`judge:field-partial-drop
+ * session this fired 11x on the `plan` field (`verifier:field-partial-drop
  * {plan, kept:51, dropped:4}`), deleting S1/S2/S3's `verifiers:` lines, after
- * which the judge FAILed those stories for having no verifiers in the digest.
+ * which the verifier FAILed those stories for having no verifiers in the digest.
  *
  * The fix is to require the offending match to actually live ON the join.
  * Two things had to be established to make that a real constraint rather
@@ -479,7 +479,7 @@ function hexRunStraddles(joined: string, joinIdx: number): boolean {
  * leak whenever the split was uneven — a 42-char token split 27/15 transmitted
  * BOTH fragments where the pre-fix code redacted them:
  *
- *     pre-fix : criteria: undefined            events: [judge:field-dropped]
+ *     pre-fix : criteria: undefined            events: [verifier:field-dropped]
  *     post-fix: criteria: ["sV8kQz3RtY7pLm…","1jK5aZ0eR8uT3iO"]   events: []
  *
  * Length cannot separate the classes (a wrap can be arbitrarily uneven), so
@@ -538,8 +538,8 @@ function entropyTokenStraddles(joined: string, joinIdx: number): boolean {
     if (LEFT_ENDS_IN_PATH.test(leftFragment) && RIGHT_STARTS_SHORT_WORD.test(rightFragment)) continue
     // Round 4: the anchor above only exonerates a left fragment ending in a
     // FILE EXTENSION, which left the general FR-006a false positive open —
-    // "…assigned correctly" + "tests/fixtures/judge-replay was refreshed"
-    // fuse into `correctlytests/fixtures/judge-replay`, over 32 chars and
+    // "…assigned correctly" + "tests/fixtures/verifier-replay was refreshed"
+    // fuse into `correctlytests/fixtures/verifier-replay`, over 32 chars and
     // over the entropy bar, and BOTH innocent lines were dropped. Found by a
     // test written for something else entirely.
     //
@@ -639,7 +639,7 @@ const SECRET_FRAGMENT_MIN_CHARS = 16
  * create|Plan|Request (all >=3 letters) is an identifier; `HUZxXdF2O3ftvnSN`
  * -> HUZx|Xd|F2|O3|ftvn|SN is not. Deliberately generous toward "word": a
  * false "yes" keeps a line that might hold a fragment, a false "no" deletes
- * evidence the judge needs, and the second failure is the one that has
+ * evidence the verifier needs, and the second failure is the one that has
  * actually hurt in production.
  */
 function looksLikeWord(token: string): boolean {
@@ -664,7 +664,7 @@ function looksLikeWord(token: string): boolean {
   // ...and those runs must be word-LENGTH. Base64 clears the ratio test on
   // 3-4 character pseudo-words (`Txob|Y+f|Dakt|WCr|SX|Rdw` scored 4 of 8 and
   // leaked 20 fragments in a 10840-split probe); real prose does not
-  // (`tests|fixtures|judge|replay` averages 6, `correctly` 9).
+  // (`tests|fixtures|verifier|replay` averages 6, `correctly` 9).
   const meanWordLength = wordy.reduce((sum, part) => sum + part.length, 0) / wordy.length
   return meanWordLength >= 4.5
 }
@@ -765,7 +765,7 @@ function scanUnits(units: string[]): { kept: string[]; anyDropped: boolean } {
   return { kept, anyDropped: toDrop.size > 0 }
 }
 
-type JudgeFieldName = "criteria" | "verifierSummaries" | "diffSummary" | "lastResponse" | "recentTranscript" | "plan"
+type VerifierFieldName = "criteria" | "verifierSummaries" | "diffSummary" | "lastResponse" | "recentTranscript" | "plan"
 
 /**
  * C-9 fix (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md — "boundary-truncation
@@ -786,9 +786,9 @@ type JudgeFieldName = "criteria" | "verifierSummaries" | "diffSummary" | "lastRe
  *
  * MINOR fix (post-review, still true under the new order): truncation used
  * to be silent — a field over the cap was sliced with no record of it
- * happening, so a judge verdict formed from truncated (i.e. incomplete)
+ * happening, so a verifier verdict formed from truncated (i.e. incomplete)
  * evidence was indistinguishable from one formed from the complete field.
- * Logs a distinct `judge:field-truncated` event whenever slicing actually
+ * Logs a distinct `verifier:field-truncated` event whenever slicing actually
  * occurs. `originalLength` in that event now reports the length of the
  * text being truncated AT THIS POINT — i.e. after any tainted units were
  * already dropped by the scan, not the raw pre-scan field length; when
@@ -796,19 +796,19 @@ type JudgeFieldName = "criteria" | "verifierSummaries" | "diffSummary" | "lastRe
  * this is deliberately the smaller, post-scan number, since that's what
  * "truncated" now describes: the size of what actually still needed cutting
  * for transmission, not how big the original raw field happened to be.
- * `judge:field-truncated` and `judge:field-dropped` are consequently
+ * `verifier:field-truncated` and `verifier:field-dropped` are consequently
  * mutually exclusive per field per call: every call site below returns as
- * soon as scanning empties a field (logging `judge:field-dropped`) and never
+ * soon as scanning empties a field (logging `verifier:field-dropped`) and never
  * reaches this function in that case — there is nothing left to truncate.
  *
- * `cap` defaults to `JUDGE_PAYLOAD_FIELD_CHAR_CAP` (the four fields that
+ * `cap` defaults to `VERIFIER_PAYLOAD_FIELD_CHAR_CAP` (the four fields that
  * share it never pass this argument); `recentTranscript` passes its own
- * `JUDGE_TRANSCRIPT_FIELD_CHAR_CAP` explicitly so the logged `cap` value
+ * `VERIFIER_TRANSCRIPT_FIELD_CHAR_CAP` explicitly so the logged `cap` value
  * always reflects the bound actually applied.
  */
-function truncateField(text: string, field: JudgeFieldName, logger: EventLogger, cap: number = JUDGE_PAYLOAD_FIELD_CHAR_CAP): string {
+function truncateField(text: string, field: VerifierFieldName, logger: EventLogger, cap: number = VERIFIER_PAYLOAD_FIELD_CHAR_CAP): string {
   if (text.length <= cap) return text
-  logger("judge:field-truncated", { field, originalLength: text.length, cap })
+  logger("verifier:field-truncated", { field, originalLength: text.length, cap })
   return text.slice(0, cap)
 }
 
@@ -844,9 +844,9 @@ function splitDiffIntoHunks(diffSummary: string): string[] {
 }
 
 /**
- * Fires `judge:field-partial-drop` when a scan removed SOME but not ALL of a
+ * Fires `verifier:field-partial-drop` when a scan removed SOME but not ALL of a
  * field's units — the field survives non-empty, but lost content. This is a
- * distinct fact from `judge:field-dropped` (each field-scanning function
+ * distinct fact from `verifier:field-dropped` (each field-scanning function
  * still logs that itself, exactly as before, when `kept.length === 0`):
  * before this, a field that lost one line out of three logged nothing at
  * all, so "the assistant never said this" and "it said this and the scan
@@ -856,20 +856,20 @@ function splitDiffIntoHunks(diffSummary: string): string[] {
  * `src/redaction.ts`'s `SENSITIVE_LABEL` — and vanished from a multi-line
  * `recentTranscript`/`criteria`/`verifierSummaries` field with zero trace).
  * Never fires when nothing was dropped, and never fires on a full empty
- * (that path is `judge:field-dropped`'s alone, not duplicated here).
+ * (that path is `verifier:field-dropped`'s alone, not duplicated here).
  */
 function logPartialDrop(
   units: readonly string[],
   kept: readonly string[],
   anyDropped: boolean,
-  field: JudgeFieldName,
+  field: VerifierFieldName,
   logger: EventLogger,
 ): void {
   // kept.length === 0 is unreachable here: every call site already returns
   // early on units.length > 0 && kept.length === 0 (the full-drop case,
-  // logged as judge:field-dropped instead) before reaching this call.
+  // logged as verifier:field-dropped instead) before reaching this call.
   if (!anyDropped) return
-  logger("judge:field-partial-drop", { field, kept: kept.length, dropped: units.length - kept.length })
+  logger("verifier:field-partial-drop", { field, kept: kept.length, dropped: units.length - kept.length })
 }
 
 /**
@@ -885,14 +885,14 @@ function logPartialDrop(
  */
 function scanLineField(rawLines: string[], field: "criteria" | "verifierSummaries", logger: EventLogger): string[] | undefined {
   const rawLength = rawLines.reduce((n, l) => n + l.length + 1, 0)
-  if (rawLength > JUDGE_PAYLOAD_RAW_FIELD_SAFETY_CAP) {
-    logger("judge:field-oversized", { field, rawLength, cap: JUDGE_PAYLOAD_RAW_FIELD_SAFETY_CAP })
+  if (rawLength > VERIFIER_PAYLOAD_RAW_FIELD_SAFETY_CAP) {
+    logger("verifier:field-oversized", { field, rawLength, cap: VERIFIER_PAYLOAD_RAW_FIELD_SAFETY_CAP })
     return undefined
   }
   const units = rawLines
   const { kept, anyDropped } = scanUnits(units)
   if (units.length > 0 && kept.length === 0) {
-    logger("judge:field-dropped", { field })
+    logger("verifier:field-dropped", { field })
     return undefined
   }
   logPartialDrop(units, kept, anyDropped, field, logger)
@@ -904,14 +904,14 @@ function scanLineField(rawLines: string[], field: "criteria" | "verifierSummarie
 /** C-9 fix: scan-then-truncate — see `scanLineField`'s doc comment for the
  * rationale; identical shape, applied to diff hunks instead of lines. */
 function scanDiffSummaryField(rawDiff: string, logger: EventLogger): string | undefined {
-  if (rawDiff.length > JUDGE_PAYLOAD_RAW_FIELD_SAFETY_CAP) {
-    logger("judge:field-oversized", { field: "diffSummary", rawLength: rawDiff.length, cap: JUDGE_PAYLOAD_RAW_FIELD_SAFETY_CAP })
+  if (rawDiff.length > VERIFIER_PAYLOAD_RAW_FIELD_SAFETY_CAP) {
+    logger("verifier:field-oversized", { field: "diffSummary", rawLength: rawDiff.length, cap: VERIFIER_PAYLOAD_RAW_FIELD_SAFETY_CAP })
     return undefined
   }
   const hunks = splitDiffIntoHunks(rawDiff)
   const { kept, anyDropped } = scanUnits(hunks)
   if (hunks.length > 0 && kept.length === 0) {
-    logger("judge:field-dropped", { field: "diffSummary" })
+    logger("verifier:field-dropped", { field: "diffSummary" })
     return undefined
   }
   logPartialDrop(hunks, kept, anyDropped, "diffSummary", logger)
@@ -921,7 +921,7 @@ function scanDiffSummaryField(rawDiff: string, logger: EventLogger): string | un
 }
 
 /**
- * `docs/JUDGE-PROMPT.md` §5: `lastResponse` and `recentTranscript` go
+ * `docs/VERIFIER-PROMPT.md` §5: `lastResponse` and `recentTranscript` go
  * through the EXACT SAME pipeline as the original three fields — scan the
  * reassembled, untruncated text first (secret patterns + entropy rule,
  * adjacent-unit boundary check), THEN truncate whatever survives to the
@@ -932,12 +932,12 @@ function scanDiffSummaryField(rawDiff: string, logger: EventLogger): string | un
  * omitted" rule), differing only in shape: `scanLineField` takes/returns
  * `string[]` (criteria/verifierSummaries are already line arrays in the
  * payload); these two fields are single prose strings both in
- * `RawJudgePayload` and in `JudgePayload`, so this takes a `string` in and
+ * `RawVerifierPayload` and in `VerifierPayload`, so this takes a `string` in and
  * rejoins surviving lines with `\n` on the way out instead of returning the
  * array. `cap` is threaded through (not hardcoded) so the same function
- * serves `lastResponse` (`JUDGE_PAYLOAD_FIELD_CHAR_CAP`), `recentTranscript`
- * (`JUDGE_TRANSCRIPT_FIELD_CHAR_CAP`) and `plan`
- * (`JUDGE_PLAN_FIELD_CHAR_CAP`, HANDOVER.md point 4).
+ * serves `lastResponse` (`VERIFIER_PAYLOAD_FIELD_CHAR_CAP`), `recentTranscript`
+ * (`VERIFIER_TRANSCRIPT_FIELD_CHAR_CAP`) and `plan`
+ * (`VERIFIER_PLAN_FIELD_CHAR_CAP`, HANDOVER.md point 4).
  */
 function scanProseField(
   text: string,
@@ -945,14 +945,14 @@ function scanProseField(
   logger: EventLogger,
   cap: number,
 ): string | undefined {
-  if (text.length > JUDGE_PAYLOAD_RAW_FIELD_SAFETY_CAP) {
-    logger("judge:field-oversized", { field, rawLength: text.length, cap: JUDGE_PAYLOAD_RAW_FIELD_SAFETY_CAP })
+  if (text.length > VERIFIER_PAYLOAD_RAW_FIELD_SAFETY_CAP) {
+    logger("verifier:field-oversized", { field, rawLength: text.length, cap: VERIFIER_PAYLOAD_RAW_FIELD_SAFETY_CAP })
     return undefined
   }
   const units = text.length === 0 ? [] : text.split("\n")
   const { kept, anyDropped } = scanUnits(units)
   if (units.length > 0 && kept.length === 0) {
-    logger("judge:field-dropped", { field })
+    logger("verifier:field-dropped", { field })
     return undefined
   }
   logPartialDrop(units, kept, anyDropped, field, logger)
@@ -962,17 +962,17 @@ function scanProseField(
 }
 
 /**
- * FR-031 (extended by `docs/JUDGE-PROMPT.md` §5): builds the judge payload
+ * FR-031 (extended by `docs/VERIFIER-PROMPT.md` §5): builds the verifier payload
  * from the five raw evidence fields.
  *
  * Each field is scanned in full first — the strict scan (secret patterns via
  * `redactSecrets`, plus a Shannon-entropy rule) runs on the *reassembled,
- * untruncated* field, per FR-031 / Dataset: Judge payload hygiene — and only
+ * untruncated* field, per FR-031 / Dataset: Verifier payload hygiene — and only
  * the text that survives scanning is then truncated to the field's cap (C-9
  * fix: see `truncateField`'s doc comment for why the order matters — scanning
  * before truncating means a secret straddling the cap boundary is always
  * seen whole). A field emptied by scanning is omitted from the return value
- * and logs `judge:field-dropped` once. The function only ever sees the five
+ * and logs `verifier:field-dropped` once. The function only ever sees the five
  * typed fields the caller passes in — there
  * is no free-form chat-narrative parameter for it to leak, so schema
  * exclusion of narrative (Dataset row 2) is structural, not a runtime check;
@@ -980,8 +980,8 @@ function scanProseField(
  * conversation, by §5's explicit design, but they are still just two bounded,
  * scanned, named fields — not an unbounded transcript dump.
  */
-export function buildJudgePayload(raw: RawJudgePayload, logger: EventLogger): JudgePayload {
-  const payload: JudgePayload = {}
+export function buildVerifierPayload(raw: RawVerifierPayload, logger: EventLogger): VerifierPayload {
+  const payload: VerifierPayload = {}
 
   const criteria = scanLineField(raw.criteria, "criteria", logger)
   if (criteria) payload.criteria = criteria
@@ -992,69 +992,69 @@ export function buildJudgePayload(raw: RawJudgePayload, logger: EventLogger): Ju
   const diffSummary = scanDiffSummaryField(raw.diffSummary, logger)
   if (diffSummary !== undefined) payload.diffSummary = diffSummary
 
-  const lastResponse = scanProseField(raw.lastResponse, "lastResponse", logger, JUDGE_PAYLOAD_FIELD_CHAR_CAP)
+  const lastResponse = scanProseField(raw.lastResponse, "lastResponse", logger, VERIFIER_PAYLOAD_FIELD_CHAR_CAP)
   if (lastResponse !== undefined) payload.lastResponse = lastResponse
 
-  const recentTranscript = scanProseField(raw.recentTranscript, "recentTranscript", logger, JUDGE_TRANSCRIPT_FIELD_CHAR_CAP)
+  const recentTranscript = scanProseField(raw.recentTranscript, "recentTranscript", logger, VERIFIER_TRANSCRIPT_FIELD_CHAR_CAP)
   if (recentTranscript !== undefined) payload.recentTranscript = recentTranscript
 
-  const plan = scanProseField(raw.plan, "plan", logger, JUDGE_PLAN_FIELD_CHAR_CAP)
+  const plan = scanProseField(raw.plan, "plan", logger, VERIFIER_PLAN_FIELD_CHAR_CAP)
   if (plan !== undefined) payload.plan = plan
 
   return payload
 }
 
 // ---------------------------------------------------------------------------
-// runJudge — FR-030, FR-030a, FR-030b, FR-032
+// runVerifier — FR-030, FR-030a, FR-030b, FR-032
 // ---------------------------------------------------------------------------
 
 /**
  * HANDOVER.md point 4 (user decision, 2026-07-29): one verdict per
- * acceptance item of a story. `note` says what the judge observed or what
+ * acceptance item of a story. `note` says what the verifier observed or what
  * is specifically missing — the actionable detail the old prose
  * `fit/summary/gaps` shape could not carry per item.
  */
-export interface JudgeItemVerdict {
+export interface VerifierItemVerdict {
   itemId: string
   met: boolean
   note: string
 }
 
-/** One entry per story the judge was asked to audit. `pass` requires every
- * listed item `met === true` (enforced by `isJudgeVerdictShape`, not just
+/** One entry per story the verifier was asked to audit. `pass` requires every
+ * listed item `met === true` (enforced by `isVerifierVerdictShape`, not just
  * documented here). */
-export interface JudgeStoryVerdict {
+export interface VerifierStoryVerdict {
   storyId: string
   pass: boolean
   summary: string
-  items: JudgeItemVerdict[]
+  items: VerifierItemVerdict[]
 }
 
 /**
  * HANDOVER.md point 4, superseding the `{fit, summary, gaps}` shape (itself
- * a `docs/JUDGE-PROMPT.md` §4 redesign of the original `{fit, notes}`):
- * structured per-story, per-acceptance-item feedback. The judge is the sole
+ * a `docs/VERIFIER-PROMPT.md` §4 redesign of the original `{fit, notes}`):
+ * structured per-story, per-acceptance-item feedback. The verifier is the sole
  * arbiter of completion (point 2), so its output must name exactly which
  * criteria are met and which are not — a one-sentence `summary` plus a
  * free-form gaps list was not machine-checkable enough to drive
  * continuations ("story S2 not delivered — A3, A4 still missing").
  */
-export interface JudgeVerdict {
-  stories: JudgeStoryVerdict[]
+export interface VerifierVerdict {
+  stories: VerifierStoryVerdict[]
 }
 
 type ModelRef = { providerID: string; modelID: string }
 
 /**
  * Deviation from `docs/vertex2-module-contracts.md` section 8: the contract
- * declares `runJudge(...): Promise<JudgeVerdict | null>`. A bare `null`
+ * declares `runVerifier(...): Promise<VerifierVerdict | null>`. A bare `null`
  * cannot distinguish *why* no verdict is available, and the contract's own
  * prose punts on this ("your call... document it in your final report since
- * wave 3 wiring needs to know exactly what you return"). `runJudge` here
+ * wave 3 wiring needs to know exactly what you return"). `runVerifier` here
  * returns this discriminated union instead: `{ verdict }` on success, or
  * `{ verdict: null, reason }` with `reason` one of:
  *  - `"unsupported"` — the FR-030b capability probe failed OR the combined
- *    probe + deny-map build did not settle within `JUDGE_TOTAL_BUDGET_MS`
+ *    probe + deny-map build did not settle within `VERIFIER_TOTAL_BUDGET_MS`
  *    (CRITICAL fix: a probe that cannot be confirmed in time is treated the
  *    same as one actively refused); zero `session.create`/`session.prompt`
  *    calls were made either way.
@@ -1063,20 +1063,20 @@ type ModelRef = { providerID: string; modelID: string }
  *    reason other than the shared budget expiring).
  *  - `"malformed"` — the subturn returned text that is not valid JSON, or
  *    valid JSON that does not match the `{stories: [...]}` verdict shape
- *    (`isJudgeVerdictShape`).
- * This lets wave-3 wiring log `judge:unsupported` / `judge:unavailable` /
- * `judge:malformed` with the right label without re-deriving it from a
- * bare-null result. `runJudge` also calls the injected `logger` itself for
+ *    (`isVerifierVerdictShape`).
+ * This lets wave-3 wiring log `verifier:unsupported` / `verifier:unavailable` /
+ * `verifier:malformed` with the right label without re-deriving it from a
+ * bare-null result. `runVerifier` also calls the injected `logger` itself for
  * these three event ids at the point each condition is detected (see the
  * "logging ambiguity" note in the final report) — this mirrors the pattern
  * `subturn.ts` already established for `subturn:cleanup-failed` (the module
  * that detects a condition logs it, rather than deferring to a caller that
  * would have to re-derive the same classification from the reason string).
  *
- * FR-014 (docs/JUDGE-RELIABILITY-FIXES-SPEC.md, User Story 12) adds
+ * FR-014 (docs/VERIFIER-RELIABILITY-FIXES-SPEC.md, User Story 12) adds
  * `childSessionID`: the id of the subturn session the LAST attempt created,
  * so the gate can apply the tool-call floor — a `met:false` may not be
- * applied unless the judge child session actually made >= 1 tool call. This
+ * applied unless the verifier child session actually made >= 1 tool call. This
  * is the only deterministic protection for CONTENT claims (29 of the 49
  * recovered item notes), which FR-001's path check cannot touch by
  * construction.
@@ -1089,11 +1089,11 @@ type ModelRef = { providerID: string; modelID: string }
  * AS3; this field surfaces the id, it does not promise the session still
  * exists.
  */
-export type JudgeRunResult =
-  | { verdict: JudgeVerdict; childSessionID?: string; observedToolCall?: boolean }
+export type VerifierRunResult =
+  | { verdict: VerifierVerdict; childSessionID?: string; observedToolCall?: boolean }
   | { verdict: null; reason: "unsupported" | "unavailable" | "malformed"; childSessionID?: string; observedToolCall?: boolean }
 
-const JUDGE_AGENT_NAME = "vertex-judge"
+const VERIFIER_AGENT_NAME = "vertex-verifier"
 
 /** FR-030: total budget shared across the capability probe + deny-map build
  * AND the subturn attempt(s) (override attempt, then its session-model
@@ -1101,60 +1101,60 @@ const JUDGE_AGENT_NAME = "vertex-judge"
  * clock now starts before the probe, not just before the subturn).
  *
  * Raised from the spec's literal 5000ms after live-host measurement: with
- * the probe passing, a real judge subturn against a hosted model
+ * the probe passing, a real verifier subturn against a hosted model
  * (openrouter/z-ai/glm-5.2) consumed the ENTIRE 5s budget on the model
- * round-trip alone and logged `judge:unavailable {reason:"timeout"}` every
- * time — i.e. the spec's budget made the judge unreachable in practice, not
+ * round-trip alone and logged `verifier:unavailable {reason:"timeout"}` every
+ * time — i.e. the spec's budget made the verifier unreachable in practice, not
  * merely tight. 5s is a plausible bound for a local/cached model and an
  * impossible one for a remote frontier model.
  *
- * `VERTEX_JUDGE_BUDGET_MS` overrides it (values <= 0 or unparseable fall
+ * `VERTEX_VERIFIER_BUDGET_MS` overrides it (values <= 0 or unparseable fall
  * back to the default) so an operator on a slow provider can raise it
  * further, or drive it back down to the spec's 5000 to reproduce FR-030's
- * literal behaviour. The judge remains advisory and non-gating, so the cost
+ * literal behaviour. The verifier remains advisory and non-gating, so the cost
  * of a longer budget is bounded latency on an already-idle session, never a
  * blocked turn.
  *
  * The 90s default is set from measurement, not taste. Two full successful
- * judge runs (probe + child session create + model round-trip + delete)
+ * verifier runs (probe + child session create + model round-trip + delete)
  * against openrouter/z-ai/glm-5.2 measured **28.8s and 45.6s** — a ~1.6x
  * spread between back-to-back runs of an identical payload, i.e. provider
  * latency here is highly variable rather than tightly clustered. Budgets
  * near the observed cost are therefore actively harmful: they convert that
- * variance into intermittent `judge:unavailable` timeouts that are
+ * variance into intermittent `verifier:unavailable` timeouts that are
  * indistinguishable from a broken feature (a 30s budget would have passed
  * the first run and failed the second). 90s is ~2x the slowest observation.
  *
- * The 90s figure above was calibrated for the ZERO-TOOL judge (a single
- * model round-trip). HANDOVER.md point 3 makes the judge tool-using: it now
+ * The 90s figure above was calibrated for the ZERO-TOOL verifier (a single
+ * model round-trip). HANDOVER.md point 3 makes the verifier tool-using: it now
  * re-runs a story's declared verifier commands itself over multiple steps
  * (maxSteps 12), and in the field session that motivated the redesign the
  * equivalent verifier runs (`make check`, targeted re-tests) took MINUTES,
  * not seconds — a 90s budget would convert the redesign's core capability
- * into a guaranteed `judge:unavailable` timeout. The default is therefore
+ * into a guaranteed `verifier:unavailable` timeout. The default is therefore
  * raised to 300s.
  *
- * Erring generous is the right asymmetry here: the judge runs at idle and
+ * Erring generous is the right asymmetry here: the verifier runs at idle and
  * remains fail-open (a timeout degrades to "no verdict", never a blocked
  * turn), so an over-long budget costs only latency on an already-idle
  * session, while an over-short one silently removes the feature. */
-const DEFAULT_JUDGE_TOTAL_BUDGET_MS = 300_000
+const DEFAULT_VERIFIER_TOTAL_BUDGET_MS = 300_000
 
-function resolveJudgeBudgetMs(): number {
-  const raw = Number(process.env.VERTEX_JUDGE_BUDGET_MS)
-  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_JUDGE_TOTAL_BUDGET_MS
+function resolveVerifierBudgetMs(): number {
+  const raw = Number(process.env.VERTEX_VERIFIER_BUDGET_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_VERIFIER_TOTAL_BUDGET_MS
 }
 
-export const JUDGE_TOTAL_BUDGET_MS = resolveJudgeBudgetMs()
+export const VERIFIER_TOTAL_BUDGET_MS = resolveVerifierBudgetMs()
 
 /**
  * HANDOVER.md points 2-4 (user decision, 2026-07-29), superseding the
- * `docs/JUDGE-PROMPT.md` §4/§5 prompt: the judge is now an independent
+ * `docs/VERIFIER-PROMPT.md` §4/§5 prompt: the verifier is now an independent
  * completion AUDITOR with read-only tools, not a zero-tool evidence
  * summarizer. Three load-bearing instructions, each tied to a field-session
  * failure:
  *  - verify, don't trust (points 2/3): the 894-message session's claims
- *    were real but the harness credited none of them; the judge must read
+ *    were real but the harness credited none of them; the verifier must read
  *    the referenced files and re-run declared verifiers itself. Verifiers
  *    must be run as STANDALONE bash commands — never `;`-chained or piped —
  *    because the field session's deterministic gate correctly refused 19
@@ -1165,13 +1165,13 @@ export const JUDGE_TOTAL_BUDGET_MS = resolveJudgeBudgetMs()
  *    story, one item entry per acceptance item, pass requires every item
  *    met — machine-checkable enough to drive per-story continuations.
  *
- * FR-011 (docs/JUDGE-RELIABILITY-FIXES-SPEC.md, User Story 9 — P0, the
+ * FR-011 (docs/VERIFIER-RELIABILITY-FIXES-SPEC.md, User Story 9 — P0, the
  * primary root-cause fix) adds a fourth: **observation is required in the
  * NEGATIVE direction too**. The prompt above said only "Read the files a
  * claim references before crediting it" — an obligation attached to
  * `met:true` and nothing else, leaving the far more damaging direction
  * completely unconstrained. The live probe isolated exactly that gap: given
- * only the payload, `runJudge` returned `pass:false` in **9.8 s** with the
+ * only the payload, `runVerifier` returned `pass:false` in **9.8 s** with the
  * note *"research/x.json does not exist ... ls shows no research/
  * directory"* for a file that existed (probe P1). The same agent, on the
  * same bytes, given a prompt that named what to check, called `bash ls -la`
@@ -1184,12 +1184,12 @@ export const JUDGE_TOTAL_BUDGET_MS = resolveJudgeBudgetMs()
  * The two sentences added below are deliberately absolute and name the
  * escape hatch, because "verify, don't trust" plainly did not bind: an
  * absence claim REQUIRES a prior read/glob/grep/bash observation, and when
- * the judge cannot observe it must SAY so in the note rather than assert
- * absence. Without the second sentence, a judge that cannot run a tool has
+ * the verifier cannot observe it must SAY so in the note rather than assert
+ * absence. Without the second sentence, a verifier that cannot run a tool has
  * no compliant way to express doubt and will reach for the fabrication
  * again.
  */
-const JUDGE_SYSTEM_PROMPT = [
+const VERIFIER_SYSTEM_PROMPT = [
   "You are an independent completion auditor for a coding plan whose stories have been claimed complete.",
   "You receive a plan digest (stories, their acceptance items, and the verifier commands each story declares), a diff summary, verifier output summaries, and the parent agent's last response plus a short recent transcript, as a JSON object.",
   "Do not trust the transcript or the parent's claims — verify them yourself with your read-only tools (read, grep, glob, list, bash).",
@@ -1206,26 +1206,26 @@ const JUDGE_SYSTEM_PROMPT = [
 ].join(" ")
 
 /**
- * Parse the judge's reply, tolerating the wrappers models actually emit.
+ * Parse the verifier's reply, tolerating the wrappers models actually emit.
  *
- * `JSON.parse(text)` alone rejected a real judge run in UAT G12 with
- * `judge:malformed {reason:"response is not valid JSON"}` -- the plan had
+ * `JSON.parse(text)` alone rejected a real verifier run in UAT G12 with
+ * `verifier:malformed {reason:"response is not valid JSON"}` -- the plan had
  * completed, the subturn had run, and the whole thing was discarded because the
  * model fenced its JSON. A zero-tool agent is instructed to return JSON and
  * usually does, but "usually" is not a contract: markdown fences and a leading
- * sentence are the two most common deviations, and each costs a full judge
+ * sentence are the two most common deviations, and each costs a full verifier
  * budget (up to 90s and a model call) for nothing.
  *
  * Deliberately narrow: strip fences, then take the outermost balanced object.
  * No repair of malformed JSON, no regex extraction of individual fields --
- * shape validation still happens in `isJudgeVerdictShape`, and a reply that is
+ * shape validation still happens in `isVerifierVerdictShape`, and a reply that is
  * genuinely not a verdict must still be reported as malformed rather than
  * guessed at.
  *
  * Returns `undefined` for "could not parse", which is distinguishable from a
  * successfully parsed `null`.
  */
-export function parseJudgeResponse(text: string): unknown {
+export function parseVerifierResponse(text: string): unknown {
   const attempt = (candidate: string): unknown => {
     try {
       return JSON.parse(candidate)
@@ -1271,7 +1271,7 @@ export function parseJudgeResponse(text: string): unknown {
   return undefined
 }
 
-function isJudgeItemVerdictShape(value: unknown): value is JudgeItemVerdict {
+function isVerifierItemVerdictShape(value: unknown): value is VerifierItemVerdict {
   if (typeof value !== "object" || value === null) return false
   const item = value as Record<string, unknown>
   return (
@@ -1285,12 +1285,12 @@ function isJudgeItemVerdictShape(value: unknown): value is JudgeItemVerdict {
 /**
  * HANDOVER.md point 4 shape check. Stricter than the `{fit, summary, gaps}`
  * check it replaces, in ways that are all load-bearing:
- *  - `stories` must be a NON-EMPTY array — the judge is the sole arbiter of
+ *  - `stories` must be a NON-EMPTY array — the verifier is the sole arbiter of
  *    completion (point 2), so an empty audit is never a valid verdict.
  *  - every story needs a non-blank `storyId`, a boolean `pass`, a string
  *    `summary`, and an `items` array of `{itemId (non-blank), met
  *    (boolean), note (string)}` — a wrong per-item shape is rejected, not
- *    coerced, exactly as the old `isJudgeGapShape` rule worked.
+ *    coerced, exactly as the old `isVerifierGapShape` rule worked.
  *  - `pass: true` REQUIRES every listed item `met === true`: a pass with an
  *    unmet item is malformed, not a prompt-compliance question — this is
  *    the machine-checkable invariant continuations rely on.
@@ -1302,7 +1302,7 @@ function isJudgeItemVerdictShape(value: unknown): value is JudgeItemVerdict {
  *    tolerated: models add commentary fields; only the contract keys are
  *    validated.
  */
-function isJudgeVerdictShape(value: unknown): value is JudgeVerdict {
+function isVerifierVerdictShape(value: unknown): value is VerifierVerdict {
   if (typeof value !== "object" || value === null) return false
   const v = value as Record<string, unknown>
   if (!Array.isArray(v.stories) || v.stories.length === 0) return false
@@ -1312,8 +1312,8 @@ function isJudgeVerdictShape(value: unknown): value is JudgeVerdict {
     if (typeof s.storyId !== "string" || s.storyId.trim().length === 0) return false
     if (typeof s.pass !== "boolean") return false
     if (typeof s.summary !== "string") return false
-    if (!Array.isArray(s.items) || !s.items.every(isJudgeItemVerdictShape)) return false
-    if (s.pass === true && !(s.items as JudgeItemVerdict[]).every((item) => item.met === true)) return false
+    if (!Array.isArray(s.items) || !s.items.every(isVerifierItemVerdictShape)) return false
+    if (s.pass === true && !(s.items as VerifierItemVerdict[]).every((item) => item.met === true)) return false
   }
   return true
 }
@@ -1331,7 +1331,7 @@ function isJudgeVerdictShape(value: unknown): value is JudgeVerdict {
  * Why `Object.create` and not a subclass: `SelfCreatedSessions` owns its
  * `ids` Set per instance, so a subclass instance would record child ids into
  * a SECOND registry and the caller's registry would no longer recognise the
- * judge's own child sessions — breaking FR-036 (all five hooks must return
+ * verifier's own child sessions — breaking FR-036 (all five hooks must return
  * early for harness-created sessions), which is a live-session correctness
  * property, not a test detail. Prototype delegation keeps exactly one
  * registry: the override shadows only `record`, forwards to the real
@@ -1352,9 +1352,9 @@ function observeChildSessionID(
 }
 
 /**
- * FR-030/FR-030a/FR-030b/FR-032: runs the judge subturn.
+ * FR-030/FR-030a/FR-030b/FR-032: runs the verifier subturn.
  *
- * 0. CRITICAL fix: the `JUDGE_TOTAL_BUDGET_MS` budget clock (`start`) now
+ * 0. CRITICAL fix: the `VERIFIER_TOTAL_BUDGET_MS` budget clock (`start`) now
  *    starts BEFORE step 1, not after it. Previously `probeCapability` and
  *    `buildDenyMap` were plain un-timed `await`s taken before `start` was
  *    read, so a hanging `client.app.agents()`/`client.tool.ids()` could
@@ -1363,28 +1363,28 @@ function observeChildSessionID(
  *    build now count against the same 5s total as the subturn attempt(s).
  * 1. Runs `subturn.ts`'s `probeCapabilityBounded` (probe, then tool-map
  *    build, raced together against the remaining budget) WITH
- *    `JUDGE_PROBE_POLICY` (HANDOVER.md point 3): the probe verifies the
- *    registered judge agent has no capability beyond read/grep/glob/list/
+ *    `VERIFIER_PROBE_POLICY` (HANDOVER.md point 3): the probe verifies the
+ *    registered verifier agent has no capability beyond read/grep/glob/list/
  *    bash (with edit/write/webfetch/task provably denied), and the
  *    resulting allow-aware map from `buildToolPolicyMap` — not a pure deny
  *    map — is what the subturn's `tools` field receives. A failure returns
  *    immediately with zero `session.create`/`session.prompt` calls
  *    (`runSubturn` is never reached). A probe failure OR a timeout both log
- *    `judge:unsupported` once (a probe that cannot be confirmed in time is
+ *    `verifier:unsupported` once (a probe that cannot be confirmed in time is
  *    treated identically to one actively refused); a tool-map-build failure
- *    (non-timeout) logs `judge:unavailable`, unchanged from before this fix.
+ *    (non-timeout) logs `verifier:unavailable`, unchanged from before this fix.
  *    This module does not receive a pre-cached tool map from the caller
  *    (the contracted signature has no slot for one) — it re-derives it on
  *    every call. See the "deny map caching" note in the final report for
  *    the trade-off this implies.
- * 2. Model = `judgeModelOverride ?? sessionModel` for the first attempt. If
- *    `judgeModelOverride` was set and that attempt's subturn fails (thrown,
+ * 2. Model = `verifierModelOverride ?? sessionModel` for the first attempt. If
+ *    `verifierModelOverride` was set and that attempt's subturn fails (thrown,
  *    timed out, or otherwise `{ok: false}`), retries once with
- *    `sessionModel`. Every attempt draws from the SAME `JUDGE_TOTAL_BUDGET_MS`
+ *    `sessionModel`. Every attempt draws from the SAME `VERIFIER_TOTAL_BUDGET_MS`
  *    clock started in step 0 — each attempt's `timeoutMs` is whatever is
  *    left of the total, not a fresh budget per attempt.
  * 3. A successful subturn's response text is parsed as JSON and checked
- *    against the `{stories: [...]}` shape (`isJudgeVerdictShape`, HANDOVER.md
+ *    against the `{stories: [...]}` shape (`isVerifierVerdictShape`, HANDOVER.md
  *    point 4); anything else — including BOTH superseded shapes
  *    (`{fit, summary, gaps}` and `{fit, notes}`) — is `"malformed"`, not
  *    thrown.
@@ -1394,39 +1394,39 @@ function observeChildSessionID(
  *    captured by observing the recorder rather than by changing
  *    `runSubturn`'s return type.
  */
-export async function runJudge(
+export async function runVerifier(
   client: OpencodeClient,
   deps: { selfCreated: SelfCreatedSessions; logger: EventLogger },
   opts: {
     parentSessionID: string
     sessionModel: ModelRef
-    judgeModelOverride?: ModelRef
-    payload: JudgePayload
+    verifierModelOverride?: ModelRef
+    payload: VerifierPayload
   },
-): Promise<JudgeRunResult> {
+): Promise<VerifierRunResult> {
   const { selfCreated, logger } = deps
-  const { parentSessionID, sessionModel, judgeModelOverride, payload } = opts
+  const { parentSessionID, sessionModel, verifierModelOverride, payload } = opts
 
   const observed: { childSessionID?: string } = {}
   const recordingSelfCreated = observeChildSessionID(selfCreated, observed)
 
   const start = Date.now()
 
-  const probeResult = await probeCapabilityBounded(client, JUDGE_AGENT_NAME, JUDGE_TOTAL_BUDGET_MS, JUDGE_PROBE_POLICY)
+  const probeResult = await probeCapabilityBounded(client, VERIFIER_AGENT_NAME, VERIFIER_TOTAL_BUDGET_MS, VERIFIER_PROBE_POLICY)
   if (!probeResult.ok) {
     if (probeResult.cause === "deny-map") {
-      logger("judge:unavailable", { reason: `tool policy map unavailable: ${probeResult.reason}` })
+      logger("verifier:unavailable", { reason: `tool policy map unavailable: ${probeResult.reason}` })
       return { verdict: null, reason: "unavailable" }
     }
     // cause is "probe" or "timeout" — both fold to "unsupported" (fix #1:
     // a probe/tool-map timeout is treated the same as an ordinary probe
-    // refusal, matching the existing judge:unsupported log path).
-    logger("judge:unsupported", { reason: probeResult.reason })
+    // refusal, matching the existing verifier:unsupported log path).
+    logger("verifier:unsupported", { reason: probeResult.reason })
     return { verdict: null, reason: "unsupported" }
   }
   const toolsMap = probeResult.tools
 
-  const attempts: ModelRef[] = judgeModelOverride ? [judgeModelOverride, sessionModel] : [sessionModel]
+  const attempts: ModelRef[] = verifierModelOverride ? [verifierModelOverride, sessionModel] : [sessionModel]
   const parts = [{ type: "text" as const, text: JSON.stringify(payload) }]
 
   // NOTE: must carry `observedToolCall` (FR-014) — a narrower type here
@@ -1434,16 +1434,16 @@ export async function runJudge(
   let last: SubturnResult | null = null
 
   for (const model of attempts) {
-    const remaining = JUDGE_TOTAL_BUDGET_MS - (Date.now() - start)
+    const remaining = VERIFIER_TOTAL_BUDGET_MS - (Date.now() - start)
     if (remaining <= 0) {
       last = { ok: false, reason: "timeout" }
       break
     }
     last = await runSubturn(client, recordingSelfCreated, logger, {
       parentSessionID,
-      agent: JUDGE_AGENT_NAME,
+      agent: VERIFIER_AGENT_NAME,
       model,
-      system: JUDGE_SYSTEM_PROMPT,
+      system: VERIFIER_SYSTEM_PROMPT,
       parts,
       tools: toolsMap,
       timeoutMs: remaining,
@@ -1464,18 +1464,18 @@ export async function runJudge(
   const toolCall = last?.observedToolCall === undefined ? {} : { observedToolCall: last.observedToolCall }
 
   if (!last || !last.ok) {
-    logger("judge:unavailable", { reason: last?.reason ?? "unknown" })
+    logger("verifier:unavailable", { reason: last?.reason ?? "unknown" })
     return { verdict: null, reason: "unavailable", ...child, ...toolCall }
   }
 
-  const parsed = parseJudgeResponse(last.text)
+  const parsed = parseVerifierResponse(last.text)
   if (parsed === undefined) {
-    logger("judge:malformed", { reason: "response is not valid JSON" })
+    logger("verifier:malformed", { reason: "response is not valid JSON" })
     return { verdict: null, reason: "malformed", ...child, ...toolCall }
   }
 
-  if (!isJudgeVerdictShape(parsed)) {
-    logger("judge:malformed", { reason: "response does not match {stories: [{storyId, pass, summary, items}]} shape" })
+  if (!isVerifierVerdictShape(parsed)) {
+    logger("verifier:malformed", { reason: "response does not match {stories: [{storyId, pass, summary, items}]} shape" })
     return { verdict: null, reason: "malformed", ...child, ...toolCall }
   }
 

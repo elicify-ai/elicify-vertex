@@ -29,9 +29,9 @@ This feature introduces **waves** (groups of stories that activate and execute c
 
 A 1h34m live session (`ses_0668b2422ffe4hbFM3AkIerZmp`, 2026-07-27, `/home/dev/vertextest`, 93 messages, 25 bash calls) produced **zero evidence**: 21/21 acceptance items `null`, 0 receipts, 0 checkpoints, story S1 left `active` and S2–S5 never started. Root-caused against the real session data and the real functions:
 
-- **D1 — Relevance-gap rejects covering verifiers (blocking).** `verifiersEquivalent` (`measurement.ts:824`) compares the resolver's `rationale` plus **set equality** of `matchedPaths`. It has no notion of coverage, so a *broader* verifier is scored as a miss. Verified directly against the shipped function: `go test ./...` vs prescribed `go test ./internal/auth/...` → gap; `npm test` vs prescribed `npx vitest run tests/lexer.test.ts` → gap. In the live session this fired 3 times (08:09:32, 08:20:15, 08:37:41) on precisely the 3 commands that `parseVerification` scored `verified` with exit 0 — the only 3 of 25 that would have minted a receipt. `success = rawSuccess && !relevanceGap` then suppressed every one. **Nothing downstream — evidence, checkpoints, wave progression, judge — can function until this is fixed.**
-- **D2 — The judge is a post-hoc QA pass, not a completion detector.** `appendJudgeCloseOut` runs only when `phaseEngine.onIdle` returns `closed` *and* the final story is already `complete`. It therefore fires exactly when the work is already declared done, and can never say "you stopped early." In the live session it never ran at all.
-- **D3 — No completion driver.** `gate.ts` has exactly four continuation triggers (promise-no-act, zero-criteria stop-block, criteria-block, judge verdict). None is "the plan still has unfinished stories." All four were inert: 0 deferral keywords in 91 assistant messages; `classifyStopMode` scored the session `normal` so `shouldBlockStop` hard-returns false (it requires `deep`); `pins.json` was `{}`; the final story was never complete. The plan is a *record*, never a *driver*.
+- **D1 — Relevance-gap rejects covering verifiers (blocking).** `verifiersEquivalent` (`measurement.ts:824`) compares the resolver's `rationale` plus **set equality** of `matchedPaths`. It has no notion of coverage, so a *broader* verifier is scored as a miss. Verified directly against the shipped function: `go test ./...` vs prescribed `go test ./internal/auth/...` → gap; `npm test` vs prescribed `npx vitest run tests/lexer.test.ts` → gap. In the live session this fired 3 times (08:09:32, 08:20:15, 08:37:41) on precisely the 3 commands that `parseVerification` scored `verified` with exit 0 — the only 3 of 25 that would have minted a receipt. `success = rawSuccess && !relevanceGap` then suppressed every one. **Nothing downstream — evidence, checkpoints, wave progression, verifier — can function until this is fixed.**
+- **D2 — The verifier is a post-hoc QA pass, not a completion detector.** `appendVerifierCloseOut` runs only when `phaseEngine.onIdle` returns `closed` *and* the final story is already `complete`. It therefore fires exactly when the work is already declared done, and can never say "you stopped early." In the live session it never ran at all.
+- **D3 — No completion driver.** `gate.ts` has exactly four continuation triggers (promise-no-act, zero-criteria stop-block, criteria-block, verifier verdict). None is "the plan still has unfinished stories." All four were inert: 0 deferral keywords in 91 assistant messages; `classifyStopMode` scored the session `normal` so `shouldBlockStop` hard-returns false (it requires `deep`); `pins.json` was `{}`; the final story was never complete. The plan is a *record*, never a *driver*.
 - **D4 — `newTurn` never advances in autonomous runs.** `turnIndex` reached 1 at 07:54:48 and never moved again across 43 minutes, yielding 250 `per-turn-cap:dropped` against 5 `directive_rendered` — a **2% directive delivery rate**. `composer.newTurn` is called only from `chat.message` (2 user messages all session) and from `promptContinuation` (never dispatched, per D3).
 
 D1 and D4 are defects in already-shipped behaviour and are specified here because the wave model cannot be evaluated on top of them. D2 and D3 are the design inversion this revision introduces.
@@ -78,8 +78,8 @@ No `docs/reference/` directory exists in this repository. In-repo precedents use
 |---|---|---|---|
 | `StoryV2.status` union | **HIGH** | `isStoryV2`, `checkpoint`, `getActiveStory`, `createPlan`, `STORY_STATUSES` | All 10 `getActiveStory` call sites; `plan.json` on disk |
 | `PlanV2.schemaVersion` | **HIGH** | `isPlanV2`, `hydrateFromDisk`, `persistPlan` | Every persisted plan; `persistPlan` silently drops entries failing validation — **data-loss risk if archival is not implemented first** |
-| `getActiveStory` | **HIGH** | `plugin.ts:121,540,618,711,748`; `gate.ts:204,251,316`; `tools.ts:149,200` | Verifier resolution, judge payload, phase keying, criteria reinject |
-| `PhaseEngine.session.activeStoryId` | **MEDIUM** | `onMutation`, `onVerifierOutcome`, `getPhase(sid)` (no storyId) | `resolveStoryIdForPhase`, elevate/close transitions, judge trigger |
+| `getActiveStory` | **HIGH** | `plugin.ts:121,540,618,711,748`; `gate.ts:204,251,316`; `tools.ts:149,200` | Verifier resolution, verifier payload, phase keying, criteria reinject |
+| `PhaseEngine.session.activeStoryId` | **MEDIUM** | `onMutation`, `onVerifierOutcome`, `getPhase(sid)` (no storyId) | `resolveStoryIdForPhase`, elevate/close transitions, verifier trigger |
 | `checkpoint` ordering guard | **MEDIUM** | `tools.ts:188` | T8 story-advance arc (`tools.ts:197-202`) |
 | `checkScope` | **LOW** | `plugin.ts:517` | scope-watchdog finding |
 | `createPlan` | **LOW** | `tools.ts:137` | `onPlanCreated` compliance recording |
@@ -93,12 +93,12 @@ No `docs/reference/` directory exists in this repository. In-repo precedents use
 | `tool.execute.after` → mutation path (`plugin.ts:476-500`) | Calls `checkScope`; must see union scope |
 | `tool.execute.after` → verification path (`plugin.ts:526-591`) | Mints receipts; the only place receipts are created; session-gated |
 | `experimental.chat.system.transform` (`plugin.ts:~700-830`) | Builds `Finding[]`; two new families injected here |
-| `event(session.idle)` → `handleSessionIdle` (`gate.ts:300`) | Reads active story for prescription + judge payload |
+| `event(session.idle)` → `handleSessionIdle` (`gate.ts:300`) | Reads active story for prescription + verifier payload |
 | `elicify_vertex_plan_checkpoint` (`tools.ts:152-205`) | Evidence validation + successor promotion |
 
 ### Cluster Placement
 
-This feature belongs to the **story-contract / plan lifecycle** cluster (`story.ts` + `wiring/tools.ts`), spanning into the **injection composer** cluster (two new finding families) and the **phase engine** cluster (concurrency correctness). It does **not** touch the receipt, redaction, judge, or measurement clusters.
+This feature belongs to the **story-contract / plan lifecycle** cluster (`story.ts` + `wiring/tools.ts`), spanning into the **injection composer** cluster (two new finding families) and the **phase engine** cluster (concurrency correctness). It does **not** touch the receipt, redaction, verifier, or measurement clusters.
 
 ---
 
@@ -225,7 +225,7 @@ When a wave holds two or more delivery stories and no subagent (`task`) calls we
 
 ### User Story 8 — Union scope watchdog (Priority: P1)
 
-With several stories active at once, scope drift must be judged against the union of their `scopeGlobs`, not one story's.
+With several stories active at once, scope drift must be verifierd against the union of their `scopeGlobs`, not one story's.
 
 **Why this priority**: Without it the watchdog fires on nearly every mutation during a wave, flooding the composer budget.
 
@@ -256,26 +256,26 @@ With several stories active at once, scope drift must be judged against the unio
 
 ---
 
-### User Story 10 — The judge detects incompleteness at idle (Priority: P0)
+### User Story 10 — The verifier detects incompleteness at idle (Priority: P0)
 
-When the agent goes idle, the judge must assess **whether the declared work is actually complete** and, if not, drive a continuation naming what is missing. Today the judge runs only after the final story is already `complete` — it validates work that has already declared itself done, which is QA, not self-correction. The valuable moment is precisely the one it cannot see: the agent stopping early with stories unstarted and acceptance items unevidenced.
+When the agent goes idle, the verifier must assess **whether the declared work is actually complete** and, if not, drive a continuation naming what is missing. Today the verifier runs only after the final story is already `complete` — it validates work that has already declared itself done, which is QA, not self-correction. The valuable moment is precisely the one it cannot see: the agent stopping early with stories unstarted and acceptance items unevidenced.
 
 **Why this priority**: This is the inversion the feature exists for. Without it, a long autonomous run ends silently at 20% completion, exactly as observed in the field session (D2/D3).
 
-**Independent Test**: Put a plan in a partially-complete state, fire `session.idle`, and confirm the judge is invoked with the incomplete plan and its verdict drives a continuation naming the unfinished stories.
+**Independent Test**: Put a plan in a partially-complete state, fire `session.idle`, and confirm the verifier is invoked with the incomplete plan and its verdict drives a continuation naming the unfinished stories.
 
-**Deterministic-first ordering (load-bearing)**: the judge is the **last** check at idle, not the first. Any deterministic gap — a story not complete, an acceptance item unevidenced, unverified changes, a missing plan — is answered by a direct continuation and the judge is **not invoked at all**. The judge runs only when the deterministic layer has no remaining objection, because that is the only moment its answer is not already known. This makes it cheap (at most one invocation per "looks done" idle rather than per idle) and targets it at the one question a state machine cannot answer: *is this substantively complete, or merely checked off?*
+**Deterministic-first ordering (load-bearing)**: the verifier is the **last** check at idle, not the first. Any deterministic gap — a story not complete, an acceptance item unevidenced, unverified changes, a missing plan — is answered by a direct continuation and the verifier is **not invoked at all**. The verifier runs only when the deterministic layer has no remaining objection, because that is the only moment its answer is not already known. This makes it cheap (at most one invocation per "looks done" idle rather than per idle) and targets it at the one question a state machine cannot answer: *is this substantively complete, or merely checked off?*
 
 **Acceptance Scenarios**:
 
-1. **Given** an active plan with ≥1 story not `complete` or ≥1 acceptance item unevidenced, **When** `session.idle` fires, **Then** a deterministic continuation is dispatched naming the specific gap **and the judge is not invoked**.
-2. **Given** an active plan where every story is `complete` and every acceptance item is evidenced, **When** `session.idle` fires, **Then** the judge is invoked with a completion-oriented payload containing the original ask, every story's status, and the evidence bound to each acceptance item.
-3. **Given** a judge verdict of `complete: false`, **When** the verdict is returned, **Then** a continuation is dispatched naming each item in `missing` and the verdict's `nextAction`.
-4. **Given** a judge verdict of `complete: true`, **When** the verdict is returned, **Then** no continuation is dispatched and the session is permitted to close.
-5. **Given** every deterministic check passes and the judge is unsupported, times out, or returns malformed output, **When** `session.idle` fires, **Then** no continuation is dispatched, the session is permitted to close, and a `judge:unavailable-at-close` event is logged.
-6. **Given** the judge has already driven `maxJudgeContinuations` continuations this session, **When** `session.idle` fires again with deterministic checks passing, **Then** the judge is not invoked and the session is permitted to close.
-7. **Given** two consecutive judge verdicts report an identical `missing` set with no new evidence recorded between them, **When** the second verdict returns, **Then** no continuation is dispatched and a `judge:no-progress` event is logged.
-8. **Given** no plan exists and the ask was classified multi-story, **When** `session.idle` fires, **Then** a deterministic plan-required continuation is dispatched and the judge is not invoked.
+1. **Given** an active plan with ≥1 story not `complete` or ≥1 acceptance item unevidenced, **When** `session.idle` fires, **Then** a deterministic continuation is dispatched naming the specific gap **and the verifier is not invoked**.
+2. **Given** an active plan where every story is `complete` and every acceptance item is evidenced, **When** `session.idle` fires, **Then** the verifier is invoked with a completion-oriented payload containing the original ask, every story's status, and the evidence bound to each acceptance item.
+3. **Given** a verifier verdict of `complete: false`, **When** the verdict is returned, **Then** a continuation is dispatched naming each item in `missing` and the verdict's `nextAction`.
+4. **Given** a verifier verdict of `complete: true`, **When** the verdict is returned, **Then** no continuation is dispatched and the session is permitted to close.
+5. **Given** every deterministic check passes and the verifier is unsupported, times out, or returns malformed output, **When** `session.idle` fires, **Then** no continuation is dispatched, the session is permitted to close, and a `verifier:unavailable-at-close` event is logged.
+6. **Given** the verifier has already driven `maxVerifierContinuations` continuations this session, **When** `session.idle` fires again with deterministic checks passing, **Then** the verifier is not invoked and the session is permitted to close.
+7. **Given** two consecutive verifier verdicts report an identical `missing` set with no new evidence recorded between them, **When** the second verdict returns, **Then** no continuation is dispatched and a `verifier:no-progress` event is logged.
+8. **Given** no plan exists and the ask was classified multi-story, **When** `session.idle` fires, **Then** a deterministic plan-required continuation is dispatched and the verifier is not invoked.
 
 ---
 
@@ -299,19 +299,19 @@ A verifier that covers **more** than the prescribed one must count as satisfying
 
 ### User Story 12 — The plan drives itself to completion (Priority: P0)
 
-While a plan has unfinished stories and the session goes idle, the harness must deterministically re-inject the active story and its next legal step — independent of the judge, so the loop survives judge unavailability. This is the deterministic floor beneath US-10.
+While a plan has unfinished stories and the session goes idle, the harness must deterministically re-inject the active story and its next legal step — independent of the verifier, so the loop survives verifier unavailability. This is the deterministic floor beneath US-10.
 
-**Why this priority**: This is the primary completion driver, not a fallback. It runs **before** the judge at every idle and answers every gap the state machine can see — which is most of them, faster, more precisely, and at zero token cost. It also gates the judge (FR-038): while this layer has an objection, the judge is never invoked.
+**Why this priority**: This is the primary completion driver, not a fallback. It runs **before** the verifier at every idle and answers every gap the state machine can see — which is most of them, faster, more precisely, and at zero token cost. It also gates the verifier (FR-038): while this layer has an objection, the verifier is never invoked.
 
-**Independent Test**: Put a plan in a partially-complete state with the judge disabled, fire `session.idle`, and confirm a continuation naming the active story is dispatched.
+**Independent Test**: Put a plan in a partially-complete state with the verifier disabled, fire `session.idle`, and confirm a continuation naming the active story is dispatched.
 
 **Acceptance Scenarios**:
 
-1. **Given** a plan with ≥1 `active` or `pending` story, **When** `session.idle` fires, **Then** a `plan-progress` continuation is dispatched naming the active story, its unevidenced acceptance items, and the next legal step, **and the judge is not invoked**.
+1. **Given** a plan with ≥1 `active` or `pending` story, **When** `session.idle` fires, **Then** a `plan-progress` continuation is dispatched naming the active story, its unevidenced acceptance items, and the next legal step, **and the verifier is not invoked**.
 2. **Given** `maxPlanProgressContinuations` have already been dispatched for this plan, **When** `session.idle` fires again, **Then** no further plan-progress continuation is dispatched.
-3. **Given** a plan whose stories are all `complete` with every acceptance item evidenced, **When** `session.idle` fires, **Then** no plan-progress continuation is dispatched and control passes to the judge.
-4. **Given** a plan containing a `blocked` or `failed` story, **When** `session.idle` fires, **Then** a continuation naming that story is dispatched and the judge is not invoked — a halted plan is deterministically incomplete.
-5. **Given** every story is `complete` but one acceptance item's receipt no longer validates (e.g. invalidated by a later mutation), **When** `session.idle` fires, **Then** a `plan-progress` continuation naming that item is dispatched and the judge is not invoked.
+3. **Given** a plan whose stories are all `complete` with every acceptance item evidenced, **When** `session.idle` fires, **Then** no plan-progress continuation is dispatched and control passes to the verifier.
+4. **Given** a plan containing a `blocked` or `failed` story, **When** `session.idle` fires, **Then** a continuation naming that story is dispatched and the verifier is not invoked — a halted plan is deterministically incomplete.
+5. **Given** every story is `complete` but one acceptance item's receipt no longer validates (e.g. invalidated by a later mutation), **When** `session.idle` fires, **Then** a `plan-progress` continuation naming that item is dispatched and the verifier is not invoked.
 
 ---
 
@@ -371,7 +371,7 @@ The injection mechanism itself is unchanged: mid-turn directives continue to go 
 1. **Given** visibility is enabled, **When** a directive is rendered into the system prompt, **Then** exactly one toast is emitted whose message names the directive family and its prescription, and the system-prompt injection is unchanged.
 2. **Given** visibility is set to `off`, **When** a directive is rendered, **Then** no toast is emitted and the system-prompt injection is unchanged.
 3. **Given** visibility is set to `gates`, **When** a routine mid-turn directive is rendered, **Then** no toast is emitted; **but when** a gate fires or a health/failure signal occurs, **Then** a toast is emitted.
-4. **Given** a health/failure condition (`verify:relevance-gap`, `judge:unavailable`, receipt-not-minted, directive dropped at ≥90% for a turn), **When** it occurs with visibility enabled, **Then** a toast is emitted with variant `warning` or `error`.
+4. **Given** a health/failure condition (`verify:relevance-gap`, `verifier:unavailable`, receipt-not-minted, directive dropped at ≥90% for a turn), **When** it occurs with visibility enabled, **Then** a toast is emitted with variant `warning` or `error`.
 5. **Given** the toast call fails or the host has no TUI attached, **When** a toast is attempted, **Then** the failure is swallowed and no harness behaviour changes.
 6. **Given** more than `maxToastsPerMinute` toasts would be emitted, **When** the cap is reached, **Then** further toasts are suppressed for the remainder of that window and one summary toast reports the suppressed count.
 7. **Given** the same directive family and instance id would toast twice, **When** the duplicate is attempted, **Then** it is suppressed.
@@ -404,7 +404,7 @@ Only unknowns that survive grounding are eligible to be asked. This keeps the hu
 **Interactive vs autonomous.** "Interactive" means a genuine (non-harness-authored) user message has occurred in this session — reusing the `harnessAuthoredIds` tracking that FR-067a introduces for confirmation, so there is exactly one definition of "a human is present".
 
 - **Interactive** → every surviving unknown MUST be asked via the host `question` tool, one question per unknown, in plain English, with concrete options and exactly one option marked `(Recommended)`. The agent MUST NOT proceed to `plan_create` while a surviving unknown is unasked.
-- **Autonomous** → the agent MUST NOT ask (there is nobody to answer, and the question tool blocks the model's turn with no way to release it). Surviving unknowns resolve as `ASSUMED` with rationale and stated risk, and are surfaced to the judge at close.
+- **Autonomous** → the agent MUST NOT ask (there is nobody to answer, and the question tool blocks the model's turn with no way to release it). Surviving unknowns resolve as `ASSUMED` with rationale and stated risk, and are surfaced to the verifier at close.
 
 **No timeout.** The host `question` tool exposes no timeout, expiry, or deadline field, and the reply/reject endpoints that would let the harness auto-answer exist only on the v2 SDK surface — the plugin receives the v1 client, which does not expose `question.*` at all. A harness-side timeout is therefore not implementable without reaching into private SDK internals, and is explicitly out of scope. The interactive/autonomous split above is what handles an absent human.
 
@@ -423,7 +423,7 @@ Only unknowns that survive grounding are eligible to be asked. This keeps the hu
 9. **Given** an `UNKNOWNS` entry marked `ASSUMED` with no recorded grounding attempt, **When** the intake record is validated, **Then** it is rejected — grounding must be attempted before an unknown may be assumed.
 10. **Given** an interactive session with ≥1 surviving unknown and no observed `question` tool call, **When** `plan_create` is called, **Then** it is rejected stating that surviving unknowns must be asked.
 11. **Given** an interactive session, **When** the agent asks a surviving unknown, **Then** the question carries plain-English text, ≥2 concrete options, and exactly one option labelled `(Recommended)` listed first.
-12. **Given** an autonomous session (no genuine user message this session), **When** unknowns survive grounding, **Then** no question is asked, each unknown resolves as `ASSUMED` with rationale and risk, and those assumptions are included in the judge payload at close.
+12. **Given** an autonomous session (no genuine user message this session), **When** unknowns survive grounding, **Then** no question is asked, each unknown resolves as `ASSUMED` with rationale and risk, and those assumptions are included in the verifier payload at close.
 
 ---
 
@@ -433,8 +433,8 @@ Primary flows:
 - When a directive is rendered and visibility is enabled, the system emits one compact toast alongside the unchanged system-prompt injection.
 - When the toast channel is unavailable, the system continues unchanged — visibility is never on the critical path.
 - When a plan is created with stories declaring waves, the system groups them by wave, appends one verification story per wave, and activates every story in wave 1 with a shared `startedAt`.
-- When the session goes idle with a plan that is not complete, the system invokes the judge to assess completion and, on `complete: false`, dispatches a continuation naming what is missing.
-- When the judge is unavailable and a plan has unfinished stories, the system dispatches a deterministic plan-progress continuation instead.
+- When the session goes idle with a plan that is not complete, the system invokes the verifier to assess completion and, on `complete: false`, dispatches a continuation naming what is missing.
+- When the verifier is unavailable and a plan has unfinished stories, the system dispatches a deterministic plan-progress continuation instead.
 - When an observed verifier covers the prescribed one, the system records it as a valid verification and mints a receipt.
 - When an assistant reply cycle completes, the system advances the composer turn so per-turn caps reset.
 - When a delivery story is delivered, the system records `delivered` without requiring evidence.
@@ -995,7 +995,7 @@ Boundary conditions:
 
 ---
 
-#### Scenario Outline: A deterministic gap answers directly and never invokes the judge
+#### Scenario Outline: A deterministic gap answers directly and never invokes the verifier
 
 **Traces to**: User Story 10, Acceptance Scenarios 1, 8
 **Category**: Happy Path
@@ -1003,7 +1003,7 @@ Boundary conditions:
 - **Given** a session state containing `<gap>`
 - **When** `session.idle` fires
 - **Then** a deterministic continuation is dispatched naming that gap
-- **And** the judge is not invoked
+- **And** the verifier is not invoked
 
 **Examples**:
 
@@ -1020,7 +1020,7 @@ Boundary conditions:
 
 ---
 
-#### Scenario: A deterministically complete plan invokes the judge
+#### Scenario: A deterministically complete plan invokes the verifier
 
 **Traces to**: User Story 10, Acceptance Scenario 2
 **Category**: Happy Path
@@ -1028,7 +1028,7 @@ Boundary conditions:
 - **Given** an active plan where every story is `complete`
 - **And** every acceptance item carries valid evidence
 - **When** `session.idle` fires
-- **Then** the judge is invoked exactly once
+- **Then** the verifier is invoked exactly once
 - **And** the payload contains the original ask, every story's status, and the evidence bound to each acceptance item
 
 ---
@@ -1039,7 +1039,7 @@ Boundary conditions:
 **Category**: Happy Path
 
 - **Given** an incomplete plan at idle
-- **When** the judge returns `{ complete: false, missing: ["S2 not started"], nextAction: "begin S2" }`
+- **When** the verifier returns `{ complete: false, missing: ["S2 not started"], nextAction: "begin S2" }`
 - **Then** a continuation is dispatched
 - **And** the continuation text contains "S2 not started"
 - **And** the continuation text contains "begin S2"
@@ -1052,7 +1052,7 @@ Boundary conditions:
 **Category**: Happy Path
 
 - **Given** a plan at idle
-- **When** the judge returns `{ complete: true }`
+- **When** the verifier returns `{ complete: true }`
 - **Then** no continuation is dispatched
 
 ---
@@ -1064,21 +1064,21 @@ Boundary conditions:
 
 - **Given** a plan whose stories are all `complete`
 - **When** `session.idle` fires
-- **Then** the judge is invoked once
+- **Then** the verifier is invoked once
 - **And** its `fit` assessment is surfaced as before
 
 ---
 
-#### Scenario Outline: Judge failure at close fails open
+#### Scenario Outline: Verifier failure at close fails open
 
 **Traces to**: User Story 10, Acceptance Scenario 5
 **Category**: Error Path
 
 - **Given** a deterministically complete plan at idle
-- **When** the judge returns `<failure>`
+- **When** the verifier returns `<failure>`
 - **Then** no continuation is dispatched
 - **And** the session is permitted to close
-- **And** a `judge:unavailable-at-close` event is logged
+- **And** a `verifier:unavailable-at-close` event is logged
 
 **Examples**:
 
@@ -1090,15 +1090,15 @@ Boundary conditions:
 
 ---
 
-#### Scenario: Judge continuations are capped per session
+#### Scenario: Verifier continuations are capped per session
 
 **Traces to**: User Story 10, Acceptance Scenario 6
 **Category**: Edge Case
 
-- **Given** the judge has already driven `maxJudgeContinuations` continuations this session
+- **Given** the verifier has already driven `maxVerifierContinuations` continuations this session
 - **When** `session.idle` fires again with the plan still incomplete
-- **Then** the judge is not invoked
-- **And** no judge-driven continuation is dispatched
+- **Then** the verifier is not invoked
+- **And** no verifier-driven continuation is dispatched
 
 ---
 
@@ -1107,11 +1107,11 @@ Boundary conditions:
 **Traces to**: User Story 10, Acceptance Scenario 7
 **Category**: Edge Case
 
-- **Given** a judge verdict reporting `missing: ["S2 not started"]`
+- **Given** a verifier verdict reporting `missing: ["S2 not started"]`
 - **And** no new evidence recorded since that verdict
 - **When** a second verdict reports the identical `missing` set
 - **Then** no continuation is dispatched
-- **And** a `judge:no-progress` event is logged
+- **And** a `verifier:no-progress` event is logged
 
 ---
 
@@ -1160,7 +1160,7 @@ Boundary conditions:
 - **When** `session.idle` fires
 - **Then** a `plan-progress` continuation is dispatched
 - **And** its text names S1 and S1's unevidenced acceptance items
-- **And** the judge is not invoked
+- **And** the verifier is not invoked
 
 ---
 
@@ -1172,7 +1172,7 @@ Boundary conditions:
 - **Given** a plan containing a `blocked` story
 - **When** `session.idle` fires
 - **Then** a continuation naming that blocked story is dispatched
-- **And** the judge is not invoked
+- **And** the verifier is not invoked
 
 ---
 
@@ -1185,7 +1185,7 @@ Boundary conditions:
 - **And** one acceptance item's receipt no longer validates after a later mutation
 - **When** `session.idle` fires
 - **Then** a `plan-progress` continuation naming that acceptance item is dispatched
-- **And** the judge is not invoked
+- **And** the verifier is not invoked
 
 ---
 
@@ -1211,13 +1211,13 @@ Boundary conditions:
 
 ---
 
-#### Scenario: Judge and plan-progress never double-dispatch
+#### Scenario: Verifier and plan-progress never double-dispatch
 
 **Traces to**: User Story 12, Acceptance Scenario 4
 **Category**: Edge Case
 
 - **Given** an incomplete plan at idle
-- **And** the judge returned `complete: false` and dispatched a continuation
+- **And** the verifier returned `complete: false` and dispatched a continuation
 - **When** the plan-progress check runs in the same idle
 - **Then** no second continuation is dispatched
 
@@ -1448,7 +1448,7 @@ Boundary conditions:
 - **When** the intake record is completed
 - **Then** no `question` tool call is made
 - **And** the unknown is resolved as `ASSUMED` with rationale and risk
-- **And** that assumption appears in the judge payload at close
+- **And** that assumption appears in the verifier payload at close
 
 ---
 
@@ -1540,20 +1540,20 @@ Boundary conditions:
 | 48 | `plan_create_rejects_no_verifier_or_scope` | Unit | Scenario Outline: Structurally inadequate plans are rejected | Row 2 |
 | 49 | `plan_create_rejects_blank_fields` | Unit | Scenario Outline: Structurally inadequate plans are rejected | Rows 3–4 |
 | 50 | `plan_create_rejects_duplicate_story_text` | Unit | Scenario Outline: Structurally inadequate plans are rejected | Row 5 |
-| 51 | `plan_progress_continuation_dispatched` | Unit | Scenario: An incomplete plan at idle dispatches a plan-progress continuation | Deterministic floor, judge disabled |
+| 51 | `plan_progress_continuation_dispatched` | Unit | Scenario: An incomplete plan at idle dispatches a plan-progress continuation | Deterministic floor, verifier disabled |
 | 52 | `plan_progress_continuation_capped` | Unit | Scenario: Plan-progress continuations are capped | Loop safety |
 | 53 | `plan_progress_silent_when_finished` | Unit | Scenario: A finished plan dispatches nothing | No nagging after completion |
-| 54 | `deterministic_gap_never_invokes_judge` | Integration | Scenario Outline: A deterministic gap answers directly and never invokes the judge | All 8 gap rows; asserts 0 judge invocations |
-| 54a | `judge_invoked_only_when_deterministically_complete` | Integration | Scenario: A deterministically complete plan invokes the judge | The gating condition (FR-038) |
-| 54b | `halted_plan_blocks_judge` | Unit | Scenario: A halted plan is deterministically incomplete | `blocked`/`failed` are gaps, not completion |
+| 54 | `deterministic_gap_never_invokes_verifier` | Integration | Scenario Outline: A deterministic gap answers directly and never invokes the verifier | All 8 gap rows; asserts 0 verifier invocations |
+| 54a | `verifier_invoked_only_when_deterministically_complete` | Integration | Scenario: A deterministically complete plan invokes the verifier | The gating condition (FR-038) |
+| 54b | `halted_plan_blocks_verifier` | Unit | Scenario: A halted plan is deterministically incomplete | `blocked`/`failed` are gaps, not completion |
 | 54c | `invalidated_receipt_reopens_story` | Unit | Scenario: An invalidated receipt reopens a complete story | Re-validates evidence at idle, not just at checkpoint |
-| 55 | `judge_incomplete_verdict_drives_continuation` | Integration | Scenario: A `complete: false` verdict drives a continuation | Self-correction loop |
-| 56 | `judge_complete_verdict_permits_close` | Integration | Scenario: A `complete: true` verdict permits close | No false nagging |
-| 57 | `judge_quality_pass_on_complete_plan` | Integration | Scenario: A fully complete plan still receives a quality verdict | Pre-existing behaviour preserved |
-| 58 | `judge_failure_at_close_fails_open` | Integration | Scenario Outline: Judge failure at close fails open | 3 example rows; close permitted, event logged |
-| 59 | `judge_continuations_capped` | Integration | Scenario: Judge continuations are capped per session | Cost + loop bound |
-| 60 | `judge_no_progress_stops_loop` | Integration | Scenario: Repeated identical verdicts stop the loop | Anti-nag detector |
-| 61 | `judge_and_plan_progress_never_double_dispatch` | Integration | Scenario: Judge and plan-progress never double-dispatch | One continuation per idle |
+| 55 | `verifier_incomplete_verdict_drives_continuation` | Integration | Scenario: A `complete: false` verdict drives a continuation | Self-correction loop |
+| 56 | `verifier_complete_verdict_permits_close` | Integration | Scenario: A `complete: true` verdict permits close | No false nagging |
+| 57 | `verifier_quality_pass_on_complete_plan` | Integration | Scenario: A fully complete plan still receives a quality verdict | Pre-existing behaviour preserved |
+| 58 | `verifier_failure_at_close_fails_open` | Integration | Scenario Outline: Verifier failure at close fails open | 3 example rows; close permitted, event logged |
+| 59 | `verifier_continuations_capped` | Integration | Scenario: Verifier continuations are capped per session | Cost + loop bound |
+| 60 | `verifier_no_progress_stops_loop` | Integration | Scenario: Repeated identical verdicts stop the loop | Anti-nag detector |
+| 61 | `verifier_and_plan_progress_never_double_dispatch` | Integration | Scenario: Verifier and plan-progress never double-dispatch | One continuation per idle |
 | 62 | `multi_story_without_plan_driven_to_plan` | Integration | Scenario: Multi-story work without a plan is driven to plan | Mandatory planning |
 | 63 | `assistant_reply_advances_turn` | Integration | Scenario: An assistant reply cycle advances the composer turn | D4 fix |
 | 64 | `continuation_does_not_double_advance_turn` | Integration | Scenario: A harness continuation does not double-advance the turn | D4 guard |
@@ -1575,7 +1575,7 @@ Boundary conditions:
 | 80 | `assumed_unknown_requires_grounding` | Unit | Scenario: An assumed unknown requires a recorded grounding attempt | Ground-before-ask/assume |
 | 81 | `interactive_must_ask_surviving_unknowns` | Integration | Scenario: An interactive session must ask surviving unknowns | Gate + question shape |
 | 82 | `question_shape_options_and_recommendation` | Unit | Scenario: An interactive session must ask surviving unknowns | ≥2 options, one `(Recommended)` first |
-| 83 | `autonomous_assumes_without_asking` | Integration | Scenario: An autonomous session assumes instead of asking | No question tool call; assumptions reach the judge |
+| 83 | `autonomous_assumes_without_asking` | Integration | Scenario: An autonomous session assumes instead of asking | No question tool call; assumptions reach the verifier |
 | 84 | `interactive_detection_excludes_harness_messages` | Unit | Scenario: An autonomous session assumes instead of asking | `harnessAuthoredIds` drives the interactive/autonomous split |
 | 85 | `checkpoint_freezes_receipt_content` | Unit | Scenario: Checkpointing freezes the receipt's content into the plan | FR-082: content copied, not referenced |
 | 86 | `frozen_evidence_survives_invalidate` | Unit | Scenario: Frozen evidence survives an invalidating mutation | FR-085 — the CRIT-005 case |
@@ -1652,7 +1652,7 @@ This feature **modifies existing functionality**.
 | v1 `goals.json` archival | `story.test.ts` `story_v1_archival` (test 13) | No — must pass unchanged | v2 archival is additive, must not disturb v1 handling |
 | `clearPlan` archives reversibly | `story.test.ts` "clearPlan (human-facing escape hatch)" | Yes — `clear_plan_works_on_v3` | Must handle v3 plans and waves |
 | Receipt surfaced to model in tool output | `plugin.integration.test.ts` "verification receipt surfaced…" | No — must pass unchanged | Receipt mechanics untouched |
-| Judge fires at final-story completion | `integration-judge.test.ts` | Yes — `judge_fires_on_final_wave_verification` | "Final story" now means the final wave's verification story |
+| Verifier fires at final-story completion | `integration-verifier.test.ts` | Yes — `verifier_fires_on_final_wave_verification` | "Final story" now means the final wave's verification story |
 | Composer per-turn caps and cooldowns | `composer.test.ts` | Yes — `wave_verification_uncapped_across_turns` | New families must not break cap semantics |
 | T8 story-advance phase arc | `plugin.integration.test.ts` / `phase.test.ts` | Yes — `phase_advance_on_wave_transition` | T8 now fires on wave transition, not per-story |
 
@@ -1735,24 +1735,24 @@ Worked example — the real field case, currently a gap:
 
 - **FR-082**: On a successful checkpoint the system MUST copy the validating receipt's content — `command`, `exitCode`, `outcome`, `observedAt`, `workspaceRoot`, and the originating `receiptId` — into the acceptance item's `evidence` in `plan.json`.
 - **FR-083**: Checkpoint-time validation MUST continue to resolve `receiptId` against the live `VerificationReceiptStore` exactly as today (observed, workspace-matching, exit 0, not predating story start). Freezing changes what is *stored*, never what is *required to earn* evidence.
-- **FR-084**: Every reader after checkpoint — idle completion checks, wave gating, the judge payload — MUST read the frozen record in `plan.json` and MUST NOT re-resolve `receiptId` against the live store.
+- **FR-084**: Every reader after checkpoint — idle completion checks, wave gating, the verifier payload — MUST read the frozen record in `plan.json` and MUST NOT re-resolve `receiptId` against the live store.
 - **FR-085**: A frozen evidence record MUST survive process restart and MUST NOT be invalidated by `verificationReceipts.invalidate`; a completed story MUST NOT reopen because the in-memory store was cleared.
 - **FR-086**: Frozen evidence MUST be schema-validated on read; a malformed record MUST be treated as absent (the item is unevidenced) rather than crashing the load.
 - **FR-087**: A later mutation MUST still invalidate *live* receipts for not-yet-checkpointed items (existing behaviour, unchanged) — freezing applies only at and after a successful checkpoint.
 
 **Supersedes**: the Assumption stating that receipt invalidation remains session-global and path-scoping is deferred, and Ambiguity #3, are both corrected by FR-082…FR-087 — path-scoped invalidation is no longer needed, because a frozen record is never invalidated at all.
 
-### D2 — Judge as completion detector
+### D2 — Verifier as completion detector
 
-- **FR-038**: At `session.idle` the system MUST evaluate deterministic completion FIRST, and MUST invoke the judge **only when every deterministic check passes** (a plan exists, every story is `complete`, and every acceptance item carries valid evidence). Any deterministic gap MUST be answered by a direct continuation with the judge left uninvoked.
-- **FR-038a**: The judge MUST NOT be invoked when no plan exists, when any story is `pending`/`active`/`delivered`/`blocked`/`failed`, or when any acceptance item lacks evidence.
-- **FR-039**: The judge payload MUST contain the original ask, every story's id/text/status, and the ids of acceptance items lacking evidence.
-- **FR-040**: The judge verdict schema MUST carry `{ complete: boolean, missing: string[], nextAction: string }` in addition to the existing quality `fit` assessment.
+- **FR-038**: At `session.idle` the system MUST evaluate deterministic completion FIRST, and MUST invoke the verifier **only when every deterministic check passes** (a plan exists, every story is `complete`, and every acceptance item carries valid evidence). Any deterministic gap MUST be answered by a direct continuation with the verifier left uninvoked.
+- **FR-038a**: The verifier MUST NOT be invoked when no plan exists, when any story is `pending`/`active`/`delivered`/`blocked`/`failed`, or when any acceptance item lacks evidence.
+- **FR-039**: The verifier payload MUST contain the original ask, every story's id/text/status, and the ids of acceptance items lacking evidence.
+- **FR-040**: The verifier verdict schema MUST carry `{ complete: boolean, missing: string[], nextAction: string }` in addition to the existing quality `fit` assessment.
 - **FR-041**: A `complete: false` verdict MUST dispatch a continuation whose text contains every entry in `missing` and the verdict's `nextAction`.
 - **FR-042**: A `complete: true` verdict MUST NOT dispatch a continuation.
-- **FR-043**: The judge MUST still run once for a quality assessment when the plan is fully complete, preserving pre-existing behaviour.
-- **FR-044**: Judge unavailability (`unsupported`, `unavailable`, `malformed`, timeout) MUST fail open — no continuation is dispatched and the session is permitted to close, logging `judge:unavailable-at-close`. The deterministic layer has already run and raised no objection by the time the judge is reached (FR-038), so there is nothing to fall back to.
-- **FR-045**: Judge-driven continuations MUST be capped at `maxJudgeContinuations` per session (default 3) and MUST stop when two consecutive verdicts report an identical `missing` set with no new evidence recorded between them, logging `judge:no-progress`.
+- **FR-043**: The verifier MUST still run once for a quality assessment when the plan is fully complete, preserving pre-existing behaviour.
+- **FR-044**: Verifier unavailability (`unsupported`, `unavailable`, `malformed`, timeout) MUST fail open — no continuation is dispatched and the session is permitted to close, logging `verifier:unavailable-at-close`. The deterministic layer has already run and raised no objection by the time the verifier is reached (FR-038), so there is nothing to fall back to.
+- **FR-045**: Verifier-driven continuations MUST be capped at `maxVerifierContinuations` per session (default 3) and MUST stop when two consecutive verdicts report an identical `missing` set with no new evidence recorded between them, logging `verifier:no-progress`.
 
 ### D3 — Deterministic completion driver
 
@@ -1781,7 +1781,7 @@ Worked example — the real field case, currently a gap:
 - **FR-058**: The mid-turn injection mechanism MUST remain `experimental.chat.system.transform` with an unchanged O-D-P-E body; visibility MUST NOT alter what the model receives.
 - **FR-059**: When visibility is `"all"` and a directive is rendered, the system MUST emit exactly one `client.tui.showToast` call summarising that directive's family and prescription.
 - **FR-060**: When visibility is `"gates"`, toasts MUST be emitted only for gate fires and health/failure signals, never for routine mid-turn directives.
-- **FR-061**: Health/failure conditions (`verify:relevance-gap`, `judge:unavailable`, a verified command that minted no receipt, and a turn whose directive drop rate is ≥90%) MUST emit a toast with variant `warning` or `error` when visibility is not `"off"`.
+- **FR-061**: Health/failure conditions (`verify:relevance-gap`, `verifier:unavailable`, a verified command that minted no receipt, and a turn whose directive drop rate is ≥90%) MUST emit a toast with variant `warning` or `error` when visibility is not `"off"`.
 - **FR-062**: A failed or unavailable toast call MUST be swallowed and MUST NOT change any harness behaviour (verified: `showToast` returns `{data:true}` and does not throw with no TUI attached).
 - **FR-063**: Toasts MUST be capped at `maxToastsPerMinute` (default 6) and deduplicated by `family + instanceId`; on hitting the cap a single summary toast MUST report the suppressed count.
 - **FR-064**: A `/elicify-vertex-visibility` slash command MUST toggle **that session's** visibility mode, intercepted via `command.execute.before`. The intercepted name MUST match the registration key literally — deriving it from a configurable `activeSkillTrigger` made the toggle a silent no-op under any custom trigger.
@@ -1806,7 +1806,7 @@ Worked example — the real field case, currently a gap:
 - **FR-077**: A session MUST be classified `interactive` when a genuine, non-harness-authored user message has occurred in it, reusing the `harnessAuthoredIds` set from FR-067a; otherwise it is `autonomous`.
 - **FR-078**: In an interactive session, `createPlan` MUST reject while any surviving unknown has not been asked via the `question` tool (observed as a `tool === "question"` call in `tool.execute.after`).
 - **FR-079**: A question raised for a surviving unknown MUST carry plain-English text, ≥2 concrete options, and exactly one option whose label ends with `(Recommended)`, listed first — the host `QuestionOption` type has no `recommended` field, so the marker MUST be encoded in the label.
-- **FR-080**: In an autonomous session the agent MUST NOT invoke the `question` tool; surviving unknowns MUST resolve as `ASSUMED` with rationale and risk, and MUST be included in the judge payload at close.
+- **FR-080**: In an autonomous session the agent MUST NOT invoke the `question` tool; surviving unknowns MUST resolve as `ASSUMED` with rationale and risk, and MUST be included in the verifier payload at close.
 - **FR-081**: The system MUST NOT attempt a harness-side question timeout: the host exposes no timeout field, and the reply/reject endpoints exist only on the v2 SDK surface which the plugin's v1 client does not expose.
 
 ---
@@ -1825,11 +1825,11 @@ Worked example — the real field case, currently a gap:
 - **SC-010**: Replaying the 25 recorded bash calls from session `ses_0668b2422ffe4hbFM3AkIerZmp` through the fixed relevance check yields ≥3 minted receipts (currently 0), and 0 relevance gaps on the three `go build ./... && go test ./... -count=1` runs.
 - **SC-011**: For the 7 rows of the covering-verifier Examples table, the relevance check returns the stated `gap` value in 7/7 cases.
 - **SC-012**: In a simulated idle with a plan at 1 of 5 stories complete, exactly 1 continuation is dispatched, and its text names at least one unfinished story id.
-- **SC-013**: With the judge forced to each of `unsupported`/`timeout`/`malformed` on a deterministically complete plan, the session closes with no continuation in 3/3 cases and logs `judge:unavailable-at-close`.
-- **SC-013a**: Across the 8 deterministic-gap rows, the judge is invoked **0 times** — measured as zero `session.create` calls for the `vertex-judge` agent.
-- **SC-013b**: In the replayed field session (`ses_0668b2422ffe4hbFM3AkIerZmp`), which never reached deterministic completion, the judge is invoked 0 times while ≥1 deterministic continuation is dispatched.
+- **SC-013**: With the verifier forced to each of `unsupported`/`timeout`/`malformed` on a deterministically complete plan, the session closes with no continuation in 3/3 cases and logs `verifier:unavailable-at-close`.
+- **SC-013a**: Across the 8 deterministic-gap rows, the verifier is invoked **0 times** — measured as zero `session.create` calls for the `vertex-verifier` agent.
+- **SC-013b**: In the replayed field session (`ses_0668b2422ffe4hbFM3AkIerZmp`), which never reached deterministic completion, the verifier is invoked 0 times while ≥1 deterministic continuation is dispatched.
 - **SC-014**: Over a 10-cycle autonomous run with no user messages, `turnIndex` advances ≥9 times and the ratio of `directive_rendered` to `per-turn-cap:dropped` is ≥ 1:3 (measured 5:250 ≈ 1:50 before the fix).
-- **SC-015**: A judge-driven continuation loop terminates within `maxJudgeContinuations` invocations in 100% of runs — no session exceeds the cap.
+- **SC-015**: A verifier-driven continuation loop terminates within `maxVerifierContinuations` invocations in 100% of runs — no session exceeds the cap.
 - **SC-016**: `createPlan` rejects all 5 defect rows of the inadequate-plan Examples table, each with an error naming the offending story or field.
 - **SC-017**: With visibility `"all"`, the system-prompt text produced for a given finding set is byte-identical to the text produced with visibility `"off"` — the model's input is provably unaffected by the visibility setting.
 - **SC-018**: All 9 rows of the visibility mode×event table produce the stated toast/no-toast outcome, 9/9.
@@ -1882,19 +1882,19 @@ Worked example — the real field case, currently a gap:
 | FR-036 | US-11 | A covering verifier is not a relevance gap | `subset_verifier_is_a_gap` |
 | FR-036a | US-11 | A covering verifier is not a relevance gap | `covering_verifier_not_a_gap` |
 | FR-037 | US-11 | A covering verifier mints a receipt | `covering_verifier_mints_receipt` |
-| FR-038 | US-10, US-12 | A deterministic gap answers directly and never invokes the judge; A deterministically complete plan invokes the judge | `deterministic_gap_never_invokes_judge`, `judge_invoked_only_when_deterministically_complete` |
-| FR-038a | US-10, US-12 | A deterministic gap answers directly and never invokes the judge; A halted plan is deterministically incomplete; An invalidated receipt reopens a complete story | `deterministic_gap_never_invokes_judge`, `halted_plan_blocks_judge`, `invalidated_receipt_reopens_story` |
-| FR-039 | US-10 | A deterministically complete plan invokes the judge | `judge_invoked_only_when_deterministically_complete` |
-| FR-040 | US-10 | A `complete: false` verdict drives a continuation | `judge_incomplete_verdict_drives_continuation` |
-| FR-041 | US-10 | A `complete: false` verdict drives a continuation | `judge_incomplete_verdict_drives_continuation` |
-| FR-042 | US-10 | A `complete: true` verdict permits close | `judge_complete_verdict_permits_close` |
-| FR-043 | US-10 | A fully complete plan still receives a quality verdict | `judge_quality_pass_on_complete_plan` |
-| FR-044 | US-10 | Judge failure at close fails open | `judge_failure_at_close_fails_open` |
-| FR-045 | US-10 | Judge continuations are capped per session; Repeated identical verdicts stop the loop | `judge_continuations_capped`, `judge_no_progress_stops_loop` |
+| FR-038 | US-10, US-12 | A deterministic gap answers directly and never invokes the verifier; A deterministically complete plan invokes the verifier | `deterministic_gap_never_invokes_verifier`, `verifier_invoked_only_when_deterministically_complete` |
+| FR-038a | US-10, US-12 | A deterministic gap answers directly and never invokes the verifier; A halted plan is deterministically incomplete; An invalidated receipt reopens a complete story | `deterministic_gap_never_invokes_verifier`, `halted_plan_blocks_verifier`, `invalidated_receipt_reopens_story` |
+| FR-039 | US-10 | A deterministically complete plan invokes the verifier | `verifier_invoked_only_when_deterministically_complete` |
+| FR-040 | US-10 | A `complete: false` verdict drives a continuation | `verifier_incomplete_verdict_drives_continuation` |
+| FR-041 | US-10 | A `complete: false` verdict drives a continuation | `verifier_incomplete_verdict_drives_continuation` |
+| FR-042 | US-10 | A `complete: true` verdict permits close | `verifier_complete_verdict_permits_close` |
+| FR-043 | US-10 | A fully complete plan still receives a quality verdict | `verifier_quality_pass_on_complete_plan` |
+| FR-044 | US-10 | Verifier failure at close fails open | `verifier_failure_at_close_fails_open` |
+| FR-045 | US-10 | Verifier continuations are capped per session; Repeated identical verdicts stop the loop | `verifier_continuations_capped`, `verifier_no_progress_stops_loop` |
 | FR-046 | US-12 | An incomplete plan at idle dispatches a plan-progress continuation | `plan_progress_continuation_dispatched` |
 | FR-047 | US-12 | Plan-progress continuations are capped | `plan_progress_continuation_capped` |
 | FR-048 | US-12 | A finished plan dispatches nothing | `plan_progress_silent_when_finished` |
-| FR-049 | US-12 | Judge and plan-progress never double-dispatch | `judge_and_plan_progress_never_double_dispatch` |
+| FR-049 | US-12 | Verifier and plan-progress never double-dispatch | `verifier_and_plan_progress_never_double_dispatch` |
 | FR-050 | US-13 | Multi-story work without a plan is driven to plan | `multi_story_without_plan_driven_to_plan` |
 | FR-051 | US-14 | An assistant reply cycle advances the composer turn | `assistant_reply_advances_turn`, `autonomous_run_directive_delivery_rate` |
 | FR-052 | US-14 | A harness continuation does not double-advance the turn | `continuation_does_not_double_advance_turn` |
@@ -1950,11 +1950,11 @@ Two review passes produced **64 findings, 14 CRITICAL** (`vertex2-waves-spec-rev
 | **W1 — Unblock evidence** | D1 covering verifiers (FR-033…037) with pinned coverage semantics; D4 turn advancement (FR-051/052) | CRIT-009, MAJ (SC-014 relabelling hole) | — | **Yes** — receipts must be minted where 0 were before |
 | **W2 — Evidence durability & data model** | Freeze-at-checkpoint evidence into `plan.json`; per-session (not whole-file) archival; archival trigger coverage; lock semantics; `schemaVersion` 3 | CRIT-001, CRIT-002, CRIT-005, CRIT-006, CRIT-010 | W1 | No |
 | **W3 — Wave model** | `wave`/`kind`/`delivered`; `getActiveStories` + all 11 call sites; verification-story scope fix; wave gating; rework loop; `PhaseEngine` concurrency | CRIT-003, CRIT-004, FR-030 | W2 | No |
-| **W4 — Idle ordering & judge** | Deterministic-first ordering; plan-progress loop; judge completion verdict | FR-038/038a, D3 | W2, W3 | **Yes** — the field-session failure must not reproduce |
+| **W4 — Idle ordering & verifier** | Deterministic-first ordering; plan-progress loop; verifier completion verdict | FR-038/038a, D3 | W2, W3 | **Yes** — the field-session failure must not reproduce |
 | **W5 — Intake** | `harnessAuthoredIds` via pre-registered `messageID`; interactive/autonomous redesign; grounding verified from observed tool calls; question-gate binding | C2-001, C2-002, C2-003, C2-004, M2-001 | W4 | **Yes** |
 | **W6 — Visibility** | Toast channel, visibility modes, toggle command | — | W1 | No |
 
-**Ordering rationale.** W1 first because D1 suppresses *all* evidence today — until it lands, nothing downstream (gates, waves, judge, intake) can be observed working even if correctly implemented, and every later wave's live re-test would be meaningless. W2 before W3 because the wave model's gate depends on evidence that survives a mutation and a restart, which today it does not. W5 last because its four criticals are the least settled and it has the most redesign still to do; it is also the only wave that can deadlock a session, so it should land on a base that is otherwise proven.
+**Ordering rationale.** W1 first because D1 suppresses *all* evidence today — until it lands, nothing downstream (gates, waves, verifier, intake) can be observed working even if correctly implemented, and every later wave's live re-test would be meaningless. W2 before W3 because the wave model's gate depends on evidence that survives a mutation and a restart, which today it does not. W5 last because its four criticals are the least settled and it has the most redesign still to do; it is also the only wave that can deadlock a session, so it should land on a base that is otherwise proven.
 
 **Known-unrevised on entry.** W2 must record the evidence-durability decision that is currently absent from the FRs entirely (review-2 M2-002): a checkpoint copies the receipt's *content* — command, exitCode, observedAt, workspaceRoot — into `plan.json` as an immutable record, and later checks read `plan.json` only. Assumption line ~1906 and Ambiguity #3 still state the opposite and must be corrected in the same pass.
 
@@ -1965,15 +1965,15 @@ Two review passes produced **64 findings, 14 CRITICAL** (`vertex2-waves-spec-rev
 | # | What's Ambiguous | Likely Agent Assumption | Question to Resolve |
 |---|---|---|---|
 | 1 | How the verification story's acceptance items bind to receipts — one receipt per delivery story, or does the verification story get its own separate receipt? | Agent binds each verification acceptance item to the receipt already attached to the corresponding delivery story (no new verification run). | Should completing the wave verification story require a *fresh* verifier run of its own, or merely assert that each delivery story already holds a valid receipt? **Spec currently assumes the latter (FR-022).** |
-| 2 | Whether `getActiveStory` (singular) should be removed or retained | Agent retains it returning the first active story, to limit blast radius across 10 call sites. | Should the 10 existing `getActiveStory` call sites each be individually reviewed for union semantics, or is "first active" acceptable for verifier resolution / judge payload / criteria reinject? |
+| 2 | Whether `getActiveStory` (singular) should be removed or retained | Agent retains it returning the first active story, to limit blast radius across 10 call sites. | Should the 10 existing `getActiveStory` call sites each be individually reviewed for union semantics, or is "first active" acceptable for verifier resolution / verifier payload / criteria reinject? |
 | 3 | ~~Verifier-written artifacts invalidating receipts mid-batch~~ | — | **RESOLVED by FR-082…FR-087 (freeze at checkpoint).** Frozen evidence is never invalidated, so path-scoped invalidation is unnecessary. The residual window is narrow and unchanged: a mutation between earning a receipt and checkpointing it still invalidates that *live* receipt (FR-087), and the agent re-verifies. |
 | 4 | What "resolved verifier" means in the mandatory-next-step text when a story declares no `verifiers` | Agent falls back to `resolveVerifier` over the story's `scopeGlobs`, then to the generic prescription string. | Confirm the fallback chain for the instruction text. |
 | 5 | Whether a wave may be added to an existing plan after creation | Agent assumes no — waves are fixed at `createPlan`. | Should there be an `amend`-style path to append a wave mid-plan? **Spec assumes not in scope.** |
-| 6 | ~~Whether the judge should fire per-wave or only at final-wave completion~~ | — | **RESOLVED**: the judge fires at every `session.idle` where the plan is incomplete (FR-038), not on completion. Superseded by US-10. |
+| 6 | ~~Whether the verifier should fire per-wave or only at final-wave completion~~ | — | **RESOLVED**: the verifier fires at every `session.idle` where the plan is incomplete (FR-038), not on completion. Superseded by US-10. |
 | 7 | How "covering" is decided across toolchains — is `npm test` allowed to cover a prescribed `go test`? | Agent scopes coverage to the same toolchain/runner, treating a different runner as non-covering (FR-036). | Confirm that cross-toolchain commands never cover each other, even when one is a whole-suite command. |
-| 8 | Whether the completion judge sees the raw user ask verbatim | Agent passes the first user message text, redacted, truncated to the existing judge field cap. | Should the judge see the full conversation, the first ask only, or a model-authored restatement of the goal? |
-| 9 | What counts as "new evidence recorded" for the `judge:no-progress` detector | Agent compares the count of evidenced acceptance items plus the receipt-store size between verdicts. | Confirm the progress signal; a weak signal risks either premature stop or an endless loop. |
-| 10 | Interaction between judge-driven continuations and `maxCriteriaBlocks` | Agent keeps the caps independent (`maxJudgeContinuations`, `maxPlanProgressContinuations`, `maxCriteriaBlocks` each separate). | Should there be a single global continuation budget per session instead of three independent caps? |
+| 8 | Whether the completion verifier sees the raw user ask verbatim | Agent passes the first user message text, redacted, truncated to the existing verifier field cap. | Should the verifier see the full conversation, the first ask only, or a model-authored restatement of the goal? |
+| 9 | What counts as "new evidence recorded" for the `verifier:no-progress` detector | Agent compares the count of evidenced acceptance items plus the receipt-store size between verdicts. | Confirm the progress signal; a weak signal risks either premature stop or an endless loop. |
+| 10 | Interaction between verifier-driven continuations and `maxCriteriaBlocks` | Agent keeps the caps independent (`maxVerifierContinuations`, `maxPlanProgressContinuations`, `maxCriteriaBlocks` each separate). | Should there be a single global continuation budget per session instead of three independent caps? |
 
 ---
 
@@ -2034,11 +2034,11 @@ Two review passes produced **64 findings, 14 CRITICAL** (`vertex2-waves-spec-rev
 - Subagent delegation uses opencode's `task` tool; if a future host renames it, `delegation-gap` silently stops firing (advisory only, no correctness impact).
 - `getActiveStory` (singular) is retained as "first active" to bound the blast radius; call sites are reviewed individually but not all converted to union semantics (Ambiguity #2).
 - No cap is imposed on stories per wave or waves per plan.
-- ~~The judge continues to fire only at final-wave verification completion.~~ **Superseded**: the judge fires at every idle where the plan is incomplete, and its primary job is completion detection; quality assessment is retained as a secondary output (US-10).
-- The completion judge is advisory in the sense that it never grants or denies *evidence* — but its verdict does drive a continuation. "Non-gating" in FR-030 means "cannot substitute for a receipt", not "cannot cause the agent to keep working".
+- ~~The verifier continues to fire only at final-wave verification completion.~~ **Superseded**: the verifier fires at every idle where the plan is incomplete, and its primary job is completion detection; quality assessment is retained as a secondary output (US-10).
+- The completion verifier is advisory in the sense that it never grants or denies *evidence* — but its verdict does drive a continuation. "Non-gating" in FR-030 means "cannot substitute for a receipt", not "cannot cause the agent to keep working".
 - Coverage is evaluated within a toolchain; a command from a different runner never covers another (Ambiguity #7).
 - The three continuation caps remain independent rather than a single shared budget (Ambiguity #10).
-- Judge latency is 30–90s (measured 28.8s and 45.6s in isolation), so at most one judge invocation per idle is acceptable; the caps exist to bound cost as much as to prevent loops.
+- Verifier latency is 30–90s (measured 28.8s and 45.6s in isolation), so at most one verifier invocation per idle is acceptable; the caps exist to bound cost as much as to prevent loops.
 
 ## Clarifications
 
@@ -2048,10 +2048,10 @@ Two review passes produced **64 findings, 14 CRITICAL** (`vertex2-waves-spec-rev
 - Q: When a wave's verification fails, what happens to that story? → A: **Back to `active`, wave stays open.** The story keeps its original `startedAt`; the wave's verification story stays incomplete; the next wave stays blocked.
 - Q: How should the `schemaVersion` 2 → 3 bump be handled? → A: **No backward compatibility or migration needed.** v3 only. (Implementation note: an existing v2 plan is archived rather than silently dropped, because `persistPlan` discards entries failing validation — archival prevents data loss without performing any conversion.)
 - Q: Should the harness require actual subagent fanout, or only require the verification gate? → A: **Nudge only; verification is the hard gate.** A multi-story wave with no observed `task` calls produces an advisory `delegation-gap` directive but is never blocked. The receipt requirement is the sole non-bypassable enforcement.
-- Q: When should the LLM judge be invoked? → A: **At idle, to detect incompleteness — not on story/plan completion.** Invoking it only once work is already declared complete is QA and fails the actual purpose, which is self-correcting long-running tasks. Completion detection is the primary job; quality assessment is retained as a secondary output for the already-complete case.
-- Q: Must the harness enforce that the LLM writes proper user stories and a plan, and follows it? → A: **Yes.** `createPlan` rejects structurally inadequate plans deterministically (FR-053…FR-056), multi-story work without a plan is driven to create one (FR-050), and the plan is driven to completion by both the judge (FR-038) and a deterministic fallback loop (FR-046).
-- Q: Should the judge run at every idle, or only once deterministic checks pass? → A: **Deterministic first; the judge only when nothing deterministic objects.** If a story is not complete or evidence is missing, we already know the answer — prompt the main agent directly and skip the judge entirely. The judge is reserved for the case where the state machine says "done", because that is the only moment its answer is not already known, and the only question it can answer better: *substantively complete, or merely checked off?* This also bounds cost to roughly one judge call per "looks done" idle instead of one per idle.
-- Q: If the deterministic layer already passed, what does judge failure fall back to? → A: **Nothing — the session closes.** There is no fallback to construct, because the deterministic layer ran first and raised no objection. Failure is logged as `judge:unavailable-at-close`.
+- Q: When should the LLM verifier be invoked? → A: **At idle, to detect incompleteness — not on story/plan completion.** Invoking it only once work is already declared complete is QA and fails the actual purpose, which is self-correcting long-running tasks. Completion detection is the primary job; quality assessment is retained as a secondary output for the already-complete case.
+- Q: Must the harness enforce that the LLM writes proper user stories and a plan, and follows it? → A: **Yes.** `createPlan` rejects structurally inadequate plans deterministically (FR-053…FR-056), multi-story work without a plan is driven to create one (FR-050), and the plan is driven to completion by both the verifier (FR-038) and a deterministic fallback loop (FR-046).
+- Q: Should the verifier run at every idle, or only once deterministic checks pass? → A: **Deterministic first; the verifier only when nothing deterministic objects.** If a story is not complete or evidence is missing, we already know the answer — prompt the main agent directly and skip the verifier entirely. The verifier is reserved for the case where the state machine says "done", because that is the only moment its answer is not already known, and the only question it can answer better: *substantively complete, or merely checked off?* This also bounds cost to roughly one verifier call per "looks done" idle instead of one per idle.
+- Q: If the deterministic layer already passed, what does verifier failure fall back to? → A: **Nothing — the session closes.** There is no fallback to construct, because the deterministic layer ran first and raised no objection. Failure is logged as `verifier:unavailable-at-close`.
 - Q: Injected prompts are invisible to the user — should that change? → A: **Keep the current injection mechanism; add toast notifications for mid-turn injections.** The model keeps receiving the full O-D-P-E body via `system.transform` (unchanged); the user gets a compact toast alongside it. Idle corrections need nothing new — they already go through `session.prompt` and are visible as real messages; they were absent in the field session only because zero continuations fired (D3).
 - Q: Should the mid-turn directive be its own tool entry rather than a toast? → A: **Rejected after testing.** `session.shell` was verified to create a genuine model-independent tool part, but it always renders as `bash`, spawns a real shell per directive, emits 2 messages per injection, and carries unsuppressible shell-profile noise (a no-output `true` command still produced 3 lines of it). Fabricating a part directly is impossible — the session API has no part-creation endpoint.
 - Q: Should visibility be configurable? → A: **Yes — `"off" | "gates" | "all"`, default `"all"` (on), with a `/elicify-vertex-visibility` toggle** intercepted by `command.execute.before`, the same mechanism `/elicify-vertex` already uses.
@@ -2059,6 +2059,6 @@ Two review passes produced **64 findings, 14 CRITICAL** (`vertex2-waves-spec-rev
 - Q: Is a confidence level enough? → A: **No.** Self-reported confidence is a calibration task models perform badly and is trivially gameable; it is explicitly not accepted as a substitute for resolving an unknown (FR-074). It may route, never gate.
 - Q: Can a generic checklist work across all request types? → A: **No — rejected.** A fixed dimension list is either too abstract to bite or too specific to generalise across typo fixes, perf work, refactors and migrations. Replaced by three self-tailoring mechanisms: generated misreadings ("3 ways this could be misread"), testability-as-detector (a criterion with no proving command *is* the unknown), and only two universal anchors ("what does done look like?", "what must not change?").
 - Q: Should unknowns go straight to the human? → A: **No — ground first.** The agent must attempt resolution from the codebase, then any available datasource, then web research where applicable. Only unknowns surviving grounding are eligible to be asked, and each `ASSUMED` entry must record what grounding was attempted (FR-076).
-- Q: What happens to surviving unknowns? → A: **Interactive sessions must ask via the `question` tool** — plain English, ≥2 concrete options, exactly one `(Recommended)` listed first; `plan_create` is blocked until they are asked (FR-078/079). **Autonomous sessions must not ask** (nobody can answer and the tool blocks the turn) — unknowns resolve as `ASSUMED` with risk and are surfaced to the judge at close (FR-080).
+- Q: What happens to surviving unknowns? → A: **Interactive sessions must ask via the `question` tool** — plain English, ≥2 concrete options, exactly one `(Recommended)` listed first; `plan_create` is blocked until they are asked (FR-078/079). **Autonomous sessions must not ask** (nobody can answer and the tool blocks the turn) — unknowns resolve as `ASSUMED` with risk and are surfaced to the verifier at close (FR-080).
 - Q: Can the harness time out an unanswered question? → A: **No, and it is explicitly out of scope (FR-081).** The host exposes no timeout/expiry field on questions, and the reply/reject endpoints that would let the harness auto-answer exist only on the v2 SDK surface — the plugin receives the v1 client, which does not expose `question.*`. The interactive/autonomous split replaces the timeout.
 - Q: Are the three field-observed defects in scope for this spec? → A: **Yes — D1 and D4 block evaluation of everything else.** D1 (covering verifiers) suppresses all evidence; D4 (turn freeze) throttles directive delivery to ~2%. Both are specified here (US-11, US-14) and should land before the wave model is built on top of them.

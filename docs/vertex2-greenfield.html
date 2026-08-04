@@ -534,7 +534,7 @@ receipt type — it's actually widened upstream."</div>
     <div class="card"><h4>Block conversion</h4><p>Share of gate blocks followed by a green, <em>relevant</em>
       verifier within the same turn. Measures whether prescriptions actually teach.</p></div>
     <div class="card"><h4>Proposal acceptance</h4><p>Share of elevate-phase proposals ("I also found X — take it?")
-      the user accepts. Proxy for judged, non-annoying proactivity.</p></div>
+      the user accepts. Proxy for assessed, non-annoying proactivity.</p></div>
     <div class="card"><h4>Criteria-met-at-close</h4><p>Acceptance items with hard evidence at checkpoint ÷ total.
       Detects literal-answer-wrong-intent.</p></div>
     <div class="card"><h4>Calibration</h4><p>Declared confidence vs verifier outcome, per model.
@@ -582,9 +582,9 @@ receipt type — it's actually widened upstream."</div>
 <section>
   <div class="sec-num">08</div>
   <h2>Implementing the guide layer — the three-tier composer</h2>
-  <p class="sec-sub">The obvious question: doesn't "diagnose and prescribe" need an LLM judge?
+  <p class="sec-sub">The obvious question: doesn't "diagnose and prescribe" need an LLM verifier?
   Mostly no — and where judgment is genuinely needed, extract it from the <em>working model itself,
-  pinned in time so it cannot be rationalized</em>. A judge model exists only as a thin escalation tier.</p>
+  pinned in time so it cannot be rationalized</em>. A verifier model exists only as a thin escalation tier.</p>
 
   <div class="grid3">
     <div class="card">
@@ -598,26 +598,26 @@ receipt type — it's actually widened upstream."</div>
       never hallucinates.</p>
     </div>
     <div class="card">
-      <span class="tag blue">tier 2 · the real judge</span>
+      <span class="tag blue">tier 2 · the real verifier</span>
       <h4>Temporal self-judgment</h4>
-      <p>"Was this expected?" needs no judge — it needs <strong>pre-commitment</strong>. The harness
+      <p>"Was this expected?" needs no verifier — it needs <strong>pre-commitment</strong>. The harness
       demands <code>EXPECT: &lt;one line&gt;</code> before the run (captured deterministically from the
-      text stream), then compares expectation vs observation with string/exit logic. The judge is the
+      text stream), then compares expectation vs observation with string/exit logic. The verifier is the
       working model at time T, audited at time T+1 — judgment extracted <em>before the outcome exists</em>
       cannot be rationalized after. Same mechanism: confidence calibration, criteria replay
       (every "met" must carry a receipt id), root-cause ladder.</p>
     </div>
     <div class="card">
       <span class="tag">tier 3 · escalation only</span>
-      <h4>LLM judge, on a leash</h4>
+      <h4>LLM verifier, on a leash</h4>
       <p>Needed for three things only: intent-vs-criteria audit at the final gate of deep stories,
       classifying failures the taxonomy misses, scoring taste passes <em>for measurement</em>.
       Constraints: runs as an <strong>in-loop subturn</strong> — a child session
       (<code>session.create({parentID})</code>) prompted with tool-calling disabled, on the
       <strong>session's own model by default</strong> (always configured; optional
-      <code>judgeModel</code> override), 5&nbsp;s cap, never in the hot path, deterministic
+      <code>verifierModel</code> override), 5&nbsp;s cap, never in the hot path, deterministic
       fallback, and an <strong>evidence-only diet</strong> — diff + criteria + verifier output,
-      never the chat narrative, or the judge inherits the coherence bias it exists to catch.</p>
+      never the chat narrative, or the verifier inherits the coherence bias it exists to catch.</p>
     </div>
   </div>
 
@@ -634,20 +634,20 @@ receipt type — it's actually widened upstream."</div>
       <tr><td class="pname">Re-model on repeat failure</td><td>1 + 2</td>
         <td>detection: signature + same-location diff tracking (tier 1); the "what belief was false?" answer is the model's artifact (tier 2)</td></tr>
       <tr><td class="pname">Criteria replay</td><td>2 → 3</td>
-        <td>model marks met/unmet with receipt ids, harness validates receipts (tier 2); judge audits intent-fit once, at the final gate of deep stories (tier 3)</td></tr>
+        <td>model marks met/unmet with receipt ids, harness validates receipts (tier 2); verifier audits intent-fit once, at the final gate of deep stories (tier 3)</td></tr>
       <tr><td class="pname">Confidence calibration</td><td>2</td>
         <td>declared confidence captured pre-run; outcome deterministic; calibration curve per model</td></tr>
       <tr><td class="pname">Taste pass</td><td>2 → 3</td>
-        <td>fresh-role prompt on the diff (tier 2); judge scores a sample offline for the measurement layer (tier 3)</td></tr>
+        <td>fresh-role prompt on the diff (tier 2); verifier scores a sample offline for the measurement layer (tier 3)</td></tr>
       <tr><td class="pname">Directive ROI</td><td>1 + 3</td>
-        <td>compliance is detectable from artifacts (tier 1 string checks); outcome deltas are plain statistics; judge only labels ambiguous outcomes offline</td></tr>
+        <td>compliance is detectable from artifacts (tier 1 string checks); outcome deltas are plain statistics; verifier only labels ambiguous outcomes offline</td></tr>
     </tbody>
   </table>
 
   <div class="callout"><p><strong>The principle:</strong> the guide layer's intelligence is
   <em>state you already collect, kept until the moment it matters, poured into templates</em> —
   plus the working model's own judgment, extracted <em>before</em> outcomes exist so it is checkable
-  <em>after</em>. A second model judges only what the first model cannot be pinned to: intent.
+  <em>after</em>. A second model verifies only what the first model cannot be pinned to: intent.
   Graceful degradation top-down: tier 3 unavailable → tier 2 still guides; tier 2 artifact missing →
   tier 1 still prescribes.</p></div>
 </section>

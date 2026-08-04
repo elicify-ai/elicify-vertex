@@ -33,14 +33,14 @@ afterEach(() => {
 
 function harness(opts: {
   maxCriteriaBlocks?: number
-  judgeEnabled?: boolean
+  verifierEnabled?: boolean
   maxNoProgressTurns?: number
   busyChildren?: boolean
   maxStoryReaudits?: number
-  /** FR-014: parts returned for the judge child session (a `tool` part = the judge observed something). */
+  /** FR-014: parts returned for the verifier child session (a `tool` part = the verifier observed something). */
   childParts?: Array<{ type: string }>
-  /** The verdict the stubbed judge subturn returns. */
-  judgeVerdict?: unknown
+  /** The verdict the stubbed verifier subturn returns. */
+  verifierVerdict?: unknown
 } = {}) {
   const stateDir = temporaryRoot()
   const logger = vi.fn()
@@ -61,10 +61,10 @@ function harness(opts: {
   }
   const client = { session } as unknown as OpencodeClient
   const states = new Map<string, ReturnType<typeof freshSessionState>>()
-  // `appendJudgeCloseOut` is the ONLY caller of `recentVerifierSummaries` in
-  // gate.ts, and it reads it only after the `judgeEnabled`/`modelId` guards —
+  // `appendVerifierCloseOut` is the ONLY caller of `recentVerifierSummaries` in
+  // gate.ts, and it reads it only after the `verifierEnabled`/`modelId` guards —
   // so "was this mock called?" is an exact, side-effect-free probe of
-  // "did the judge stage run?" with no agent/network stubbing.
+  // "did the verifier stage run?" with no agent/network stubbing.
   const recentVerifierSummaries = vi.fn(() => [] as string[])
 
   const ctx: GateContext = {
@@ -79,7 +79,7 @@ function harness(opts: {
     states,
     activeSessionIDs: () => [...states.entries()].filter(([, s]) => s.active).map(([id]) => id),
     maxCriteriaBlocks: opts.maxCriteriaBlocks ?? 3,
-    judgeEnabled: opts.judgeEnabled ?? false,
+    verifierEnabled: opts.verifierEnabled ?? false,
     isValidReceipt: () => false,
     recentVerifierSummaries,
     diffSummary: () => "",
@@ -112,7 +112,10 @@ function harness(opts: {
 function promiseTexts(prompt: ReturnType<typeof vi.fn>): string[] {
   return prompt.mock.calls
     .map((call) => (call[0] as { body: { parts: Array<{ text: string }> } }).body.parts[0].text)
-    .filter((text) => text.includes("vertex:promise-no-act"))
+    // The `[vertex:...]` marker is stripped at dispatch so the model reads
+    // a continuation as an instruction, not as harness output — match the
+    // directive's own wording. The family stays in the event log.
+    .filter((text) => text.includes("states an intent to do further work"))
 }
 
 /** Every dispatched continuation, paired with the session it was addressed to. */
@@ -190,13 +193,36 @@ function driveToElevate(h: ReturnType<typeof harness>, sid: string, storyId: str
   h.phaseEngine.onVerifierOutcome(sid, storyId, { success: true, coversFinalStory: true })
 }
 
-const planTexts = (prompt: ReturnType<typeof vi.fn>): string[] =>
-  continuations(prompt)
+/**
+ * Continuation texts belonging to one directive family.
+ *
+ * The `[vertex:…]` marker is stripped from what the model receives (a
+ * continuation must read as an instruction, not as harness output), so the
+ * family is no longer recoverable from the text. It comes from the
+ * `gate:continuation-dispatched` audit event instead, whose 500-char prefix
+ * is matched back to the full dispatched text.
+ */
+function familyTexts(h: ReturnType<typeof harness>, family: string): string[] {
+  const prefixes = h.logger.mock.calls
+    .filter((c) => c[0] === "gate:continuation-dispatched" && (c[1] as { family?: string })?.family === family)
+    .map((c) => (c[1] as { text: string }).text.slice(0, 60))
+  return continuations(h.prompt)
     .map((c) => c.text)
-    .filter((text) => text.includes("vertex:plan-incomplete"))
+    .filter((t) => prefixes.some((prefix) => t.startsWith(prefix)))
+}
+
+/** Same, keeping the session each continuation was addressed to. */
+function familyContinuations(h: ReturnType<typeof harness>, family: string): Array<{ sid: string; text: string }> {
+  const prefixes = h.logger.mock.calls
+    .filter((c) => c[0] === "gate:continuation-dispatched" && (c[1] as { family?: string })?.family === family)
+    .map((c) => (c[1] as { text: string }).text.slice(0, 60))
+  return continuations(h.prompt).filter((c) => prefixes.some((prefix) => c.text.startsWith(prefix)))
+}
+
+const planTexts = (h: ReturnType<typeof harness>): string[] => familyTexts(h, "plan-incomplete")
 
 describe("handleSessionIdle — stage-1 plan-completion gate", () => {
-  it("AC-1/AC-2: dispatches one continuation naming every open story with its status, the active story's declared verifier, and the acceptance items the judge will audit", async () => {
+  it("AC-1/AC-2: dispatches one continuation naming every open story with its status, the active story's declared verifier, and the acceptance items the verifier will audit", async () => {
     const h = harness()
     const sid = "s1"
     quietSession(h, sid)
@@ -208,15 +234,15 @@ describe("handleSessionIdle — stage-1 plan-completion gate", () => {
     expect(fired).toHaveLength(1)
     const text = fired[0].text
     expect(fired[0].sid).toBe(sid)
-    expect(text).toContain("[vertex:plan-incomplete]")
+    expect(text).toContain("The story plan is not complete")
     // AC-2: which stories are incomplete, and their status.
     expect(text).toContain('S1 (active): "Scaffold the app"')
     expect(text).toContain('S2 (pending): "Sources management page"')
     expect(text).toContain('S3 (pending): "End-to-end UAT via Playwright"')
     // AC-2 (redesign point 8): the active story's declared verifier...
     expect(text).toContain("npx vitest run tests/scaffold.test.ts")
-    // ...and EVERY acceptance item the judge will audit (A1 and A2 — the
-    // per-item evidence-citation contract is gone, so the judge audits all
+    // ...and EVERY acceptance item the verifier will audit (A1 and A2 — the
+    // per-item evidence-citation contract is gone, so the verifier audits all
     // of them; the prescription names them so the model can self-check).
     expect(text).toContain('A1: "dev server boots"')
     expect(text).toContain('A2: "unit tests pass"')
@@ -237,14 +263,14 @@ describe("handleSessionIdle — stage-1 plan-completion gate", () => {
 
     await handleSessionIdle(h.ctx, sid)
 
-    const texts = planTexts(h.prompt)
+    const texts = planTexts(h)
     expect(texts).toHaveLength(1)
     expect(texts[0]).toContain("S1 declares no verifiers")
     expect(texts[0]).toContain("amend S1 to declare the verifier you intend to use")
   })
 
-  it("AC-6 discrimination: a fully complete plan is NOT blocked, and the judge stage still runs exactly as before (AC-4)", async () => {
-    const h = harness({ judgeEnabled: true })
+  it("AC-6 discrimination: a fully complete plan is NOT blocked, and the verifier stage still runs exactly as before (AC-4)", async () => {
+    const h = harness({ verifierEnabled: true })
     const sid = "s1"
     const state = quietSession(h, sid)
     state.modelId = "anthropic/claude-opus-4"
@@ -267,20 +293,20 @@ describe("handleSessionIdle — stage-1 plan-completion gate", () => {
     await handleSessionIdle(h.ctx, sid)
 
     expect(continuations(h.prompt)).toHaveLength(0)
-    expect(h.recentVerifierSummaries).toHaveBeenCalledTimes(1) // judge stage entered
+    expect(h.recentVerifierSummaries).toHaveBeenCalledTimes(1) // verifier stage entered
     expect(state.criteriaBlocks).toBe(0) // no block budget consumed
     expect(loggedEventTypes(h.logger)).not.toContain("gate:plan-incomplete")
   })
 
-  it("AC-3 (redesign point 2): the judge DOES audit a claimed-final story even while an earlier story is still open", async () => {
-    // This REVERSES the pre-redesign behavior the old test encoded (the judge
+  it("AC-3 (redesign point 2): the verifier DOES audit a claimed-final story even while an earlier story is still open", async () => {
+    // This REVERSES the pre-redesign behavior the old test encoded (the verifier
     // was gated behind every story reaching "complete" deterministically, so
-    // it could never rescue exactly this stall). The judge is now the sole
+    // it could never rescue exactly this stall). The verifier is now the sole
     // arbiter: it audits any claimed-complete story at idle regardless of the
     // others' states. Here S2 is claimed complete while S1 is still pending
     // — unreachable through the tool surface (checkpoint promotes in order),
     // written straight to disk to isolate the audit gate.
-    const h = harness({ judgeEnabled: true })
+    const h = harness({ verifierEnabled: true })
     const sid = "s1"
     const state = quietSession(h, sid)
     state.modelId = "anthropic/claude-opus-4"
@@ -318,7 +344,7 @@ describe("handleSessionIdle — stage-1 plan-completion gate", () => {
           dependsOn: [],
           status: "complete",
           completedAt: new Date().toISOString(),
-          // S2 is the claimed-complete final story the judge audits; its task
+          // S2 is the claimed-complete final story the verifier audits; its task
           // carries the matching complete status + completedAt.
           tasks: [{ id: "S2.T1", text: "run the UAT", dependsOn: [], status: "complete", completedAt: new Date().toISOString() }],
         },
@@ -328,14 +354,14 @@ describe("handleSessionIdle — stage-1 plan-completion gate", () => {
 
     await handleSessionIdle(h.ctx, sid)
 
-    // The judge stage ENTERED — it read the verifier summaries to build the
+    // The verifier stage ENTERED — it read the verifier summaries to build the
     // audit payload for the claimed S2 (the stub client's probe then fails
     // open, dispatching nothing, but the entry is the reversal's proof).
     expect(h.recentVerifierSummaries).toHaveBeenCalledTimes(1)
     // S1 is still open, so the deterministic plan-incomplete branch still
-    // fires for it (the judge failing open falls through to the rest of the
+    // fires for it (the verifier failing open falls through to the rest of the
     // tree).
-    const texts = planTexts(h.prompt)
+    const texts = planTexts(h)
     expect(texts).toHaveLength(1)
     expect(texts[0]).toContain('S1 (pending): "Sources management page"')
     // Only S1 is open, so the claimed-but-unaudited final story is not
@@ -357,9 +383,9 @@ describe("handleSessionIdle — stage-1 plan-completion gate", () => {
 
     const texts = continuations(h.prompt).map((c) => c.text)
     expect(texts).toHaveLength(2)
-    expect(texts[0]).toContain("vertex:plan-incomplete")
-    expect(texts[1]).toContain("vertex:stop-block")
-    expect(texts[1]).not.toContain("vertex:plan-incomplete")
+    expect(texts[0]).toContain("The story plan is not complete")
+    expect(texts[1]).toContain("No acceptance criteria were captured")
+    expect(texts[1]).not.toContain("The story plan is not complete")
     expect(state.criteriaBlocks).toBe(1)
     expect(loggedEventTypes(h.logger)).toContain("gate:plan-incomplete-capped")
   })
@@ -377,9 +403,9 @@ describe("handleSessionIdle — stage-1 plan-completion gate", () => {
 
     const texts = continuations(h.prompt).map((c) => c.text)
     expect(texts).toHaveLength(1)
-    expect(texts[0]).toContain("vertex:plan-incomplete")
+    expect(texts[0]).toContain("The story plan is not complete")
     expect(promiseTexts(h.prompt)).toHaveLength(0)
-    expect(texts[0]).not.toContain("vertex:stop-block")
+    expect(texts[0]).not.toContain("No acceptance criteria were captured")
   })
 
   it("a session with no plan at all is untouched by the new branch", async () => {
@@ -411,7 +437,7 @@ describe("handleSessionIdle — stage-1 plan-completion gate", () => {
 
     await handleSessionIdle(h.ctx, sid)
 
-    const texts = planTexts(h.prompt)
+    const texts = planTexts(h)
     expect(texts).toHaveLength(1)
     expect(texts[0]).toContain('S1 (blocked): "Blocked story"')
     expect(texts[0]).toContain("No story is active")
@@ -436,7 +462,7 @@ describe("handleSessionIdle — stage-1 plan-completion gate", () => {
 
     await handleSessionIdle(h.ctx, sid)
 
-    const texts = planTexts(h.prompt)
+    const texts = planTexts(h)
     expect(texts).toHaveLength(1)
     expect(texts[0]).toContain("elicify_vertex_plan_reopen")
     expect(texts[0]).toContain("S1")
@@ -491,9 +517,9 @@ describe("handleSessionIdle — stage-1 plan-completion gate", () => {
       await handleSessionIdle(h.ctx, sid!)
 
       const texts = continuations(h.prompt).map((c) => c.text)
-      expect(texts.filter((t) => t.includes("vertex:plan-incomplete"))).toHaveLength(0)
+      expect(familyTexts(h, "plan-incomplete")).toHaveLength(0)
       expect(texts).toHaveLength(1)
-      expect(texts[0]).toContain("vertex:stop-block") // suppression is scoped, not a global mute
+      expect(texts[0]).toContain("No acceptance criteria were captured") // suppression is scoped, not a global mute
       expect(state.criteriaBlocks).toBe(0)
     } finally {
       if (savedHoldout === undefined) delete process.env.VERTEX_HOLDOUT
@@ -509,7 +535,7 @@ describe("handleSessionIdle — stage-1 plan-completion gate", () => {
 // ===========================================================================
 
 describe("handleSessionIdle — promise-no-act port", () => {
-  it("blocks with [vertex:promise-no-act] when the last assistant text defers work after changed files", async () => {
+  it("blocks with a promise-no-act continuation when the last assistant text defers work after changed files", async () => {
     const { ctx, evidenceLedger, prompt, states, stateDir } = harness()
     const sid = "s1"
     const state = freshSessionState(stateDir)
@@ -674,7 +700,7 @@ describe("handleSessionIdle — turn-freeze fix (composer.newTurn on every conti
 //
 // `handleSessionIdle` used to `return` before any enforcement whenever
 // `activeSessionIDs().length > 1`, which silently switched off promise-no-act,
-// the stop-block and the judge for EVERY session as soon as a second one
+// the stop-block and the verifier for EVERY session as soon as a second one
 // existed. Enforcement is now per-session; the multi-session signal survives
 // only as a log/advisory. See gate.ts's `handleSessionIdle` doc comment.
 // ===========================================================================
@@ -703,7 +729,7 @@ describe("handleSessionIdle — per-session enforcement under concurrent session
     await handleSessionIdle(h.ctx, "s1")
     await handleSessionIdle(h.ctx, "s2")
 
-    const fired = continuations(h.prompt).filter((c) => c.text.includes("vertex:stop-block"))
+    const fired = familyContinuations(h, "stop-block")
     expect(fired.map((c) => c.sid)).toEqual(["s1", "s2"])
     // Each continuation cites only its OWN session's changed path — no
     // cross-session bleed through the shared EvidenceLedger instance.
@@ -725,7 +751,7 @@ describe("handleSessionIdle — per-session enforcement under concurrent session
     await handleSessionIdle(h.ctx, "verified")
     await handleSessionIdle(h.ctx, "unverified")
 
-    const fired = continuations(h.prompt).filter((c) => c.text.includes("vertex:stop-block"))
+    const fired = familyContinuations(h, "stop-block")
     expect(fired.map((c) => c.sid)).toEqual(["unverified"])
   })
 
@@ -771,17 +797,17 @@ describe("handleSessionIdle — per-session enforcement under concurrent session
   it("a self-created child session does not disable its parent's gate or read as multi-session", async () => {
     const h = harness()
     activateBlockableSession(h, "parent", "src/alpha.ts")
-    // A judge/intake subturn child leaking into the active list (FR-036):
+    // A verifier/intake subturn child leaking into the active list (FR-036):
     // recorded in SelfCreatedSessions exactly as `runSubturn` records it.
     const child = freshSessionState(h.stateDir)
     child.active = true
-    h.states.set("judge-child-1", child)
-    h.selfCreated.record("judge-child-1", "parent")
-    expect(h.ctx.activeSessionIDs()).toEqual(["parent", "judge-child-1"])
+    h.states.set("verifier-child-1", child)
+    h.selfCreated.record("verifier-child-1", "parent")
+    expect(h.ctx.activeSessionIDs()).toEqual(["parent", "verifier-child-1"])
 
     await handleSessionIdle(h.ctx, "parent")
 
-    const fired = continuations(h.prompt).filter((c) => c.text.includes("vertex:stop-block"))
+    const fired = familyContinuations(h, "stop-block")
     expect(fired.map((c) => c.sid)).toEqual(["parent"])
     // The parent is still the only real session — no degraded-attribution
     // advisory, and therefore no spurious criteria re-injection.
@@ -830,7 +856,7 @@ describe("handleSessionIdle — watchdog: delegation deferral + stall pause", ()
     expect(loggedEventTypes(h.logger)).toContain("gate:delegation-stale")
     expect(loggedEventTypes(h.logger)).not.toContain("gate:delegation-defer")
     // The gate proceeded: the plan-incomplete continuation fired.
-    expect(continuations(h.prompt).map((c) => c.text).some((t) => t.includes("vertex:plan-incomplete"))).toBe(true)
+    expect(familyTexts(h, "plan-incomplete").length).toBeGreaterThan(0)
   })
 
   it("resumes the gate once the delegation returns and the child goes idle", async () => {
@@ -852,7 +878,7 @@ describe("handleSessionIdle — watchdog: delegation deferral + stall pause", ()
     h.delegation.noteTaskDone(sid, "task-call-1")
     childBusy = false
     await handleSessionIdle(h.ctx, sid) // tracker clear, child idle -> fires
-    expect(continuations(h.prompt).map((c) => c.text).some((t) => t.includes("vertex:plan-incomplete"))).toBe(true)
+    expect(familyTexts(h, "plan-incomplete").length).toBeGreaterThan(0)
   })
 
   it("pauses auto-continuations after maxNoProgressTurns consecutive no-progress idles, then stays silent", async () => {
@@ -894,18 +920,18 @@ describe("handleSessionIdle — watchdog: delegation deferral + stall pause", ()
 })
 
 // ===========================================================================
-// Judge-verdict reconciliation (FR-001 / FR-001b / FR-005 / FR-007 / FR-014).
+// Verifier-verdict reconciliation (FR-001 / FR-001b / FR-005 / FR-007 / FR-014).
 //
-// These drive the REAL `handleJudgeAudit` with a stubbed judge subturn, so the
+// These drive the REAL `handleVerifierAudit` with a stubbed verifier subturn, so the
 // assertions are about what the gate DOES with a verdict, not about the model.
 // Every fixture is grounded in the audited session
-// (`ses_04dc77bdaffej8SFJvYm5yO0CW`): the notes are real shapes the judge
+// (`ses_04dc77bdaffej8SFJvYm5yO0CW`): the notes are real shapes the verifier
 // actually produced.
 // ===========================================================================
 
-/** Stub the judge subturn end to end: probe passes, verdict is `verdict`, and
- * the child session reports `childParts` (a `tool` part = the judge looked). */
-function stubJudge(
+/** Stub the verifier subturn end to end: probe passes, verdict is `verdict`, and
+ * the child session reports `childParts` (a `tool` part = the verifier looked). */
+function stubVerifier(
   h: ReturnType<typeof harness>,
   verdict: unknown,
   childParts: Array<{ type: string }> = [{ type: "tool" }],
@@ -916,19 +942,19 @@ function stubJudge(
   // inside runSubturn (code review MAJ-004) — a stub that keeps serving parts
   // after delete would hide that the floor never fires in production.
   let childDeleted = false
-  session.create = vi.fn(async () => ({ data: { id: "judge-child-1" }, error: undefined }))
+  session.create = vi.fn(async () => ({ data: { id: "verifier-child-1" }, error: undefined }))
   session.delete = vi.fn(async () => {
     childDeleted = true
     return { data: {}, error: undefined }
   })
   session.messages = vi.fn(async (args: { path?: { id?: string } }) =>
-    args?.path?.id === "judge-child-1" && !childDeleted
+    args?.path?.id === "verifier-child-1" && !childDeleted
       ? { data: [{ info: { role: "assistant" }, parts: childParts }], error: undefined }
       : { data: [], error: undefined },
   )
   const prompt = session.prompt as ReturnType<typeof vi.fn>
   session.prompt = vi.fn(async (args: { body?: { agent?: string } }) => {
-    if (args?.body?.agent === "vertex-judge") {
+    if (args?.body?.agent === "vertex-verifier") {
       return { data: { info: {}, parts: [{ type: "text", text: JSON.stringify(verdict) }] }, error: undefined }
     }
     return prompt(args as never)
@@ -936,7 +962,7 @@ function stubJudge(
   const appAgents = vi.fn(async () => ({
     data: [
       {
-        name: "vertex-judge",
+        name: "vertex-verifier",
         mode: "subagent",
         builtIn: false,
         permission: { edit: "deny", write: "deny", bash: { "*": "deny" }, webfetch: "deny", task: "deny" },
@@ -960,31 +986,31 @@ function claimedStory(h: ReturnType<typeof harness>, sid: string, verifiers: str
   h.storyEngine.checkpoint(sid, "S1.T1", "complete")
 }
 
-describe("handleJudgeAudit — verdict reconciliation", () => {
+describe("handleVerifierAudit — verdict reconciliation", () => {
   it("FR-001: a false 'file is missing' claim is contradicted and the story is NOT reverted", async () => {
-    const h = harness({ judgeEnabled: true })
+    const h = harness({ verifierEnabled: true })
     const sid = "s1"
     const state = quietSession(h, sid)
     state.modelId = "anthropic/claude-opus-4"
     // The worktree for this session is the temp stateDir; create the file the
-    // judge will (falsely) claim is absent.
+    // verifier will (falsely) claim is absent.
     writeFileSync(join(h.stateDir, "present.md"), "# real content\n", "utf8")
     state.workspaceRoot = h.stateDir
     claimedStory(h, sid)
-    stubJudge(h, {
+    stubVerifier(h, {
       stories: [{ storyId: "S1", pass: false, summary: "missing file", items: [{ itemId: "A1", met: false, note: "present.md does not exist on disk" }] }],
     })
 
     await handleSessionIdle(h.ctx, sid)
 
-    expect(loggedEventTypes(h.logger)).toContain("judge:contradicted")
+    expect(loggedEventTypes(h.logger)).toContain("verifier:contradicted")
     expect(h.storyEngine.getPlan(sid)!.stories[0].status).toBe("complete")
     // FR-001b: the pass is harness-derived, so it must be marked as such.
-    expect(h.storyEngine.getPlan(sid)!.stories[0].judge?.contradictedItemIds).toEqual(["A1"])
+    expect(h.storyEngine.getPlan(sid)!.stories[0].verifier?.contradictedItemIds).toEqual(["A1"])
   })
 
   it("FR-001: a CONTENT claim about an existing file is never contradicted — the story still reverts", async () => {
-    const h = harness({ judgeEnabled: true })
+    const h = harness({ verifierEnabled: true })
     const sid = "s1"
     const state = quietSession(h, sid)
     state.modelId = "anthropic/claude-opus-4"
@@ -992,7 +1018,7 @@ describe("handleJudgeAudit — verdict reconciliation", () => {
     state.workspaceRoot = h.stateDir
     claimedStory(h, sid)
     // The REAL correct-FAIL shape from the audited session.
-    stubJudge(h, {
+    stubVerifier(h, {
       stories: [
         {
           storyId: "S1",
@@ -1005,65 +1031,65 @@ describe("handleJudgeAudit — verdict reconciliation", () => {
 
     await handleSessionIdle(h.ctx, sid)
 
-    expect(loggedEventTypes(h.logger)).not.toContain("judge:contradicted")
+    expect(loggedEventTypes(h.logger)).not.toContain("verifier:contradicted")
     expect(h.storyEngine.getPlan(sid)!.stories[0].status).toBe("active") // reverted, correctly
   })
 
   it("FR-014: a verdict produced with ZERO tool calls is not applied", async () => {
-    const h = harness({ judgeEnabled: true })
+    const h = harness({ verifierEnabled: true })
     const sid = "s1"
     const state = quietSession(h, sid)
     state.modelId = "anthropic/claude-opus-4"
     state.workspaceRoot = h.stateDir
     claimedStory(h, sid)
-    stubJudge(
+    stubVerifier(
       h,
       { stories: [{ storyId: "S1", pass: false, summary: "nope", items: [{ itemId: "A1", met: false, note: "not delivered" }] }] },
-      [{ type: "text" }], // the judge answered without observing anything
+      [{ type: "text" }], // the verifier answered without observing anything
     )
 
     await handleSessionIdle(h.ctx, sid)
 
-    expect(loggedEventTypes(h.logger)).toContain("judge:unverified")
+    expect(loggedEventTypes(h.logger)).toContain("verifier:unverified")
     expect(h.storyEngine.getPlan(sid)!.stories[0].status).toBe("complete") // claim stands
   })
 
   it("FR-005: pass:false with every item met is dropped per story, leaving the story untouched", async () => {
-    const h = harness({ judgeEnabled: true })
+    const h = harness({ verifierEnabled: true })
     const sid = "s1"
     const state = quietSession(h, sid)
     state.modelId = "anthropic/claude-opus-4"
     state.workspaceRoot = h.stateDir
     claimedStory(h, sid)
     // The real S2 stamp shape: pass:false while every item is met:true.
-    stubJudge(h, {
+    stubVerifier(h, {
       stories: [{ storyId: "S1", pass: false, summary: "contradictory", items: [{ itemId: "A1", met: true, note: "all good" }] }],
     })
 
     await handleSessionIdle(h.ctx, sid)
 
-    expect(loggedEventTypes(h.logger)).toContain("judge:verdict-contradictory")
+    expect(loggedEventTypes(h.logger)).toContain("verifier:verdict-contradictory")
     expect(h.storyEngine.getPlan(sid)!.stories[0].status).toBe("complete")
   })
 
   // -------------------------------------------------------------------------
   // C2 (grill round 2) — a bounding stamp is NOT an audit pass.
   //
-  // `boundUnappliedVerdicts` must write a stamp, or the `!story.judge` audit
-  // selector re-runs the judge on the story every idle forever (MAJ-003). It
+  // `boundUnappliedVerdicts` must write a stamp, or the `!story.verifier` audit
+  // selector re-runs the verifier on the story every idle forever (MAJ-003). It
   // used to write `pass: true` to do that, which meant an unusable verdict —
   // one the harness explicitly refused to act on — read downstream as "this
-  // story passed audit", including to the close-out's `judge?.pass === true`
+  // story passed audit", including to the close-out's `verifier?.pass === true`
   // gate. The refusal now has its own field.
   // -------------------------------------------------------------------------
   it("C2: an UNVERIFIED verdict is stamped as unapplied, not as a pass", async () => {
-    const h = harness({ judgeEnabled: true })
+    const h = harness({ verifierEnabled: true })
     const sid = "s1"
     const state = quietSession(h, sid)
     state.modelId = "anthropic/claude-opus-4"
     state.workspaceRoot = h.stateDir
     claimedStory(h, sid)
-    stubJudge(
+    stubVerifier(
       h,
       { stories: [{ storyId: "S1", pass: false, summary: "nope", items: [{ itemId: "A1", met: false, note: "not delivered" }] }] },
       [{ type: "text" }], // no tool call -> FR-014 refuses the verdict
@@ -1071,29 +1097,29 @@ describe("handleJudgeAudit — verdict reconciliation", () => {
 
     await handleSessionIdle(h.ctx, sid)
 
-    const stamp = h.storyEngine.getPlan(sid)!.stories[0].judge!
+    const stamp = h.storyEngine.getPlan(sid)!.stories[0].verifier!
     expect(stamp.unapplied).toBe("unverified")
-    // The judge's actual answer is preserved rather than overwritten with a
-    // pass the judge never gave.
+    // The verifier's actual answer is preserved rather than overwritten with a
+    // pass the verifier never gave.
     expect(stamp.pass).toBe(false)
     // ...and refusing to apply it still means refusing to REVERT on it.
     expect(h.storyEngine.getPlan(sid)!.stories[0].status).toBe("complete")
   })
 
   it("C2: a CONTRADICTORY verdict is stamped as unapplied and reverts nothing", async () => {
-    const h = harness({ judgeEnabled: true })
+    const h = harness({ verifierEnabled: true })
     const sid = "s1"
     const state = quietSession(h, sid)
     state.modelId = "anthropic/claude-opus-4"
     state.workspaceRoot = h.stateDir
     claimedStory(h, sid)
-    stubJudge(h, {
+    stubVerifier(h, {
       stories: [{ storyId: "S1", pass: false, summary: "contradictory", items: [{ itemId: "A1", met: true, note: "all good" }] }],
     })
 
     await handleSessionIdle(h.ctx, sid)
 
-    const stamp = h.storyEngine.getPlan(sid)!.stories[0].judge!
+    const stamp = h.storyEngine.getPlan(sid)!.stories[0].verifier!
     expect(stamp.unapplied).toBe("contradictory")
     expect(h.storyEngine.getPlan(sid)!.stories[0].status).toBe("complete")
   })
@@ -1102,24 +1128,24 @@ describe("handleJudgeAudit — verdict reconciliation", () => {
   // had no test at all; reverting `allPassed` left the suite green.
   //
   // Round 5 changed which shape reaches it. The FR-014 floor used to sweep the
-  // whole batch, so a story the judge PASSED with every item met was stamped
+  // whole batch, so a story the verifier PASSED with every item met was stamped
   // `unverified` too (CR-5) — now fixed, and a clean pass applies. The shape
   // that remains, and the one worth guarding, is a pass with NOTHING BEHIND
   // IT: `pass: true` with no items, produced without a single tool call.
-  // `isJudgeVerdictShape` accepts it (`[].every(...)` is vacuously true), so
+  // `isVerifierVerdictShape` accepts it (`[].every(...)` is vacuously true), so
   // only this guard stops it satisfying the plan-complete claim.
   it("MAJ-3: an unobserved pass:true with no items does NOT count toward the close-out", async () => {
-    const h = harness({ judgeEnabled: true })
+    const h = harness({ verifierEnabled: true })
     const sid = "s1"
     const state = quietSession(h, sid)
     state.modelId = "anthropic/claude-opus-4"
     state.workspaceRoot = h.stateDir
     claimedStory(h, sid)
 
-    stubJudge(h, { stories: [{ storyId: "S1", pass: true, summary: "looks fine to me", items: [] }] }, [{ type: "text" }])
+    stubVerifier(h, { stories: [{ storyId: "S1", pass: true, summary: "looks fine to me", items: [] }] }, [{ type: "text" }])
     await handleSessionIdle(h.ctx, sid)
 
-    const stamp = h.storyEngine.getPlan(sid)!.stories[0].judge!
+    const stamp = h.storyEngine.getPlan(sid)!.stories[0].verifier!
     expect(stamp.pass).toBe(true)
     expect(stamp.unapplied).toBe("unverified")
 
@@ -1131,12 +1157,12 @@ describe("handleJudgeAudit — verdict reconciliation", () => {
     expect(said).toContain("S1")
   })
 
-  // CR-5: a story the judge genuinely passed, in a batch bounded because a
+  // CR-5: a story the verifier genuinely passed, in a batch bounded because a
   // SIBLING was unsubstantiated, must still be applied. It used to be stamped
   // `unverified` too, which barred it from `allPassed` AND from re-audit (the
   // selector skips a stamped story), so it could never become verified.
   it("CR-5: a clean passing verdict is applied even when a sibling is bounded", async () => {
-    const h = harness({ judgeEnabled: true })
+    const h = harness({ verifierEnabled: true })
     const sid = "s1"
     const state = quietSession(h, sid)
     state.modelId = "anthropic/claude-opus-4"
@@ -1148,7 +1174,7 @@ describe("handleJudgeAudit — verdict reconciliation", () => {
     h.storyEngine.checkpoint(sid, "S1.T1", "complete")
     h.storyEngine.checkpoint(sid, "S2.T1", "complete")
 
-    stubJudge(
+    stubVerifier(
       h,
       {
         stories: [
@@ -1161,36 +1187,36 @@ describe("handleJudgeAudit — verdict reconciliation", () => {
     await handleSessionIdle(h.ctx, sid)
 
     const stories = h.storyEngine.getPlan(sid)!.stories
-    expect(stories[0].judge!.unapplied).toBe("unverified")
-    expect(stories[1].judge!.unapplied).toBeUndefined()
-    expect(stories[1].judge!.pass).toBe(true)
+    expect(stories[0].verifier!.unapplied).toBe("unverified")
+    expect(stories[1].verifier!.unapplied).toBeUndefined()
+    expect(stories[1].verifier!.pass).toBe(true)
   })
 
   // CR-4: an empty `items` array made the floor's trigger vacuously false, so
   // the least substantiated verdict possible — a bare `pass:false` with no
   // items, produced with zero tool calls — bypassed it and reverted the story.
   it("CR-4: an unobserved pass:false with NO items does not revert the story", async () => {
-    const h = harness({ judgeEnabled: true })
+    const h = harness({ verifierEnabled: true })
     const sid = "s1"
     const state = quietSession(h, sid)
     state.modelId = "anthropic/claude-opus-4"
     state.workspaceRoot = h.stateDir
     claimedStory(h, sid)
 
-    stubJudge(h, { stories: [{ storyId: "S1", pass: false, summary: "the research files are missing", items: [] }] }, [
+    stubVerifier(h, { stories: [{ storyId: "S1", pass: false, summary: "the research files are missing", items: [] }] }, [
       { type: "text" },
     ])
     await handleSessionIdle(h.ctx, sid)
 
     expect(h.storyEngine.getPlan(sid)!.stories[0].status).toBe("complete")
-    expect(loggedEventTypes(h.logger)).toContain("judge:unverified")
+    expect(loggedEventTypes(h.logger)).toContain("verifier:unverified")
   })
 
   // CR-8: `itemId` is LLM-authored and not unique. Matching the contradiction
   // set by id let one disproven path claim clear a DIFFERENT item sharing the
   // id, laundering a genuine content failure into a harness-derived pass.
   it("CR-8: a duplicated itemId does not let one veto mask a real failure", async () => {
-    const h = harness({ judgeEnabled: true })
+    const h = harness({ verifierEnabled: true })
     const sid = "s1"
     const state = quietSession(h, sid)
     state.modelId = "anthropic/claude-opus-4"
@@ -1198,7 +1224,7 @@ describe("handleJudgeAudit — verdict reconciliation", () => {
     state.workspaceRoot = h.stateDir
     claimedStory(h, sid)
 
-    stubJudge(h, {
+    stubVerifier(h, {
       stories: [
         {
           storyId: "S1",
@@ -1219,22 +1245,22 @@ describe("handleJudgeAudit — verdict reconciliation", () => {
   })
 
   it("C2: a plan settled only by unapplied stamps does NOT get the independently-verified close-out", async () => {
-    const h = harness({ judgeEnabled: true })
+    const h = harness({ verifierEnabled: true })
     const sid = "s1"
     const state = quietSession(h, sid)
     state.modelId = "anthropic/claude-opus-4"
     state.workspaceRoot = h.stateDir
     claimedStory(h, sid)
-    stubJudge(
+    stubVerifier(
       h,
       { stories: [{ storyId: "S1", pass: false, summary: "nope", items: [{ itemId: "A1", met: false, note: "not delivered" }] }] },
       [{ type: "text" }],
     )
     await handleSessionIdle(h.ctx, sid)
 
-    // Second idle: every story is complete and stamped, so the judge is not
+    // Second idle: every story is complete and stamped, so the verifier is not
     // re-run. The harness must say the story was never verified rather than
-    // claim the judge confirmed it — or go silent, which is what an
+    // claim the verifier confirmed it — or go silent, which is what an
     // `allPassed` that counted the bounding stamp would have produced.
     await handleSessionIdle(h.ctx, sid)
 
@@ -1252,17 +1278,17 @@ describe("handleJudgeAudit — verdict reconciliation", () => {
   // the exact outcome the escalation exists to prevent. A surviving mutant
   // showed the reset had no test.
   it("MAJ-4: a second unaudited plan in the same session still escalates", async () => {
-    const h = harness({ judgeEnabled: true })
+    const h = harness({ verifierEnabled: true })
     const sid = "s1"
     const state = quietSession(h, sid)
     state.modelId = "anthropic/claude-opus-4"
     state.workspaceRoot = h.stateDir
 
     const unauditedRound = async (): Promise<void> => {
-      stubJudge(
+      stubVerifier(
         h,
         { stories: [{ storyId: "S1", pass: false, summary: "nope", items: [{ itemId: "A1", met: false, note: "not delivered" }] }] },
-        [{ type: "text" }], // judge observed nothing -> bounding stamp
+        [{ type: "text" }], // verifier observed nothing -> bounding stamp
       )
       await handleSessionIdle(h.ctx, sid)
       await handleSessionIdle(h.ctx, sid) // settled -> escalation
@@ -1287,13 +1313,13 @@ describe("handleJudgeAudit — verdict reconciliation", () => {
   // dispatch burned the single escalation and the run went silent — the
   // outcome the branch exists to prevent.
   it("MAJ-4: a stall-paused escalation is not counted as spent", async () => {
-    const h = harness({ judgeEnabled: true, maxNoProgressTurns: 1 })
+    const h = harness({ verifierEnabled: true, maxNoProgressTurns: 1 })
     const sid = "s1"
     const state = quietSession(h, sid)
     state.modelId = "anthropic/claude-opus-4"
     state.workspaceRoot = h.stateDir
     claimedStory(h, sid)
-    stubJudge(
+    stubVerifier(
       h,
       { stories: [{ storyId: "S1", pass: false, summary: "nope", items: [{ itemId: "A1", met: false, note: "not delivered" }] }] },
       [{ type: "text" }],
@@ -1316,13 +1342,13 @@ describe("handleJudgeAudit — verdict reconciliation", () => {
   })
 
   it("FR-007: past the re-audit cap the story is escalated, not reverted again", async () => {
-    const h = harness({ judgeEnabled: true, maxStoryReaudits: 1 })
+    const h = harness({ verifierEnabled: true, maxStoryReaudits: 1 })
     const sid = "s1"
     const state = quietSession(h, sid)
     state.modelId = "anthropic/claude-opus-4"
     state.workspaceRoot = h.stateDir
     claimedStory(h, sid)
-    stubJudge(h, {
+    stubVerifier(h, {
       stories: [{ storyId: "S1", pass: false, summary: "still not done", items: [{ itemId: "A1", met: false, note: "no sources cited" }] }],
     })
 
@@ -1333,56 +1359,56 @@ describe("handleJudgeAudit — verdict reconciliation", () => {
     h.storyEngine.checkpoint(sid, "S1.T1", "complete")
     await handleSessionIdle(h.ctx, sid)
 
-    expect(loggedEventTypes(h.logger)).toContain("judge:reaudit-capped")
+    expect(loggedEventTypes(h.logger)).toContain("verifier:reaudit-capped")
     expect(h.storyEngine.getPlan(sid)!.stories[0].status).toBe("complete") // not reverted again
   })
 
   // M3 (grill round 2): the cap stopped the REVERT but not the LOOP. It
-  // `continue`d without stamping, so `story.judge` kept the stamp from the
-  // previous audit — whose `judgedAt` predates the `completedAt` written when
+  // `continue`d without stamping, so `story.verifier` kept the stamp from the
+  // previous audit — whose `verifiedAt` predates the `completedAt` written when
   // the story was re-completed — and the selector re-picked the story on every
-  // subsequent idle, running a full judge subturn each time. Measured in the
+  // subsequent idle, running a full verifier subturn each time. Measured in the
   // field as 5 subturns over 5 idles with no exit.
-  it("M3: past the cap the story is stamped, so the judge is not re-run on later idles", async () => {
-    const h = harness({ judgeEnabled: true, maxStoryReaudits: 1 })
+  it("M3: past the cap the story is stamped, so the verifier is not re-run on later idles", async () => {
+    const h = harness({ verifierEnabled: true, maxStoryReaudits: 1 })
     const sid = "s1"
     const state = quietSession(h, sid)
     state.modelId = "anthropic/claude-opus-4"
     state.workspaceRoot = h.stateDir
     claimedStory(h, sid)
-    stubJudge(h, {
+    stubVerifier(h, {
       stories: [{ storyId: "S1", pass: false, summary: "still not done", items: [{ itemId: "A1", met: false, note: "no sources cited" }] }],
     })
 
-    const judgeSubturns = (): number =>
-      h.prompt.mock.calls.filter((c: unknown[]) => (c[0] as { body?: { agent?: string } })?.body?.agent === "vertex-judge")
+    const verifierSubturns = (): number =>
+      h.prompt.mock.calls.filter((c: unknown[]) => (c[0] as { body?: { agent?: string } })?.body?.agent === "vertex-verifier")
         .length
 
     await handleSessionIdle(h.ctx, sid) // revert 1 of 1
     h.storyEngine.checkpoint(sid, "S1.T1", "complete")
     await handleSessionIdle(h.ctx, sid) // cap reached
-    const atCap = judgeSubturns()
+    const atCap = verifierSubturns()
 
-    const stamp = h.storyEngine.getPlan(sid)!.stories[0].judge!
+    const stamp = h.storyEngine.getPlan(sid)!.stories[0].verifier!
     expect(stamp.unapplied).toBe("capped")
 
-    // Three more idles with nothing changed: the judge must not run again.
+    // Three more idles with nothing changed: the verifier must not run again.
     await handleSessionIdle(h.ctx, sid)
     await handleSessionIdle(h.ctx, sid)
     await handleSessionIdle(h.ctx, sid)
-    expect(judgeSubturns()).toBe(atCap)
+    expect(verifierSubturns()).toBe(atCap)
   })
 
   // A capped story WAS audited — saying it was "never verified" would be
   // false. The escalation names it as disputed instead.
   it("M3: the settled-plan escalation calls a capped story disputed, not unverified", async () => {
-    const h = harness({ judgeEnabled: true, maxStoryReaudits: 1 })
+    const h = harness({ verifierEnabled: true, maxStoryReaudits: 1 })
     const sid = "s1"
     const state = quietSession(h, sid)
     state.modelId = "anthropic/claude-opus-4"
     state.workspaceRoot = h.stateDir
     claimedStory(h, sid)
-    stubJudge(h, {
+    stubVerifier(h, {
       stories: [{ storyId: "S1", pass: false, summary: "still not done", items: [{ itemId: "A1", met: false, note: "no sources cited" }] }],
     })
     await handleSessionIdle(h.ctx, sid)
@@ -1405,6 +1431,59 @@ describe("handleJudgeAudit — verdict reconciliation", () => {
 // implementation produced CRIT-002 (a session that could be wedged forever).
 // These pin both halves.
 // ===========================================================================
+// ===========================================================================
+// Continuation authority (2026-08-04).
+//
+// A continuation is dispatched through `session.prompt`, so it already arrives
+// as a user-role message. The `[vertex:...]` marker was the only thing telling
+// the model the harness wrote it — and a message read as automated nagging is
+// a message the model can discount. It is stripped from what the model sees
+// and recorded as the family in the event log, which is how an operator still
+// distinguishes harness steering from their own words.
+// ===========================================================================
+describe("dispatched continuations carry no harness marker", () => {
+  it("strips the marker from the text the model receives", async () => {
+    const h = harness({ verifierEnabled: true })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid)
+    stubVerifier(h, {
+      stories: [{ storyId: "S1", pass: false, summary: "not done", items: [{ itemId: "A1", met: false, note: "no sources cited" }] }],
+    })
+
+    await handleSessionIdle(h.ctx, sid)
+
+    const texts = continuations(h.prompt).map((c) => c.text)
+    expect(texts.length).toBeGreaterThan(0)
+    for (const text of texts) {
+      expect(text, "no continuation may advertise the harness as its author").not.toMatch(/\[vertex:/)
+    }
+    // ...but the content still arrives.
+    expect(texts.join("\n")).toMatch(/verifier/i)
+  })
+
+  it("records the family and the text so the operator can still audit it", async () => {
+    const h = harness({ verifierEnabled: true })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid)
+    stubVerifier(h, {
+      stories: [{ storyId: "S1", pass: false, summary: "not done", items: [{ itemId: "A1", met: false, note: "no sources cited" }] }],
+    })
+
+    await handleSessionIdle(h.ctx, sid)
+
+    expect(h.logger).toHaveBeenCalledWith(
+      "gate:continuation-dispatched",
+      expect.objectContaining({ sessionID: sid, family: "verifier" }),
+    )
+  })
+})
+
 describe("promptContinuation — FR-012 delivery classification", () => {
   it("a slow (still-streaming) turn is NOT reported as a delivery failure", async () => {
     const h = harness()
@@ -1489,9 +1568,9 @@ describe("promptContinuation — FR-012 delivery classification", () => {
   })
 })
 
-describe("judge re-audit counter — MIN-004", () => {
+describe("verifier re-audit counter — MIN-004", () => {
   it("a PASSING verdict clears that story's consecutive-revert streak", async () => {
-    const h = harness({ judgeEnabled: true, maxStoryReaudits: 2 })
+    const h = harness({ verifierEnabled: true, maxStoryReaudits: 2 })
     const sid = "s1"
     const state = quietSession(h, sid)
     state.modelId = "anthropic/claude-opus-4"
@@ -1499,7 +1578,7 @@ describe("judge re-audit counter — MIN-004", () => {
     claimedStory(h, sid)
 
     // Revert once.
-    stubJudge(h, {
+    stubVerifier(h, {
       stories: [{ storyId: "S1", pass: false, summary: "not done", items: [{ itemId: "A1", met: false, note: "no sources cited" }] }],
     })
     await handleSessionIdle(h.ctx, sid)
@@ -1507,7 +1586,7 @@ describe("judge re-audit counter — MIN-004", () => {
 
     // Now it passes: the streak must reset, not accumulate.
     h.storyEngine.checkpoint(sid, "S1.T1", "complete")
-    stubJudge(h, { stories: [{ storyId: "S1", pass: true, summary: "delivered", items: [{ itemId: "A1", met: true, note: "verified" }] }] })
+    stubVerifier(h, { stories: [{ storyId: "S1", pass: true, summary: "delivered", items: [{ itemId: "A1", met: true, note: "verified" }] }] })
     await handleSessionIdle(h.ctx, sid)
 
     expect(state.storyReaudits.S1).toBeUndefined()
@@ -1515,46 +1594,46 @@ describe("judge re-audit counter — MIN-004", () => {
 })
 
 // ===========================================================================
-// FR-011 / FR-006 (MIN-002) — the plan digest the judge is actually sent.
+// FR-011 / FR-006 (MIN-002) — the plan digest the verifier is actually sent.
 //
 // Both requirements are properties of ONE string: the `plan` field of the
-// payload dispatched to the `vertex-judge` subturn. So these read it back off
+// payload dispatched to the `vertex-verifier` subturn. So these read it back off
 // the prompt mock rather than re-rendering it — a re-render could agree with a
 // broken caller (the whole MAJ-005 finding was that `renderPlanDigest` was
 // correct in isolation but the call site never gave it the root).
 //
 // Grounding (`ses_04dc77bdaffej8SFJvYm5yO0CW`): with bare relative paths in the
-// digest the judge asserted "research/x.json does not exist" about files that
+// digest the verifier asserted "research/x.json does not exist" about files that
 // DID exist, and the 4000-char cap truncated the tail of the plan, after which
 // it FAILed stories citing "S5 has no independent verifier set in the digest"
 // — the content the cap had removed.
 // ===========================================================================
 
-/** The `plan` field of the payload the judge was actually prompted with. */
-function judgePlanDigest(h: ReturnType<typeof harness>): string {
+/** The `plan` field of the payload the verifier was actually prompted with. */
+function verifierPlanDigest(h: ReturnType<typeof harness>): string {
   const session = h.ctx.client.session as unknown as Record<string, unknown>
   const prompt = session.prompt as ReturnType<typeof vi.fn>
-  const call = prompt.mock.calls.find((c) => (c[0] as { body?: { agent?: string } })?.body?.agent === "vertex-judge")
-  expect(call, "the judge subturn was never prompted").toBeDefined()
+  const call = prompt.mock.calls.find((c) => (c[0] as { body?: { agent?: string } })?.body?.agent === "vertex-verifier")
+  expect(call, "the verifier subturn was never prompted").toBeDefined()
   const text = (call![0] as { body: { parts: Array<{ text: string }> } }).body.parts[0].text
   return (JSON.parse(text) as { plan?: string }).plan ?? ""
 }
 
 describe("renderPlanDigest — FR-011 absolute worktree root", () => {
   it("states the absolute worktree root as the digest's first line", async () => {
-    const h = harness({ judgeEnabled: true })
+    const h = harness({ verifierEnabled: true })
     const sid = "s1"
     const state = quietSession(h, sid)
     state.modelId = "anthropic/claude-opus-4"
     state.workspaceRoot = h.stateDir
     claimedStory(h, sid, ["test -f research/x.md"])
-    stubJudge(h, {
+    stubVerifier(h, {
       stories: [{ storyId: "S1", pass: true, summary: "delivered", items: [{ itemId: "A1", met: true, note: "read it" }] }],
     })
 
     await handleSessionIdle(h.ctx, sid)
 
-    const digest = judgePlanDigest(h)
+    const digest = verifierPlanDigest(h)
     // MUTATION: drop the `workspaceRoot` argument at the call site -> red.
     expect(digest.split("\n")[0]).toBe(`Worktree root (all paths below are relative to this): ${h.stateDir}`)
     // The root is an ABSOLUTE path, which is the entire point of AS1: a
@@ -1569,7 +1648,7 @@ describe("renderPlanDigest — FR-011 absolute worktree root", () => {
 
 describe("renderPlanDigest — FR-006 / MIN-002: audited stories render first", () => {
   it("puts the story under audit ahead of the stories that are not", async () => {
-    const h = harness({ judgeEnabled: true })
+    const h = harness({ verifierEnabled: true })
     const sid = "s1"
     const state = quietSession(h, sid)
     state.modelId = "anthropic/claude-opus-4"
@@ -1604,13 +1683,13 @@ describe("renderPlanDigest — FR-006 / MIN-002: audited stories render first", 
     h.storyEngine.checkpoint(sid, "S3.T1", "complete")
     expect(h.storyEngine.getPlan(sid)!.stories.map((s) => s.status)).toEqual(["active", "active", "complete"])
 
-    stubJudge(h, {
+    stubVerifier(h, {
       stories: [{ storyId: "S3", pass: true, summary: "delivered", items: [{ itemId: "A1", met: true, note: "read it" }] }],
     })
 
     await handleSessionIdle(h.ctx, sid)
 
-    const digest = judgePlanDigest(h)
+    const digest = verifierPlanDigest(h)
     const s3 = digest.indexOf("S3 (")
     const s1 = digest.indexOf("S1 (")
     const s2 = digest.indexOf("S2 (")

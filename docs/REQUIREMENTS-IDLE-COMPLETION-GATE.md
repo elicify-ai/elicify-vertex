@@ -12,13 +12,13 @@ When the model goes idle, the harness runs **deterministic validation first**.
      model to continue. That message must be **constructive**: it names what is
      still open and what would close it, not merely "finish the job".
    - **On pass**, proceed to stage 2.
-2. **Judge stage.** Only once every deterministic marker is satisfied does the
-   LLM judge perform final validation of fit.
+2. **Verifier stage.** Only once every deterministic marker is satisfied does the
+   LLM verifier perform final validation of fit.
 
-The ordering is the point. The judge is expensive, advisory and fallible; it must
+The ordering is the point. The verifier is expensive, advisory and fallible; it must
 not be asked "is this done?" while a machine can already answer "no, S2–S6 are
 untouched". Equally, a deterministic pass is not sufficient on its own — that is
-what the judge is for.
+what the verifier is for.
 
 ## What is implemented today
 
@@ -30,9 +30,9 @@ what the judge is for.
    verification
 
 **Plan story completion is not a gate condition.** `getPlan()` appears in the
-gate only inside `appendJudgeCloseOut`, where it decides whether the FINAL story
-is complete and therefore whether the judge may run. The plan is read to
-*permit* the judge, never to *demand* completion.
+gate only inside `appendVerifierCloseOut`, where it decides whether the FINAL story
+is complete and therefore whether the verifier may run. The plan is read to
+*permit* the verifier, never to *demand* completion.
 
 So stage 1 as specified does not exist, and stage 2 is gated on a condition
 stage 1 was supposed to enforce.
@@ -52,7 +52,7 @@ S6  pending    End-to-end UAT via Playwright        <- finalStoryId
 
 Not one story was ever checkpointed. The session closed silently: at the moment
 of idle there were no pinned criteria and no unverified changed files, so all
-three existing checks passed and nothing consulted the plan. The judge then
+three existing checks passed and nothing consulted the plan. The verifier then
 never ran — correctly, per stage 2's own rule, because the final story was not
 complete.
 
@@ -79,9 +79,9 @@ abandoned plan would still close silently, because no check looks at it.
   status, and for the active story what evidence would close it (its declared
   verifiers, and which acceptance items lack evidence). A generic "keep going"
   does not satisfy this.
-- **AC-3** The judge does **not** run while any deterministic marker is
+- **AC-3** The verifier does **not** run while any deterministic marker is
   unsatisfied.
-- **AC-4** When every story is complete, the judge runs exactly as today.
+- **AC-4** When every story is complete, the verifier runs exactly as today.
 - **AC-5** Blocking respects the existing `maxCriteriaBlocks` cap and the
   holdout/visibility rules, so it cannot trap a session in a loop.
 - **AC-6** Mutation-verified: removing the story-completion check must turn a

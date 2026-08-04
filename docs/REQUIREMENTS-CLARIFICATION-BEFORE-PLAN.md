@@ -122,7 +122,7 @@ No new plumbing.
 - **AC-4** The challenge is proportionate: a single-story plan with concrete
   acceptance items gets a short form or none, so one-shot work is not taxed.
 - **AC-5** No self-reported clarification field is added to `plan.json`. If the
-  judge needs clarification context, it reads the session's real `question` tool
+  verifier needs clarification context, it reads the session's real `question` tool
   parts.
 - **AC-6** Mutation-verified: removing the observed-clarification check turns a
   named test red, and the AC-4 discrimination test proves trivial plans pass.

@@ -55,11 +55,11 @@
  *    (review CRIT-002) requires the deny-all capability probe to run,
  *    and be honoured, before ANY subturn — including the intake one — is
  *    issued ("intake:unsupported" is the intake-side twin of
- *    "judge:unsupported" throughout FR-030b's text and the Integration
- *    Boundaries table: "Same probe dependency as the judge"). More
+ *    "verifier:unsupported" throughout FR-030b's text and the Integration
+ *    Boundaries table: "Same probe dependency as the verifier"). More
  *    directly, `subturn.ts`'s own `runSubturn` doc comment names the
  *    caller responsible for this by module: "Does NOT call
- *    probeCapability — that is the caller's (judge.ts / story.ts)
+ *    probeCapability — that is the caller's (verifier.ts / story.ts)
  *    responsibility to run first". This module IS that caller. Because
  *    the given `deps` shape has no seam for a caller-cached deny map or
  *    probe result, both are re-computed on every non-trivial
@@ -74,9 +74,9 @@
  * item receipt/waiver citation (and `opts.isValidReceipt`) was removed
  * after a real session showed the model fabricating plausible receipt ids
  * 13 times in a row, then blocking every story rather than completing it.
- * Verification moved OUT of this module to an independent completion judge
+ * Verification moved OUT of this module to an independent completion verifier
  * (runs at session.idle with real tools), whose per-story verdicts arrive
- * here via `applyJudgeVerdicts` and can REVERT an over-claimed story back
+ * here via `applyVerifierVerdicts` and can REVERT an over-claimed story back
  * to "active".
  *
  * 2026-07-30 redesign (task/DAG completion model, supersedes the wave
@@ -99,12 +99,12 @@
  * final story that depends on its siblings cannot have all tasks complete
  * until those siblings are done), so no redundant guard is kept.
  * ---------------------------------------------------------------------
- * 2026-08-03 judge-reliability fixes (docs/JUDGE-RELIABILITY-FIXES-SPEC.md,
+ * 2026-08-03 verifier-reliability fixes (docs/VERIFIER-RELIABILITY-FIXES-SPEC.md,
  * FR-002/002a-d, FR-003, FR-004). All three are grounded in one audited live
  * session (`ses_04dc77bdaffej8SFJvYm5yO0CW`):
  *
  *  - FR-002 (concurrent-write data loss). Two plugin runtimes drove that
- *    session and both wrote `plan.json`; a judge stamp provably written at
+ *    session and both wrote `plan.json`; a verifier stamp provably written at
  *    10:26:28 is ABSENT from the final file, and S6 carries no stamp at all.
  *    Cause: `getPlan` cached the session's plan forever, mutations were
  *    applied to that cached object, and `persistPlan` then did
@@ -129,7 +129,7 @@
  *            resurrect deleted stories, hence the three `mutate` modes
  *            (`merge` | `replace` | `delete`); only `merge` reconciles.
  *      gate.ts:742-753 documents a load-bearing OBJECT IDENTITY assumption
- *            (`applyJudgeVerdicts` stamps in place on the plan object the
+ *            (`applyVerifierVerdicts` stamps in place on the plan object the
  *            gate closure already holds, and the close-out then re-reads
  *            `plan.stories`). Reconciliation therefore assigns field-by-
  *            field into the existing plan/story/task objects and splices
@@ -151,7 +151,7 @@
  *    `story.completedAt` while the gate's audit filter (gate.ts:794)
  *    requires `completedAt !== undefined` — so a story reopened while
  *    `complete` (observed 3x: `previousStatus: complete -> newStatus:
- *    complete`) became permanently invisible to the judge. It now stamps a
+ *    complete`) became permanently invisible to the verifier. It now stamps a
  *    FRESH `completedAt` whenever the derived status is still `complete`.
  * ---------------------------------------------------------------------
  */
@@ -205,7 +205,7 @@ export const lockIO = {
    * The plugin runs in-process inside opencode, so every millisecond spent
    * here freezes the whole server, not just this call. An async sleep is the
    * only way to avoid that and is NOT available: all seven `mutate` callers
-   * (`createPlan`, `checkpoint`, `applyJudgeVerdicts`, `reopenStory`,
+   * (`createPlan`, `checkpoint`, `applyVerifierVerdicts`, `reopenStory`,
    * `clearPlan`, `amendStory`, `attachEvidence`) are synchronous methods,
    * called synchronously from `wiring/tools.ts`, `wiring/gate.ts` and
    * `plugin.ts`, so making this awaitable means turning the whole
@@ -275,8 +275,8 @@ export interface AcceptanceItem {
   /**
    * DEPRECATED (HANDOVER.md redesign point 1): per-item receipt/waiver
    * citations are no longer required, read, or reset by anything in this
-   * module — `checkpoint` is now a bare claim and the completion judge
-   * (via `applyJudgeVerdicts`) is the sole arbiter of whether the claim
+   * module — `checkpoint` is now a bare claim and the completion verifier
+   * (via `applyVerifierVerdicts`) is the sole arbiter of whether the claim
    * was real. The field stays in the type, and the validators keep
    * accepting it, because plan.json files written before the redesign
    * carry it and must still load. Nothing here writes it anymore;
@@ -285,25 +285,25 @@ export interface AcceptanceItem {
   evidence: { receiptId: string } | { waiver: true; sourceMessageId: string; signature?: string } | null
 }
 
-/** HANDOVER.md redesign point 5: the completion judge's per-acceptance-item
+/** HANDOVER.md redesign point 5: the completion verifier's per-acceptance-item
  * note — which criteria are met, which aren't, and what's specifically
  * missing — so wiring can render per-story detail ("S2 not delivered — A3,
  * A4 still missing") instead of a generic nudge. */
-export interface JudgeItemNote {
+export interface VerifierItemNote {
   itemId: string
   met: boolean
   note: string
 }
 
-/** The latest completion-judge audit stamped onto a story by
- * `applyJudgeVerdicts`. Stamps are history, not state: a story carries its
+/** The latest completion-verifier audit stamped onto a story by
+ * `applyVerifierVerdicts`. Stamps are history, not state: a story carries its
  * most recent verdict even after a later status change, so wiring can
  * always say WHY a story is where it is. */
-export interface StoryJudgeStamp {
+export interface StoryVerifierStamp {
   pass: boolean
   summary: string
-  items: JudgeItemNote[]
-  judgedAt: string
+  items: VerifierItemNote[]
+  verifiedAt: string
   /**
    * FR-001b (2026-08-03): the ids of `met:false` items the HARNESS overruled
    * before this verdict was applied — the gate's path-existence cross-check
@@ -311,10 +311,10 @@ export interface StoryJudgeStamp {
    * demonstrably exists, and re-derives `pass: true` when EVERY failing item
    * of the story was individually disproven.
    *
-   * Absent (or empty) therefore means "a genuine, unmodified judge verdict".
+   * Absent (or empty) therefore means "a genuine, unmodified verifier verdict".
    * The distinction is load-bearing: the plan close-out must never claim the
-   * judge "independently verified" a story whose pass the harness derived —
-   * the judge actually failed it and was overruled on deterministic grounds.
+   * verifier "independently verified" a story whose pass the harness derived —
+   * the verifier actually failed it and was overruled on deterministic grounds.
    * Optional on disk so plans written before this field existed still load
    * (mirrors `dependsOn`/`revision`).
    */
@@ -324,17 +324,17 @@ export interface StoryJudgeStamp {
    * the harness refused to act on — it is not an audit result.
    *
    * `boundUnappliedVerdicts` has to write a stamp, because the audit selector
-   * keys off `!story.judge` and would otherwise re-run the judge on this story
+   * keys off `!story.verifier` and would otherwise re-run the verifier on this story
    * on every subsequent idle forever (MAJ-003). It used to write `pass: true`
    * for that purpose, which laundered "the harness declined to apply this"
    * into "this story passed audit" — and since the close-out's gate is
-   * `story.judge?.pass === true`, an unverified story could satisfy the
+   * `story.verifier?.pass === true`, an unverified story could satisfy the
    * plan-complete claim outright.
    *
    * So the two states are now distinct: `pass` stays whatever it means, and
    * this field records that the verdict was never enforced and why.
    *   - `"contradictory"` — FR-005: `pass:false` with every item `met:true`.
-   *   - `"unverified"`    — FR-014: the judge never observed the worktree.
+   *   - `"unverified"`    — FR-014: the verifier never observed the worktree.
    *   - `"capped"`        — FR-007: the re-audit cap was reached, so the
    *     harness stopped reverting. Unlike the other two the verdict was
    *     USABLE; the harness declined to keep acting on it. The story is
@@ -367,11 +367,11 @@ export interface Task {
   status: TaskStatus
   /** ISO-8601 set the moment this task transitions to `"active"` (at
    * createPlan for level-0 tasks, at checkpoint's level-promotion
-   * afterwards, at judge-revert, and at reopen). Optional so a task.json
+   * afterwards, at verifier-revert, and at reopen). Optional so a task.json
    * written before activation still validates. */
   startedAt?: string
   /** ISO-8601 set on every `checkpoint(..., "complete", ...)`; cleared on
-   * any non-complete outcome, judge revert, or reopen. */
+   * any non-complete outcome, verifier revert, or reopen. */
   completedAt?: string
 }
 
@@ -397,7 +397,7 @@ export interface StoryV2 {
    * 2026-07-30: story status is now DERIVED from its tasks (and stored):
    * all tasks complete → complete; any task active → active; else the
    * worst terminal task (failed beats blocked) or pending. It is recomputed
-   * by `recomputeStoryStatuses` after every checkpoint / judge verdict /
+   * by `recomputeStoryStatuses` after every checkpoint / verifier verdict /
    * reopen, never input by the caller.
    */
   status: "pending" | "active" | "complete" | "blocked" | "failed"
@@ -413,15 +413,15 @@ export interface StoryV2 {
   /**
    * ADDED (HANDOVER.md redesign point 1): ISO-8601 timestamp set when the
    * story becomes `"complete"` (all its tasks complete). Cleared when a
-   * judge verdict reverts the story to `"active"` (or when a task is
+   * verifier verdict reverts the story to `"active"` (or when a task is
    * checkpointed to a non-complete status / reopened).
    */
   completedAt?: string
   /**
-   * ADDED (HANDOVER.md redesign points 1/5): the latest completion-judge
-   * audit of this story. Written only by `applyJudgeVerdicts`.
+   * ADDED (HANDOVER.md redesign points 1/5): the latest completion-verifier
+   * audit of this story. Written only by `applyVerifierVerdicts`.
    */
-  judge?: StoryJudgeStamp
+  verifier?: StoryVerifierStamp
   /**
    * ADDED (2026-07-30 task/DAG redesign): the atomic execution units this
    * story decomposes into. REQUIRED (≥1) — a story with no tasks is a
@@ -503,7 +503,7 @@ function isAmendment(value: unknown): value is { reason: string; ts: string } {
   return isRecord(value) && typeof value.reason === "string" && typeof value.ts === "string"
 }
 
-function isJudgeItemNote(value: unknown): value is JudgeItemNote {
+function isVerifierItemNote(value: unknown): value is VerifierItemNote {
   return (
     isRecord(value) &&
     typeof value.itemId === "string" &&
@@ -523,12 +523,12 @@ function isFutureSchemaEntry(value: unknown): boolean {
   return typeof version === "number" && version > 2
 }
 
-function isStoryJudgeStamp(value: unknown): value is StoryJudgeStamp {
+function isStoryVerifierStamp(value: unknown): value is StoryVerifierStamp {
   if (!isRecord(value)) return false
   if (typeof value.pass !== "boolean") return false
   if (typeof value.summary !== "string") return false
-  if (!Array.isArray(value.items) || !value.items.every(isJudgeItemNote)) return false
-  if (typeof value.judgedAt !== "string") return false
+  if (!Array.isArray(value.items) || !value.items.every(isVerifierItemNote)) return false
+  if (typeof value.verifiedAt !== "string") return false
   // FR-001b: optional on disk (stamps written before the field existed must
   // still load); reject only a PRESENT-but-wrong-shaped value.
   if (value.contradictedItemIds !== undefined && !isStringArray(value.contradictedItemIds)) return false
@@ -577,12 +577,12 @@ function isStoryV2(value: unknown): value is StoryV2 {
   // plans that predate the field; treat absent as []. Reject only a
   // PRESENT-but-wrong-shaped value.
   if (value.dependsOn !== undefined && !isStringArray(value.dependsOn)) return false
-  // `startedAt` / `completedAt` / `judge` are likewise optional — old plans
+  // `startedAt` / `completedAt` / `verifier` are likewise optional — old plans
   // lack them and must still load; reject only a PRESENT-but-wrong-shaped
   // value.
   if (value.startedAt !== undefined && typeof value.startedAt !== "string") return false
   if (value.completedAt !== undefined && typeof value.completedAt !== "string") return false
-  if (value.judge !== undefined && !isStoryJudgeStamp(value.judge)) return false
+  if (value.verifier !== undefined && !isStoryVerifierStamp(value.verifier)) return false
   return true
 }
 
@@ -600,7 +600,7 @@ function isPlanV2(value: unknown): value is PlanV2 {
   // 2026-08-03 lacks it and MUST still load — `coerceLoadedPlan` fills the
   // absent case with 0 at the disk boundary). Reject only a PRESENT-but-
   // wrong-shaped value, same discrimination the story-level `dependsOn`,
-  // `startedAt`, `completedAt` and `judge` fields already get.
+  // `startedAt`, `completedAt` and `verifier` fields already get.
   if (value.revision !== undefined && (typeof value.revision !== "number" || !Number.isFinite(value.revision))) {
     return false
   }
@@ -628,7 +628,7 @@ function coerceLoadedPlan(plan: PlanV2): PlanV2 {
 // ---------------------------------------------------------------------------
 // FR-002: in-place reconciliation (object identity is load-bearing)
 //
-// `gate.ts:742-753` holds the plan object across `applyJudgeVerdicts` and
+// `gate.ts:742-753` holds the plan object across `applyVerifierVerdicts` and
 // then re-reads `plan.stories` to decide the close-out. A reconciliation
 // that REPLACED the cached plan with the freshly-parsed disk copy would
 // silently break that close-out, so these helpers copy the disk state
@@ -640,17 +640,17 @@ function coerceLoadedPlan(plan: PlanV2): PlanV2 {
 
 /**
  * FR-004 helper: an ISO-8601 completion stamp guaranteed to sort STRICTLY
- * after an existing judge stamp. The gate's audit filter is a string
- * comparison (`story.judge.judgedAt < story.completedAt`, `gate.ts:794`), and
+ * after an existing verifier stamp. The gate's audit filter is a string
+ * comparison (`story.verifier.verifiedAt < story.completedAt`, `gate.ts:794`), and
  * ISO-8601 UTC strings sort lexicographically, so an equal timestamp — which
  * a same-millisecond audit-then-reopen produces — reads as "not re-claimed"
- * and hides the story from the judge again. Falls back to `now` whenever
+ * and hides the story from the verifier again. Falls back to `now` whenever
  * there is no prior stamp or it cannot be parsed (never throws, never
  * produces `Invalid Date`).
  */
-function freshCompletionStamp(now: string, judgedAt: string | undefined): string {
-  if (judgedAt === undefined || now > judgedAt) return now
-  const parsed = Date.parse(judgedAt)
+function freshCompletionStamp(now: string, verifiedAt: string | undefined): string {
+  if (verifiedAt === undefined || now > verifiedAt) return now
+  const parsed = Date.parse(verifiedAt)
   if (!Number.isFinite(parsed)) return now
   return new Date(parsed + 1).toISOString()
 }
@@ -674,7 +674,7 @@ function assignStoryInPlace(target: StoryV2, source: StoryV2): void {
   target.status = source.status
   target.startedAt = source.startedAt
   target.completedAt = source.completedAt
-  target.judge = source.judge
+  target.verifier = source.verifier
   target.dependsOn = source.dependsOn ?? []
   const existingById = new Map(target.tasks.map((task) => [task.id, task]))
   const merged = source.tasks.map((incoming) => {
@@ -848,7 +848,7 @@ export class StoryEngine {
    * is exactly why the lock was contended. When one does, `reconcileWithDisk`
    * sees a newer disk revision and overwrites the cache, taking the
    * unpersisted change with it under a generic `plan:concurrent-merge` log.
-   * That is the measured 7-12% judge-stamp loss.
+   * That is the measured 7-12% verifier-stamp loss.
    *
    * Tracking it does two things the old code could not: a no-op mutation
    * still flushes a pending change (instead of stranding it behind an
@@ -1047,7 +1047,7 @@ export class StoryEngine {
         scopeGlobs: [...(input.scopeGlobs ?? [])],
         // MAJ-8: element-type validation at the boundary, matching `dependsOn`
       // above. Downstream `.trim()`/`.join()` guards were patches; this is the
-      // reason a non-string can no longer reach `gate.ts`'s judge prompt or
+      // reason a non-string can no longer reach `gate.ts`'s verifier prompt or
       // `findings.ts`.
       verifiers: (() => {
         const raw = input.verifiers ?? []
@@ -1182,7 +1182,7 @@ export class StoryEngine {
    * ADDED — not in the §9 contract's method list (see header comment).
    * LEGACY (HANDOVER.md redesign point 1): per-item evidence citations are
    * no longer part of the completion contract — `checkpoint` never reads
-   * this field and the completion judge supersedes it. This method remains
+   * this field and the completion verifier supersedes it. This method remains
    * only so pre-redesign plans with attached evidence still round-trip
    * through memory and disk; new wiring should not call it.
    */
@@ -1226,21 +1226,21 @@ export class StoryEngine {
    * are ALL `"complete"` goes `"active"` (fresh `startedAt`); otherwise it
    * goes `"pending"` and waits for `checkpoint`'s level-promotion to
    * activate it once its predecessors finish. Complete tasks are LEFT
-   * complete (re-audit only re-does the work the judge flunked — but see
-   * `applyJudgeVerdicts`, which is what re-opens complete tasks after a
+   * complete (re-audit only re-does the work the verifier flunked — but see
+   * `applyVerifierVerdicts`, which is what re-opens complete tasks after a
    * failed verdict; `reopenStory` is the model-facing resume path for a
    * blocked/failed story).
    *
    * The old "only a blocked/failed story may be reopened" precondition is
    * GONE: `reopenStory` now also targets a story whose status a failed
-   * judge verdict already reverted to `"active"` (the model resumes it), or
+   * verifier verdict already reverted to `"active"` (the model resumes it), or
    * any story the model genuinely wants to resume. It simply re-activates
    * the story's not-complete tasks per the DAG rule and recomputes status.
    *
    * `completedAt` (task and story) is cleared for re-activated tasks; the
    * reopen itself is recorded as a story amendment for audit. Acceptance-
    * item `evidence` is deliberately NOT reset (deprecated, superseded by
-   * `StoryV2.judge`). Throws on an unknown session/story; never a silent
+   * `StoryV2.verifier`). Throws on an unknown session/story; never a silent
    * no-op.
    *
    * FR-004 (2026-08-03) — a reopened story can be RE-AUDITED. Observed 3x in
@@ -1252,7 +1252,7 @@ export class StoryEngine {
    * TRANSITION. The story was therefore left `complete` with
    * `completedAt: undefined`, and the gate's audit filter (`gate.ts:794`)
    * requires `completedAt !== undefined` — the story became permanently
-   * invisible to the judge. FR-003's idempotent no-op is explicitly NOT the
+   * invisible to the verifier. FR-003's idempotent no-op is explicitly NOT the
    * mechanism here: there is no incomplete task left to re-checkpoint. So a
    * still-`complete` story gets a FRESH `completedAt` stamped below, which
    * makes it audit-eligible immediately with no further checkpoint.
@@ -1271,7 +1271,7 @@ export class StoryEngine {
 
       for (const task of story.tasks) {
         // Complete tasks stay complete — re-audit re-opens them via
-        // applyJudgeVerdicts, not here.
+        // applyVerifierVerdicts, not here.
         if (task.status === "complete") continue
         const deps = graph.deps.get(task.id) ?? new Set<string>()
         let allDepsComplete = true
@@ -1300,11 +1300,11 @@ export class StoryEngine {
       // FR-004: nothing was re-activated (every task was already complete),
       // so the story is still `complete` — re-stamp `completedAt` so the
       // audit filter selects it again on the very next idle. The stamp must
-      // also be strictly LATER than any existing judge stamp, because that
-      // filter is `judge.judgedAt < completedAt`: the audit and the reopen
+      // also be strictly LATER than any existing verifier stamp, because that
+      // filter is `verifier.verifiedAt < completedAt`: the audit and the reopen
       // can land inside the same millisecond, and an equal timestamp would
       // silently reproduce the bug this requirement exists to kill.
-      if (story.status === "complete") story.completedAt = freshCompletionStamp(now, story.judge?.judgedAt)
+      if (story.status === "complete") story.completedAt = freshCompletionStamp(now, story.verifier?.verifiedAt)
       this.logger("story:reopened", { sessionID, storyId, previousStatus, newStatus: story.status })
       return { changed: true, result: undefined }
     })
@@ -1355,7 +1355,7 @@ export class StoryEngine {
 
   /**
    * 2026-07-30 task/DAG redesign: checkpoint operates on a TASK id (the
-   * atomic unit). It is still a CLAIM, not a proof — the completion judge
+   * atomic unit). It is still a CLAIM, not a proof — the completion verifier
    * audits stories at session.idle. What is enforced here, all structural,
    * all BEFORE any mutation (a thrown error still leaves the plan file
    * byte-for-byte unchanged):
@@ -1365,7 +1365,7 @@ export class StoryEngine {
    *  - `"blocked"`/`"failed"` carry no active-task requirement (mirrors
    *    the old story-level rule), and an optional `opts.reason` is appended
    *    to the parent STORY's amendments (`"blocked: <reason>"` /
-   *    `"failed: <reason>"`) so the judge and wiring can see WHY.
+   *    `"failed: <reason>"`) so the verifier and wiring can see WHY.
    *
    * After the task's status is set: the parent story is recomputed (if all
    * its tasks are now `"complete"`, the story auto-completes with
@@ -1387,7 +1387,7 @@ export class StoryEngine {
    * The three genuinely out-of-order claims still throw — a `"pending"`
    * task never activated, and a `"blocked"`/`"failed"` task must be reopened
    * first. E8: the no-op deliberately touches NEITHER the task's/story's
-   * `completedAt` NOR the judge stamp, so a failed audit cannot be laundered
+   * `completedAt` NOR the verifier stamp, so a failed audit cannot be laundered
    * by re-claiming the task.
    *
    * Returns the task ids that are active AFTER the call (FR-003 / round-2
@@ -1478,9 +1478,9 @@ export class StoryEngine {
 
   /**
    * HANDOVER.md redesign points 1/5 (+ 2026-07-30 task re-open): the
-   * completion judge is the sole arbiter of whether a checkpoint's claim
+   * completion verifier is the sole arbiter of whether a checkpoint's claim
    * was real. It hands its per-story verdicts here; this method stamps
-   * each one onto its story (`StoryV2.judge`) and enforces the verdict:
+   * each one onto its story (`StoryV2.verifier`) and enforces the verdict:
    *  - pass on a `"complete"` story: confirmed — status untouched, id in
    *    `passed`.
    *  - fail on a `"complete"` story: REVERT. The story goes back to
@@ -1491,11 +1491,11 @@ export class StoryEngine {
    *    `reverted`.
    *  - any verdict on a non-`"complete"` story: the stamp is recorded
    *    (still useful audit information) but nothing transitions, and
-   *    `judge:verdict-not-enforced` names the story so the no-op is visible
+   *    `verifier:verdict-not-enforced` names the story so the no-op is visible
    *    in the log rather than inferable only from an empty audit summary
    *    (FR-009 / MAJ-008).
    * Unknown story ids are collected into `unknown` and NEVER throw. Persists
-   * once at the end and logs `story:judge-audit`. Throws only when the
+   * once at the end and logs `story:verifier-audit`. Throws only when the
    * session has no plan at all.
    *
    * FR-001b (2026-08-03): `contradictedByStory` carries, per story id, the
@@ -1504,7 +1504,7 @@ export class StoryEngine {
    * that file demonstrably exists, and re-derives `pass: true` when every
    * failing item of a story was disproven that way. Those ids are recorded
    * on the stamp so a harness-derived pass stays distinguishable from a
-   * genuine judge pass forever after (the close-out must not claim the judge
+   * genuine verifier pass forever after (the close-out must not claim the verifier
    * "independently verified" a story it actually failed). The parameter is
    * OPTIONAL: two-argument callers are unchanged and their stamps carry no
    * `contradictedItemIds` at all, which is exactly the "genuine verdict"
@@ -1517,13 +1517,13 @@ export class StoryEngine {
    * reconciliation because `gate.ts:742-753` holds this plan object and
    * re-reads `plan.stories` after this call returns.
    */
-  applyJudgeVerdicts(
+  applyVerifierVerdicts(
     sessionID: string,
     verdicts: Array<{
       storyId: string
       pass: boolean
       summary: string
-      items: JudgeItemNote[]
+      items: VerifierItemNote[]
       /** C2: mark the stamp as bookkeeping for a verdict the harness did NOT enforce. */
       unapplied?: "contradictory" | "unverified" | "capped"
     }>,
@@ -1537,7 +1537,7 @@ export class StoryEngine {
       const reverted: string[] = []
       const passed: string[] = []
       const unknown: string[] = []
-      const judgedAt = new Date().toISOString()
+      const verifiedAt = new Date().toISOString()
       let stamped = 0
 
       for (const verdict of verdicts) {
@@ -1547,13 +1547,13 @@ export class StoryEngine {
           continue
         }
         // Copy the items defensively — the stamp becomes part of the
-        // persisted plan and must not alias the judge module's array.
+        // persisted plan and must not alias the verifier module's array.
         const contradicted = contradictedByStory?.get(verdict.storyId)
-        story.judge = {
+        story.verifier = {
           pass: verdict.pass,
           summary: verdict.summary,
           items: verdict.items.map((item) => ({ ...item })),
-          judgedAt,
+          verifiedAt,
           // Absent (not `[]`) when the harness overruled nothing, so the
           // on-disk shape of an untouched verdict is byte-identical to what
           // pre-FR-001b engines wrote.
@@ -1569,9 +1569,9 @@ export class StoryEngine {
           // `pass:false` (the verdict was rejected as unusable, so acting on
           // it is precisely what the caller refused to do) and not a `passed`
           // entry on `pass:true` (which is how the laundering arose). The
-          // stamp's only job is to stop the `!story.judge` selector from
-          // re-running the judge on this story forever.
-          this.logger("judge:verdict-not-enforced", {
+          // stamp's only job is to stop the `!story.verifier` selector from
+          // re-running the verifier on this story forever.
+          this.logger("verifier:verdict-not-enforced", {
             sessionID,
             storyId: story.id,
             status: story.status,
@@ -1585,12 +1585,12 @@ export class StoryEngine {
           // requires re-doing the work, so a reverted claim withdraws the
           // task-level completion as well as the story-level one.
           story.status = "active"
-          story.startedAt = judgedAt
+          story.startedAt = verifiedAt
           story.completedAt = undefined
           for (const task of story.tasks) {
             if (task.status === "complete") {
               task.status = "active"
-              task.startedAt = judgedAt
+              task.startedAt = verifiedAt
               task.completedAt = undefined
             }
           }
@@ -1603,11 +1603,11 @@ export class StoryEngine {
           // checkpoint moved it between selection and application. Without
           // this event the audit reads `{passed:[], reverted:[], unknown:[]}`
           // with no story named anywhere, which is indistinguishable from
-          // "the judge returned nothing" — exactly the invisible-skip class
+          // "the verifier returned nothing" — exactly the invisible-skip class
           // FR-009 exists to close. It is logged per story rather than folded
-          // into `story:judge-audit` below, which is a summary of TRANSITIONS
+          // into `story:verifier-audit` below, which is a summary of TRANSITIONS
           // and has no slot for a per-story reason.
-          this.logger("judge:verdict-not-enforced", {
+          this.logger("verifier:verdict-not-enforced", {
             sessionID,
             storyId: story.id,
             status: story.status,
@@ -1621,7 +1621,7 @@ export class StoryEngine {
       return { changed: stamped > 0, result: { reverted, passed, unknown } }
     })
 
-    this.logger("story:judge-audit", { sessionID, ...outcome })
+    this.logger("story:verifier-audit", { sessionID, ...outcome })
     return outcome
   }
 
@@ -1813,18 +1813,18 @@ export class StoryEngine {
       if (next === "complete" && prev !== "complete") {
         // FR-004, second site (REPRODUCED 2026-08-03). `freshCompletionStamp`
         // was wired into `reopenStory` only, but this is the path that runs
-        // when the model re-checkpoints a task the judge just reverted — the
+        // when the model re-checkpoints a task the verifier just reverted — the
         // common case, since the revert directive orders exactly that. With a
         // raw `now`, an audit and the re-checkpoint that follows it can land
         // in the same millisecond; the gate's selector is the string test
-        // `story.judge.judgedAt < story.completedAt`, so an EQUAL stamp reads
+        // `story.verifier.verifiedAt < story.completedAt`, so an EQUAL stamp reads
         // as "not re-claimed" and the story is never re-audited again.
         //
         // Caught as a 2-in-8 flake in the full suite (`a PASSING verdict
         // clears that story's consecutive-revert streak`): under load the
         // audit and the checkpoint collided on the millisecond, the second
         // audit never ran, and the re-audit counter stayed at 1.
-        story.completedAt = freshCompletionStamp(now, story.judge?.judgedAt)
+        story.completedAt = freshCompletionStamp(now, story.verifier?.verifiedAt)
       } else if (next !== "complete") {
         story.completedAt = undefined
       }
@@ -1999,7 +1999,7 @@ export class StoryEngine {
    * Acquires the shared state lock ONCE (with the FR-002c bounded retry),
    * re-reads `plan.json`, reconciles the on-disk state into the cached plan
    * IN PLACE, runs `fn`, writes, releases. The ordering is the entire point:
-   * the audited session lost a judge stamp because the mutation happened
+   * the audited session lost a verifier stamp because the mutation happened
    * first and the lock only ever covered the write, so a stale cache
    * clobbered a peer's entry. Round-1 C4 also rules out the obvious
    * alternative — re-hydrating inside `persistPlan` (i.e. after the
@@ -2037,7 +2037,7 @@ export class StoryEngine {
         // plan IN PLACE, but nothing reached disk. Leaving it there is worse
         // than losing the write, because memory and disk now disagree and
         // every caller reports success:
-        //   - a judge stamp applied only in memory is erased by the next
+        //   - a verifier stamp applied only in memory is erased by the next
         //     merge from a peer's copy — the measured 7-12% stamp loss;
         //   - an aborted `clearPlan` reports "cleared" while the plan is
         //     still on disk, so it resurrects on the next hydrate;
@@ -2219,7 +2219,7 @@ export class StoryEngine {
    *
    * The assignment is field-by-field into the existing objects (see
    * `assignPlanInPlace`): `gate.ts:742-753` holds this plan object across
-   * `applyJudgeVerdicts` and re-reads `plan.stories` afterwards, so swapping
+   * `applyVerifierVerdicts` and re-reads `plan.stories` afterwards, so swapping
    * the reference would silently break the plan close-out.
    */
   private reconcileWithDisk(sessionID: string, onDisk: PlanV2 | undefined): void {
@@ -2238,7 +2238,7 @@ export class StoryEngine {
     if (diskRevision <= cachedRevision) return
     if (this.pendingPersist.has(sessionID)) {
       // C3: this merge is about to overwrite a change that never reached
-      // disk. It is real data loss (the judge stamps that vanished in the
+      // disk. It is real data loss (the verifier stamps that vanished in the
       // audited session), and it was previously indistinguishable from an
       // ordinary merge.
       // CR-13 (round 5): log the loss, but do NOT re-raise `writeAborted`.
@@ -2408,8 +2408,8 @@ export interface ClassifyResult {
 }
 
 /**
- * Raised from the spec's literal 5000ms for the same reason as judge.ts's
- * `JUDGE_TOTAL_BUDGET_MS` (see that constant's comment): once the FR-030b
+ * Raised from the spec's literal 5000ms for the same reason as verifier.ts's
+ * `VERIFIER_TOTAL_BUDGET_MS` (see that constant's comment): once the FR-030b
  * capability probe started passing, live runs showed the intake subturn
  * consuming the whole 5s on the model round-trip and logging
  * `intake:classify-fallback {reason:"timeout"}` every time — so the
@@ -2417,9 +2417,9 @@ export interface ClassifyResult {
  * every real ask. `VERTEX_INTAKE_BUDGET_MS` overrides it (values <= 0 or
  * unparseable fall back to the default).
  *
- * Intake is on the critical path of a user's first turn (unlike the judge,
+ * Intake is on the critical path of a user's first turn (unlike the verifier,
  * which runs at idle), so this default is deliberately lower than the
- * judge's: a wrong-but-fast heuristic classification is a better failure
+ * verifier's: a wrong-but-fast heuristic classification is a better failure
  * mode here than a long stall before the assistant responds.
  */
 const DEFAULT_INTAKE_SUBTURN_TIMEOUT_MS = 15_000

@@ -26,7 +26,7 @@ const SECRET_PATTERNS: readonly { pattern: RegExp; replacement: string }[] = [
   // Bearer/Basic/URL-credential — independent of this label pattern)
   // eliminates the false positive without narrowing real `label: value` /
   // `label=value` leaks. An unlabeled secret with no `:`/`=` nearby (e.g. "the
-  // password is hunter2...") is still covered by `judge.ts`'s separate
+  // password is hunter2...") is still covered by `verifier.ts`'s separate
   // high-entropy scan (`tripsEntropyScan`), which does not depend on this
   // pattern matching at all.
   {

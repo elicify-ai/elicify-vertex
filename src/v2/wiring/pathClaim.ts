@@ -2,18 +2,18 @@
  * FR-001 — the path-existence claim discriminator.
  *
  * WHY THIS EXISTS. In the audited session (`ses_04dc77bdaffej8SFJvYm5yO0CW`)
- * the completion judge reverted genuinely-delivered stories on claims that a
+ * the completion verifier reverted genuinely-delivered stories on claims that a
  * file or directory did not exist when it demonstrably did — e.g.
  * `"renewable-energy.md and space-exploration.md are MISSING on disk"` against
  * files that were 4262 B and 3138 B at that moment, and
  * `"the research/ directory does not exist"` against a directory holding 12
- * files. This module decides, for one judge item note, whether the harness may
+ * files. This module decides, for one verifier item note, whether the harness may
  * overrule that specific claim by observing the filesystem itself.
  *
  * WHY IT IS DELIBERATELY NARROW (grill round 2, C-3). A naive "does the note
  * contain a path token and a negation" matcher is provably unsafe against the
  * real corpus. The first notes in
- * `tests/fixtures/judge-replay/item-notes.json` are:
+ * `tests/fixtures/verifier-replay/item-notes.json` are:
  *
  *     research/renewable-energy.md exists (1046 bytes) but contains no URLs
  *     or Sources section
@@ -192,7 +192,7 @@ export function parsePathAbsenceClaim(note: string): PathClaim {
   // and `?` all walked past it ("research/x.md is missing, the KPI values are
   // fabricated" was dropped), and `absent` / `no such file` were not in the
   // list at all ("src/pages/Renewable.jsx is absent the recharts import" — a
-  // near-verbatim paraphrase of corpus note N32, a CORRECT judge failure —
+  // near-verbatim paraphrase of corpus note N32, a CORRECT verifier failure —
   // was dropped).
   // Skipped for the LEADING form ("missing research/x.md"),
   // where the absence word precedes its path: TRAILING_QUALIFIER reads the

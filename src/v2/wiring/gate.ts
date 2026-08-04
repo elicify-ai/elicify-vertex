@@ -10,15 +10,15 @@
  *
  * HANDOVER.md redesign (2026-07-29, points 2/4/8/9) — the completion model
  * changed fundamentally:
- *  - The completion JUDGE is now the sole arbiter of story/plan completion.
+ *  - The completion VERIFIER is now the sole arbiter of story/plan completion.
  *    It runs here, at idle, over every story that CLAIMED complete since its
- *    last audit (`handleJudgeAudit`) — no longer gated behind the
- *    deterministic state it exists to rescue (the old `appendJudgeCloseOut`
+ *    last audit (`handleVerifierAudit`) — no longer gated behind the
+ *    deterministic state it exists to rescue (the old `appendVerifierCloseOut`
  *    could only run once every story was already `complete`, so a session
  *    stalled on the deterministic gate — exactly the failure it existed
- *    for — never saw a judge at all: the 894-message field session ended
+ *    for — never saw a verifier at all: the 894-message field session ended
  *    5/5 blocked with 0 audits).
- *  - Judge verdicts are structured per acceptance item and are APPLIED:
+ *  - Verifier verdicts are structured per acceptance item and are APPLIED:
  *    a failed claim reverts the story to `active` with named gaps, and the
  *    continuation names those gaps per story (point 8).
  *  - The gate defers ALL nudging while a `task`-tool delegation is in
@@ -48,8 +48,8 @@ import type { PhaseEngine } from "../phase.js"
 import type { PinStore } from "../pin.js"
 import type { StoryEngine } from "../story.js"
 import { resolveVerifier } from "../resolve.js"
-import { runJudge, buildJudgePayload, type JudgeStoryVerdict } from "../judge.js"
-import type { JudgeItemNote, PlanV2 } from "../story.js"
+import { runVerifier, buildVerifierPayload, type VerifierStoryVerdict } from "../verifier.js"
+import type { VerifierItemNote, PlanV2 } from "../story.js"
 import type { SelfCreatedSessions } from "../subturn.js"
 import type { ManifestCache } from "./manifest.js"
 import { incompletePlanFinding } from "./findings.js"
@@ -76,10 +76,10 @@ export interface GateContext {
    */
   activeSessionIDs: () => string[]
   maxCriteriaBlocks: number
-  judgeEnabled: boolean
-  judgeModelOverride?: { providerID: string; modelID: string }
+  verifierEnabled: boolean
+  verifierModelOverride?: { providerID: string; modelID: string }
   isValidReceipt: (sessionID: string, receiptID: string) => boolean
-  /** Recent verifier output summaries this session, for the judge payload (best-effort, bounded). */
+  /** Recent verifier output summaries this session, for the verifier payload (best-effort, bounded). */
   recentVerifierSummaries: (sessionID: string) => string[]
   diffSummary: (sessionID: string) => string
   /** `promptContinuation` opens a new composer turn per dispatched
@@ -93,7 +93,7 @@ export interface GateContext {
   /** Redesign point 9: pause auto-continuations after this many consecutive
    * continuations produced no observable activity. <= 0 disables. */
   maxNoProgressTurns: number
-  /** FR-007: cap consecutive judge reverts per story, then escalate. <=0 disables. */
+  /** FR-007: cap consecutive verifier reverts per story, then escalate. <=0 disables. */
   maxStoryReaudits: number
   /** FR-060/FR-061: surfaces gate fires and health signals to the operator.
    * Optional so existing callers and tests need no change; when absent the
@@ -130,6 +130,33 @@ async function promptContinuation(
     console.error("[vertex-v2] session.prompt unavailable; cannot enforce idle gate")
     return
   }
+  // The working model must read a continuation as an INSTRUCTION, not as an
+  // automated nag it can discount. Continuations are already dispatched
+  // through `session.prompt`, so they arrive as user-role messages; the
+  // `[vertex:...]` marker was the only thing advertising the harness as their
+  // author. Strip it from what the model sees.
+  //
+  // Applied to EVERY continuation family, not just the verifier's: they share
+  // one channel and one authority argument, and stripping some while leaving
+  // others teaches the model that a bracketed prefix means "safe to discount".
+  //
+  // The marker is not discarded — it is logged as the family, which is how an
+  // operator still tells harness steering from their own words when reading a
+  // transcript. Nothing recorded the dispatched text before this.
+  // Two things advertise the harness: `formatGateContinuationText`'s
+  // "[vertex] completion paused …" headline, and the `[vertex:family]` token
+  // on the directive itself. Both go.
+  const family = /\[vertex:([a-z-]+)\]/.exec(text)?.[1] ?? "unmarked"
+  const dispatchText = text
+    .replace(/^\[vertex\][^\n]*\n+/, "")
+    .replace(/\[vertex:[a-z-]+\]\s*/g, "")
+    .trim()
+  ctx.logger("gate:continuation-dispatched", {
+    sessionID: sid,
+    family,
+    chars: dispatchText.length,
+    text: dispatchText.slice(0, 500),
+  })
   const state = ctx.states.get(sid)
   // MIN-006 (code review): a prompt that timed out and settles LATER must not
   // release the guard of a newer continuation. Each dispatch takes a ticket;
@@ -140,7 +167,7 @@ async function promptContinuation(
     state.idleContinuationInFlight = true
     // M4: recorded so the reentrant `chat.message` this prompt causes can be
     // recognised as our own echo rather than as user intent.
-    state.lastContinuationText = text
+    state.lastContinuationText = dispatchText
   }
 
   // A dispatched continuation is a fresh prompt, so it opens a new turn in
@@ -175,7 +202,7 @@ async function promptContinuation(
   //
   // `session.prompt` resolves only when the whole assistant turn ENDS, so any
   // continuation that provokes real work necessarily outruns a 30s race. In
-  // the audited session this fired 9 times — once per judge audit — and every
+  // the audited session this fired 9 times — once per verifier audit — and every
   // one was logged `gate:continuation-failed`, yet the transcript shows each
   // continuation arriving as a user message the agent then reacted to. The
   // directives were delivered; the harness was mis-reporting its own success
@@ -214,7 +241,7 @@ async function promptContinuation(
     let prompt: Promise<unknown>
     try {
       prompt = Promise.resolve(
-        ctx.client.session.prompt({ path: { id: sid }, body: { parts: [{ type: "text", text }] } } as never),
+        ctx.client.session.prompt({ path: { id: sid }, body: { parts: [{ type: "text", text: dispatchText }] } } as never),
       )
     } catch (syncErr) {
       release()
@@ -321,7 +348,7 @@ function narrowestPrescription(ctx: GateContext, state: V2SessionState, sid: str
  * (`docs/REQUIREMENTS-IDLE-COMPLETION-GATE.md`).
  *
  * Before this existed, `getPlan()` was read in this file ONLY inside
- * `appendJudgeCloseOut`, to decide whether the judge was *permitted* to
+ * `appendVerifierCloseOut`, to decide whether the verifier was *permitted* to
  * run — never to *demand* completion. So a plan whose stories were all
  * still `pending` closed silently whenever the other three checks happened
  * to pass (no pinned criteria, no unverified changed files), which is
@@ -356,10 +383,10 @@ function narrowestPrescription(ctx: GateContext, state: V2SessionState, sid: str
  *    the two branches draw on one budget, so a plan that spends it can
  *    leave the criteria branch quiet for the rest of that turn.
  *
- *  - **Past the cap we stop NUDGING, but the judge still cannot run.** The
+ *  - **Past the cap we stop NUDGING, but the verifier still cannot run.** The
  *    early return below is skipped once capped, so the rest of the tree
  *    (zero-criteria fallback, phase close) runs normally — but
- *    `appendJudgeCloseOut` independently requires the plan's final story to
+ *    `appendVerifierCloseOut` independently requires the plan's final story to
  *    be `complete`, and `StoryEngine.checkpoint` now REJECTS completing the
  *    final story unless every OTHER story is already `complete` too (see
  *    `story.ts`'s `checkpoint`, the `isFinal` branch — added for
@@ -568,16 +595,16 @@ async function handleCriteriaReplay(ctx: GateContext, sid: string, state: V2Sess
 }
 
 /**
- * `docs/JUDGE-PROMPT.md` §5: bounded window of recent turns (both roles)
+ * `docs/VERIFIER-PROMPT.md` §5: bounded window of recent turns (both roles)
  * folded into `recentTranscript`. Char-capped downstream by
- * `buildJudgePayload` (`JUDGE_TRANSCRIPT_FIELD_CHAR_CAP`, 4000 chars) — this
+ * `buildVerifierPayload` (`VERIFIER_TRANSCRIPT_FIELD_CHAR_CAP`, 4000 chars) — this
  * turn-count is a soft pre-filter, not the real bound. Judgment call: no
  * number is given in the design doc beyond "the last few turns"; 8 messages
  * (roughly 4 exchanges) is picked to comfortably carry an earlier hedge or
  * admitted shortcut a couple of turns back, while the char cap is what
  * actually keeps the payload bounded regardless of this constant.
  */
-const JUDGE_RECENT_TRANSCRIPT_TURN_WINDOW = 8
+const VERIFIER_RECENT_TRANSCRIPT_TURN_WINDOW = 8
 
 /**
  * Structural shape of one `client.session.messages` entry. Deliberately
@@ -587,7 +614,7 @@ const JUDGE_RECENT_TRANSCRIPT_TURN_WINDOW = 8
  * intentionally-identical shape rather than a shared import (this module's
  * SCOPE does not include editing `tools.ts`).
  */
-interface JudgeTranscriptEntry {
+interface VerifierTranscriptEntry {
   info?: { id?: string; role?: string }
   message?: { id?: string; role?: string }
   parts?: Array<{ type?: string; text?: unknown }>
@@ -597,7 +624,7 @@ function isFieldsStyle(value: unknown): value is { data?: unknown; error?: unkno
   return typeof value === "object" && value !== null && ("data" in value || "error" in value)
 }
 
-function extractEntryText(entry: JudgeTranscriptEntry): string {
+function extractEntryText(entry: VerifierTranscriptEntry): string {
   return (entry.parts ?? [])
     .filter((p): p is { type: string; text: string } => !!p && p.type === "text" && typeof p.text === "string")
     .map((p) => p.text)
@@ -605,20 +632,20 @@ function extractEntryText(entry: JudgeTranscriptEntry): string {
 }
 
 /**
- * `docs/JUDGE-PROMPT.md` §5: fetches the parent session's own last assistant
+ * `docs/VERIFIER-PROMPT.md` §5: fetches the parent session's own last assistant
  * message (verbatim) and a bounded recent-turn window (both roles, compact
- * `role: text` format) to feed `buildJudgePayload`'s new `lastResponse`/
+ * `role: text` format) to feed `buildVerifierPayload`'s new `lastResponse`/
  * `recentTranscript` raw fields. Uses the exact same `client.session.messages`
  * call shape already proven working elsewhere in this codebase
  * (`wiring/tools.ts:58`'s `isUserMessage`, for waiver-provenance validation)
  * — not new capability.
  *
  * Fails open on any fetch/shape problem (empty strings, never throws),
- * matching this module's "advisory, never gating" posture for the judge as a
- * whole: a transcript fetch failure must degrade the judge's input, not
+ * matching this module's "advisory, never gating" posture for the verifier as a
+ * whole: a transcript fetch failure must degrade the verifier's input, not
  * break the close-out path that calls this.
  */
-async function fetchJudgeTranscriptFields(
+async function fetchVerifierTranscriptFields(
   client: OpencodeClient,
   sid: string,
 ): Promise<{ lastResponse: string; recentTranscript: string }> {
@@ -628,7 +655,7 @@ async function fetchJudgeTranscriptFields(
     const list = isFieldsStyle(raw) ? raw.data : raw
     if (!Array.isArray(list)) return empty
 
-    const turns = (list as JudgeTranscriptEntry[])
+    const turns = (list as VerifierTranscriptEntry[])
       .map((entry) => {
         const info = entry.info ?? entry.message
         const role = info?.role
@@ -648,7 +675,7 @@ async function fetchJudgeTranscriptFields(
     }
 
     const recentTranscript = turns
-      .slice(-JUDGE_RECENT_TRANSCRIPT_TURN_WINDOW)
+      .slice(-VERIFIER_RECENT_TRANSCRIPT_TURN_WINDOW)
       .map((t) => `${t.role}: ${t.text}`)
       .join("\n")
 
@@ -659,9 +686,9 @@ async function fetchJudgeTranscriptFields(
 }
 
 /**
- * Redesign point 4/8: renders the plan for the judge payload's `plan` field —
+ * Redesign point 4/8: renders the plan for the verifier payload's `plan` field —
  * the whole plan for context, with the stories to audit named up front. The
- * judge reads this, then verifies the claims against the worktree itself
+ * verifier reads this, then verifies the claims against the worktree itself
  * (its own read/grep/glob/bash), so the digest's job is precision, not
  * persuasion: statuses, the task decomposition (id/dependsOn/status), the
  * acceptance items that ARE the contract, and declared verifiers, verbatim.
@@ -669,27 +696,27 @@ async function fetchJudgeTranscriptFields(
  * 2026-07-30 task/DAG redesign: the old stored `StoryV2.wave` field is GONE
  * — waves are computed from the task DAG as topological levels, never stored
  * or input — so the digest now renders each story's TASKS (with their own
- * `dependsOn`) instead of a wave number, handing the judge the same
- * dependency structure the engine promotes by. The judge still audits STORIES
+ * `dependsOn`) instead of a wave number, handing the verifier the same
+ * dependency structure the engine promotes by. The verifier still audits STORIES
  * (acceptance items are the contract); a story becomes auditable when all its
- * tasks complete, which is exactly when `handleJudgeAudit` picks it up.
+ * tasks complete, which is exactly when `handleVerifierAudit` picks it up.
  *
- * FR-011 (P0 — `docs/JUDGE-RELIABILITY-FIXES-SPEC.md` US-9 AS1): the digest
+ * FR-011 (P0 — `docs/VERIFIER-RELIABILITY-FIXES-SPEC.md` US-9 AS1): the digest
  * MUST open with the ABSOLUTE worktree root. Every path the plan carries
  * (acceptance items, `verifiers:` lines, scope globs) is written relative to
- * the worktree, and the judge runs in a child session whose cwd it cannot see
+ * the worktree, and the verifier runs in a child session whose cwd it cannot see
  * in the payload. In the audited session (`ses_04dc77bdaffej8SFJvYm5yO0CW`)
- * that gap produced the signature fabrication: the judge asserted
+ * that gap produced the signature fabrication: the verifier asserted
  * "research/x.json does not exist" about a file that DID exist, because a bare
  * relative path is unresolvable text unless you know what it is relative to.
- * One line of context turns every path in the digest into something the judge
+ * One line of context turns every path in the digest into something the verifier
  * can actually `read`/`ls`, which is the precondition for the prompt's
  * "observe before you claim absence" rule to be followable at all.
  *
  * MIN-002 / FR-006: the stories UNDER AUDIT render first. The digest is
- * truncated at `JUDGE_PLAN_FIELD_CHAR_CAP` from the END, so plan order alone
+ * truncated at `VERIFIER_PLAN_FIELD_CHAR_CAP` from the END, so plan order alone
  * decided what survived — and in the audited session the truncation removed
- * exactly the `verifiers:` lines of the later stories, after which the judge
+ * exactly the `verifiers:` lines of the later stories, after which the verifier
  * FAILed those stories citing the content the cap had removed ("S5 has no
  * independent verifier set in the digest"). Ordering audited stories first
  * makes truncation structurally incapable of dropping the contract being
@@ -725,14 +752,14 @@ function renderPlanDigest(plan: PlanV2, auditIds: ReadonlySet<string>, workspace
 }
 
 /**
- * Redesign point 8: the revert continuation is where the judge's structured
+ * Redesign point 8: the revert continuation is where the verifier's structured
  * verdict becomes constructive, per-story detail — "story S2 not delivered;
- * A3, A4 still missing, and here is what the judge saw" — instead of a
+ * A3, A4 still missing, and here is what the verifier saw" — instead of a
  * generic "the plan is not done" reminder.
  */
-function formatJudgeReverts(plan: PlanV2, verdicts: readonly JudgeStoryVerdict[]): string {
+function formatVerifierReverts(plan: PlanV2, verdicts: readonly VerifierStoryVerdict[]): string {
   const lines: string[] = [
-    "[vertex:judge] The completion judge independently audited your claimed stories against the worktree and found them NOT delivered.",
+    "[vertex:verifier] The completion verifier independently audited your claimed stories against the worktree and found them NOT delivered.",
   ]
   for (const verdict of verdicts.filter((v) => !v.pass)) {
     const story = plan.stories.find((s) => s.id === verdict.storyId)
@@ -746,33 +773,33 @@ function formatJudgeReverts(plan: PlanV2, verdicts: readonly JudgeStoryVerdict[]
     "Fix exactly the named items, run each story's declared verifiers as standalone commands (never ';'-chained " +
       "or piped — that hides the real exit code) and read their output, then checkpoint each reverted task complete " +
       "again (elicify_vertex_plan_checkpoint with the taskId) — the story auto-completes when all its tasks are done, " +
-      "and the judge re-audits it. Do not re-claim without new evidence — the judge re-audits every claim.",
+      "and the verifier re-audits it. Do not re-claim without new evidence — the verifier re-audits every claim.",
   )
   return lines.join("\n")
 }
 
 /**
- * Redesign points 2/4 — THE ARBITER. Replaces the old `appendJudgeCloseOut`,
+ * Redesign points 2/4 — THE ARBITER. Replaces the old `appendVerifierCloseOut`,
  * which could only run after every story had already reached `complete`
  * through the deterministic gate — i.e. it could never fire in the one
  * situation it existed for (a session stalled on that gate). This stage runs
  * at EVERY idle in which at least one story has claimed `complete` since its
- * last audit, hands those claims to the tool-using judge, and APPLIES the
+ * last audit, hands those claims to the tool-using verifier, and APPLIES the
  * structured verdicts:
  *
- *  - failed claim   -> `StoryEngine.applyJudgeVerdicts` reverts the story to
+ *  - failed claim   -> `StoryEngine.applyVerifierVerdicts` reverts the story to
  *    `active`, and a constructive continuation names the unmet items
  *    (returns true — the rest of the tree skips this idle).
  *  - all claims pass -> silent for intermediate stories; a single close-out
  *    line only when the WHOLE plan is settled and the final story's claim
  *    just passed (returns true).
- *  - judge unavailable/malformed -> fail open (claims stand, a health
+ *  - verifier unavailable/malformed -> fail open (claims stand, a health
  *    notification says the audit did not happen), exactly the posture the
- *    judge has always had.
+ *    verifier has always had.
  *
- * A story needs auditing when it is `complete` and either carries no judge
+ * A story needs auditing when it is `complete` and either carries no verifier
  * stamp at all or was re-claimed (`completedAt`) after its latest stamp —
- * so a judged-and-passed plan never re-audits, and a re-claimed story
+ * so a verifierd-and-passed plan never re-audits, and a re-claimed story
  * always does.
  */
 /** FR-007 — per-story consecutive-revert counter, process-local in
@@ -797,7 +824,7 @@ function bumpReaudit(state: V2SessionState, storyId: string): void {
  *
  * Both non-applying paths (FR-005 contradictory, FR-014 unverified) used to
  * `return false` without stamping the story, so the audit selector's
- * `!story.judge` test re-selected it on the very next idle — a full judge
+ * `!story.verifier` test re-selected it on the very next idle — a full verifier
  * subturn per idle, forever, with FR-007's cap never reached because it is
  * enforced further down. Measured before this fix: 8 subturns over 8 idles.
  *
@@ -809,14 +836,14 @@ function boundUnappliedVerdicts(
   ctx: GateContext,
   sid: string,
   state: V2SessionState,
-  verdicts: readonly JudgeStoryVerdict[],
+  verdicts: readonly VerifierStoryVerdict[],
   reason: "contradictory" | "unverified" | "capped",
 ): void {
   for (const verdict of verdicts) {
     bumpReaudit(state, verdict.storyId)
   }
   try {
-    ctx.storyEngine.applyJudgeVerdicts(
+    ctx.storyEngine.applyVerifierVerdicts(
       sid,
       verdicts.map((v) => ({
         storyId: v.storyId,
@@ -824,7 +851,7 @@ function boundUnappliedVerdicts(
         // the harness did NOT act on it, not to act on it by another route.
         // C2: `pass: true` was doing double duty here and laundering the
         // refusal into an audit pass; `unapplied` carries the "do not
-        // transition" meaning now, and `pass` reports what the judge said.
+        // transition" meaning now, and `pass` reports what the verifier said.
         pass: v.pass,
         summary: `verdict not applied (${reason}): ${v.summary}`,
         items: v.items,
@@ -853,14 +880,14 @@ function applyPathVeto(
   ctx: GateContext,
   sid: string,
   state: V2SessionState,
-  verdict: JudgeStoryVerdict,
-): { verdict: JudgeStoryVerdict; contradicted: string[] } {
+  verdict: VerifierStoryVerdict,
+): { verdict: VerifierStoryVerdict; contradicted: string[] } {
   if (verdict.pass) return { verdict, contradicted: [] }
   const root = state.workspaceRoot
   const contradicted: string[] = []
   // CR-8: identity of the items this veto actually disproved. `itemId` cannot
   // serve as the key — it is LLM-authored and not unique.
-  const contradictedItems = new Set<JudgeItemNote>()
+  const contradictedItems = new Set<VerifierItemNote>()
 
   const items = verdict.items.map((item) => {
     if (item.met) return item
@@ -885,11 +912,11 @@ function applyPathVeto(
     }
     if (!allExist) return item
     contradicted.push(item.itemId)
-    ctx.logger("judge:contradicted", { sessionID: sid, storyId: verdict.storyId, itemId: item.itemId, paths })
+    ctx.logger("verifier:contradicted", { sessionID: sid, storyId: verdict.storyId, itemId: item.itemId, paths })
     // MIN-003 (code review): FR-001b says the stamp must RETAIN the original
-    // items plus the marker. Flipping `met` to true here rewrote the judge's
+    // items plus the marker. Flipping `met` to true here rewrote the verifier's
     // finding in the durable record; the note is annotated instead so a reader
-    // sees both what the judge claimed and that the harness disproved it.
+    // sees both what the verifier claimed and that the harness disproved it.
     // `contradictedItemIds` on the stamp remains the machine-readable signal.
     const annotated = { ...item, note: `${item.note} [harness: contradicted — path(s) exist: ${paths.join(", ")}]` }
     contradictedItems.add(annotated)
@@ -899,7 +926,7 @@ function applyPathVeto(
   if (contradicted.length === 0) return { verdict, contradicted }
   // FR-001 AS2: every failing item was individually disproven, so the story's
   // pass is re-derived — but FR-001b requires the result stay distinguishable
-  // from a genuine judge pass (see `applyJudgeVerdicts`'s `contradictedItemIds`).
+  // from a genuine verifier pass (see `applyVerifierVerdicts`'s `contradictedItemIds`).
   // A story passes only when EVERY failing item was individually disproven.
   // Derived from the contradiction set because `met` is deliberately left
   // untouched above (MIN-003).
@@ -916,12 +943,12 @@ function applyPathVeto(
 /**
  * C2 — the settled-but-never-audited close-out.
  *
- * A bounding stamp (`judge.unapplied`) stops the audit selector from re-running
- * the judge on that story, which is its whole point. The consequence is that
- * once every story is complete and stamped, `handleJudgeAudit` returns early
+ * A bounding stamp (`verifier.unapplied`) stops the audit selector from re-running
+ * the verifier on that story, which is its whole point. The consequence is that
+ * once every story is complete and stamped, `handleVerifierAudit` returns early
  * and the plan's real close-out — the one that reports the audit result — is
  * never reached. While the bounding stamp said `pass: true`, that did not show:
- * the story counted toward `allPassed` and the run ended claiming the judge had
+ * the story counted toward `allPassed` and the run ended claiming the verifier had
  * independently verified everything. With `pass` now telling the truth, the
  * same path would instead end in SILENCE, which is a different way of not
  * telling the operator that a story was never checked.
@@ -938,25 +965,25 @@ async function emitUnauditedEscalation(
   plan: PlanV2,
 ): Promise<boolean> {
   if (state.unauditedEscalated) return false
-  if (!plan.stories.every((story) => story.status === "complete" && story.judge !== undefined)) return false
-  // A capped story WAS audited — the judge failed it and the harness stopped
+  if (!plan.stories.every((story) => story.status === "complete" && story.verifier !== undefined)) return false
+  // A capped story WAS audited — the verifier failed it and the harness stopped
   // reverting. Reporting it as "never verified" would be false, so the two
   // groups are named separately.
-  const unverified = plan.stories.filter((s2) => s2.judge?.unapplied !== undefined && s2.judge.unapplied !== "capped")
-  const disputed = plan.stories.filter((s2) => s2.judge?.unapplied === "capped")
+  const unverified = plan.stories.filter((s2) => s2.verifier?.unapplied !== undefined && s2.verifier.unapplied !== "capped")
+  const disputed = plan.stories.filter((s2) => s2.verifier?.unapplied === "capped")
   const unaudited = [...unverified, ...disputed].map((story) => story.id)
   if (unaudited.length === 0) return false
-  ctx.logger("judge:unaudited-escalation", { sessionID: sid, stories: unaudited })
+  ctx.logger("verifier:unaudited-escalation", { sessionID: sid, stories: unaudited })
   const clauses: string[] = []
   if (unverified.length > 0) {
     clauses.push(
-      `the completion judge produced no usable verdict for ${unverified.map((s2) => s2.id).join(", ")}, so ` +
+      `the completion verifier produced no usable verdict for ${unverified.map((s2) => s2.id).join(", ")}, so ` +
         "those stories were NOT verified against the worktree",
     )
   }
   if (disputed.length > 0) {
     clauses.push(
-      `the judge repeatedly failed ${disputed.map((s2) => s2.id).join(", ")} and the re-audit cap was reached, so ` +
+      `the verifier repeatedly failed ${disputed.map((s2) => s2.id).join(", ")} and the re-audit cap was reached, so ` +
         "the harness stopped re-opening them — those stories are DISPUTED, not confirmed",
     )
   }
@@ -964,7 +991,7 @@ async function emitUnauditedEscalation(
     ctx,
     sid,
     state,
-    `[vertex:judge] Every story of the plan is complete, but ${clauses.join("; and ")}. Report what was delivered, ` +
+    `[vertex:verifier] Every story of the plan is complete, but ${clauses.join("; and ")}. Report what was delivered, ` +
       `the commands you ran and the results you observed, state explicitly that ${unaudited.join(", ")} did not pass ` +
       "audit, then stop.",
   )
@@ -976,71 +1003,71 @@ async function emitUnauditedEscalation(
   return dispatched
 }
 
-async function handleJudgeAudit(ctx: GateContext, sid: string, state: V2SessionState): Promise<boolean> {
-  if (!ctx.judgeEnabled) return false
+async function handleVerifierAudit(ctx: GateContext, sid: string, state: V2SessionState): Promise<boolean> {
+  if (!ctx.verifierEnabled) return false
   const plan = ctx.storyEngine.getPlan(sid)
   if (!plan) return false
   if (!state.modelId) return false
 
-  const unjudged = plan.stories.filter(
+  const unverifiedStories = plan.stories.filter(
     (story) =>
       story.status === "complete" &&
-      (!story.judge || (story.completedAt !== undefined && story.judge.judgedAt < story.completedAt)),
+      (!story.verifier || (story.completedAt !== undefined && story.verifier.verifiedAt < story.completedAt)),
   )
-  if (unjudged.length === 0) return emitUnauditedEscalation(ctx, sid, state, plan)
+  if (unverifiedStories.length === 0) return emitUnauditedEscalation(ctx, sid, state, plan)
 
   const [providerID, ...rest] = state.modelId.split("/")
   const modelID = rest.join("/")
   if (!providerID || !modelID) return false
 
-  const auditIds = new Set(unjudged.map((story) => story.id))
+  const auditIds = new Set(unverifiedStories.map((story) => story.id))
   const criteria = ctx.pinStore.get(sid).map((c) => c.text)
   const verifierSummaries = ctx.recentVerifierSummaries(sid)
   const diffSummary = ctx.diffSummary(sid)
-  const { lastResponse, recentTranscript } = await fetchJudgeTranscriptFields(ctx.client, sid)
-  const payload = buildJudgePayload(
+  const { lastResponse, recentTranscript } = await fetchVerifierTranscriptFields(ctx.client, sid)
+  const payload = buildVerifierPayload(
     {
       criteria,
       diffSummary,
       verifierSummaries,
       lastResponse,
       recentTranscript,
-      // FR-011: the judge cannot resolve the digest's relative paths without
+      // FR-011: the verifier cannot resolve the digest's relative paths without
       // the root it is told they are relative to.
       plan: renderPlanDigest(plan, auditIds, state.workspaceRoot),
     },
     bindSession(sid, ctx.logger),
   )
 
-  const result = await runJudge(
+  const result = await runVerifier(
     ctx.client,
     { selfCreated: ctx.selfCreated, logger: bindSession(sid, ctx.logger) },
     {
       parentSessionID: sid,
       sessionModel: { providerID, modelID },
-      judgeModelOverride: ctx.judgeModelOverride,
+      verifierModelOverride: ctx.verifierModelOverride,
       payload,
     },
   )
 
   if (!result.verdict) {
-    // FR-061: a judge that silently does not run is indistinguishable from a
-    // judge that passed. Say so.
+    // FR-061: a verifier that silently does not run is indistinguishable from a
+    // verifier that passed. Say so.
     void ctx.visibility?.notify("health", {
       sessionID: sid,
-      family: "judge:unavailable",
-      message: `the completion judge did not run (${result.reason ?? "unknown"}) — claimed stories are unverified`,
+      family: "verifier:unavailable",
+      message: `the completion verifier did not run (${result.reason ?? "unknown"}) — claimed stories are unverified`,
       variant: "warning",
     })
     return false
   }
 
   // Verdicts for stories outside the audit set are dropped, not applied —
-  // the judge was told what to audit; anything else it chose to opine on is
+  // the verifier was told what to audit; anything else it chose to opine on is
   // not grounded in this run's payload.
   const onTarget = result.verdict.stories.filter((v) => auditIds.has(v.storyId))
   if (onTarget.length === 0) {
-    ctx.logger("judge:off-target", {
+    ctx.logger("verifier:off-target", {
       sessionID: sid,
       requested: [...auditIds],
       received: result.verdict.stories.map((v) => v.storyId),
@@ -1048,10 +1075,10 @@ async function handleJudgeAudit(ctx: GateContext, sid: string, state: V2SessionS
     return false
   }
 
-  // FR-014 — the tool-call floor. The audited session's judge fabricated
+  // FR-014 — the tool-call floor. The audited session's verifier fabricated
   // filesystem claims it never looked at; a live probe reproduced it in 9.8s
-  // and showed that when the judge DOES observe, it is right. A `met:false`
-  // the judge produced without a single tool call is therefore unverified,
+  // and showed that when the verifier DOES observe, it is right. A `met:false`
+  // the verifier produced without a single tool call is therefore unverified,
   // not evidence — and unlike FR-001 this covers CONTENT claims too (29 of
   // the 49 recovered real notes are content-only, the class no path check can
   // ever contradict). Fail-open: an unreadable child session applies the
@@ -1065,24 +1092,24 @@ async function handleJudgeAudit(ctx: GateContext, sid: string, state: V2SessionS
   // VACUOUSLY FALSE for a verdict with an empty `items` array — so the most
   // unsubstantiated verdict of all (a `pass:false` with no items at all,
   // produced without a single tool call) sailed past the floor and reverted
-  // the story. `isJudgeVerdictShape` accepts `items: []`, FR-005 is gated on
+  // the story. `isVerifierVerdictShape` accepts `items: []`, FR-005 is gated on
   // `items.length > 0`, and `applyPathVeto` maps an empty array, so nothing
   // downstream caught it either. Any unobserved verdict that would COST
   // something — a failing story, or one with nothing backing it — is bounded.
   const wouldRevert = onTarget.some((v) => !v.pass || v.items.length === 0 || v.items.some((i) => !i.met))
   if (observed === false && wouldRevert) {
-    ctx.logger("judge:unverified", { sessionID: sid, stories: onTarget.map((v) => v.storyId) })
+    ctx.logger("verifier:unverified", { sessionID: sid, stories: onTarget.map((v) => v.storyId) })
     void ctx.visibility?.notify("health", {
       sessionID: sid,
-      family: "judge:unverified",
-      message: "the completion judge failed stories without observing the worktree — verdict not applied",
+      family: "verifier:unverified",
+      message: "the completion verifier failed stories without observing the worktree — verdict not applied",
       variant: "warning",
     })
     // MAJ-003: this drop-path must still count toward the re-audit cap and
     // stamp the story, or the audit selector re-selects it every idle forever
-    // (measured: 8 judge subturns over 8 idles, cap never firing).
+    // (measured: 8 verifier subturns over 8 idles, cap never firing).
     // CR-5 (round 5): bound only the verdicts this floor is ABOUT. It used to
-    // sweep the whole batch, so a story the judge PASSED with every item met
+    // sweep the whole batch, so a story the verifier PASSED with every item met
     // was stamped `unapplied:"unverified"` too — which bars it from
     // `allPassed` AND from re-audit (the selector skips a stamped story), so
     // it could never become verified for the rest of the run. A passing,
@@ -1092,10 +1119,10 @@ async function handleJudgeAudit(ctx: GateContext, sid: string, state: V2SessionS
     const substantiated = onTarget.filter((v) => !unsubstantiated.includes(v))
     boundUnappliedVerdicts(ctx, sid, state, unsubstantiated, "unverified")
     if (substantiated.length > 0) {
-      // A clean pass in the same batch still applies, so a story the judge
+      // A clean pass in the same batch still applies, so a story the verifier
       // genuinely confirmed is not held hostage by a sibling's bad verdict.
       try {
-        ctx.storyEngine.applyJudgeVerdicts(sid, substantiated)
+        ctx.storyEngine.applyVerifierVerdicts(sid, substantiated)
       } catch {
         // Fail-open: applying the clean subset is best-effort.
       }
@@ -1103,24 +1130,24 @@ async function handleJudgeAudit(ctx: GateContext, sid: string, state: V2SessionS
     return false
   }
   if (observed === undefined) {
-    ctx.logger("judge:crosscheck-inconclusive", { sessionID: sid, reason: "child session parts unreadable" })
+    ctx.logger("verifier:crosscheck-inconclusive", { sessionID: sid, reason: "child session parts unreadable" })
   }
 
   // FR-001 + FR-005 — reconcile each verdict against deterministic fact
   // BEFORE applying it. Both rules are per story so one bad verdict can never
   // discard a sibling's correct finding (grill round 2, M-9).
-  const reconciled: JudgeStoryVerdict[] = []
+  const reconciled: VerifierStoryVerdict[] = []
   const contradictedByStory = new Map<string, string[]>()
   for (const verdict of onTarget) {
     // FR-005: `pass:false` while every listed item is `met:true` is
     // self-contradictory. Drop THIS story's verdict (never repair it into a
-    // pass the judge did not give), leave the story untouched, and let the
+    // pass the verifier did not give), leave the story untouched, and let the
     // re-audit cap bound the retry.
     if (!verdict.pass && verdict.items.length > 0 && verdict.items.every((i) => i.met)) {
-      ctx.logger("judge:verdict-contradictory", { sessionID: sid, storyId: verdict.storyId })
+      ctx.logger("verifier:verdict-contradictory", { sessionID: sid, storyId: verdict.storyId })
       // MAJ-003: bound it — bump the cap AND stamp the story, otherwise the
-      // audit selector (`!story.judge`) re-selects it on every subsequent
-      // idle and the judge is re-run forever with no exit.
+      // audit selector (`!story.verifier`) re-selects it on every subsequent
+      // idle and the verifier is re-run forever with no exit.
       boundUnappliedVerdicts(ctx, sid, state, [verdict], "contradictory")
       continue
     }
@@ -1134,21 +1161,21 @@ async function handleJudgeAudit(ctx: GateContext, sid: string, state: V2SessionS
   // FR-007 — cap consecutive reverts per story. A disputed story is escalated
   // to the operator instead of looping: the audited session ran 9 audit
   // cycles and 82 checkpoints over 10 tasks with no exit.
-  const applicable: JudgeStoryVerdict[] = []
+  const applicable: VerifierStoryVerdict[] = []
   for (const verdict of reconciled) {
     if (!verdict.pass && reaudits(state, verdict.storyId) >= ctx.maxStoryReaudits && ctx.maxStoryReaudits > 0) {
-      ctx.logger("judge:reaudit-capped", { sessionID: sid, storyId: verdict.storyId, reverts: reaudits(state, verdict.storyId) })
+      ctx.logger("verifier:reaudit-capped", { sessionID: sid, storyId: verdict.storyId, reverts: reaudits(state, verdict.storyId) })
       void ctx.visibility?.notify("health", {
         sessionID: sid,
-        family: "judge:reaudit-capped",
-        message: `story ${verdict.storyId} has been re-opened by the judge ${reaudits(state, verdict.storyId)} times — not reverting again; resolve it or amend the story`,
+        family: "verifier:reaudit-capped",
+        message: `story ${verdict.storyId} has been re-opened by the verifier ${reaudits(state, verdict.storyId)} times — not reverting again; resolve it or amend the story`,
         variant: "error",
       })
       // M3 (grill round 2): the cap used to `continue` here WITHOUT stamping,
-      // which stopped the revert but not the loop. `story.judge` kept its
-      // previous stamp, whose `judgedAt` predates the `completedAt` written
+      // which stopped the revert but not the loop. `story.verifier` kept its
+      // previous stamp, whose `verifiedAt` predates the `completedAt` written
       // when the story was re-completed, so the audit selector re-selected it
-      // on the very next idle — a full judge subturn every idle, forever, the
+      // on the very next idle — a full verifier subturn every idle, forever, the
       // exact runaway FR-007 exists to end. Stamping it bounds the selector;
       // marking it `capped` keeps it out of the close-out's `allPassed`.
       boundUnappliedVerdicts(ctx, sid, state, [verdict], "capped")
@@ -1163,41 +1190,41 @@ async function handleJudgeAudit(ctx: GateContext, sid: string, state: V2SessionS
   }
   if (applicable.length === 0) return false
 
-  const applied = ctx.storyEngine.applyJudgeVerdicts(sid, applicable, contradictedByStory)
+  const applied = ctx.storyEngine.applyVerifierVerdicts(sid, applicable, contradictedByStory)
 
   if (applied.reverted.length > 0) {
-    return dispatchContinuation(ctx, sid, state, formatGateContinuationText(formatJudgeReverts(plan, applicable)))
+    return dispatchContinuation(ctx, sid, state, formatGateContinuationText(formatVerifierReverts(plan, applicable)))
   }
 
   // Close-out fires when the WHOLE plan is settled and EVERY story carries a
-  // passing judge stamp — not only when the final story was in this audit's
-  // set. `applyJudgeVerdicts` stamps `story.judge` in place on the plan
+  // passing verifier stamp — not only when the final story was in this audit's
+  // set. `applyVerifierVerdicts` stamps `story.verifier` in place on the plan
   // object this closure holds, so `plan` already reflects the fresh stamps;
-  // a story judged-pass in an earlier audit keeps its stamp, so staggered
+  // a story verifierd-pass in an earlier audit keeps its stamp, so staggered
   // audits (final passes first, a non-final story passes in a later audit)
   // still produce the close-out line on the audit that settles the plan.
   // It cannot re-fire on a later idle: once every story is complete with a
-  // passing stamp, none is "unjudged", so this function returns early before
+  // passing stamp, none is "unverifiedStories", so this function returns early before
   // reaching here.
   const settled = plan.stories.every((story) => story.status === "complete")
   // C2: a bounding stamp (`unapplied`) is NOT a pass. It records that the
   // harness refused to act on an unusable verdict, so the story has never
   // actually been audited — counting it here let an unverified story satisfy
   // "every story passed" and produce the independently-verified close-out.
-  const allPassed = plan.stories.every((story) => story.judge?.pass === true && story.judge.unapplied === undefined)
+  const allPassed = plan.stories.every((story) => story.verifier?.pass === true && story.verifier.unapplied === undefined)
   if (settled && allPassed) {
-    // FR-001b: a pass the HARNESS re-derived (by contradicting the judge's
-    // path claims) must not be reported as "the judge independently
+    // FR-001b: a pass the HARNESS re-derived (by contradicting the verifier's
+    // path claims) must not be reported as "the verifier independently
     // verified" — that would launder a harness override into an audit
     // result. Name those stories instead.
-    const vetoed = plan.stories.filter((s2) => (s2.judge?.contradictedItemIds?.length ?? 0) > 0).map((s2) => s2.id)
+    const vetoed = plan.stories.filter((s2) => (s2.verifier?.contradictedItemIds?.length ?? 0) > 0).map((s2) => s2.id)
     const line =
       vetoed.length === 0
-        ? "[vertex:judge] The completion judge independently verified every story of the plan against the worktree — " +
+        ? "[vertex:verifier] The completion verifier independently verified every story of the plan against the worktree — " +
           "all claims passed audit. Report what was delivered, the commands you ran and the results you observed, then stop."
-        : "[vertex:judge] Every story of the plan is complete. The judge verified all of them except " +
-          `${vetoed.join(", ")}, where the harness overruled a judge claim that a file was missing when it demonstrably exists ` +
-          "(those items were not independently confirmed by the judge). Report what was delivered, the commands you ran and " +
+        : "[vertex:verifier] Every story of the plan is complete. The verifier verified all of them except " +
+          `${vetoed.join(", ")}, where the harness overruled a verifier claim that a file was missing when it demonstrably exists ` +
+          "(those items were not independently confirmed by the verifier). Report what was delivered, the commands you ran and " +
           "the results you observed, then stop."
     return dispatchContinuation(ctx, sid, state, line)
   }
@@ -1209,7 +1236,7 @@ async function handleJudgeAudit(ctx: GateContext, sid: string, state: V2SessionS
  *
  * `SelfCreatedSessions.isSelfCreated` checks the id itself against the
  * recorded set BEFORE ever calling `resolveParent` (see `subturn.ts`), and
- * the only sessions this harness creates are the judge and intake subturns —
+ * the only sessions this harness creates are the verifier and intake subturns —
  * direct children, recorded by id, never nested further (`wiring/state.ts`'s
  * `SelfCreatedGuard` doc says the same). `GateContext` carries no
  * parent-lookup function, so supplying one here would mean inventing a seam
@@ -1226,7 +1253,7 @@ const NO_PARENT_LOOKUP = (): string | null => null
  *
  * ── ENFORCEMENT IS PER-SESSION ────────────────────────────────────────────
  * This function used to return early — skipping promise-no-act, the
- * stop-block continuation, the criteria replay and the judge — whenever
+ * stop-block continuation, the criteria replay and the verifier — whenever
  * `ctx.activeSessionIDs().length > 1`. That came from spec FR-015's
  * multi-session advisory clause (review MIN-007), whose stated premise was:
  * with two sessions active, `file.edited` attribution is suppressed, "so
@@ -1246,7 +1273,7 @@ const NO_PARENT_LOOKUP = (): string | null => null
  *  - Suppressing changes can therefore only make the gate quieter, never
  *    produce a block the model cannot satisfy. There was no unsatisfiable-
  *    block hazard for the bail-out to prevent, while the bail-out itself
- *    disabled promise-no-act, the stop-block and the judge for BOTH
+ *    disabled promise-no-act, the stop-block and the verifier for BOTH
  *    sessions the moment a second one existed (waves-review MAJ-007).
  *  - v1 never had this bail-out either: `src/index.ts`'s `session.idle`
  *    handler checks only `gate.isActive(sid)` and the in-flight set. The
@@ -1303,10 +1330,10 @@ export async function handleSessionIdle(ctx: GateContext, sid: string): Promise<
 
   // Degraded-attribution ADVISORY (never a suppression — see doc above).
   //
-  // FR-036: a session the harness itself created (judge/intake subturn) is
+  // FR-036: a session the harness itself created (verifier/intake subturn) is
   // not a peer user session. If one ever reaches this list, it must not make
   // its own parent look multi-session — that would fire a spurious
-  // criteria-reinject on every judge close-out, and under the old bail-out
+  // criteria-reinject on every verifier close-out, and under the old bail-out
   // would have let a single user session silently disable its own gate.
   // `plugin.ts` keeps child sessions out of `states` today (every hook that
   // creates state returns early for `isSelf`), so this filter is
@@ -1319,11 +1346,11 @@ export async function handleSessionIdle(ctx: GateContext, sid: string): Promise<
     state.needsCriteriaReinject = true // advisory surface on the next transform
   }
 
-  // THE ARBITER (redesign point 2) — first among the content branches: judge
+  // THE ARBITER (redesign point 2) — first among the content branches: verifier
   // every story that claimed complete since its last audit, applying verdicts
   // (reverting over-claimed stories with named gaps) BEFORE any deterministic
   // nudge is composed, so the rest of the tree sees post-audit plan state.
-  if (await handleJudgeAudit(ctx, sid, state)) return
+  if (await handleVerifierAudit(ctx, sid, state)) return
 
   // STAGE 1 (deterministic completion) — ahead of every other remaining
   // branch, including promise-no-act. See `handleIncompletePlan` for the
@@ -1352,7 +1379,7 @@ export async function handleSessionIdle(ctx: GateContext, sid: string): Promise<
   }
 
   const unverifiedChangesExist = ctx.evidenceLedger.hasChangedFiles(sid) && !ctx.evidenceLedger.hasVerification(sid)
-  // The phase engine's close arc no longer gates the judge — the arbiter
+  // The phase engine's close arc no longer gates the verifier — the arbiter
   // above runs on claims directly. `onIdle` still drives the phase machine
   // itself (elevate/close transitions feed the composer).
   ctx.phaseEngine.onIdle(sid, storyId, {

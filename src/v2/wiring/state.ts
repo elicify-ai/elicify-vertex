@@ -54,7 +54,7 @@ export interface V2SessionState {
   lastContinuationText: string | null
   /**
    * C2: the settled-but-never-audited escalation has already been dispatched
-   * for this plan. It fires from `handleJudgeAudit`'s early return, which runs
+   * for this plan. It fires from `handleVerifierAudit`'s early return, which runs
    * on every subsequent idle, so without this it would repeat forever.
    * Reset by `resetTurnState` (MAJ-4): it was previously initialised only in
    * `freshSessionState`, so a SECOND unaudited plan in the same session found
@@ -125,7 +125,7 @@ export interface V2SessionState {
   /** Cap reached: the gate goes silent until the next real user message. */
   stallPaused: boolean
 
-  /** FR-007: consecutive judge reverts per story id. Process-local by
+  /** FR-007: consecutive verifier reverts per story id. Process-local by
    * design — persisting it would mean a `StoryV2` schema change, and the cap
    * is a courtesy bound (stop the loop) rather than a safety control. Reset
    * by `resetTurnState` when a real user message re-engages. */
@@ -243,7 +243,7 @@ export function nextInstanceId(state: V2SessionState): string {
  * checks `sessionID` itself against the recorded id set FIRST, before ever
  * calling `resolveParent` (see `subturn.ts`), so every session this harness
  * itself created (the only case that actually occurs in this codebase — the
- * judge/intake subturns never nest a grandchild) is caught with zero calls
+ * verifier/intake subturns never nest a grandchild) is caught with zero calls
  * to `resolveParent`. `resolveParent` is still wired to a real (synchronous,
  * in-memory) child->parent map populated at the moment wiring records a
  * subturn, so the defensive grandchild case in FR-036's text is honoured

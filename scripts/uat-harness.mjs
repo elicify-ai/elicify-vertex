@@ -959,7 +959,7 @@ console.log("\nR. V2 story lifecycle (test 33: uat_v2_story_lifecycle)")
   //    non-final story's TASK completes as a bare claim — the redesign
   //    (HANDOVER.md point 1) removed the per-item receipt/waiver citation
   //    contract entirely, so the tool takes a taskId (not a storyId + items);
-  //    over-claiming is now the completion judge's job at idle, not the
+  //    over-claiming is now the completion verifier's job at idle, not the
   //    tool's. Completing S1.T1 auto-completes S1 and promotes S2.T1 to
   //    active (the DAG's level-promotion).
   await hooks.tool.elicify_vertex_plan_checkpoint.execute({ taskId: task1, status: "complete" }, ctx)

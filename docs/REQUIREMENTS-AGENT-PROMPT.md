@@ -140,7 +140,7 @@ re-planning after grounding. These are one sentence apart and easily confused.
 ## 6. Completion
 
 *Observed:* 517 messages, 6-story plan, not one story ever checkpointed, session
-closed silently, judge never ran.
+closed silently, verifier never ran.
 
 **R-16** The prompt MUST state that a story plan is a contract: every story ends
 `complete`, or `blocked`/`failed` **with a stated reason**. Silently leaving a
@@ -150,7 +150,7 @@ story open is not an available option.
 blocks on an incomplete plan and names what would close the active story. Prompt
 wording must match what that message says, so the two do not contradict.
 
-**R-18** The prompt MUST state that the completion judge runs only after every
+**R-18** The prompt MUST state that the completion verifier runs only after every
 deterministic marker passes, and that its verdict is advisory — it never
 substitutes for evidence.
 

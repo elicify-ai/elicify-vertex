@@ -61,7 +61,7 @@ We will list resolved security advisories here (and on GitHub Security Advisorie
 
 1. Acknowledge within 72 hours.
 2. Try to reproduce locally. If we can't, ask for more detail.
-3. Triage severity (CVSS 3.1 or 4.0, plus our own judgement).
+3. Triage severity (CVSS 3.1 or 4.0, plus our own verifierment).
 4. Open a private GitHub Security Advisory linked to a draft PR. Invite the reporter as a collaborator.
 5. Develop and review the fix in private.
 6. Coordinate a release. The advisory goes public and the release ships on the same day.

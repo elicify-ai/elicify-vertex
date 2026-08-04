@@ -92,7 +92,7 @@ function makeStubClient(): StubClient {
   const sessionDelete = vi.fn(async () => ({ data: {}, error: undefined }))
   const sessionMessages = vi.fn(async () => ({ data: [], error: undefined }))
   const appAgents = vi.fn(async () => ({
-    data: [denyAllAgent("vertex-judge"), denyAllAgent("vertex-intake")],
+    data: [denyAllAgent("vertex-verifier"), denyAllAgent("vertex-intake")],
     error: undefined,
   }))
   const toolIds = vi.fn(async () => ({ data: ["bash", "edit", "write", "webfetch", "read"], error: undefined }))
@@ -114,7 +114,7 @@ beforeEach(() => {
 afterEach(() => {
   rmSync(workDir, { recursive: true, force: true })
   delete process.env.VERTEX_V2
-  delete process.env.VERTEX_JUDGE
+  delete process.env.VERTEX_VERIFIER
 })
 
 function pluginInput(client: unknown): PluginInput {

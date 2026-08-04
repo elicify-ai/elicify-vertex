@@ -18,7 +18,7 @@
  *   - reopen, status, clear round out the surface.
  *
  * checkpoint remains a CLAIM (HANDOVER.md point 1): no receipt, no waiver,
- * no evidence — the completion judge audits the claim at session.idle.
+ * no evidence — the completion verifier audits the claim at session.idle.
  */
 import { mkdtempSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"

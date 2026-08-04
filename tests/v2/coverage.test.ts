@@ -613,7 +613,7 @@ describe("-C after a pipe is a display flag, not a directory change", () => {
 
 // ===========================================================================
 // FR-013 — absolute/relative path normalisation against the worktree root.
-// (Spec dataset rows 30 and 31, docs/JUDGE-RELIABILITY-FIXES-SPEC.md.)
+// (Spec dataset rows 30 and 31, docs/VERIFIER-RELIABILITY-FIXES-SPEC.md.)
 //
 // Grounding: in the audited session (`ses_04dc77bdaffej8SFJvYm5yO0CW`) the
 // agent ran each story's declared verifiers one at a time, spelling the paths

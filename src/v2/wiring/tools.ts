@@ -14,7 +14,7 @@
  * returns the active TASKS (one subagent per element); the model fans out
  * a `task`-tool subagent against each. `elicify_vertex_plan_checkpoint`
  * takes `{ taskId, status, reason? }` — a story auto-completes when all
- * its tasks are done, at which point the completion judge audits it.
+ * its tasks are done, at which point the completion verifier audits it.
  *
  * HANDOVER.md redesign point 1 (preserved): a checkpoint is a CLAIM, not a
  * close — no receipt, no waiver, no evidence validation. The old per-story
@@ -304,7 +304,7 @@ export function buildPlanTools(deps: PlanToolsDeps) {
       "allowed) or whole story ids (the task then waits for every task of that story). A story's optional top-" +
       "level dependsOn names other STORY ids and means none of this story's tasks can start until those stories " +
       "are fully done. AcceptanceItems are written as functional, verifiable claims ('make check passes', 'X " +
-      "returns 200') because the completion judge will independently check every one of them against the real " +
+      "returns 200') because the completion verifier will independently check every one of them against the real " +
       "worktree. Tasks with no dependsOn all start active at once (wave 0) — fan out a subagent per active task.",
     args: {
       stories: tool.schema
@@ -378,7 +378,7 @@ export function buildPlanTools(deps: PlanToolsDeps) {
     description:
       "Checkpoint a TASK in the elicify-vertex v2 plan (complete|failed|blocked). A 'complete' checkpoint is a " +
       "CLAIM, not a close: when the task's parent story has ALL its tasks complete, the story auto-completes, and " +
-      "at the next idle the completion judge independently audits every acceptance item against the real worktree " +
+      "at the next idle the completion verifier independently audits every acceptance item against the real worktree " +
       "(reading files, re-running the story's declared verifiers) and re-opens the story with named gaps if the " +
       "claim does not hold. Claim only what you have genuinely delivered and verified. No receipt or waiver ids " +
       "are needed or accepted. Pass a reason for failed/blocked.",
@@ -463,8 +463,8 @@ export function buildPlanTools(deps: PlanToolsDeps) {
     description:
       "Reopen a story in the elicify-vertex v2 plan so work on it can resume. Use this after whatever actually " +
       "caused a block or failure has been resolved (a missing dependency now exists, a design question got " +
-      "answered, an external blocker cleared), or to resume a story the completion judge reverted — never as a " +
-      "way to dodge unmet acceptance criteria (the judge will audit the next claim all the same). The story's " +
+      "answered, an external blocker cleared), or to resume a story the completion verifier reverted — never as a " +
+      "way to dodge unmet acceptance criteria (the verifier will audit the next claim all the same). The story's " +
       "not-complete tasks are re-activated when their dependencies are satisfied, or rejoin the queue as pending " +
       "otherwise; complete tasks are left complete.",
     args: {

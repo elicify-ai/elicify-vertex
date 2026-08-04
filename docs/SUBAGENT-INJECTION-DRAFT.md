@@ -14,8 +14,8 @@ plugin).
 
 Scope confirmed by the user: every subagent the main agent invokes via the
 `task` tool gets this prompt — uniformly, no per-`subagent_type` variant. The
-judge is the one exception, and it needs no special-case code:
-`runJudge`/`runSubturn` create the judge session directly via
+verifier is the one exception, and it needs no special-case code:
+`runVerifier`/`runSubturn` create the verifier session directly via
 `client.session.create` + `client.session.prompt` (`src/v2/subturn.ts:440,483`),
 never through the `task` tool, so it is already outside the reach of a
 `tool.execute.before` hook keyed on `toolInput.tool === "task"`. Same for the
@@ -130,7 +130,7 @@ history on every subsequent turn, not just the child's).
 
 1. ~~Can a subagent reach the `question` tool at all?~~ **Resolved: no**, and
    **correction to how**: structural denial the way `AGENT_PERMISSION` denies
-   `vertex-judge`/`vertex-intake` (`config.ts`) does NOT generalise here —
+   `vertex-verifier`/`vertex-intake` (`config.ts`) does NOT generalise here —
    checked directly. That mechanism works only because we register those two
    agents ourselves and set their `permission` config. A `task`-tool subagent's
    `subagent_type` (`general-purpose`, `code-reviewer`, a user's own custom
@@ -151,8 +151,8 @@ history on every subsequent turn, not just the child's).
    the same file, or a separate small file — so it doesn't silently drift from
    the sections it draws from (evidence, known_traps, scope_discipline) the way
    the three activation surfaces used to.
-4. ~~Skip injection for `isSelf` sessions (judge, intake subturns)?~~
-   **Resolved, and simpler than expected:** no explicit check needed. Judge and
+4. ~~Skip injection for `isSelf` sessions (verifier, intake subturns)?~~
+   **Resolved, and simpler than expected:** no explicit check needed. Verifier and
    intake are both created via `runSubturn` → `client.session.create` +
    `client.session.prompt` (`src/v2/subturn.ts:440,483`), never via the `task`
    tool, so a `tool.execute.before` hook keyed on `toolInput.tool === "task"`

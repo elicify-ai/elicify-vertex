@@ -9,7 +9,7 @@
  *
  * This module has no runtime behavior of its own: it only re-exports/aliases
  * types so every v2 module (phase.ts, pin.ts, artifacts.ts, resolve.ts,
- * dosing.ts, composer.ts, subturn.ts, judge.ts, story.ts, measurement.ts)
+ * dosing.ts, composer.ts, subturn.ts, verifier.ts, story.ts, measurement.ts)
  * imports one canonical definition instead of hand-rolling copies that could
  * drift.
  */
@@ -31,7 +31,7 @@ export type EventLogger = (eventType: string, payload: Record<string, unknown>) 
  * (node_modules/@opencode-ai/sdk/dist/client.d.ts,
  * node_modules/@opencode-ai/sdk/dist/gen/sdk.gen.d.ts) — the class exposing
  * `.session.create`, `.session.prompt`, `.session.delete`, `.tool.ids`, and
- * `.app.agents` that subturn.ts/judge.ts/story.ts need.
+ * `.app.agents` that subturn.ts/verifier.ts/story.ts need.
  */
 export type { OpencodeClient } from "@opencode-ai/sdk"
 

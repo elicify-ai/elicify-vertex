@@ -180,7 +180,7 @@ export function storyCompletionFinding(opts: { instanceId: string; nextStory: St
     observation: "The active story's bound verifier just passed, but it is not the plan's final story.",
     diagnosis:
       "An intermediate story going green does not elevate a multi-story plan (US-7) — completion is scoped per story, not session-wide.",
-    prescription: `Checkpoint the tasks you just finished for this story (elicify_vertex_plan_checkpoint with each taskId) — the story auto-completes when all its tasks are done, then the completion judge audits it at the next idle. The next wave of tasks activates automatically once no task remains active; ${nextStory.id} follows: ${nextStory.text}.`,
+    prescription: `Checkpoint the tasks you just finished for this story (elicify_vertex_plan_checkpoint with each taskId) — the story auto-completes when all its tasks are done, then the completion verifier audits it at the next idle. The next wave of tasks activates automatically once no task remains active; ${nextStory.id} follows: ${nextStory.text}.`,
     instanceId,
   }
 }
@@ -191,17 +191,17 @@ export function storyCompletionFinding(opts: { instanceId: string; nextStory: St
  * 1/4/8): there are no per-item evidence citations anymore, so this no
  * longer enumerates "items lacking evidence" (a citation-counting
  * exercise). What closes a story now is a checkpoint CLAIM that survives
- * the completion judge's independent audit — so the prescription names the
+ * the completion verifier's independent audit — so the prescription names the
  * story's verifiers (run standalone, so their exit codes are reliable) and,
- * when the judge has already failed this story once, the exact items and
- * notes from that audit, verbatim. Naming the judge's own words back is
+ * when the verifier has already failed this story once, the exact items and
+ * notes from that audit, verbatim. Naming the verifier's own words back is
  * what makes the continuation constructive ("S2 not delivered — A3, A4
  * still missing") instead of a generic "keep going".
  */
 /**
  * Is this stamp a verdict the harness actually ACTED ON?
  *
- * A `judge.unapplied` stamp of `"unverified"` (FR-014: the judge answered
+ * A `verifier.unapplied` stamp of `"unverified"` (FR-014: the verifier answered
  * without observing the worktree) or `"contradictory"` (FR-005: `pass:false`
  * with every item met) records a verdict the harness rejected as unusable.
  * Rendering its items as a prescription hands the model the very fabricated
@@ -209,18 +209,18 @@ export function storyCompletionFinding(opts: { instanceId: string; nextStory: St
  * nothing verified. `"capped"` is different: that verdict WAS usable, the
  * harness merely stopped re-opening the story, so its detail still stands.
  */
-function judgeVerdictIsActionable(story: StoryV2): boolean {
-  const stamp = story.judge
+function verifierVerdictIsActionable(story: StoryV2): boolean {
+  const stamp = story.verifier
   if (!stamp || stamp.pass) return false
   return stamp.unapplied !== "unverified" && stamp.unapplied !== "contradictory"
 }
 
 function activeStoryPrescription(story: StoryV2): string {
-  const judgeNote =
-    judgeVerdictIsActionable(story) && story.judge
-      ? `The completion judge's last audit of ${story.id} FAILED — "${story.judge.summary}". ` +
+  const verifierNote =
+    verifierVerdictIsActionable(story) && story.verifier
+      ? `The completion verifier's last audit of ${story.id} FAILED — "${story.verifier.summary}". ` +
         `Items it found unmet: ${listWithOverflow(
-          story.judge.items.filter((i) => !i.met).map((i) => `${i.itemId} (${i.note})`),
+          story.verifier.items.filter((i) => !i.met).map((i) => `${i.itemId} (${i.note})`),
           MAX_LISTED_ITEMS,
         )}. Fix exactly those before claiming again. `
       : ""
@@ -239,8 +239,8 @@ function activeStoryPrescription(story: StoryV2): string {
 
   const itemsClause =
     story.acceptanceItems.length === 0
-      ? `${story.id} declares no acceptance items, so there is nothing for the judge to audit — amend it to declare what "done" means before checkpointing.`
-      : `Acceptance items the judge will audit on ${story.id}: ${listWithOverflow(
+      ? `${story.id} declares no acceptance items, so there is nothing for the verifier to audit — amend it to declare what "done" means before checkpointing.`
+      : `Acceptance items the verifier will audit on ${story.id}: ${listWithOverflow(
           story.acceptanceItems.map((item) => `${item.id}: "${quote(item.text)}"`),
           MAX_LISTED_ITEMS,
         )}.`
@@ -250,8 +250,8 @@ function activeStoryPrescription(story: StoryV2): string {
     : `${story.id} declares no verifiers, so nothing narrower is bound to it — run ${GENERIC_VERIFIER_CATEGORIES}, or amend ${story.id} to declare the verifier you intend to use.`
 
   return (
-    `Resume story ${story.id} — "${quote(story.text)}". ${judgeNote}${tasksClause}${itemsClause} ${verifierClause} ` +
-    `Checkpoint each task as it finishes (elicify_vertex_plan_checkpoint with the taskId) — ${story.id} auto-completes when all its tasks are done, then the completion judge independently audits it at the next idle. ` +
+    `Resume story ${story.id} — "${quote(story.text)}". ${verifierNote}${tasksClause}${itemsClause} ${verifierClause} ` +
+    `Checkpoint each task as it finishes (elicify_vertex_plan_checkpoint with the taskId) — ${story.id} auto-completes when all its tasks are done, then the completion verifier independently audits it at the next idle. ` +
     `If a task genuinely cannot proceed, checkpoint it blocked or failed with a reason rather than leaving it silently open.`
   )
 }
@@ -282,20 +282,20 @@ export function incompletePlanFinding(opts: {
 }): Finding {
   const { instanceId, totalStories, incomplete, activeStories } = opts
 
-  // Point 8: name, per story, WHAT is missing — when the judge already
+  // Point 8: name, per story, WHAT is missing — when the verifier already
   // audited the story and failed it, its own unmet-item ids ride in the
-  // roster ("S2 (judge: A3, A4 unmet)") so the model sees the specific
+  // roster ("S2 (verifier: A3, A4 unmet)") so the model sees the specific
   // deficit, not just an open status.
   const roster = listWithOverflow(
     incomplete.map((story) => {
-      const judgeDetail =
-        judgeVerdictIsActionable(story) && story.judge
-          ? `, judge: ${listWithOverflow(
-              story.judge.items.filter((i) => !i.met).map((i) => i.itemId),
+      const verifierDetail =
+        verifierVerdictIsActionable(story) && story.verifier
+          ? `, verifier: ${listWithOverflow(
+              story.verifier.items.filter((i) => !i.met).map((i) => i.itemId),
               MAX_LISTED_ITEMS,
             )} unmet`
           : ""
-      return `${story.id} (${story.status}${judgeDetail}): "${quote(story.text)}"`
+      return `${story.id} (${story.status}${verifierDetail}): "${quote(story.text)}"`
     }),
     MAX_LISTED_STORIES,
   )
@@ -306,7 +306,7 @@ export function incompletePlanFinding(opts: {
 
   const diagnosis =
     "Idle was reached with an open story contract. A story closes only when its completion claim survives the " +
-    "completion judge's independent audit — the plan itself already says these stories are not there."
+    "completion verifier's independent audit — the plan itself already says these stories are not there."
 
   const stalledOnBlocked = incomplete.filter((story) => story.status === "blocked" || story.status === "failed")
 

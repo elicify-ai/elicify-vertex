@@ -1,14 +1,14 @@
 /**
  * Vertex 2 — shared child-session ("subturn") infrastructure.
  *
- * Used by BOTH the judge subturn (US-9, `src/v2/judge.ts`) and the intake
+ * Used by BOTH the verifier subturn (US-9, `src/v2/verifier.ts`) and the intake
  * classification subturn (US-5, `src/v2/story.ts`). This is the module the
  * review round's two CRITICAL findings (CRIT-001, CRIT-002) lived closest
  * to, so the three pieces below are the security-relevant surface:
  *
  *  - `SelfCreatedSessions` — FR-036: every session id this harness creates
  *    must be recognizable so all five harness hooks can return early for it
- *    (the plugin must be inert to its own child sessions, or the judge/
+ *    (the plugin must be inert to its own child sessions, or the verifier/
  *    intake subturn would receive the harness's own activation cue and
  *    directive block on top of its "evidence-only" payload).
  *  - `probeCapability` / `buildDenyMap` — FR-030b (review CRIT-002):
@@ -19,18 +19,18 @@
  *    then *verified* by reading the resolution back — the probe's refusal
  *    path is the control, not the deny map itself (spec Open Question 1).
  *    HANDOVER.md point 3 (user decision, 2026-07-29): this zero-tool posture
- *    is DELIBERATELY REVERSED for the judge only — `probeCapability` now
+ *    is DELIBERATELY REVERSED for the verifier only — `probeCapability` now
  *    takes an optional `ProbePolicy` (an allowlist of tool names permitted
  *    to resolve true, plus the permission keys that must still provably
- *    deny), and `JUDGE_PROBE_POLICY` grants the judge read/grep/glob/list/
+ *    deny), and `VERIFIER_PROBE_POLICY` grants the verifier read/grep/glob/list/
  *    bash so it can independently re-run a story's declared verifiers (a
  *    real 894-message field session ended 5/5 stories blocked with the
- *    judge never able to rescue it). The intake subturn keeps the default
+ *    verifier never able to rescue it). The intake subturn keeps the default
  *    zero-tool policy unchanged; `buildDenyMap` is likewise untouched, with
  *    `buildToolPolicyMap` added alongside it for allow-aware maps.
  *  - `probeCapabilityBounded` — CRITICAL fix (post-review): `probeCapability`
  *    and `buildDenyMap` are plain, un-timed `await`s on their own. Both
- *    `judge.ts`'s `runJudge` and `story.ts`'s `classifyMultiStory` issue
+ *    `verifier.ts`'s `runVerifier` and `story.ts`'s `classifyMultiStory` issue
  *    them BEFORE starting the FR-030 5s budget clock that only ever wrapped
  *    the later `runSubturn` call — so a hanging `client.app.agents()` /
  *    `client.tool.ids()` blocked the caller indefinitely, violating FR-030's
@@ -117,7 +117,7 @@ function unwrap<T>(result: unknown): T {
 
 /**
  * Process-lifetime registry of every session id the harness itself created
- * (judge/intake children). Generalises v1's narrower `gateContinuationSessions`
+ * (verifier/intake children). Generalises v1's narrower `gateContinuationSessions`
  * set (`src/index.ts`, consumed once per continuation) into a durable
  * membership check every harness hook consults for its whole lifetime.
  *
@@ -183,15 +183,15 @@ export interface ProbePolicy {
 }
 
 /**
- * The judge's policy under the HANDOVER.md point-3 reversal: read-only
- * inspection tools (read/grep/glob/list) plus bash — bash so the judge can
+ * The verifier's policy under the HANDOVER.md point-3 reversal: read-only
+ * inspection tools (read/grep/glob/list) plus bash — bash so the verifier can
  * independently re-run a story's declared verifier commands rather than
  * trusting the transcript (the field session's core failure: claims were
  * real but unverifiable by the harness). Still hard-denied: edit and write
- * (the judge must never modify the work it audits), webfetch (no network),
- * and task (no sub-subagents — the judge is a leaf).
+ * (the verifier must never modify the work it audits), webfetch (no network),
+ * and task (no sub-subagents — the verifier is a leaf).
  */
-export const JUDGE_PROBE_POLICY: ProbePolicy = {
+export const VERIFIER_PROBE_POLICY: ProbePolicy = {
   allowTools: ["read", "grep", "glob", "list", "bash"],
   denyPermissions: ["edit", "write", "webfetch", "task"],
 }
@@ -201,12 +201,12 @@ export const JUDGE_PROBE_POLICY: ProbePolicy = {
  * `types.gen.d.ts:1705`/`1215` — returns `Array<string>`) plus a `"*": false`
  * wildcard entry for hosts that honour one. Called once at plugin
  * construction; the caller (wave-3 wiring) caches the result and uses it
- * both to populate `config.agent["vertex-judge"].tools` / `["vertex-intake"]`
+ * both to populate `config.agent["vertex-verifier"].tools` / `["vertex-intake"]`
  * at registration and as the `tools` value on every `session.prompt` call.
  *
  * Enumeration failure (the SDK throws, or the fields-style result carries an
  * `error`) is NOT swallowed here — it propagates so the caller can treat
- * "deny map could not be built" as an immediate `judge:unsupported` /
+ * "deny map could not be built" as an immediate `verifier:unsupported` /
  * `intake:unsupported` condition without ever registering an agent whose
  * tools resolution is unknown. This is also why `probeCapability` below
  * does not re-call `client.tool.ids()` itself: if the deny map was built
@@ -231,7 +231,7 @@ export async function buildDenyMap(client: OpencodeClient): Promise<Record<strin
 
 /**
  * HANDOVER.md point 3: the allow-aware counterpart of `buildDenyMap`, used
- * for the judge's subturn `tools` field and registration. Every enumerated
+ * for the verifier's subturn `tools` field and registration. Every enumerated
  * tool id maps to false EXCEPT the allowlisted names, which map to true;
  * `"*": false` is kept so a host that honours the wildcard still denies
  * anything un-enumerated. An allowlisted name the host did not enumerate is
@@ -272,7 +272,7 @@ const DENY_REQUIRED_PERMISSIONS = ["edit", "bash", "webfetch"] as const
  * `{ permission: "edit", action: "deny", pattern: "*" }`. Indexing this
  * array with `permission["edit"]` (the old flat-object assumption) reads
  * `undefined` for every key — the exact "permission.edit is undefined,
- * expected deny" failure reason observed in real intake/judge probe events.
+ * expected deny" failure reason observed in real intake/verifier probe events.
  *
  * This function accepts BOTH shapes defensively (the array shape is what a
  * live host actually returns today; the flat-object shape stays supported
@@ -350,7 +350,7 @@ function permissionDenied(permission: unknown, key: string): { denied: boolean; 
  * `client.app.agents()` throwing, or the fields-style result carrying an
  * `error` — returns `{ ok: false, reason }` with a specific, non-generic
  * reason string (SC-017 / FR-030b: callers log this reason verbatim under
- * `judge:unsupported` / `intake:unsupported`).
+ * `verifier:unsupported` / `intake:unsupported`).
  */
 export async function probeCapability(
   client: OpencodeClient,
@@ -423,7 +423,7 @@ export type CapabilityProbeBoundedResult =
 const CAPABILITY_PROBE_BOUNDED_TIMEOUT_MESSAGE = "vertex:capability-probe-timeout"
 
 /**
- * Shared by `judge.ts` (`runJudge`) and `story.ts` (`classifyMultiStory`):
+ * Shared by `verifier.ts` (`runVerifier`) and `story.ts` (`classifyMultiStory`):
  * both callers run `probeCapability` then, on success, `buildDenyMap` before
  * ever issuing a subturn, and both are meant to share ONE 5s-total budget
  * with the subturn attempt(s) that follow (FR-030). Runs the two calls as
@@ -444,8 +444,8 @@ const CAPABILITY_PROBE_BOUNDED_TIMEOUT_MESSAGE = "vertex:capability-probe-timeou
  *    / `buildToolPolicyMap`) threw/rejected (its own documented failure
  *    mode).
  *  - `cause: "timeout"` — `budgetMs` elapsed before either step settled.
- *    Callers MUST treat this the same as `cause: "probe"` (e.g. judge.ts's
- *    `judge:unsupported` path) — a probe that cannot be confirmed in time is
+ *    Callers MUST treat this the same as `cause: "probe"` (e.g. verifier.ts's
+ *    `verifier:unsupported` path) — a probe that cannot be confirmed in time is
  *    exactly as unusable as one actively refused.
  */
 export async function probeCapabilityBounded(
@@ -497,13 +497,13 @@ export async function probeCapabilityBounded(
 
 export interface SubturnRequest {
   parentSessionID: string
-  /** "vertex-judge" | "vertex-intake" — never `opts.activeAgent` (FR-036). */
+  /** "vertex-verifier" | "vertex-intake" — never `opts.activeAgent` (FR-036). */
   agent: string
   /** Omit to use the host's configured default model for that agent. */
   model?: { providerID: string; modelID: string }
   system: string
   parts: Array<{ type: "text"; text: string }>
-  /** The tool map from `buildDenyMap` (zero-tool agents) or `buildToolPolicyMap` (judge, HANDOVER.md point 3). */
+  /** The tool map from `buildDenyMap` (zero-tool agents) or `buildToolPolicyMap` (verifier, HANDOVER.md point 3). */
   tools: Record<string, boolean>
   /** Total budget for THIS attempt, including no further retry inside this call — the caller owns any retry-and-resubmit policy (FR-030a). */
   timeoutMs: number
@@ -525,7 +525,7 @@ export type SubturnResult =
  * worked because its stub kept serving parts after `session.delete`.
  *
  * Returns `undefined` (not `false`) when the parts cannot be read, so the
- * caller can distinguish "the judge did not look" from "we could not tell"
+ * caller can distinguish "the verifier did not look" from "we could not tell"
  * and fail open on the latter.
  */
 /** CR-14: cap on the observed-tool-call read (see its call site). */
@@ -670,7 +670,7 @@ async function deleteChildSession(
  * is logged via `subturn:cleanup-failed` and never changes the returned
  * `SubturnResult` (FR-038).
  *
- * Does NOT call `probeCapability` — that is the caller's (judge.ts /
+ * Does NOT call `probeCapability` — that is the caller's (verifier.ts /
  * story.ts) responsibility to run first and decide whether to call this
  * function at all (module contract test 44: a failed probe must produce
  * zero `session.create`/`session.prompt` calls, which requires the caller

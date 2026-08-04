@@ -158,7 +158,7 @@ describe("visibility_mode_governs_toasts (FR-060)", () => {
     const { client, showToast } = makeClient()
     const notifier = new VisibilityNotifier({ client, mode: "off", logger: vi.fn(), now })
 
-    await notifier.notify("health", { family: "judge", message: "judge:unavailable" })
+    await notifier.notify("health", { family: "verifier", message: "verifier:unavailable" })
 
     expect(showToast).not.toHaveBeenCalled()
     expect(now).not.toHaveBeenCalled()
@@ -208,7 +208,7 @@ describe("rendered_directive_emits_one_toast (FR-059)", () => {
     const { client, showToast } = makeClient()
     const notifier = new VisibilityNotifier({ client, mode: "all", logger: vi.fn(), now: makeClock().now })
 
-    await notifier.notify("health", { family: "judge", message: "judge:unavailable", instanceId: "h-1" })
+    await notifier.notify("health", { family: "verifier", message: "verifier:unavailable", instanceId: "h-1" })
     await notifier.notify("gate", { family: "plan-gate", message: "plan_create blocked", instanceId: "g-1" })
 
     expect(bodies(showToast).map((b) => b.variant)).toEqual(["warning", "warning"])
@@ -306,7 +306,7 @@ describe("toast_failure_is_swallowed (FR-062)", () => {
     const { client } = makeClient(async () => ({ data: undefined, error: { message: "bad request" } }))
     const notifier = new VisibilityNotifier({ client, mode: "all", logger, now: makeClock().now })
 
-    await expect(notifier.notify("health", { message: "judge:unavailable" })).resolves.toBeUndefined()
+    await expect(notifier.notify("health", { message: "verifier:unavailable" })).resolves.toBeUndefined()
 
     const failure = logger.mock.calls.find((call) => call[0] === "visibility:toast-failed")
     expect(failure).toBeDefined()
@@ -559,8 +559,8 @@ describe("toasts_capped_and_deduped — dedupe (FR-063)", () => {
     const { client, showToast } = makeClient()
     const notifier = new VisibilityNotifier({ client, mode: "all", logger: vi.fn(), now: makeClock().now })
 
-    await notifier.notify("health", { family: "judge", message: "judge:unavailable" })
-    await notifier.notify("health", { family: "judge", message: "judge:unavailable" })
+    await notifier.notify("health", { family: "verifier", message: "verifier:unavailable" })
+    await notifier.notify("health", { family: "verifier", message: "verifier:unavailable" })
 
     expect(showToast).toHaveBeenCalledTimes(2)
   })

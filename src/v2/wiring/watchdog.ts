@@ -38,7 +38,7 @@
  *    boundary is exact — no threshold tuning, no text munging.
  *  - The self-report goal model. The reference's stall counter feeds its
  *    whole completion story (goal status -> "paused", self-reported
- *    evidence, nag escalation). This repo's completion arbiter is the judge
+ *    evidence, nag escalation). This repo's completion arbiter is the verifier
  *    (HANDOVER points 1-4); the watchdog NEVER decides completion. Its only
  *    output is a continuation-policy verdict: keep nudging, defer, or stop
  *    auto-continuing and surface a stall.

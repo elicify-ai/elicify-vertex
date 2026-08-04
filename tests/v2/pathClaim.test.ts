@@ -1,7 +1,7 @@
 /**
  * FR-001's discriminator, validated against the REAL corpus.
  *
- * `tests/fixtures/judge-replay/item-notes.json` holds all 49 item notes
+ * `tests/fixtures/verifier-replay/item-notes.json` holds all 49 item notes
  * recovered verbatim from the audited session's revert continuations, labelled
  * `drop` (a false path-absence claim the harness may overrule) or `keep`
  * (anything else — content claims, mixed claims, and every note that asserts a
@@ -14,7 +14,7 @@
  *     research/renewable-energy.md exists (1046 bytes) but contains no URLs or
  *     Sources section
  *
- * are labelled `keep` and belong to CORRECT judge failures — a matcher loose
+ * are labelled `keep` and belong to CORRECT verifier failures — a matcher loose
  * enough to drop them would let the harness bless genuinely-undelivered work,
  * which is exactly the failure mode that killed the original story-level veto
  * (grill round 2, C-2/C-3).
@@ -34,7 +34,7 @@ interface CorpusRow {
 }
 
 const corpus: CorpusRow[] = JSON.parse(
-  readFileSync(join(process.cwd(), "tests/fixtures/judge-replay/item-notes.json"), "utf8"),
+  readFileSync(join(process.cwd(), "tests/fixtures/verifier-replay/item-notes.json"), "utf8"),
 ) as CorpusRow[]
 
 describe("parsePathAbsenceClaim — the 49-note real corpus (FR-001, SC-001a/SC-002)", () => {
@@ -86,7 +86,7 @@ describe("parsePathAbsenceClaim — the 49-note real corpus (FR-001, SC-001a/SC-
    */
   const layout: Record<string, boolean> = (
     JSON.parse(
-      readFileSync(join(process.cwd(), "tests/fixtures/judge-replay/worktree-layout.json"), "utf8"),
+      readFileSync(join(process.cwd(), "tests/fixtures/verifier-replay/worktree-layout.json"), "utf8"),
     ) as { paths: Record<string, boolean> }
   ).paths
   const wouldDrop = (note: string): boolean => {
@@ -142,7 +142,7 @@ describe("parsePathAbsenceClaim — rules (FR-001, C-3)", () => {
    * EACH of which would have suppressed a genuine content failure — the exact
    * hazard FR-001 was re-scoped to avoid. They are pinned here because the
    * 49-note corpus does not contain them: the corpus proves the matcher
-   * handles what the judge DID say, these prove it handles what a judge
+   * handles what the verifier DID say, these prove it handles what a verifier
    * plausibly COULD say.
    */
   it.each([
@@ -190,7 +190,7 @@ describe("parsePathAbsenceClaim — rules (FR-001, C-3)", () => {
 
 // ===========================================================================
 // MAJ-001 re-attack — phrasings absent from the corpus and from every earlier
-// test. A false DROP here silently suppresses a real judge failure, so this is
+// test. A false DROP here silently suppresses a real verifier failure, so this is
 // the highest-consequence property in the module and deserves adversarial
 // breadth rather than the happy path.
 // ===========================================================================
@@ -310,7 +310,7 @@ describe("CRIT-2 — a second claim in the same note keeps the whole item", () =
     "research/x.md is missing? unclear",
     // `absent` and `no such file` were absent from TRAILING_QUALIFIER entirely.
     // The first is a near-verbatim paraphrase of corpus note N32 — a CORRECT
-    // judge failure against a file that exists, which the harness would have
+    // verifier failure against a file that exists, which the harness would have
     // overruled into a pass.
     "src/pages/Renewable.jsx is absent the recharts import",
     "research/x.md no such file the sources are fake",

@@ -100,16 +100,16 @@ describe("redactSecrets", () => {
     expect(redactSecrets(input)).toBe(input)
   })
 
-  it("C-8 backstop: an unlabeled high-entropy secret with no ':'/'=' anywhere near it is still flagged by judge.ts's entropy scan (tightening the label pattern did not quietly open a gap)", () => {
+  it("C-8 backstop: an unlabeled high-entropy secret with no ':'/'=' anywhere near it is still flagged by verifier.ts's entropy scan (tightening the label pattern did not quietly open a gap)", () => {
     // redactSecrets itself has no entropy rule — it only matches named
     // patterns (SECRET_PATTERNS). This test proves the *combination* still
     // holds: a genuine secret phrased without any assignment separator does
     // not survive redactSecrets AND fall through with nothing else catching
-    // it, because src/v2/judge.ts's tripsEntropyScan (Shannon entropy, order-
+    // it, because src/v2/verifier.ts's tripsEntropyScan (Shannon entropy, order-
     // independent of any label match) is the dedicated backstop for exactly
-    // this shape. Reproduced here via the same mechanism judge.ts itself uses
+    // this shape. Reproduced here via the same mechanism verifier.ts itself uses
     // (redactSecrets unchanged-ness is not what catches this — entropy is);
-    // see tests/v2/judge.test.ts for the full buildJudgePayload-level proof.
+    // see tests/v2/verifier.test.ts for the full buildVerifierPayload-level proof.
     const unlabeledSecret = "the password is hunter2xyzabcQ9mK3pL7vN2wR8tY5"
     // redactSecrets alone does NOT touch this (no ':'/'=' after "password",
     // and the value itself matches no dedicated SECRET_PATTERNS entry either)
@@ -148,7 +148,7 @@ describe("redactSecrets", () => {
   // (HMAC-SHA256 digest) and `scope.worktreeDigest` fields on every disk
   // write via goals.ts's atomicWriteJson(redactForDisk(...)), breaking
   // verifyReceiptSignature for anything persisted afterward. The fix landed
-  // in src/v2/judge.ts instead, scoped to the judge payload's free-form
+  // in src/v2/verifier.ts instead, scoped to the verifier payload's free-form
   // prose/line fields only. This test pins the regression: redactForDisk
   // must never alter a receipt-shaped object's signature/digest fields.
   it("C-15 regression guard: redactForDisk leaves a receipt-shaped object's bare-hex signature and worktree digest byte-identical", () => {

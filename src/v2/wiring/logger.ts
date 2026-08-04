@@ -65,10 +65,10 @@ export function createSharedV2Logger(getContext: (sessionID: string | undefined)
 /**
  * Session-bound wrapper for call-style modules that build a fresh
  * `EventLogger` argument per invocation rather than holding one long-lived
- * (`judge.ts`'s `runJudge`/`buildJudgePayload`, `story.ts`'s
- * `classifyMultiStory`). `judge.ts` specifically logs several event types
- * (`judge:unsupported`, `judge:unavailable`, `judge:malformed`,
- * `judge:field-dropped`) with NO `sessionID` in their payload at all — a gap
+ * (`verifier.ts`'s `runVerifier`/`buildVerifierPayload`, `story.ts`'s
+ * `classifyMultiStory`). `verifier.ts` specifically logs several event types
+ * (`verifier:unsupported`, `verifier:unavailable`, `verifier:malformed`,
+ * `verifier:field-dropped`) with NO `sessionID` in their payload at all — a gap
  * against FR-033's "every event MUST carry ... session id" invariant that
  * this wrapper closes by injecting the bound session id whenever the
  * module's own payload omitted one. When the payload already carries its

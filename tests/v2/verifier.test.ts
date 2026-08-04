@@ -1,10 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
 // ---------------------------------------------------------------------------
-// subturn.ts is mocked for the runJudge suite: probeCapabilityBounded/
+// subturn.ts is mocked for the runVerifier suite: probeCapabilityBounded/
 // runSubturn are wave-1 infrastructure with their own dedicated coverage in
 // tests/v2/subturn.test.ts (including real-timer timeout behavior, and
-// probeCapabilityBounded's own probe/deny-map/timeout race). Judge.ts only
+// probeCapabilityBounded's own probe/deny-map/timeout race). Verifier.ts only
 // needs to prove it *drives* that infrastructure correctly (right agent
 // name, right model per attempt, shared budget — INCLUDING the probe +
 // deny-map step per the CRITICAL fix below, correct classification of the
@@ -12,10 +12,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 // deterministically instead of racing real timers. SelfCreatedSessions is
 // left un-mocked (trivial, no behavior worth stubbing).
 //
-// CRITICAL fix (post-review): runJudge used to call subturn.ts's
+// CRITICAL fix (post-review): runVerifier used to call subturn.ts's
 // probeCapability/buildDenyMap directly, with no timeout, BEFORE starting
-// its own JUDGE_TOTAL_BUDGET_MS clock — a hang in either could block
-// runJudge indefinitely. runJudge now calls the single bounded helper
+// its own VERIFIER_TOTAL_BUDGET_MS clock — a hang in either could block
+// runVerifier indefinitely. runVerifier now calls the single bounded helper
 // probeCapabilityBounded(client, agent, budgetMs) instead, so this suite
 // mocks that one function rather than the two calls it used to make
 // directly.
@@ -29,18 +29,18 @@ vi.mock("../../src/v2/subturn.js", async (importOriginal) => {
   }
 })
 
-import { buildJudgePayload, JUDGE_TOTAL_BUDGET_MS, runJudge, parseJudgeResponse } from "../../src/v2/judge.js"
-import { JUDGE_PROBE_POLICY, probeCapabilityBounded, runSubturn, SelfCreatedSessions } from "../../src/v2/subturn.js"
+import { buildVerifierPayload, VERIFIER_TOTAL_BUDGET_MS, runVerifier, parseVerifierResponse } from "../../src/v2/verifier.js"
+import { VERIFIER_PROBE_POLICY, probeCapabilityBounded, runSubturn, SelfCreatedSessions } from "../../src/v2/subturn.js"
 import type { OpencodeClient } from "../../src/v2/types.js"
 
 const mockProbeCapabilityBounded = vi.mocked(probeCapabilityBounded)
 const mockRunSubturn = vi.mocked(runSubturn)
 
-// HANDOVER.md point 3: the judge's tool map is no longer a pure deny map —
+// HANDOVER.md point 3: the verifier's tool map is no longer a pure deny map —
 // the read-only tools (read/grep/glob/list/bash) resolve true, everything
-// else false. runJudge must thread whatever the (mocked) bounded probe
+// else false. runVerifier must thread whatever the (mocked) bounded probe
 // returns straight into the subturn's `tools` field.
-const JUDGE_TOOLS_MAP = {
+const VERIFIER_TOOLS_MAP = {
   read: true,
   grep: true,
   glob: true,
@@ -103,16 +103,16 @@ function makeClient(): OpencodeClient {
 
 beforeEach(() => {
   vi.clearAllMocks()
-  mockProbeCapabilityBounded.mockResolvedValue({ ok: true, tools: JUDGE_TOOLS_MAP })
+  mockProbeCapabilityBounded.mockResolvedValue({ ok: true, tools: VERIFIER_TOOLS_MAP })
   mockRunSubturn.mockResolvedValue({ ok: true, text: JSON.stringify(PASS_VERDICT) })
 })
 
 // ===========================================================================
-// buildJudgePayload — test 18 (judge_payload_evidence_only), test 39
-// (judge_payload_secret_scan), Dataset: Judge payload hygiene (all 9 rows)
+// buildVerifierPayload — test 18 (verifier_payload_evidence_only), test 39
+// (verifier_payload_secret_scan), Dataset: Verifier payload hygiene (all 9 rows)
 // ===========================================================================
 
-describe("buildJudgePayload", () => {
+describe("buildVerifierPayload", () => {
   it("row 1 / test 18: clean criteria + diff summary + verifier summary transmit unchanged", () => {
     const logger = vi.fn()
     const raw = {
@@ -122,7 +122,7 @@ describe("buildJudgePayload", () => {
       lastResponse: "",
       recentTranscript: "", plan: "",
     }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
     expect(payload).toEqual({
       criteria: raw.criteria,
       diffSummary: raw.diffSummary,
@@ -133,7 +133,7 @@ describe("buildJudgePayload", () => {
 
   it("row 2 / test 18: payload has no free-form narrative field to leak NARRATIVE_CANARY through — schema excludes it structurally", () => {
     const logger = vi.fn()
-    // buildJudgePayload's signature accepts only the five named fields — there
+    // buildVerifierPayload's signature accepts only the five named fields — there
     // is no free-form chat-narrative parameter for a canary to travel
     // through. A canary planted in any of the real fields is still just
     // content, scanned like anything else; asserting it survives (when it
@@ -146,7 +146,7 @@ describe("buildJudgePayload", () => {
       lastResponse: "",
       recentTranscript: "", plan: "",
     }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
     expect(JSON.stringify(payload)).not.toContain("NARRATIVE_CANARY")
     expect(
       Object.keys(payload).every((k) =>
@@ -166,14 +166,14 @@ describe("buildJudgePayload", () => {
       lastResponse: "",
       recentTranscript: "", plan: "",
     }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
     expect(payload.diffSummary).toBe(cleanHunk)
     expect(payload.diffSummary).not.toContain("sk-live")
     // field not emptied — no field-dropped, but one of the two hunks WAS
     // dropped, so the partial-drop event (added post-review — see the
-    // judge:field-partial-drop tests below) must fire instead of nothing.
+    // verifier:field-partial-drop tests below) must fire instead of nothing.
     expect(logger).toHaveBeenCalledTimes(1)
-    expect(logger).toHaveBeenCalledWith("judge:field-partial-drop", { field: "diffSummary", kept: 1, dropped: 1 })
+    expect(logger).toHaveBeenCalledWith("verifier:field-partial-drop", { field: "diffSummary", kept: 1, dropped: 1 })
   })
 
   it("row 4 / test 39: token split across a line boundary within one hunk is still caught (reassembled-field scan)", () => {
@@ -191,9 +191,9 @@ describe("buildJudgePayload", () => {
       'def456ghi789jklmno"',
     ].join("\n")
     const raw = { criteria: [], diffSummary: hunkWithSplitSecret, verifierSummaries: [], lastResponse: "", recentTranscript: "", plan: "" }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
     expect(payload.diffSummary).toBeUndefined()
-    expect(logger).toHaveBeenCalledWith("judge:field-dropped", { field: "diffSummary" })
+    expect(logger).toHaveBeenCalledWith("verifier:field-dropped", { field: "diffSummary" })
   })
 
   it("row 5 / test 39: unlabelled 40-char hex token trips the entropy rule (redactSecrets alone misses it)", () => {
@@ -206,12 +206,12 @@ describe("buildJudgePayload", () => {
       lastResponse: "",
       recentTranscript: "", plan: "",
     }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
     expect(payload.verifierSummaries).toEqual(["5 passed, 0 failed"])
     // field not emptied (second line survives), but the first line WAS
     // dropped — partial-drop event fires instead of silence.
     expect(logger).toHaveBeenCalledTimes(1)
-    expect(logger).toHaveBeenCalledWith("judge:field-partial-drop", { field: "verifierSummaries", kept: 1, dropped: 1 })
+    expect(logger).toHaveBeenCalledWith("verifier:field-partial-drop", { field: "verifierSummaries", kept: 1, dropped: 1 })
   })
 
   it("row 6 / test 39: connection string wrapped across two verifier-summary lines — both removed on reassembled scan", () => {
@@ -225,15 +225,15 @@ describe("buildJudgePayload", () => {
       lastResponse: "",
       recentTranscript: "", plan: "",
     }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
     expect(payload.verifierSummaries).toEqual(["2 passed, 0 failed"])
     // field not emptied — one surviving line, but both wrapped lines were
     // dropped as a pair — partial-drop event fires instead of silence.
     expect(logger).toHaveBeenCalledTimes(1)
-    expect(logger).toHaveBeenCalledWith("judge:field-partial-drop", { field: "verifierSummaries", kept: 1, dropped: 2 })
+    expect(logger).toHaveBeenCalledWith("verifier:field-partial-drop", { field: "verifierSummaries", kept: 1, dropped: 2 })
   })
 
-  it("row 7 / test 39: 200-char base64 blob in a criteria line is removed; emptying the field logs judge:field-dropped", () => {
+  it("row 7 / test 39: 200-char base64 blob in a criteria line is removed; emptying the field logs verifier:field-dropped", () => {
     const logger = vi.fn()
     const base64Blob = Buffer.from(Array.from({ length: 150 }, (_, i) => (i * 37 + 13) % 256)).toString(
       "base64",
@@ -245,27 +245,27 @@ describe("buildJudgePayload", () => {
       lastResponse: "",
       recentTranscript: "", plan: "",
     }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
     expect(payload.criteria).toBeUndefined()
-    expect(logger).toHaveBeenCalledWith("judge:field-dropped", { field: "criteria" })
+    expect(logger).toHaveBeenCalledWith("verifier:field-dropped", { field: "criteria" })
   })
 
   it("row 8 / test 39: an oversized clean verifier summary is truncated to the field cap after scanning (C-9: scan-then-truncate)", () => {
     const logger = vi.fn()
     const longClean = "ok ".repeat(1334) // ~4002 chars, well past the 2000-char field cap, no secrets
     const raw = { criteria: [], diffSummary: "", verifierSummaries: [longClean], lastResponse: "", recentTranscript: "", plan: "" }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
     expect(payload.verifierSummaries).toBeDefined()
     const survivingLength = payload.verifierSummaries!.join("\n").length
     expect(survivingLength).toBeLessThanOrEqual(2000)
     expect(survivingLength).toBeLessThan(longClean.length)
     // MINOR fix (post-review): truncation is no longer silent — a
-    // judge:field-truncated event records that this field was cut, even
-    // though it survives non-empty (never a judge:field-dropped, since the
+    // verifier:field-truncated event records that this field was cut, even
+    // though it survives non-empty (never a verifier:field-dropped, since the
     // field is not emptied). Nothing tripped the scan here, so the
     // post-scan length truncateField sees is identical to the raw length.
     expect(logger).toHaveBeenCalledTimes(1)
-    expect(logger).toHaveBeenCalledWith("judge:field-truncated", {
+    expect(logger).toHaveBeenCalledWith("verifier:field-truncated", {
       field: "verifierSummaries",
       originalLength: longClean.length,
       cap: 2000,
@@ -276,13 +276,13 @@ describe("buildJudgePayload", () => {
     // fragment leak"): a secret positioned past where the OLD truncate-first
     // cap used to cut is now still caught. Under the old truncate-then-scan
     // order this secret sat beyond the 2000-char cut point, was sliced away
-    // before the scan ever ran, and buildJudgePayload never saw it at all —
+    // before the scan ever ran, and buildVerifierPayload never saw it at all —
     // the field only "survived" because the secret had already been
     // silently discarded, not because it was safe. Now the FULL field
     // (including everything past the old cut point) is scanned first, the
     // unit containing the secret trips, and the field is correctly dropped
     // in full — never truncated, since nothing survives scanning to
-    // truncate (judge:field-truncated and judge:field-dropped are mutually
+    // truncate (verifier:field-truncated and verifier:field-dropped are mutually
     // exclusive per field; see truncateField's doc comment).
     const secretPastOldBoundary = "x".repeat(2500) + " sk-live-abc123def456ghi789jkl012mno345pqr"
     const raw2 = {
@@ -292,11 +292,11 @@ describe("buildJudgePayload", () => {
       lastResponse: "",
       recentTranscript: "", plan: "",
     }
-    const payload2 = buildJudgePayload(raw2, logger)
+    const payload2 = buildVerifierPayload(raw2, logger)
     expect(payload2.verifierSummaries).toBeUndefined()
     expect(logger).toHaveBeenCalledTimes(1)
-    expect(logger).toHaveBeenCalledWith("judge:field-dropped", { field: "verifierSummaries" })
-    expect(logger).not.toHaveBeenCalledWith("judge:field-truncated", expect.anything())
+    expect(logger).toHaveBeenCalledWith("verifier:field-dropped", { field: "verifierSummaries" })
+    expect(logger).not.toHaveBeenCalledWith("verifier:field-truncated", expect.anything())
   })
 
   it("fix #5: a field within the cap is NOT reported as truncated", () => {
@@ -308,11 +308,11 @@ describe("buildJudgePayload", () => {
       lastResponse: "",
       recentTranscript: "", plan: "",
     }
-    buildJudgePayload(raw, logger)
+    buildVerifierPayload(raw, logger)
     expect(logger).not.toHaveBeenCalled()
   })
 
-  it("fix #5 (updated for C-9 scan-then-truncate order): a single-unit field containing a secret is dropped in full, never also reported as truncated — judge:field-dropped and judge:field-truncated are mutually exclusive per field", () => {
+  it("fix #5 (updated for C-9 scan-then-truncate order): a single-unit field containing a secret is dropped in full, never also reported as truncated — verifier:field-dropped and verifier:field-truncated are mutually exclusive per field", () => {
     const logger = vi.fn()
     // Under the OLD truncate-then-scan order this exact input used to log
     // BOTH events (truncated to the cap, then the surviving truncated text
@@ -320,18 +320,18 @@ describe("buildJudgePayload", () => {
     // NEW scan-then-truncate order, scanning runs first on the whole field:
     // since this field is a single unit (no newlines) and that unit
     // contains the secret, the WHOLE unit is dropped immediately — there is
-    // nothing left to truncate, so judge:field-truncated no longer fires
+    // nothing left to truncate, so verifier:field-truncated no longer fires
     // for this case at all.
     const secretText = 'const key = "sk-live-abc123def456ghi789jkl012mno345pqr" ' + "x".repeat(3000)
     const raw = { criteria: [], diffSummary: "", verifierSummaries: [secretText], lastResponse: "", recentTranscript: "", plan: "" }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
     expect(payload.verifierSummaries).toBeUndefined()
     expect(logger).toHaveBeenCalledTimes(1)
-    expect(logger).toHaveBeenCalledWith("judge:field-dropped", { field: "verifierSummaries" })
-    expect(logger).not.toHaveBeenCalledWith("judge:field-truncated", expect.anything())
+    expect(logger).toHaveBeenCalledWith("verifier:field-dropped", { field: "verifierSummaries" })
+    expect(logger).not.toHaveBeenCalledWith("verifier:field-truncated", expect.anything())
   })
 
-  it("C-9 (multi-unit): a field that loses a tainted line to scanning AND remains oversized afterward logs BOTH judge:field-partial-drop and judge:field-truncated", () => {
+  it("C-9 (multi-unit): a field that loses a tainted line to scanning AND remains oversized afterward logs BOTH verifier:field-partial-drop and verifier:field-truncated", () => {
     const logger = vi.fn()
     // Unlike the single-unit fix-#5 case above, a MULTI-unit field can still
     // combine a scan-driven drop with a truncation: here one line trips (and
@@ -346,21 +346,21 @@ describe("buildJudgePayload", () => {
       lastResponse: "",
       recentTranscript: "", plan: "",
     }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
     expect(payload.verifierSummaries).toBeDefined()
     expect(payload.verifierSummaries!.join("\n")).not.toContain("sk-live")
-    expect(logger).toHaveBeenCalledWith("judge:field-partial-drop", { field: "verifierSummaries", kept: 1, dropped: 1 })
-    expect(logger).toHaveBeenCalledWith("judge:field-truncated", {
+    expect(logger).toHaveBeenCalledWith("verifier:field-partial-drop", { field: "verifierSummaries", kept: 1, dropped: 1 })
+    expect(logger).toHaveBeenCalledWith("verifier:field-truncated", {
       field: "verifierSummaries",
       originalLength: longCleanLine.length,
       cap: 2000,
     })
-    expect(logger).not.toHaveBeenCalledWith("judge:field-dropped", expect.anything())
+    expect(logger).not.toHaveBeenCalledWith("verifier:field-dropped", expect.anything())
   })
 
   it("C-9: a 40-char JWT-shaped secret straddling the field's truncation-cap boundary is fully caught, not left as a leaking fragment (redact-then-truncate ordering)", () => {
     const logger = vi.fn()
-    const CAP = 2000 // JUDGE_PAYLOAD_FIELD_CHAR_CAP
+    const CAP = 2000 // VERIFIER_PAYLOAD_FIELD_CHAR_CAP
     // Exact reproduction numbers from docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md's
     // C-9: a 40-char JWT-shaped string, third segment exactly at the JWT
     // pattern's `{8,}` floor. Scanned whole it redacts to [REDACTED:JWT];
@@ -379,7 +379,7 @@ describe("buildJudgePayload", () => {
     expect(text.length).toBe(CAP + 1)
 
     const raw = { criteria: [], diffSummary: "", verifierSummaries: [text], lastResponse: "", recentTranscript: "", plan: "" }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
 
     // Redact-then-truncate: the scan sees the WHOLE field — including
     // everything past where the old cap used to cut — before any truncation
@@ -387,7 +387,7 @@ describe("buildJudgePayload", () => {
     // containing it is dropped in its entirety. Nothing survives to leak.
     expect(payload.verifierSummaries).toBeUndefined()
     expect(logger).toHaveBeenCalledTimes(1)
-    expect(logger).toHaveBeenCalledWith("judge:field-dropped", { field: "verifierSummaries" })
+    expect(logger).toHaveBeenCalledWith("verifier:field-dropped", { field: "verifierSummaries" })
   })
 
   it("C-8 backstop: a genuine unlabeled high-entropy secret — no ':'/'=' anywhere near it — is still caught by the entropy scan after the C-8 label-pattern tightening", () => {
@@ -408,9 +408,9 @@ describe("buildJudgePayload", () => {
       recentTranscript: `assistant: here is the raw value ${highEntropyToken} for reference`,
       plan: "",
     }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
     expect(payload.recentTranscript).toBeUndefined()
-    expect(logger).toHaveBeenCalledWith("judge:field-dropped", { field: "recentTranscript" })
+    expect(logger).toHaveBeenCalledWith("verifier:field-dropped", { field: "recentTranscript" })
   })
 
   it("C-15: a realistic unlabeled hex secret — well below the entropy backstop's effective threshold — is caught by the hex-run backstop", () => {
@@ -427,9 +427,9 @@ describe("buildJudgePayload", () => {
       lastResponse: "our client secret ends up being 8f3ac9d2e1b74c0aa9f2d8e7c1b3a4f6",
       recentTranscript: "", plan: "",
     }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
     expect(payload.lastResponse).toBeUndefined()
-    expect(logger).toHaveBeenCalledWith("judge:field-dropped", { field: "lastResponse" })
+    expect(logger).toHaveBeenCalledWith("verifier:field-dropped", { field: "lastResponse" })
   })
 
   it("C-15: a git-SHA-shaped hex run (not a secret) is still dropped — accepted false-positive cost of the hex-run backstop", () => {
@@ -446,9 +446,9 @@ describe("buildJudgePayload", () => {
       lastResponse: "",
       recentTranscript: "", plan: "",
     }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
     expect(payload.verifierSummaries).toBeUndefined()
-    expect(logger).toHaveBeenCalledWith("judge:field-dropped", { field: "verifierSummaries" })
+    expect(logger).toHaveBeenCalledWith("verifier:field-dropped", { field: "verifierSummaries" })
   })
 
   it("C-15: a dictionary-word passphrase embedded in prose is NOT caught — documented, accepted residual risk (no reliable local heuristic)", () => {
@@ -460,21 +460,21 @@ describe("buildJudgePayload", () => {
     // risks reopening C-8's false-positive problem.
     const text = "she pasted the password hunter2CorrectHorseBatteryStaple99 in the chat by mistake"
     const raw = { criteria: [], diffSummary: "", verifierSummaries: [], lastResponse: text, recentTranscript: "", plan: "" }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
     expect(payload.lastResponse).toBe(text)
     expect(logger).not.toHaveBeenCalled()
   })
 
   it("C-15: an oversized raw field is dropped whole, before scanning, rather than scanned in full every time (cost bound)", () => {
     const logger = vi.fn()
-    // JUDGE_PAYLOAD_RAW_FIELD_SAFETY_CAP is 100_000 — well past any
+    // VERIFIER_PAYLOAD_RAW_FIELD_SAFETY_CAP is 100_000 — well past any
     // realistic evidence field, so a field this large is treated as
     // pathological and dropped whole rather than paying the full scan cost.
     const oversized = "x".repeat(100_001)
     const raw = { criteria: [], diffSummary: "", verifierSummaries: [], lastResponse: oversized, recentTranscript: "", plan: "" }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
     expect(payload.lastResponse).toBeUndefined()
-    expect(logger).toHaveBeenCalledWith("judge:field-oversized", {
+    expect(logger).toHaveBeenCalledWith("verifier:field-oversized", {
       field: "lastResponse",
       rawLength: oversized.length,
       cap: 100_000,
@@ -492,14 +492,14 @@ describe("buildJudgePayload", () => {
       lastResponse: "",
       recentTranscript: "", plan: "",
     }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
     expect(payload.verifierSummaries).toEqual([`analysis: ${prose} completed cleanly`])
     expect(logger).not.toHaveBeenCalled()
   })
 
   it("empty raw fields are omitted (not present as empty array/string) without logging field-dropped", () => {
     const logger = vi.fn()
-    const payload = buildJudgePayload(
+    const payload = buildVerifierPayload(
       { criteria: [], diffSummary: "", verifierSummaries: [], lastResponse: "", recentTranscript: "", plan: "" },
       logger,
     )
@@ -507,7 +507,7 @@ describe("buildJudgePayload", () => {
     expect(logger).not.toHaveBeenCalled()
   })
 
-  it("dropping one criteria line among several logs judge:field-partial-drop, not silence", () => {
+  it("dropping one criteria line among several logs verifier:field-partial-drop, not silence", () => {
     const logger = vi.fn()
     const raw = {
       criteria: ["clean criterion one", "sk-live-abc123def456ghi789jkl012mno345pqr leaked here", "clean criterion two"],
@@ -516,16 +516,16 @@ describe("buildJudgePayload", () => {
       lastResponse: "",
       recentTranscript: "", plan: "",
     }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
     expect(payload.criteria).toEqual(["clean criterion one", "clean criterion two"])
     // one of three lines dropped, field survives — partial-drop event fires
     // instead of silence (was the silent gap this test used to assert).
     expect(logger).toHaveBeenCalledTimes(1)
-    expect(logger).toHaveBeenCalledWith("judge:field-partial-drop", { field: "criteria", kept: 2, dropped: 1 })
+    expect(logger).toHaveBeenCalledWith("verifier:field-partial-drop", { field: "criteria", kept: 2, dropped: 1 })
   })
 
   // =========================================================================
-  // docs/JUDGE-PROMPT.md §5 — lastResponse/recentTranscript go through the
+  // docs/VERIFIER-PROMPT.md §5 — lastResponse/recentTranscript go through the
   // SAME redaction pipeline as the original three fields.
   // =========================================================================
 
@@ -539,7 +539,7 @@ describe("buildJudgePayload", () => {
       recentTranscript: "user: please finish this\nassistant: done, tests pass",
       plan: "",
     }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
     expect(payload.lastResponse).toBe(raw.lastResponse)
     expect(payload.recentTranscript).toBe(raw.recentTranscript)
     expect(logger).not.toHaveBeenCalled()
@@ -555,10 +555,10 @@ describe("buildJudgePayload", () => {
       lastResponse: `I finished the task. Here is the key I used: ${secret}`,
       recentTranscript: "", plan: "",
     }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
     expect(payload.lastResponse).toBeUndefined()
     expect(JSON.stringify(payload)).not.toContain(secret)
-    expect(logger).toHaveBeenCalledWith("judge:field-dropped", { field: "lastResponse" })
+    expect(logger).toHaveBeenCalledWith("verifier:field-dropped", { field: "lastResponse" })
   })
 
   it("§5 security-critical: a secret embedded in recentTranscript is redacted exactly like one embedded in diffSummary", () => {
@@ -575,10 +575,10 @@ describe("buildJudgePayload", () => {
       recentTranscript: `assistant: the key I used is ${secret}, all set`,
       plan: "",
     }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
     expect(payload.recentTranscript).toBeUndefined()
     expect(JSON.stringify(payload)).not.toContain(secret)
-    expect(logger).toHaveBeenCalledWith("judge:field-dropped", { field: "recentTranscript" })
+    expect(logger).toHaveBeenCalledWith("verifier:field-dropped", { field: "recentTranscript" })
   })
 
   it("§5 security-critical: a secret on one line of recentTranscript is dropped while a clean line survives", () => {
@@ -592,17 +592,17 @@ describe("buildJudgePayload", () => {
       recentTranscript: `user: go ahead\nassistant: using ${secret} now\nassistant: all tests pass`,
       plan: "",
     }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
     expect(payload.recentTranscript).toBeDefined()
     expect(payload.recentTranscript).not.toContain(secret)
     expect(payload.recentTranscript).toContain("all tests pass")
     // field survived non-empty — no field-dropped, but partial-drop fires
     // (one of three lines was removed).
     expect(logger).toHaveBeenCalledTimes(1)
-    expect(logger).toHaveBeenCalledWith("judge:field-partial-drop", { field: "recentTranscript", kept: 2, dropped: 1 })
+    expect(logger).toHaveBeenCalledWith("verifier:field-partial-drop", { field: "recentTranscript", kept: 2, dropped: 1 })
   })
 
-  it("§5: recentTranscript is truncated to its own 4000-char cap (double the other fields' cap), not JUDGE_PAYLOAD_FIELD_CHAR_CAP", () => {
+  it("§5: recentTranscript is truncated to its own 4000-char cap (double the other fields' cap), not VERIFIER_PAYLOAD_FIELD_CHAR_CAP", () => {
     const logger = vi.fn()
     const longClean = "assistant: ok ".repeat(400) // well past 4000 chars, no secrets
     const raw = {
@@ -613,10 +613,10 @@ describe("buildJudgePayload", () => {
       recentTranscript: longClean,
       plan: "",
     }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
     expect(payload.recentTranscript).toBeDefined()
     expect(payload.recentTranscript!.length).toBeLessThanOrEqual(4000)
-    expect(logger).toHaveBeenCalledWith("judge:field-truncated", {
+    expect(logger).toHaveBeenCalledWith("verifier:field-truncated", {
       field: "recentTranscript",
       originalLength: longClean.length,
       cap: 4000,
@@ -633,10 +633,10 @@ describe("buildJudgePayload", () => {
       lastResponse: longClean,
       recentTranscript: "", plan: "",
     }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
     expect(payload.lastResponse).toBeDefined()
     expect(payload.lastResponse!.length).toBeLessThanOrEqual(2000)
-    expect(logger).toHaveBeenCalledWith("judge:field-truncated", {
+    expect(logger).toHaveBeenCalledWith("verifier:field-truncated", {
       field: "lastResponse",
       originalLength: longClean.length,
       cap: 2000,
@@ -645,7 +645,7 @@ describe("buildJudgePayload", () => {
 
   it("§5: empty lastResponse/recentTranscript are omitted, same as the other empty fields", () => {
     const logger = vi.fn()
-    const payload = buildJudgePayload(
+    const payload = buildVerifierPayload(
       { criteria: [], diffSummary: "", verifierSummaries: [], lastResponse: "", recentTranscript: "", plan: "" },
       logger,
     )
@@ -669,7 +669,7 @@ describe("buildJudgePayload", () => {
       "  A1: cli --help exits 0",
     ].join("\n")
     const raw = { criteria: [], diffSummary: "", verifierSummaries: [], lastResponse: "", recentTranscript: "", plan: planDigest }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
     expect(payload.plan).toBe(planDigest)
     expect(logger).not.toHaveBeenCalled()
   })
@@ -688,10 +688,10 @@ describe("buildJudgePayload", () => {
       // recentTranscript single-line secret test.
       plan: `S1 [claimed-complete] deploy — A1: service live with key ${secret}`,
     }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
     expect(payload.plan).toBeUndefined()
     expect(JSON.stringify(payload)).not.toContain(secret)
-    expect(logger).toHaveBeenCalledWith("judge:field-dropped", { field: "plan" })
+    expect(logger).toHaveBeenCalledWith("verifier:field-dropped", { field: "plan" })
   })
 
   it("point 4 / FR-006: an oversized clean plan is truncated to its own 16000-char cap (C-9 scan-then-truncate), not the 2000 field cap", () => {
@@ -701,11 +701,11 @@ describe("buildJudgePayload", () => {
     // subject is "the plan field has its OWN, larger cap", not the number.
     const longPlan = "story line ok\n".repeat(1400) // 19600 chars, past 16000, no secrets
     const raw = { criteria: [], diffSummary: "", verifierSummaries: [], lastResponse: "", recentTranscript: "", plan: longPlan }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
     expect(payload.plan).toBeDefined()
     expect(payload.plan!.length).toBeLessThanOrEqual(16000)
     expect(payload.plan!.length).toBeGreaterThan(4000) // proves neither the 2000 field cap nor the old 4000 plan cap was applied
-    expect(logger).toHaveBeenCalledWith("judge:field-truncated", {
+    expect(logger).toHaveBeenCalledWith("verifier:field-truncated", {
       field: "plan",
       originalLength: longPlan.length,
       cap: 16000,
@@ -713,15 +713,15 @@ describe("buildJudgePayload", () => {
   })
 
   // =========================================================================
-  // FR-006 / FR-006a — docs/JUDGE-RELIABILITY-FIXES-SPEC.md, User Story 6.
+  // FR-006 / FR-006a — docs/VERIFIER-RELIABILITY-FIXES-SPEC.md, User Story 6.
   //
   // Both requirements exist because of ONE observed production failure mode:
-  // the judge FAILing delivered stories while citing the very plan content
+  // the verifier FAILing delivered stories while citing the very plan content
   // the payload pipeline had silently removed before it ever saw it
   // ("the verifier command is incomplete in the digest", "S5 has no
   // independent verifier set in the digest"). Two independent mechanisms did
-  // the removing — the 4000-char cap (11 `judge:field-truncated`) and the
-  // no-separator adjacent-pair join (11 `judge:field-partial-drop`) — so
+  // the removing — the 4000-char cap (11 `verifier:field-truncated`) and the
+  // no-separator adjacent-pair join (11 `verifier:field-partial-drop`) — so
   // there are two sets of tests.
   // =========================================================================
 
@@ -740,12 +740,12 @@ describe("buildJudgePayload", () => {
     const planDigest = ["S1 (complete): \"Research Wave A\"", verifiersLine, nextStoryLine].join("\n")
 
     const raw = { criteria: [], diffSummary: "", verifierSummaries: [], lastResponse: "", recentTranscript: "", plan: planDigest }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
 
     expect(payload.plan).toBe(planDigest)
     expect(payload.plan).toContain(verifiersLine)
     expect(payload.plan).toContain(nextStoryLine)
-    expect(logger).not.toHaveBeenCalledWith("judge:field-partial-drop", expect.anything())
+    expect(logger).not.toHaveBeenCalledWith("verifier:field-partial-drop", expect.anything())
     expect(logger).not.toHaveBeenCalled()
   })
 
@@ -758,7 +758,7 @@ describe("buildJudgePayload", () => {
     const b = 'S2 (active): "Research Wave B"'
 
     const lineLogger = vi.fn()
-    const linePayload = buildJudgePayload(
+    const linePayload = buildVerifierPayload(
       { criteria: [a, b], diffSummary: "", verifierSummaries: [a, b], lastResponse: "", recentTranscript: "", plan: "" },
       lineLogger,
     )
@@ -766,7 +766,7 @@ describe("buildJudgePayload", () => {
     expect(linePayload.verifierSummaries).toEqual([a, b])
 
     const proseLogger = vi.fn()
-    const prosePayload = buildJudgePayload(
+    const prosePayload = buildVerifierPayload(
       {
         criteria: [],
         diffSummary: "",
@@ -797,10 +797,10 @@ describe("buildJudgePayload", () => {
       recentTranscript: "",
       plan: ["S1 (complete): deploy", "  verifiers: psql postgres://user:sec", 'retpass@dbhost:5432/mydb -c "select 1"'].join("\n"),
     }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
     expect(payload.plan).toBe("S1 (complete): deploy")
     expect(payload.plan).not.toContain("retpass")
-    expect(logger).toHaveBeenCalledWith("judge:field-partial-drop", { field: "plan", kept: 1, dropped: 2 })
+    expect(logger).toHaveBeenCalledWith("verifier:field-partial-drop", { field: "plan", kept: 1, dropped: 2 })
   })
 
   it("FR-006a regression (C-9 MUST still hold): a hex secret wrapped across two lines is still dropped as a pair", () => {
@@ -815,9 +815,9 @@ describe("buildJudgePayload", () => {
       recentTranscript: "",
       plan: "",
     }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
     expect(payload.criteria).toEqual(["3 passed, 0 failed"])
-    expect(logger).toHaveBeenCalledWith("judge:field-partial-drop", { field: "criteria", kept: 1, dropped: 2 })
+    expect(logger).toHaveBeenCalledWith("verifier:field-partial-drop", { field: "criteria", kept: 1, dropped: 2 })
   })
 
   it("FR-006a regression (C-9 MUST still hold): an entropy-only secret wrapped across two lines is still dropped as a pair", () => {
@@ -835,10 +835,10 @@ describe("buildJudgePayload", () => {
       recentTranscript: ["assistant: the deploy token is kJ8vQz3XmR7wLp2NcT9y", "Bf4HdG6sVe1AoZ5rUiWx and it worked", "user: thanks"].join("\n"),
       plan: "",
     }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
     expect(payload.recentTranscript).toBe("user: thanks")
     expect(payload.recentTranscript).not.toContain("kJ8vQz3XmR7wLp2NcT9y")
-    expect(logger).toHaveBeenCalledWith("judge:field-partial-drop", { field: "recentTranscript", kept: 1, dropped: 2 })
+    expect(logger).toHaveBeenCalledWith("verifier:field-partial-drop", { field: "recentTranscript", kept: 1, dropped: 2 })
   })
 
   it("FR-006 / SC-006: the measured 7518-char raw plan digest transmits whole — no truncation, no partial drop", () => {
@@ -846,16 +846,16 @@ describe("buildJudgePayload", () => {
     // Dataset: Plan digest row 1 — the measured RAW digest of the audited
     // 6-story plan (spec round-2 finding m-19; the originalLength 6411-6425
     // seen in the session's events is the POST-scan number). Under the old
-    // 4000-char cap this fired judge:field-truncated on all 9 audit runs.
+    // 4000-char cap this fired verifier:field-truncated on all 9 audit runs.
     const planDigest = makePlanDigestOfLength(7518)
     expect(planDigest.length).toBe(7518)
 
     const raw = { criteria: [], diffSummary: "", verifierSummaries: [], lastResponse: "", recentTranscript: "", plan: planDigest }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
 
     expect(payload.plan).toBe(planDigest)
-    expect(logger).not.toHaveBeenCalledWith("judge:field-truncated", expect.anything())
-    expect(logger).not.toHaveBeenCalledWith("judge:field-partial-drop", expect.anything())
+    expect(logger).not.toHaveBeenCalledWith("verifier:field-truncated", expect.anything())
+    expect(logger).not.toHaveBeenCalledWith("verifier:field-partial-drop", expect.anything())
     expect(logger).not.toHaveBeenCalled()
   })
 
@@ -863,10 +863,10 @@ describe("buildJudgePayload", () => {
     const logger = vi.fn()
     const planDigest = makePlanDigestOfLength(16001) // new cap + 1
     const raw = { criteria: [], diffSummary: "", verifierSummaries: [], lastResponse: "", recentTranscript: "", plan: planDigest }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
 
     expect(payload.plan!.length).toBe(16000)
-    expect(logger).toHaveBeenCalledWith("judge:field-truncated", { field: "plan", originalLength: 16001, cap: 16000 })
+    expect(logger).toHaveBeenCalledWith("verifier:field-truncated", { field: "plan", originalLength: 16001, cap: 16000 })
   })
 
   it("FR-006 / US6 AS3: raising the cap does not weaken redaction — a secret past the OLD 4000-char cap is still dropped", () => {
@@ -874,21 +874,21 @@ describe("buildJudgePayload", () => {
     // Pre-C-9 (truncate-then-scan) this secret would never have been scanned
     // at all; post-C-9 with a 4000 cap it was scanned then cut. With the
     // 16000 cap it is scanned AND transmitted-adjacent, so the scan is the
-    // only thing standing between it and the judge. It must still drop.
+    // only thing standing between it and the verifier. It must still drop.
     const secret = "sk-live-abc123def456ghi789jkl012mno345pqr"
     const planDigest = `${makePlanDigestOfLength(6000)}\n  A9: deployed with key ${secret}`
     const raw = { criteria: [], diffSummary: "", verifierSummaries: [], lastResponse: "", recentTranscript: "", plan: planDigest }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
 
     expect(payload.plan).toBeDefined()
     expect(payload.plan).not.toContain(secret)
     expect(JSON.stringify(payload)).not.toContain("sk-live")
-    expect(logger).toHaveBeenCalledWith("judge:field-partial-drop", { field: "plan", kept: expect.any(Number), dropped: 1 })
+    expect(logger).toHaveBeenCalledWith("verifier:field-partial-drop", { field: "plan", kept: expect.any(Number), dropped: 1 })
   })
 })
 
 // ===========================================================================
-// judge:field-partial-drop — post-review fix. `judge:field-dropped` already
+// verifier:field-partial-drop — post-review fix. `verifier:field-dropped` already
 // fired correctly when a field's scan emptied it ENTIRELY; nothing fired when
 // a field survived non-empty but lost some content, so "the assistant never
 // said this" and "it said this and the scan silently removed it" were
@@ -908,7 +908,7 @@ describe("buildJudgePayload", () => {
 // the (now-fixed) false positive that used to stand in for it.
 // ===========================================================================
 
-describe("judge:field-partial-drop", () => {
+describe("verifier:field-partial-drop", () => {
   it("C-8 regression: the exact false-positive sentence from the audit doc no longer trips anything and survives in recentTranscript unredacted", () => {
     const logger = vi.fn()
     const raw = {
@@ -923,7 +923,7 @@ describe("judge:field-partial-drop", () => {
       ].join("\n"),
       plan: "",
     }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
     expect(payload.recentTranscript).toBe(raw.recentTranscript)
     expect(logger).not.toHaveBeenCalled()
   })
@@ -943,7 +943,7 @@ describe("judge:field-partial-drop", () => {
       ].join("\n"),
       plan: "",
     }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
 
     // The line with the secret is gone, but the field survives non-empty.
     expect(payload.recentTranscript).toBeDefined()
@@ -953,13 +953,13 @@ describe("judge:field-partial-drop", () => {
 
     // The fix under test: a partial drop is now observable, distinguishing
     // "never said" from "said and silently removed" — and full-empty
-    // judge:field-dropped must NOT fire, since the field is not empty.
-    expect(logger).toHaveBeenCalledWith("judge:field-partial-drop", {
+    // verifier:field-dropped must NOT fire, since the field is not empty.
+    expect(logger).toHaveBeenCalledWith("verifier:field-partial-drop", {
       field: "recentTranscript",
       kept: 2,
       dropped: 1,
     })
-    expect(logger).not.toHaveBeenCalledWith("judge:field-dropped", expect.anything())
+    expect(logger).not.toHaveBeenCalledWith("verifier:field-dropped", expect.anything())
   })
 
   it("does NOT fire on a fully clean multi-line field (nothing dropped)", () => {
@@ -972,17 +972,17 @@ describe("judge:field-partial-drop", () => {
       recentTranscript: "user: go\nassistant: done, all clean",
       plan: "",
     }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
     expect(payload.criteria).toEqual(raw.criteria)
-    expect(logger).not.toHaveBeenCalledWith("judge:field-partial-drop", expect.anything())
+    expect(logger).not.toHaveBeenCalledWith("verifier:field-partial-drop", expect.anything())
     expect(logger).not.toHaveBeenCalled()
   })
 
-  it("does NOT fire when a field is dropped in full (that stays judge:field-dropped only, per field)", () => {
+  it("does NOT fire when a field is dropped in full (that stays verifier:field-dropped only, per field)", () => {
     const logger = vi.fn()
     const secret = "sk-live-abc123def456ghi789jkl012mno345pqr"
     // Single-line field: the only unit is dropped -> the field is fully
-    // empty, not partial. judge:field-dropped alone must fire.
+    // empty, not partial. verifier:field-dropped alone must fire.
     const raw = {
       criteria: [],
       diffSummary: "",
@@ -990,21 +990,21 @@ describe("judge:field-partial-drop", () => {
       lastResponse: `the key I used is ${secret}`,
       recentTranscript: "", plan: "",
     }
-    const payload = buildJudgePayload(raw, logger)
+    const payload = buildVerifierPayload(raw, logger)
     expect(payload.lastResponse).toBeUndefined()
-    expect(logger).toHaveBeenCalledWith("judge:field-dropped", { field: "lastResponse" })
-    expect(logger).not.toHaveBeenCalledWith("judge:field-partial-drop", expect.anything())
+    expect(logger).toHaveBeenCalledWith("verifier:field-dropped", { field: "lastResponse" })
+    expect(logger).not.toHaveBeenCalledWith("verifier:field-partial-drop", expect.anything())
   })
 })
 
 // ===========================================================================
-// runJudge — FR-030/FR-030a/FR-030b/FR-032, BDD "Feature: Judge (US-9)"
+// runVerifier — FR-030/FR-030a/FR-030b/FR-032, BDD "Feature: Verifier (US-9)"
 // ===========================================================================
 
-describe("runJudge", () => {
+describe("runVerifier", () => {
   const basePayload = { criteria: ["c1"], diffSummary: "@@ -1,1 +1,1 @@\n+ok", verifierSummaries: ["ok"] }
 
-  it('BDD "Judge verdict appended without gating the checkpoint": a configured judge stub returning a per-story/per-item verdict resolves cleanly', async () => {
+  it('BDD "Verifier verdict appended without gating the checkpoint": a configured verifier stub returning a per-story/per-item verdict resolves cleanly', async () => {
     // HANDOVER.md point 4: a failing story names exactly which acceptance
     // items are unmet and why, per item — the detail continuations consume.
     const verdict = {
@@ -1029,7 +1029,7 @@ describe("runJudge", () => {
     mockRunSubturn.mockResolvedValue({ ok: true, text: JSON.stringify(verdict) })
     const client = makeClient()
     const logger = vi.fn()
-    const result = await runJudge(
+    const result = await runVerifier(
       client,
       { selfCreated: new SelfCreatedSessions(), logger },
       {
@@ -1039,13 +1039,13 @@ describe("runJudge", () => {
       },
     )
     expect(result).toEqual({ verdict })
-    // No judge:* failure event on a clean success.
+    // No verifier:* failure event on a clean success.
     expect(logger).not.toHaveBeenCalled()
   })
 
-  it('BDD "Judge subturn uses the session model by default": no override — prompt model is the session model, agent is vertex-judge, parent is the current session', async () => {
+  it('BDD "Verifier subturn uses the session model by default": no override — prompt model is the session model, agent is vertex-verifier, parent is the current session', async () => {
     const client = makeClient()
-    await runJudge(
+    await runVerifier(
       client,
       { selfCreated: new SelfCreatedSessions(), logger: vi.fn() },
       {
@@ -1057,18 +1057,18 @@ describe("runJudge", () => {
     expect(mockRunSubturn).toHaveBeenCalledTimes(1)
     const req = mockRunSubturn.mock.calls[0][3]
     expect(req.model).toEqual({ providerID: "minimax", modelID: "MiniMax-M3" })
-    expect(req.agent).toBe("vertex-judge")
+    expect(req.agent).toBe("vertex-verifier")
     expect(req.parentSessionID).toBe("session-123")
     // HANDOVER.md point 3: the allow-aware tool map from the probe is
     // threaded through verbatim as the subturn's `tools` field.
-    expect(req.tools).toEqual(JUDGE_TOOLS_MAP)
+    expect(req.tools).toEqual(VERIFIER_TOOLS_MAP)
   })
 
   // =========================================================================
-  // FR-011 (P0 — docs/JUDGE-RELIABILITY-FIXES-SPEC.md, User Story 9).
+  // FR-011 (P0 — docs/VERIFIER-RELIABILITY-FIXES-SPEC.md, User Story 9).
   //
   // Probe P1 reproduced the production failure in 9.8 s: given only the
-  // payload, the judge answered `pass:false` with "research/x.json does not
+  // payload, the verifier answered `pass:false` with "research/x.json does not
   // exist ... ls shows no research/ directory" for a file that existed.
   // Probe P2/P3, same bytes but a prompt that named what to check, made 2
   // real tool calls and returned a correct verdict. The prompt's only
@@ -1081,8 +1081,8 @@ describe("runJudge", () => {
   // through.
   // =========================================================================
 
-  async function assembledJudgeSystemPrompt(): Promise<string> {
-    await runJudge(
+  async function assembledVerifierSystemPrompt(): Promise<string> {
+    await runVerifier(
       makeClient(),
       { selfCreated: new SelfCreatedSessions(), logger: vi.fn() },
       {
@@ -1095,7 +1095,7 @@ describe("runJudge", () => {
   }
 
   it("FR-011: the assembled system prompt forbids a met:false file claim that was not observed first", async () => {
-    const system = await assembledJudgeSystemPrompt()
+    const system = await assembledVerifierSystemPrompt()
     // The negative-direction obligation, its trigger, and the tools that
     // discharge it must all be present in the text the model receives.
     expect(system).toMatch(/must not report an item as "met": false/i)
@@ -1107,15 +1107,15 @@ describe("runJudge", () => {
     expect(system).toMatch(/payload is never evidence that something is absent/i)
   })
 
-  it("FR-011: the prompt gives the judge a compliant way to express doubt instead of asserting absence", async () => {
-    const system = await assembledJudgeSystemPrompt()
+  it("FR-011: the prompt gives the verifier a compliant way to express doubt instead of asserting absence", async () => {
+    const system = await assembledVerifierSystemPrompt()
     expect(system).toMatch(/if you cannot make that observation/i)
     expect(system).toMatch(/could not verify/i)
     expect(system).toMatch(/instead of claiming the file or its content does not exist/i)
   })
 
   it("FR-011: the pre-existing positive-direction instruction is kept, not replaced", async () => {
-    const system = await assembledJudgeSystemPrompt()
+    const system = await assembledVerifierSystemPrompt()
     expect(system).toContain("Read the files a claim references before crediting it.")
     // Still one flat sentence-joined string (the `.join(" ")` shape), not a
     // list or a multi-line block that a host might reformat.
@@ -1123,9 +1123,9 @@ describe("runJudge", () => {
   })
 
   // =========================================================================
-  // FR-014 (docs/JUDGE-RELIABILITY-FIXES-SPEC.md, User Story 12): the gate
-  // needs the judge child session's id to apply the tool-call floor — a
-  // verdict produced with zero tool calls may not revert a story. runJudge
+  // FR-014 (docs/VERIFIER-RELIABILITY-FIXES-SPEC.md, User Story 12): the gate
+  // needs the verifier child session's id to apply the tool-call floor — a
+  // verdict produced with zero tool calls may not revert a story. runVerifier
   // cannot read it from runSubturn's return value (it isn't there) and must
   // not edit subturn.ts, so it observes the SelfCreatedSessions recorder.
   // =========================================================================
@@ -1133,11 +1133,11 @@ describe("runJudge", () => {
   it("FR-014: a successful run reports the child session id the subturn created", async () => {
     const selfCreated = new SelfCreatedSessions()
     mockRunSubturn.mockImplementation(async (_client, registry, _logger, req) => {
-      registry.record("ses_judge_child_1", req.parentSessionID)
+      registry.record("ses_verifier_child_1", req.parentSessionID)
       return { ok: true, text: JSON.stringify(PASS_VERDICT) }
     })
 
-    const result = await runJudge(
+    const result = await runVerifier(
       makeClient(),
       { selfCreated, logger: vi.fn() },
       {
@@ -1148,30 +1148,30 @@ describe("runJudge", () => {
     )
 
     expect(result.verdict).toEqual(PASS_VERDICT)
-    expect(result.childSessionID).toBe("ses_judge_child_1")
+    expect(result.childSessionID).toBe("ses_verifier_child_1")
     // FR-036 must not regress: the CALLER's registry — not a private copy
     // inside the observing wrapper — has to recognise the child, or the
-    // harness hooks would start firing on the judge's own session.
-    expect(selfCreated.isSelfCreated("ses_judge_child_1", () => null)).toBe(true)
+    // harness hooks would start firing on the verifier's own session.
+    expect(selfCreated.isSelfCreated("ses_verifier_child_1", () => null)).toBe(true)
   })
 
   it("FR-014: a malformed or unavailable run still reports the child id (a child WAS created), and a failed probe reports none", async () => {
     mockRunSubturn.mockImplementation(async (_client, registry, _logger, req) => {
-      registry.record("ses_judge_child_2", req.parentSessionID)
+      registry.record("ses_verifier_child_2", req.parentSessionID)
       return { ok: true, text: "not json at all" }
     })
-    const malformed = await runJudge(
+    const malformed = await runVerifier(
       makeClient(),
       { selfCreated: new SelfCreatedSessions(), logger: vi.fn() },
       { parentSessionID: "p", sessionModel: { providerID: "minimax", modelID: "MiniMax-M3" }, payload: basePayload },
     )
-    expect(malformed).toEqual({ verdict: null, reason: "malformed", childSessionID: "ses_judge_child_2" })
+    expect(malformed).toEqual({ verdict: null, reason: "malformed", childSessionID: "ses_verifier_child_2" })
 
     // A refused probe never reaches runSubturn, so there is no child to name
     // and the key must be ABSENT (not an explicit undefined) — the gate reads
     // "no id" as inconclusive and fails open.
     mockProbeCapabilityBounded.mockResolvedValue({ ok: false, cause: "probe", reason: "agent not registered" })
-    const unsupported = await runJudge(
+    const unsupported = await runVerifier(
       makeClient(),
       { selfCreated: new SelfCreatedSessions(), logger: vi.fn() },
       { parentSessionID: "p", sessionModel: { providerID: "minimax", modelID: "MiniMax-M3" }, payload: basePayload },
@@ -1180,7 +1180,7 @@ describe("runJudge", () => {
     expect("childSessionID" in unsupported).toBe(false)
   })
 
-  it('BDD "Configured judgeModel failure falls back to the session model": retry uses session model within the shared 5s budget', async () => {
+  it('BDD "Configured verifierModel failure falls back to the session model": retry uses session model within the shared 5s budget', async () => {
     mockRunSubturn
       .mockImplementationOnce(async () => {
         await new Promise((r) => setTimeout(r, 30)) // simulate real elapsed time before the failure
@@ -1189,13 +1189,13 @@ describe("runJudge", () => {
       .mockResolvedValueOnce({ ok: true, text: JSON.stringify(PASS_VERDICT) })
 
     const client = makeClient()
-    const result = await runJudge(
+    const result = await runVerifier(
       client,
       { selfCreated: new SelfCreatedSessions(), logger: vi.fn() },
       {
         parentSessionID: "parent-1",
         sessionModel: { providerID: "minimax", modelID: "MiniMax-M3" },
-        judgeModelOverride: { providerID: "provider-x", modelID: "model-y" },
+        verifierModelOverride: { providerID: "provider-x", modelID: "model-y" },
         payload: basePayload,
       },
     )
@@ -1206,23 +1206,23 @@ describe("runJudge", () => {
     expect(firstReq.model).toEqual({ providerID: "provider-x", modelID: "model-y" })
     expect(secondReq.model).toEqual({ providerID: "minimax", modelID: "MiniMax-M3" })
     // Shared budget: the retry's timeout is the *remaining* time, strictly
-    // less than a fresh JUDGE_TOTAL_BUDGET_MS — never added per attempt.
-    expect(secondReq.timeoutMs).toBeLessThan(JUDGE_TOTAL_BUDGET_MS)
+    // less than a fresh VERIFIER_TOTAL_BUDGET_MS — never added per attempt.
+    expect(secondReq.timeoutMs).toBeLessThan(VERIFIER_TOTAL_BUDGET_MS)
     expect(result).toEqual({ verdict: PASS_VERDICT })
   })
 
   // =========================================================================
   // CRITICAL fix (post-review): the capability probe + deny-map build used
-  // to be plain un-timed `await`s taken BEFORE the JUDGE_TOTAL_BUDGET_MS
+  // to be plain un-timed `await`s taken BEFORE the VERIFIER_TOTAL_BUDGET_MS
   // clock started — only the later runSubturn call was ever raced against a
-  // timeout. runJudge now starts its budget clock first and calls the
+  // timeout. runVerifier now starts its budget clock first and calls the
   // bounded probeCapabilityBounded(client, agent, budgetMs) helper, so the
   // probe + deny-map step itself counts against the shared 5s total.
   // =========================================================================
 
-  it("fix #1: probeCapabilityBounded is invoked with the FULL JUDGE_TOTAL_BUDGET_MS as its budget (the clock starts before the probe)", async () => {
+  it("fix #1: probeCapabilityBounded is invoked with the FULL VERIFIER_TOTAL_BUDGET_MS as its budget (the clock starts before the probe)", async () => {
     const client = makeClient()
-    await runJudge(
+    await runVerifier(
       client,
       { selfCreated: new SelfCreatedSessions(), logger: vi.fn() },
       {
@@ -1232,18 +1232,18 @@ describe("runJudge", () => {
       },
     )
     expect(mockProbeCapabilityBounded).toHaveBeenCalledTimes(1)
-    // HANDOVER.md point 3: the judge's probe runs with JUDGE_PROBE_POLICY —
+    // HANDOVER.md point 3: the verifier's probe runs with VERIFIER_PROBE_POLICY —
     // read/grep/glob/list/bash allowed, edit/write/webfetch/task must deny.
-    expect(mockProbeCapabilityBounded).toHaveBeenCalledWith(client, "vertex-judge", JUDGE_TOTAL_BUDGET_MS, JUDGE_PROBE_POLICY)
+    expect(mockProbeCapabilityBounded).toHaveBeenCalledWith(client, "vertex-verifier", VERIFIER_TOTAL_BUDGET_MS, VERIFIER_PROBE_POLICY)
   })
 
   it("fix #1: real elapsed time spent in the probe/deny-map step reduces the subturn attempt's timeout — never a fresh 5s after the probe", async () => {
     mockProbeCapabilityBounded.mockImplementationOnce(async () => {
       await new Promise((r) => setTimeout(r, 40)) // simulate real elapsed time during probe+tool-map build
-      return { ok: true, tools: JUDGE_TOOLS_MAP }
+      return { ok: true, tools: VERIFIER_TOOLS_MAP }
     })
     const client = makeClient()
-    await runJudge(
+    await runVerifier(
       client,
       { selfCreated: new SelfCreatedSessions(), logger: vi.fn() },
       {
@@ -1254,10 +1254,10 @@ describe("runJudge", () => {
     )
     expect(mockRunSubturn).toHaveBeenCalledTimes(1)
     const req = mockRunSubturn.mock.calls[0][3]
-    // The subturn's budget is what's left of JUDGE_TOTAL_BUDGET_MS after the
+    // The subturn's budget is what's left of VERIFIER_TOTAL_BUDGET_MS after the
     // probe/deny-map step's real elapsed time — strictly less than the full
     // budget, proving the clock was already running during that step.
-    expect(req.timeoutMs).toBeLessThan(JUDGE_TOTAL_BUDGET_MS)
+    expect(req.timeoutMs).toBeLessThan(VERIFIER_TOTAL_BUDGET_MS)
   })
 
   it('fix #1: a probe/deny-map TIMEOUT (cause:"timeout") resolves to "unsupported" — the same classification as an ordinary probe refusal — never throws, never calls runSubturn', async () => {
@@ -1268,7 +1268,7 @@ describe("runJudge", () => {
     })
     const client = makeClient()
     const logger = vi.fn()
-    const result = await runJudge(
+    const result = await runVerifier(
       client,
       { selfCreated: new SelfCreatedSessions(), logger },
       {
@@ -1279,7 +1279,7 @@ describe("runJudge", () => {
     )
     expect(result).toEqual({ verdict: null, reason: "unsupported" })
     expect(logger).toHaveBeenCalledTimes(1)
-    expect(logger).toHaveBeenCalledWith("judge:unsupported", {
+    expect(logger).toHaveBeenCalledWith("verifier:unsupported", {
       reason: "capability probe (probe + deny map) timed out",
     })
     expect(mockRunSubturn).not.toHaveBeenCalled()
@@ -1288,19 +1288,19 @@ describe("runJudge", () => {
   it("fix #1: if the probe/deny-map step alone consumes the entire budget, the subturn loop reports timeout (remaining <= 0) rather than attempting with a negative/zero timeout", async () => {
     // Fake timers (rather than a real 5s+ delay) so this test proves the
     // "remaining <= 0" branch instantly: the mocked probeCapabilityBounded
-    // advances the (mocked) clock past JUDGE_TOTAL_BUDGET_MS before
+    // advances the (mocked) clock past VERIFIER_TOTAL_BUDGET_MS before
     // resolving, exactly as if a real probe/deny-map round trip had
-    // genuinely taken that long between runJudge's `start = Date.now()` and
+    // genuinely taken that long between runVerifier's `start = Date.now()` and
     // the probe settling.
     vi.useFakeTimers()
     try {
       mockProbeCapabilityBounded.mockImplementationOnce(async () => {
-        vi.advanceTimersByTime(JUDGE_TOTAL_BUDGET_MS + 10)
-        return { ok: true, tools: JUDGE_TOOLS_MAP }
+        vi.advanceTimersByTime(VERIFIER_TOTAL_BUDGET_MS + 10)
+        return { ok: true, tools: VERIFIER_TOOLS_MAP }
       })
       const client = makeClient()
       const logger = vi.fn()
-      const result = await runJudge(
+      const result = await runVerifier(
         client,
         { selfCreated: new SelfCreatedSessions(), logger },
         {
@@ -1311,17 +1311,17 @@ describe("runJudge", () => {
       )
       expect(mockRunSubturn).not.toHaveBeenCalled()
       expect(result).toEqual({ verdict: null, reason: "unavailable" })
-      expect(logger).toHaveBeenCalledWith("judge:unavailable", { reason: "timeout" })
+      expect(logger).toHaveBeenCalledWith("verifier:unavailable", { reason: "timeout" })
     } finally {
       vi.useRealTimers()
     }
   })
 
-  it('BDD "Judge timeout fails open": a subturn that reports timeout resolves to unavailable and logs judge:unavailable', async () => {
+  it('BDD "Verifier timeout fails open": a subturn that reports timeout resolves to unavailable and logs verifier:unavailable', async () => {
     mockRunSubturn.mockResolvedValue({ ok: false, reason: "timeout" })
     const client = makeClient()
     const logger = vi.fn()
-    const result = await runJudge(
+    const result = await runVerifier(
       client,
       { selfCreated: new SelfCreatedSessions(), logger },
       {
@@ -1331,18 +1331,18 @@ describe("runJudge", () => {
       },
     )
     expect(result).toEqual({ verdict: null, reason: "unavailable" })
-    expect(logger).toHaveBeenCalledWith("judge:unavailable", { reason: "timeout" })
+    expect(logger).toHaveBeenCalledWith("verifier:unavailable", { reason: "timeout" })
   })
 
-  it('BDD "Judge subturn is refused when tools cannot be disabled": probe failure => zero session.create/session.prompt (runSubturn never called), judge:unsupported logged once', async () => {
+  it('BDD "Verifier subturn is refused when tools cannot be disabled": probe failure => zero session.create/session.prompt (runSubturn never called), verifier:unsupported logged once', async () => {
     mockProbeCapabilityBounded.mockResolvedValue({
       ok: false,
       cause: "probe",
-      reason: 'agent "vertex-judge" resolves tool "bash" to true',
+      reason: 'agent "vertex-verifier" resolves tool "bash" to true',
     })
     const client = makeClient()
     const logger = vi.fn()
-    const result = await runJudge(
+    const result = await runVerifier(
       client,
       { selfCreated: new SelfCreatedSessions(), logger },
       {
@@ -1353,8 +1353,8 @@ describe("runJudge", () => {
     )
     expect(result).toEqual({ verdict: null, reason: "unsupported" })
     expect(logger).toHaveBeenCalledTimes(1)
-    expect(logger).toHaveBeenCalledWith("judge:unsupported", {
-      reason: 'agent "vertex-judge" resolves tool "bash" to true',
+    expect(logger).toHaveBeenCalledWith("verifier:unsupported", {
+      reason: 'agent "vertex-verifier" resolves tool "bash" to true',
     })
     expect(mockRunSubturn).not.toHaveBeenCalled()
     expect(client.session.create).not.toHaveBeenCalled()
@@ -1369,7 +1369,7 @@ describe("runJudge", () => {
     })
     const client = makeClient()
     const logger = vi.fn()
-    const result = await runJudge(
+    const result = await runVerifier(
       client,
       { selfCreated: new SelfCreatedSessions(), logger },
       {
@@ -1381,16 +1381,16 @@ describe("runJudge", () => {
     expect(result).toEqual({ verdict: null, reason: "unavailable" })
     expect(logger).toHaveBeenCalledTimes(1)
     const [eventId, eventPayload] = logger.mock.calls[0]
-    expect(eventId).toBe("judge:unavailable")
+    expect(eventId).toBe("verifier:unavailable")
     expect(String((eventPayload as { reason: string }).reason)).toMatch(/tool ids endpoint unavailable/)
     expect(mockRunSubturn).not.toHaveBeenCalled()
   })
 
-  it("malformed (non-JSON) response text resolves to malformed and logs judge:malformed", async () => {
+  it("malformed (non-JSON) response text resolves to malformed and logs verifier:malformed", async () => {
     mockRunSubturn.mockResolvedValue({ ok: true, text: "here is my verdict: pass, looks fine" })
     const client = makeClient()
     const logger = vi.fn()
-    const result = await runJudge(
+    const result = await runVerifier(
       client,
       { selfCreated: new SelfCreatedSessions(), logger },
       {
@@ -1400,14 +1400,14 @@ describe("runJudge", () => {
       },
     )
     expect(result).toEqual({ verdict: null, reason: "malformed" })
-    expect(logger).toHaveBeenCalledWith("judge:malformed", expect.objectContaining({ reason: expect.any(String) }))
+    expect(logger).toHaveBeenCalledWith("verifier:malformed", expect.objectContaining({ reason: expect.any(String) }))
   })
 
   it("valid JSON that does not match the {stories: [...]} shape resolves to malformed", async () => {
     mockRunSubturn.mockResolvedValue({ ok: true, text: JSON.stringify({ verdict: "maybe", confidence: 0.7 }) })
     const client = makeClient()
     const logger = vi.fn()
-    const result = await runJudge(
+    const result = await runVerifier(
       client,
       { selfCreated: new SelfCreatedSessions(), logger },
       {
@@ -1417,7 +1417,7 @@ describe("runJudge", () => {
       },
     )
     expect(result).toEqual({ verdict: null, reason: "malformed" })
-    expect(logger).toHaveBeenCalledWith("judge:malformed", expect.any(Object))
+    expect(logger).toHaveBeenCalledWith("verifier:malformed", expect.any(Object))
   })
 
   // =========================================================================
@@ -1435,7 +1435,7 @@ describe("runJudge", () => {
     })
     const client = makeClient()
     const logger = vi.fn()
-    const result = await runJudge(
+    const result = await runVerifier(
       client,
       { selfCreated: new SelfCreatedSessions(), logger },
       {
@@ -1446,7 +1446,7 @@ describe("runJudge", () => {
     )
     expect(result).toEqual({ verdict: null, reason: "malformed" })
     expect(logger).toHaveBeenCalledWith(
-      "judge:malformed",
+      "verifier:malformed",
       expect.objectContaining({ reason: expect.stringContaining("does not match") }),
     )
   })
@@ -1457,7 +1457,7 @@ describe("runJudge", () => {
       text: JSON.stringify({ fit: "pass", notes: "looks fine" }),
     })
     const client = makeClient()
-    const result = await runJudge(
+    const result = await runVerifier(
       client,
       { selfCreated: new SelfCreatedSessions(), logger: vi.fn() },
       {
@@ -1469,10 +1469,10 @@ describe("runJudge", () => {
     expect(result).toEqual({ verdict: null, reason: "malformed" })
   })
 
-  it("point 4: an empty stories array is rejected as malformed (the judge is the sole arbiter — an empty audit is not a verdict)", async () => {
+  it("point 4: an empty stories array is rejected as malformed (the verifier is the sole arbiter — an empty audit is not a verdict)", async () => {
     mockRunSubturn.mockResolvedValue({ ok: true, text: JSON.stringify({ stories: [] }) })
     const client = makeClient()
-    const result = await runJudge(
+    const result = await runVerifier(
       client,
       { selfCreated: new SelfCreatedSessions(), logger: vi.fn() },
       {
@@ -1502,7 +1502,7 @@ describe("runJudge", () => {
       }),
     })
     const client = makeClient()
-    const result = await runJudge(
+    const result = await runVerifier(
       client,
       { selfCreated: new SelfCreatedSessions(), logger: vi.fn() },
       {
@@ -1521,7 +1521,7 @@ describe("runJudge", () => {
     ]) {
       mockRunSubturn.mockResolvedValue({ ok: true, text: JSON.stringify(broken) })
       const client = makeClient()
-      const result = await runJudge(
+      const result = await runVerifier(
         client,
         { selfCreated: new SelfCreatedSessions(), logger: vi.fn() },
         {
@@ -1542,7 +1542,7 @@ describe("runJudge", () => {
       }),
     })
     const client = makeClient()
-    const result = await runJudge(
+    const result = await runVerifier(
       client,
       { selfCreated: new SelfCreatedSessions(), logger: vi.fn() },
       {
@@ -1570,7 +1570,7 @@ describe("runJudge", () => {
     mockRunSubturn.mockResolvedValue({ ok: true, text: JSON.stringify(verdict) })
     const client = makeClient()
     const logger = vi.fn()
-    const result = await runJudge(
+    const result = await runVerifier(
       client,
       { selfCreated: new SelfCreatedSessions(), logger },
       {
@@ -1583,11 +1583,11 @@ describe("runJudge", () => {
     expect(logger).not.toHaveBeenCalled()
   })
 
-  it("no judgeModelOverride means a single attempt only — no retry, no fallback logic exercised", async () => {
+  it("no verifierModelOverride means a single attempt only — no retry, no fallback logic exercised", async () => {
     mockRunSubturn.mockResolvedValue({ ok: false, reason: "provider unreachable" })
     const client = makeClient()
     const logger = vi.fn()
-    await runJudge(
+    await runVerifier(
       client,
       { selfCreated: new SelfCreatedSessions(), logger },
       {
@@ -1597,19 +1597,19 @@ describe("runJudge", () => {
       },
     )
     expect(mockRunSubturn).toHaveBeenCalledTimes(1)
-    expect(logger).toHaveBeenCalledWith("judge:unavailable", { reason: "provider unreachable" })
+    expect(logger).toHaveBeenCalledWith("verifier:unavailable", { reason: "provider unreachable" })
   })
 
   it("thrown error from runSubturn's own promise rejection still resolves via the ok:false contract, not a throw", async () => {
     // runSubturn itself never rejects (subturn.ts's own contract: every exit
-    // path resolves to a SubturnResult) — this test documents that runJudge
+    // path resolves to a SubturnResult) — this test documents that runVerifier
     // does not add its own try/catch around runSubturn and instead trusts
     // that contract, by asserting a call that resolves ok:false propagates
-    // cleanly without runJudge throwing.
+    // cleanly without runVerifier throwing.
     mockRunSubturn.mockResolvedValue({ ok: false, reason: "subturn failed: boom" })
     const client = makeClient()
     await expect(
-      runJudge(
+      runVerifier(
         client,
         { selfCreated: new SelfCreatedSessions(), logger: vi.fn() },
         {
@@ -1623,44 +1623,44 @@ describe("runJudge", () => {
 })
 
 // ===========================================================================
-// Judge reply parsing — found by UAT G12.
+// Verifier reply parsing — found by UAT G12.
 //
-// A real judge run was discarded with `judge:malformed {reason:"response is
+// A real verifier run was discarded with `verifier:malformed {reason:"response is
 // not valid JSON"}`: the plan had completed, the subturn had run, and the
-// verdict was thrown away because the model fenced its JSON. The judge agent
+// verdict was thrown away because the model fenced its JSON. The verifier agent
 // is told to return JSON and usually does, but "usually" is not a contract,
-// and each miss costs a full judge budget (up to 300s and a model call).
+// and each miss costs a full verifier budget (up to 300s and a model call).
 // ===========================================================================
 
-describe("parseJudgeResponse", () => {
+describe("parseVerifierResponse", () => {
   const verdict = { stories: [{ storyId: "S1", pass: true, summary: "tests cover the change", items: [{ itemId: "A1", met: true, note: "observed" }] }] }
 
   it("accepts bare JSON", () => {
-    expect(parseJudgeResponse(JSON.stringify(verdict))).toEqual(verdict)
+    expect(parseVerifierResponse(JSON.stringify(verdict))).toEqual(verdict)
   })
 
   it("accepts fenced JSON, with and without a language tag", () => {
-    expect(parseJudgeResponse("```json\n" + JSON.stringify(verdict) + "\n```")).toEqual(verdict)
-    expect(parseJudgeResponse("```\n" + JSON.stringify(verdict) + "\n```")).toEqual(verdict)
+    expect(parseVerifierResponse("```json\n" + JSON.stringify(verdict) + "\n```")).toEqual(verdict)
+    expect(parseVerifierResponse("```\n" + JSON.stringify(verdict) + "\n```")).toEqual(verdict)
   })
 
   it("accepts JSON preceded by prose", () => {
-    expect(parseJudgeResponse(`Here is my verdict:\n\n${JSON.stringify(verdict)}`)).toEqual(verdict)
+    expect(parseVerifierResponse(`Here is my verdict:\n\n${JSON.stringify(verdict)}`)).toEqual(verdict)
   })
 
   it("handles braces inside string values", () => {
     const tricky = { stories: [{ storyId: "S1", pass: false, summary: "saw a literal } and { in the diff", items: [] }] }
-    expect(parseJudgeResponse(`prose ${JSON.stringify(tricky)} trailing`)).toEqual(tricky)
+    expect(parseVerifierResponse(`prose ${JSON.stringify(tricky)} trailing`)).toEqual(tricky)
   })
 
   it("still returns undefined for a reply with no JSON at all (discrimination)", () => {
     // A genuinely non-JSON reply must remain malformed, not be guessed at.
-    expect(parseJudgeResponse("I think this looks fine to me, honestly.")).toBeUndefined()
-    expect(parseJudgeResponse("")).toBeUndefined()
+    expect(parseVerifierResponse("I think this looks fine to me, honestly.")).toBeUndefined()
+    expect(parseVerifierResponse("")).toBeUndefined()
   })
 
   it("does not repair malformed JSON", () => {
-    expect(parseJudgeResponse("{fit: pass, notes: unquoted}")).toBeUndefined()
+    expect(parseVerifierResponse("{fit: pass, notes: unquoted}")).toBeUndefined()
   })
 })
 
@@ -1682,7 +1682,7 @@ describe("FR-006a / C-9 — no usable secret fragment survives any wrap point", 
   it("leaks no >=16-char fragment at any of the 41 split points", () => {
     const leaks: string[] = []
     for (let i = 1; i < SECRET.length; i++) {
-      const payload = buildJudgePayload(
+      const payload = buildVerifierPayload(
         {
           criteria: [SECRET.slice(0, i), SECRET.slice(i)],
           diffSummary: "",
@@ -1702,7 +1702,7 @@ describe("FR-006a / C-9 — no usable secret fragment survives any wrap point", 
 
   it("still keeps the innocent path-join that motivated the fix", () => {
     const events: string[] = []
-    const payload = buildJudgePayload(
+    const payload = buildVerifierPayload(
       {
         criteria: [
           "  verifiers: jq -e .kpis research/space-exploration.json",
@@ -1717,7 +1717,7 @@ describe("FR-006a / C-9 — no usable secret fragment survives any wrap point", 
       (event) => events.push(event),
     )
     expect(payload.criteria).toHaveLength(2)
-    expect(events).not.toContain("judge:field-partial-drop")
+    expect(events).not.toContain("verifier:field-partial-drop")
   })
 })
 
@@ -1729,7 +1729,7 @@ describe("FR-006a / C-9 — no usable secret fragment survives any wrap point", 
 // ---------------------------------------------------------------------------
 describe("C1 — split-secret fragment adjacent to a unit dropped alone", () => {
   const scan = (criteria: string[]) =>
-    buildJudgePayload(
+    buildVerifierPayload(
       { criteria, diffSummary: "", verifierSummaries: [], lastResponse: "", recentTranscript: "", plan: "" },
       () => {},
     ).criteria ?? []
@@ -1797,13 +1797,13 @@ describe("C1 — split-secret fragment adjacent to a unit dropped alone", () => 
       "tok AKIAIOSFODNN7EXAMPLEKEYMATERIAL01",
       "createPlanRequestValidator ran clean",
       "snake_case_variable_name assigned correctly",
-      "tests/fixtures/judge-replay was refreshed",
+      "tests/fixtures/verifier-replay was refreshed",
       "documentationBuilder finished",
     ])
     expect(kept).toEqual([
       "createPlanRequestValidator ran clean",
       "snake_case_variable_name assigned correctly",
-      "tests/fixtures/judge-replay was refreshed",
+      "tests/fixtures/verifier-replay was refreshed",
       "documentationBuilder finished",
     ])
   })
@@ -1858,7 +1858,7 @@ describe("C1 — split-secret fragment adjacent to a unit dropped alone", () => 
     // are whole multi-line hunks — caught by the existing sk-live hunk test,
     // re-asserted here next to the fix it constrains.
     it("preserves newlines inside a surviving diff hunk beside a dropped one", () => {
-      const payload = buildJudgePayload(
+      const payload = buildVerifierPayload(
         {
           criteria: [],
           diffSummary: "diff --git a/s b/s\n@@ -1,1 +1,1 @@\n-tok AKIAIOSFODNN7EXAMPLEKEYMATERIAL01\ndiff --git a/b b/b\n@@ -2,2 +2,2 @@\n-old\n+new",
@@ -1909,7 +1909,7 @@ describe("C1 — split-secret fragment adjacent to a unit dropped alone", () => 
 // ---------------------------------------------------------------------------
 describe("MAJ-1: looksLikeWord is pinned in both directions", () => {
   const scan2 = (criteria: string[]) =>
-    buildJudgePayload(
+    buildVerifierPayload(
       { criteria, diffSummary: "", verifierSummaries: [], lastResponse: "", recentTranscript: "", plan: "" },
       () => {},
     ).criteria ?? []
@@ -1931,7 +1931,7 @@ describe("MAJ-1: looksLikeWord is pinned in both directions", () => {
 
   // always-false would strip these: each is ordinary content that must survive
   // intact beside a dropped secret.
-  const PROSE_TOKENS = ["createPlanRequestValidator", "snake_case_variable_name", "tests/fixtures/judge-replay", "documentationBuilder"]
+  const PROSE_TOKENS = ["createPlanRequestValidator", "snake_case_variable_name", "tests/fixtures/verifier-replay", "documentationBuilder"]
   for (const token of PROSE_TOKENS) {
     it(`keeps content: ${token}`, () => {
       expect(scan2(["tok AKIAIOSFODNN7EXAMPLEKEYMATERIAL01", `${token} was updated`])).toEqual([`${token} was updated`])
@@ -1943,7 +1943,7 @@ describe("MAJ-1: looksLikeWord is pinned in both directions", () => {
   // high-entropy token. Both must survive.
   it("keeps two prose lines whose join manufactures a high-entropy token", () => {
     expect(
-      scan2(["snake_case_variable_name assigned correctly", "tests/fixtures/judge-replay was refreshed"]),
+      scan2(["snake_case_variable_name assigned correctly", "tests/fixtures/verifier-replay was refreshed"]),
     ).toHaveLength(2)
   })
 })

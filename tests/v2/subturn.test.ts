@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest"
 
 import {
   SelfCreatedSessions,
-  JUDGE_PROBE_POLICY,
+  VERIFIER_PROBE_POLICY,
   buildDenyMap,
   buildToolPolicyMap,
   probeCapability,
@@ -92,8 +92,8 @@ function makeClient(opts: StubOpts = {}) {
 function baseRequest(overrides: Partial<SubturnRequest> = {}): SubturnRequest {
   return {
     parentSessionID: "parent-1",
-    agent: "vertex-judge",
-    system: "You are the judge.",
+    agent: "vertex-verifier",
+    system: "You are the verifier.",
     parts: [{ type: "text", text: "evaluate" }],
     tools: {},
     timeoutMs: 5000,
@@ -102,12 +102,12 @@ function baseRequest(overrides: Partial<SubturnRequest> = {}): SubturnRequest {
 }
 
 // ===========================================================================
-// Test 44: judge_tools_denied_or_refused
-// FR-030b / SC-017 / BDD "Judge subturn is refused when tools cannot be
+// Test 44: verifier_tools_denied_or_refused
+// FR-030b / SC-017 / BDD "Verifier subturn is refused when tools cannot be
 // disabled"
 // ===========================================================================
 
-describe("test 44: judge_tools_denied_or_refused", () => {
+describe("test 44: verifier_tools_denied_or_refused", () => {
   describe("happy path — probe passes, deny map is exact, agent field is exact", () => {
     it("buildDenyMap enumerates client.tool.ids() to false plus a wildcard entry", async () => {
       const client = makeClient()
@@ -123,30 +123,30 @@ describe("test 44: judge_tools_denied_or_refused", () => {
     })
 
     it("probeCapability passes when the resolved agent has zero enabled tools and full deny permissions", async () => {
-      const client = makeClient({ agents: [denyAllAgent("vertex-judge")] })
-      const result = await probeCapability(client, "vertex-judge")
+      const client = makeClient({ agents: [denyAllAgent("vertex-verifier")] })
+      const result = await probeCapability(client, "vertex-verifier")
       expect(result).toEqual({ ok: true })
     })
 
-    it("runSubturn sends the EXACT deny map and agent: \"vertex-judge\" on session.prompt", async () => {
-      const client = makeClient({ agents: [denyAllAgent("vertex-judge")] })
+    it("runSubturn sends the EXACT deny map and agent: \"vertex-verifier\" on session.prompt", async () => {
+      const client = makeClient({ agents: [denyAllAgent("vertex-verifier")] })
       const selfCreated = new SelfCreatedSessions()
       const logger = vi.fn()
       const denyMap = await buildDenyMap(client)
-      const probe = await probeCapability(client, "vertex-judge")
+      const probe = await probeCapability(client, "vertex-verifier")
       expect(probe.ok).toBe(true)
 
       const result = await runSubturn(
         client,
         selfCreated,
         logger,
-        baseRequest({ agent: "vertex-judge", tools: denyMap }),
+        baseRequest({ agent: "vertex-verifier", tools: denyMap }),
       )
 
       expect(result).toEqual({ ok: true, text: '{"fit":"pass","notes":"ok"}' })
       expect(client.session.prompt).toHaveBeenCalledTimes(1)
       const promptArgs = client.session.prompt.mock.calls[0][0]
-      expect(promptArgs.body.agent).toBe("vertex-judge")
+      expect(promptArgs.body.agent).toBe("vertex-verifier")
       expect(promptArgs.body.tools).toEqual({
         bash: false,
         edit: false,
@@ -161,7 +161,7 @@ describe("test 44: judge_tools_denied_or_refused", () => {
     })
 
     it("omits model from the prompt body when SubturnRequest.model is not supplied", async () => {
-      const client = makeClient({ agents: [denyAllAgent("vertex-judge")] })
+      const client = makeClient({ agents: [denyAllAgent("vertex-verifier")] })
       const selfCreated = new SelfCreatedSessions()
       await runSubturn(client, selfCreated, vi.fn(), baseRequest())
       const promptArgs = client.session.prompt.mock.calls[0][0]
@@ -169,7 +169,7 @@ describe("test 44: judge_tools_denied_or_refused", () => {
     })
 
     it("passes model through verbatim when SubturnRequest.model is supplied", async () => {
-      const client = makeClient({ agents: [denyAllAgent("vertex-judge")] })
+      const client = makeClient({ agents: [denyAllAgent("vertex-verifier")] })
       const selfCreated = new SelfCreatedSessions()
       await runSubturn(
         client,
@@ -185,7 +185,7 @@ describe("test 44: judge_tools_denied_or_refused", () => {
   describe("probe-failure path — zero session.create/session.prompt calls, exactly one probe failure result", () => {
     it("agent absent from client.app.agents()", async () => {
       const client = makeClient({ agents: [denyAllAgent("some-other-agent")] })
-      const result = await probeCapability(client, "vertex-judge")
+      const result = await probeCapability(client, "vertex-verifier")
       expect(result.ok).toBe(false)
       expect(result.reason).toMatch(/not present/i)
       expect(client.session.create).not.toHaveBeenCalled()
@@ -194,9 +194,9 @@ describe("test 44: judge_tools_denied_or_refused", () => {
 
     it("a tool resolves to true", async () => {
       const client = makeClient({
-        agents: [denyAllAgent("vertex-judge", { tools: { bash: true, edit: false } })],
+        agents: [denyAllAgent("vertex-verifier", { tools: { bash: true, edit: false } })],
       })
-      const result = await probeCapability(client, "vertex-judge")
+      const result = await probeCapability(client, "vertex-verifier")
       expect(result.ok).toBe(false)
       expect(result.reason).toMatch(/bash.*true|true.*bash/i)
       expect(client.session.create).not.toHaveBeenCalled()
@@ -206,12 +206,12 @@ describe("test 44: judge_tools_denied_or_refused", () => {
     it("permission.edit is not deny", async () => {
       const client = makeClient({
         agents: [
-          denyAllAgent("vertex-judge", {
+          denyAllAgent("vertex-verifier", {
             permission: { edit: "ask", bash: { "*": "deny" }, webfetch: "deny" },
           }),
         ],
       })
-      const result = await probeCapability(client, "vertex-judge")
+      const result = await probeCapability(client, "vertex-verifier")
       expect(result.ok).toBe(false)
       expect(result.reason).toMatch(/permission\.edit/)
       expect(client.session.create).not.toHaveBeenCalled()
@@ -221,12 +221,12 @@ describe("test 44: judge_tools_denied_or_refused", () => {
     it("permission.webfetch is not deny", async () => {
       const client = makeClient({
         agents: [
-          denyAllAgent("vertex-judge", {
+          denyAllAgent("vertex-verifier", {
             permission: { edit: "deny", bash: { "*": "deny" }, webfetch: "allow" },
           }),
         ],
       })
-      const result = await probeCapability(client, "vertex-judge")
+      const result = await probeCapability(client, "vertex-verifier")
       expect(result.ok).toBe(false)
       expect(result.reason).toMatch(/permission\.webfetch/)
     })
@@ -234,21 +234,21 @@ describe("test 44: judge_tools_denied_or_refused", () => {
     it("permission.bash has an entry that is not deny", async () => {
       const client = makeClient({
         agents: [
-          denyAllAgent("vertex-judge", {
+          denyAllAgent("vertex-verifier", {
             permission: { edit: "deny", bash: { "*": "deny", "rm -rf": "allow" }, webfetch: "deny" },
           }),
         ],
       })
-      const result = await probeCapability(client, "vertex-judge")
+      const result = await probeCapability(client, "vertex-verifier")
       expect(result.ok).toBe(false)
       expect(result.reason).toMatch(/permission\.bash/)
     })
 
     it("permission.bash resolves to no entries at all (fail-closed, cannot confirm deny-all)", async () => {
       const client = makeClient({
-        agents: [denyAllAgent("vertex-judge", { permission: { edit: "deny", bash: {}, webfetch: "deny" } })],
+        agents: [denyAllAgent("vertex-verifier", { permission: { edit: "deny", bash: {}, webfetch: "deny" } })],
       })
-      const result = await probeCapability(client, "vertex-judge")
+      const result = await probeCapability(client, "vertex-verifier")
       expect(result.ok).toBe(false)
       expect(result.reason).toMatch(/permission\.bash/)
     })
@@ -256,7 +256,7 @@ describe("test 44: judge_tools_denied_or_refused", () => {
     it("permission resolves as a live-host array-of-rules (not the documented flat object) — passes when edit/bash/webfetch are each denied", async () => {
       const client = makeClient({
         agents: [
-          denyAllAgent("vertex-judge", {
+          denyAllAgent("vertex-verifier", {
             permission: [
               { permission: "*", action: "allow", pattern: "*" },
               { permission: "doom_loop", action: "ask", pattern: "*" },
@@ -267,19 +267,19 @@ describe("test 44: judge_tools_denied_or_refused", () => {
           }),
         ],
       })
-      const result = await probeCapability(client, "vertex-judge")
+      const result = await probeCapability(client, "vertex-verifier")
       expect(result).toEqual({ ok: true })
     })
 
     it("array-of-rules permission: a generic permission:'*' allow rule does not count as an edit/bash/webfetch-specific deny", async () => {
       const client = makeClient({
         agents: [
-          denyAllAgent("vertex-judge", {
+          denyAllAgent("vertex-verifier", {
             permission: [{ permission: "*", action: "allow", pattern: "*" }] as unknown as Agent["permission"],
           }),
         ],
       })
-      const result = await probeCapability(client, "vertex-judge")
+      const result = await probeCapability(client, "vertex-verifier")
       expect(result.ok).toBe(false)
       expect(result.reason).toMatch(/permission\.edit/)
     })
@@ -287,7 +287,7 @@ describe("test 44: judge_tools_denied_or_refused", () => {
     it("array-of-rules permission: an edit rule that resolves to 'allow' is not read as denied even alongside a deny rule", async () => {
       const client = makeClient({
         agents: [
-          denyAllAgent("vertex-judge", {
+          denyAllAgent("vertex-verifier", {
             permission: [
               { permission: "edit", action: "deny", pattern: "*" },
               { permission: "edit", action: "allow", pattern: "*.md" },
@@ -297,7 +297,7 @@ describe("test 44: judge_tools_denied_or_refused", () => {
           }),
         ],
       })
-      const result = await probeCapability(client, "vertex-judge")
+      const result = await probeCapability(client, "vertex-verifier")
       expect(result.ok).toBe(false)
       expect(result.reason).toMatch(/permission\.edit/)
     })
@@ -308,7 +308,7 @@ describe("test 44: judge_tools_denied_or_refused", () => {
           throw new Error("host unreachable")
         },
       })
-      const result = await probeCapability(client, "vertex-judge")
+      const result = await probeCapability(client, "vertex-verifier")
       expect(result.ok).toBe(false)
       expect(result.reason).toMatch(/host unreachable/)
       expect(client.session.create).not.toHaveBeenCalled()
@@ -319,7 +319,7 @@ describe("test 44: judge_tools_denied_or_refused", () => {
       const client = makeClient({
         agentsImpl: async () => ({ data: undefined, error: "unauthorized" }),
       })
-      const result = await probeCapability(client, "vertex-judge")
+      const result = await probeCapability(client, "vertex-verifier")
       expect(result.ok).toBe(false)
       expect(result.reason).toMatch(/unauthorized/)
     })
@@ -336,8 +336,8 @@ describe("test 44: judge_tools_denied_or_refused", () => {
     it("end-to-end caller pattern: a failed probe must produce exactly one failure result and never reach runSubturn", async () => {
       const client = makeClient({ agents: [] }) // agent never registered
       const probeResults = []
-      probeResults.push(await probeCapability(client, "vertex-judge"))
-      // Caller (judge.ts, wave 2) short-circuits here — runSubturn is never
+      probeResults.push(await probeCapability(client, "vertex-verifier"))
+      // Caller (verifier.ts, wave 2) short-circuits here — runSubturn is never
       // invoked when the probe fails. This test asserts that discipline at
       // the subturn.ts boundary: nothing on the client was touched beyond
       // app.agents().
@@ -351,11 +351,11 @@ describe("test 44: judge_tools_denied_or_refused", () => {
 
   it("probeCapability and buildDenyMap tolerate a bare-value stub (no data/error wrapper)", async () => {
     const client = {
-      app: { agents: vi.fn(async () => [denyAllAgent("vertex-judge")]) },
+      app: { agents: vi.fn(async () => [denyAllAgent("vertex-verifier")]) },
       tool: { ids: vi.fn(async () => TOOL_IDS) },
       session: { create: vi.fn(), prompt: vi.fn(), delete: vi.fn() },
     } as unknown as OpencodeClient
-    const probe = await probeCapability(client, "vertex-judge")
+    const probe = await probeCapability(client, "vertex-verifier")
     expect(probe).toEqual({ ok: true })
     const denyMap = await buildDenyMap(client)
     expect(denyMap["*"]).toBe(false)
@@ -367,14 +367,14 @@ describe("test 44: judge_tools_denied_or_refused", () => {
 // probeCapabilityBounded — CRITICAL fix (post-review): probeCapability +
 // buildDenyMap raced against a caller-supplied budget so a hanging
 // client.app.agents()/client.tool.ids() cannot block the FR-030 5s total
-// budget indefinitely. Shared by judge.ts's runJudge and (once its owner
+// budget indefinitely. Shared by verifier.ts's runVerifier and (once its owner
 // adopts it) story.ts's classifyMultiStory.
 // ===========================================================================
 
 describe("probeCapabilityBounded", () => {
   it("resolves ok:true with the deny map when the probe passes within budget", async () => {
-    const client = makeClient({ agents: [denyAllAgent("vertex-judge")] })
-    const result = await probeCapabilityBounded(client, "vertex-judge", 5000)
+    const client = makeClient({ agents: [denyAllAgent("vertex-verifier")] })
+    const result = await probeCapabilityBounded(client, "vertex-verifier", 5000)
     expect(result).toEqual({
       ok: true,
       tools: { bash: false, edit: false, write: false, webfetch: false, read: false, "*": false },
@@ -383,7 +383,7 @@ describe("probeCapabilityBounded", () => {
 
   it("resolves ok:false cause:'probe' when probeCapability fails, and never calls buildDenyMap/tool.ids", async () => {
     const client = makeClient({ agents: [] }) // agent never registered
-    const result = await probeCapabilityBounded(client, "vertex-judge", 5000)
+    const result = await probeCapabilityBounded(client, "vertex-verifier", 5000)
     expect(result.ok).toBe(false)
     if (!result.ok) {
       expect(result.cause).toBe("probe")
@@ -394,12 +394,12 @@ describe("probeCapabilityBounded", () => {
 
   it("resolves ok:false cause:'deny-map' when buildDenyMap throws after a passing probe", async () => {
     const client = makeClient({
-      agents: [denyAllAgent("vertex-judge")],
+      agents: [denyAllAgent("vertex-verifier")],
       toolIdsImpl: async () => {
         throw new Error("tool ids endpoint unavailable")
       },
     })
-    const result = await probeCapabilityBounded(client, "vertex-judge", 5000)
+    const result = await probeCapabilityBounded(client, "vertex-verifier", 5000)
     expect(result.ok).toBe(false)
     if (!result.ok) {
       expect(result.cause).toBe("deny-map")
@@ -411,36 +411,36 @@ describe("probeCapabilityBounded", () => {
     const client = makeClient({
       agentsImpl: () => new Promise(() => {}), // never resolves
     })
-    const result = await probeCapabilityBounded(client, "vertex-judge", 25)
+    const result = await probeCapabilityBounded(client, "vertex-verifier", 25)
     expect(result).toEqual({ ok: false, cause: "timeout", reason: expect.any(String) })
   })
 
   it("resolves ok:false cause:'timeout' when the deny-map build hangs past budgetMs", async () => {
     const client = makeClient({
-      agents: [denyAllAgent("vertex-judge")],
+      agents: [denyAllAgent("vertex-verifier")],
       toolIdsImpl: () => new Promise(() => {}), // never resolves
     })
-    const result = await probeCapabilityBounded(client, "vertex-judge", 25)
+    const result = await probeCapabilityBounded(client, "vertex-verifier", 25)
     expect(result).toEqual({ ok: false, cause: "timeout", reason: expect.any(String) })
   })
 
   it("a passing probe well within budget does not spuriously report a timeout", async () => {
-    const client = makeClient({ agents: [denyAllAgent("vertex-judge")] })
-    const result = await probeCapabilityBounded(client, "vertex-judge", 5000)
+    const client = makeClient({ agents: [denyAllAgent("vertex-verifier")] })
+    const result = await probeCapabilityBounded(client, "vertex-verifier", 5000)
     expect(result.ok).toBe(true)
   })
 })
 
 // ===========================================================================
-// ProbePolicy / JUDGE_PROBE_POLICY / buildToolPolicyMap — HANDOVER.md point 3
-// (user decision, 2026-07-29): the judge's zero-tool posture is deliberately
+// ProbePolicy / VERIFIER_PROBE_POLICY / buildToolPolicyMap — HANDOVER.md point 3
+// (user decision, 2026-07-29): the verifier's zero-tool posture is deliberately
 // reversed — read/grep/glob/list/bash allowed, edit/write/webfetch/task still
 // provably denied. The DEFAULT policy (no policy argument) must reproduce the
 // original zero-tool behavior exactly so intake is unaffected.
 // ===========================================================================
 
-/** The judge's resolved shape under config.ts's JUDGE_PERMISSION +
- * buildJudgeToolsMap: allowlisted tools true, everything else false, with
+/** The verifier's resolved shape under config.ts's VERIFIER_PERMISSION +
+ * buildVerifierToolsMap: allowlisted tools true, everything else false, with
  * explicit deny rules for edit/write/webfetch/task. */
 /**
  * The bundled SDK types `Agent.permission` as a narrow object that has no
@@ -449,7 +449,7 @@ describe("probeCapabilityBounded", () => {
  * well). Tests must be able to express the shapes the host actually returns,
  * so the override bag is deliberately loose here rather than `Partial<Agent>`.
  */
-function judgePolicyAgent(name: string, overrides: Record<string, unknown> = {}): Agent {
+function verifierPolicyAgent(name: string, overrides: Record<string, unknown> = {}): Agent {
   return {
     name,
     mode: "subagent",
@@ -491,60 +491,60 @@ describe("ProbePolicy (HANDOVER.md point 3)", () => {
     expect(explicitDefaultFail).toEqual(noPolicyFail)
   })
 
-  it("JUDGE_PROBE_POLICY: allowlisted tools resolving true is OK (their absence is also not an error)", async () => {
-    const client = makeClient({ agents: [judgePolicyAgent("vertex-judge")] })
-    const result = await probeCapability(client, "vertex-judge", JUDGE_PROBE_POLICY)
+  it("VERIFIER_PROBE_POLICY: allowlisted tools resolving true is OK (their absence is also not an error)", async () => {
+    const client = makeClient({ agents: [verifierPolicyAgent("vertex-verifier")] })
+    const result = await probeCapability(client, "vertex-verifier", VERIFIER_PROBE_POLICY)
     expect(result).toEqual({ ok: true })
 
     // A host without `list` (missing capability, not unexpected capability)
     // degrades gracefully — still ok.
-    const withoutList = judgePolicyAgent("vertex-judge")
+    const withoutList = verifierPolicyAgent("vertex-verifier")
     delete (withoutList.tools as Record<string, boolean>).list
     const client2 = makeClient({ agents: [withoutList] })
-    const result2 = await probeCapability(client2, "vertex-judge", JUDGE_PROBE_POLICY)
+    const result2 = await probeCapability(client2, "vertex-verifier", VERIFIER_PROBE_POLICY)
     expect(result2).toEqual({ ok: true })
   })
 
-  it("JUDGE_PROBE_POLICY: a NON-allowlisted tool resolving true fails with a naming reason", async () => {
+  it("VERIFIER_PROBE_POLICY: a NON-allowlisted tool resolving true fails with a naming reason", async () => {
     const client = makeClient({
-      agents: [judgePolicyAgent("vertex-judge", { tools: { webfetch: true, read: true } })],
+      agents: [verifierPolicyAgent("vertex-verifier", { tools: { webfetch: true, read: true } })],
     })
-    const result = await probeCapability(client, "vertex-judge", JUDGE_PROBE_POLICY)
+    const result = await probeCapability(client, "vertex-verifier", VERIFIER_PROBE_POLICY)
     expect(result.ok).toBe(false)
     expect(result.reason).toMatch(/webfetch/)
     expect(result.reason).toMatch(/outside the allowlist/)
   })
 
-  it("JUDGE_PROBE_POLICY: each denyPermission key missing or not-deny fails with a naming reason", async () => {
+  it("VERIFIER_PROBE_POLICY: each denyPermission key missing or not-deny fails with a naming reason", async () => {
     // edit not deny
     let client = makeClient({
-      agents: [judgePolicyAgent("vertex-judge", { permission: { edit: "ask", write: "deny", webfetch: "deny", task: "deny" } })],
+      agents: [verifierPolicyAgent("vertex-verifier", { permission: { edit: "ask", write: "deny", webfetch: "deny", task: "deny" } })],
     })
-    let result = await probeCapability(client, "vertex-judge", JUDGE_PROBE_POLICY)
+    let result = await probeCapability(client, "vertex-verifier", VERIFIER_PROBE_POLICY)
     expect(result.ok).toBe(false)
     expect(result.reason).toMatch(/permission\.edit/)
 
     // write rule entirely absent (cannot confirm deny)
     client = makeClient({
-      agents: [judgePolicyAgent("vertex-judge", { permission: { edit: "deny", webfetch: "deny", task: "deny" } })],
+      agents: [verifierPolicyAgent("vertex-verifier", { permission: { edit: "deny", webfetch: "deny", task: "deny" } })],
     })
-    result = await probeCapability(client, "vertex-judge", JUDGE_PROBE_POLICY)
+    result = await probeCapability(client, "vertex-verifier", VERIFIER_PROBE_POLICY)
     expect(result.ok).toBe(false)
     expect(result.reason).toMatch(/permission\.write/)
 
     // webfetch allowed
     client = makeClient({
-      agents: [judgePolicyAgent("vertex-judge", { permission: { edit: "deny", write: "deny", webfetch: "allow", task: "deny" } })],
+      agents: [verifierPolicyAgent("vertex-verifier", { permission: { edit: "deny", write: "deny", webfetch: "allow", task: "deny" } })],
     })
-    result = await probeCapability(client, "vertex-judge", JUDGE_PROBE_POLICY)
+    result = await probeCapability(client, "vertex-verifier", VERIFIER_PROBE_POLICY)
     expect(result.ok).toBe(false)
     expect(result.reason).toMatch(/permission\.webfetch/)
 
-    // task not deny (no sub-subagents — the judge is a leaf)
+    // task not deny (no sub-subagents — the verifier is a leaf)
     client = makeClient({
-      agents: [judgePolicyAgent("vertex-judge", { permission: { edit: "deny", write: "deny", webfetch: "deny", task: "allow" } })],
+      agents: [verifierPolicyAgent("vertex-verifier", { permission: { edit: "deny", write: "deny", webfetch: "deny", task: "allow" } })],
     })
-    result = await probeCapability(client, "vertex-judge", JUDGE_PROBE_POLICY)
+    result = await probeCapability(client, "vertex-verifier", VERIFIER_PROBE_POLICY)
     expect(result.ok).toBe(false)
     expect(result.reason).toMatch(/permission\.task/)
   })
@@ -562,9 +562,9 @@ describe("ProbePolicy (HANDOVER.md point 3)", () => {
     })
   })
 
-  it("buildToolPolicyMap: an allowlisted name the host did not enumerate is still named true (and JUDGE_PROBE_POLICY's full allowlist round-trips)", async () => {
+  it("buildToolPolicyMap: an allowlisted name the host did not enumerate is still named true (and VERIFIER_PROBE_POLICY's full allowlist round-trips)", async () => {
     const client = makeClient() // TOOL_IDS lacks grep/glob/list
-    const map = await buildToolPolicyMap(client, JUDGE_PROBE_POLICY.allowTools!)
+    const map = await buildToolPolicyMap(client, VERIFIER_PROBE_POLICY.allowTools!)
     expect(map.read).toBe(true)
     expect(map.bash).toBe(true)
     expect(map.grep).toBe(true)
@@ -584,8 +584,8 @@ describe("ProbePolicy (HANDOVER.md point 3)", () => {
   })
 
   it("probeCapabilityBounded with a policy returns the allow-aware map (not a pure deny map)", async () => {
-    const client = makeClient({ agents: [judgePolicyAgent("vertex-judge")] })
-    const result = await probeCapabilityBounded(client, "vertex-judge", 5000, JUDGE_PROBE_POLICY)
+    const client = makeClient({ agents: [verifierPolicyAgent("vertex-verifier")] })
+    const result = await probeCapabilityBounded(client, "vertex-verifier", 5000, VERIFIER_PROBE_POLICY)
     expect(result).toEqual({
       ok: true,
       tools: {
@@ -604,9 +604,9 @@ describe("ProbePolicy (HANDOVER.md point 3)", () => {
 
   it("probeCapabilityBounded with a policy still refuses a non-allowlisted enabled tool before any map build", async () => {
     const client = makeClient({
-      agents: [judgePolicyAgent("vertex-judge", { tools: { edit: true, read: true } })],
+      agents: [verifierPolicyAgent("vertex-verifier", { tools: { edit: true, read: true } })],
     })
-    const result = await probeCapabilityBounded(client, "vertex-judge", 5000, JUDGE_PROBE_POLICY)
+    const result = await probeCapabilityBounded(client, "vertex-verifier", 5000, VERIFIER_PROBE_POLICY)
     expect(result.ok).toBe(false)
     if (!result.ok) {
       expect(result.cause).toBe("probe")
@@ -774,9 +774,9 @@ describe("SelfCreatedSessions", () => {
   })
 
   it("runSubturn records the created child session immediately after session.create", async () => {
-    const client = makeClient({ sessionCreateImpl: async () => ({ data: { id: "judge-child-9" }, error: undefined }) })
+    const client = makeClient({ sessionCreateImpl: async () => ({ data: { id: "verifier-child-9" }, error: undefined }) })
     const selfCreated = new SelfCreatedSessions()
     await runSubturn(client, selfCreated, vi.fn(), baseRequest())
-    expect(selfCreated.isSelfCreated("judge-child-9", () => null)).toBe(true)
+    expect(selfCreated.isSelfCreated("verifier-child-9", () => null)).toBe(true)
   })
 })

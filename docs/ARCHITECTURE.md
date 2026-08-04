@@ -19,21 +19,21 @@ before it cannot.
 |---|---|---|
 | **1. Behavioural contract** | Working habits injected into the session before any work starts: ground before asking, prove before claiming, stop thrashing after two failures, report with evidence. | `experimental.chat.system.transform` in `src/v2/plugin.ts`, composed by `src/v2/composer.ts` |
 | **2. Live detection and correction** | The loop is watched as it runs — edits, commands, exit codes, repeated failures, dropped promises, scope drift — and a correction is injected **at that moment**. | `tool.execute.after` + `event → session.idle` in `src/v2/plugin.ts`, rules in `src/v2/wiring/gate.ts` |
-| **3. Independent judge** | A **separate subagent session** (`vertex-judge`) opens the real worktree and rules on each acceptance criterion. It can reject the claim and reopen the work. | `runJudge` in `src/v2/judge.ts`, driven by `handleJudgeAudit` in `src/v2/wiring/gate.ts` |
+| **3. Independent verifier** | A **separate subagent session** (`vertex-verifier`) opens the real worktree and rules on each acceptance criterion. It can reject the claim and reopen the work. | `runVerifier` in `src/v2/verifier.ts`, driven by `handleVerifierAudit` in `src/v2/wiring/gate.ts` |
 
 Layer 1 is a prompt. Layer 2 is a control loop. Layer 3 is an audit.
 
-### Why a separate session for the judge
+### Why a separate session for the verifier
 
-The judge runs in a child session created through `src/v2/subturn.ts`
-(`runSubturn`), registered as the `vertex-judge` agent in
-`src/v2/wiring/config.ts` under `JUDGE_PERMISSION`: `"*": "deny"` with
+The verifier runs in a child session created through `src/v2/subturn.ts`
+(`runSubturn`), registered as the `vertex-verifier` agent in
+`src/v2/wiring/config.ts` under `VERIFIER_PERMISSION`: `"*": "deny"` with
 `read`/`grep`/`glob`/`list`/`bash` allowed and `edit`/`write`/`task`/`webfetch`
 denied. It can read the tree and run verifiers; it has no edit tool. That
 isolation is the point — the session that did the work does not get to grade
 it.
 
-Its payload is built by `buildJudgePayload` (`src/v2/judge.ts`), which
+Its payload is built by `buildVerifierPayload` (`src/v2/verifier.ts`), which
 redacts secrets before anything leaves the process — the plan digest, changed
 paths, verifier output and recent transcript are all scanned, including for
 secrets wrapped across line boundaries.
@@ -51,24 +51,24 @@ Multi-story work is recorded through the plan tools in
   computes parallel waves from the dependency graph rather than storing wave
   numbers.
 - Checkpointing a task is a **claim**, not a close. When every task in a story
-  is complete, the judge audits it at the next idle and either confirms it or
-  reverts it with named gaps (`applyJudgeVerdicts` in `src/v2/story.ts`).
+  is complete, the verifier audits it at the next idle and either confirms it or
+  reverts it with named gaps (`applyVerifierVerdicts` in `src/v2/story.ts`).
 
 ### Checks vs. acceptance criteria
 
-A deliberate split, and the reason receipts and the judge do not do the same
+A deliberate split, and the reason receipts and the verifier do not do the same
 job:
 
 - **Technical checks** (`verifiers`, verification receipts in
   `src/v2/coverage.ts`) are **evidence**. A receipt asserts exactly one thing —
   this command ran and exited 0 — and may be credited loosely.
-- **Acceptance criteria** are settled by **judgement** against the worktree.
-  Acceptance items carry no receipt requirement; the completion judge is the
+- **Acceptance criteria** are settled by **verifierment** against the worktree.
+  Acceptance items carry no receipt requirement; the completion verifier is the
   sole arbiter of whether a checkpoint's claim was real.
 
 Applying acceptance-criteria strictness to a technical check was measured to
 cost everything and buy nothing: in the audited session it produced 146
-relevance-gaps and zero receipts, which also left the judge's cross-check with
+relevance-gaps and zero receipts, which also left the verifier's cross-check with
 no data.
 
 ---

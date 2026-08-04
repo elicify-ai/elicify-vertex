@@ -42,7 +42,7 @@ Four of those are gates, not steps:
 - **The plan gate** opens for multi-story implementation only; shut, the three
   steps after it do not apply.
 - **The plan** is recorded only after the user agrees to it.
-- **Each story** is claimed by you but closed only by the completion judge,
+- **Each story** is claimed by you but closed only by the completion verifier,
   which independently verifies your claim against the worktree.
 - **The report** is made only once every story is settled.
 
@@ -143,7 +143,7 @@ them are parallel — do not serialize them.
    ("`NormalizedTrace` has fields X/Y/Z", "`make check` passes") — `verifiers`,
    the exact commands that prove it, and `tasks` (each `{ text, dependsOn? }`).
    "It works" is not an acceptance criterion; "npm test passes and /health
-   returns 200" is. The completion judge reads these claims and checks them
+   returns 200" is. The completion verifier reads these claims and checks them
    against the real worktree — write them so an independent auditor could
    verify each one without asking you anything.
 
@@ -179,7 +179,7 @@ Where it is real, run the wave in this order:
    isolation is not integration passing.
 7. Checkpoint **each task** with `elicify_vertex_plan_checkpoint` (pass the
    `taskId`) as it finishes. A story **auto-completes** when all its tasks are
-   done — at which point the completion judge audits its acceptance items
+   done — at which point the completion verifier audits its acceptance items
    against the worktree and re-opens it with named gaps if the claim does not
    hold. The next wave of tasks (those whose dependencies are now complete)
    activates automatically. A checkpoint is a *claim*, not a close.
@@ -257,10 +257,10 @@ Documented tendencies; counteract them.
   `taskId`). A story auto-completes when all its tasks are done. Leaving a
   task silently open is not an ending.
 - **Checkpointing a task `complete` is a claim, not a close.** Once a story's
-  tasks are all done the completion judge independently audits that story at
+  tasks are all done the completion verifier independently audits that story at
   the next idle — reading the worktree and re-running its declared verifiers
   itself. Claim only what you have genuinely delivered and verified. If the
-  judge re-opens a story, it re-opens its tasks and names the exact acceptance
+  verifier re-opens a story, it re-opens its tasks and names the exact acceptance
   items that failed and why — fix those, verify, and checkpoint the tasks
   again.
 - **`blocked`/`failed` is not permanent.** Once whatever caused it is resolved,

@@ -1,14 +1,14 @@
 /**
- * elicify-vertex v2 — integration tests: judge subturn through the real
- * wired plugin (wave 4, cluster "judge subturn through the real wired
+ * elicify-vertex v2 — integration tests: verifier subturn through the real
+ * wired plugin (wave 4, cluster "verifier subturn through the real wired
  * plugin").
  * ---------------------------------------------------------------------------
- * Covers TDD Plan tests 29 (`judge_async_fail_open`), 36
- * (`judge_model_selection_and_fallback`), 51
- * (`judge_verdict_appended_happy_path`) — US-9 / FR-030 / FR-030a / FR-032 —
+ * Covers TDD Plan tests 29 (`verifier_async_fail_open`), 36
+ * (`verifier_model_selection_and_fallback`), 51
+ * (`verifier_verdict_appended_happy_path`) — US-9 / FR-030 / FR-030a / FR-032 —
  * driven against the REAL wired `ElicifyVertexPluginV2` hook set
- * (`event(session.idle)` -> `src/v2/wiring/gate.ts` -> `src/v2/judge.ts` ->
- * `src/v2/subturn.ts`), not a mocked judge module. `makeStubClient` and the
+ * (`event(session.idle)` -> `src/v2/wiring/gate.ts` -> `src/v2/verifier.ts` ->
+ * `src/v2/subturn.ts`), not a mocked verifier module. `makeStubClient` and the
  * driver helpers below are a deliberate copy of `tests/v2/plugin.integration
  * .test.ts`'s own helpers (same `{data,error}` SDK response shape) per the
  * task brief — importing from that file would race its concurrent edits by
@@ -26,11 +26,11 @@
  *   story whose `status === "active"`, and `elicify_vertex_plan_checkpoint`
  *   unconditionally flips even the FINAL story away from "active" on
  *   completion, with no replacement promoted (none remain). So by the time
- *   `appendJudgeCloseOut`'s `finalStory.status === "complete"` precondition
+ *   `appendVerifierCloseOut`'s `finalStory.status === "complete"` precondition
  *   could ever be true, `getActiveStory` was *guaranteed* to return `null`,
  *   `phaseEngine.onIdle` read a phase slot nothing had ever written to,
- *   defaulted to `"intake"` instead of `"elevate"`, and `appendJudgeCloseOut`
- *   was never invoked — the judge was structurally unreachable for every
+ *   defaulted to `"intake"` instead of `"elevate"`, and `appendVerifierCloseOut`
+ *   was never invoked — the verifier was structurally unreachable for every
  *   story-plan session, in either hook-call order (idle-then-checkpoint or
  *   checkpoint-then-idle).
  *
@@ -41,8 +41,8 @@
  *   mutation/verifier-outcome call sites in `src/v2/plugin.ts` is
  *   `resolveStoryIdForPhase` (see that function's doc comment — "FIX #1").
  *
- *   The judge MODULE itself (`src/v2/judge.ts`) has always been independently
- *   covered and passing in `tests/v2/judge.test.ts`; this file exercises the
+ *   The verifier MODULE itself (`src/v2/verifier.ts`) has always been independently
+ *   covered and passing in `tests/v2/verifier.test.ts`; this file exercises the
  *   WIRING path end to end and is what now proves the fix holds — these
  *   tests are live regressions: if the fallback above is ever reverted or
  *   narrowed, they fail again.
@@ -58,13 +58,13 @@ import type { Agent } from "@opencode-ai/sdk"
 
 import { VerificationReceiptStore } from "../../src/goals.js"
 import { eventsPath } from "../../src/measurement.js"
-import { JUDGE_TOTAL_BUDGET_MS } from "../../src/v2/judge.js"
+import { VERIFIER_TOTAL_BUDGET_MS } from "../../src/v2/verifier.js"
 import { ElicifyVertexPluginV2 } from "../../src/v2/plugin.js"
 
 // ---------------------------------------------------------------------------
 // Shared stub client — copied from tests/v2/plugin.integration.test.ts (see
 // that file's header comment for why it isn't imported). Extended with a
-// `promptImpl` escape hatch so a test can control the judge subturn's
+// `promptImpl` escape hatch so a test can control the verifier subturn's
 // `session.prompt` response per-call (hang, reject, or return a specific
 // verdict) the same way tests/v2/subturn.test.ts's `makeClient` does.
 // ---------------------------------------------------------------------------
@@ -88,7 +88,7 @@ function denyAllAgent(name: string): Agent {
     mode: "subagent",
     builtIn: false,
     // Deny the UNION of both probe policies: intake's default
-    // (edit/bash/webfetch) and the judge's JUDGE_PROBE_POLICY
+    // (edit/bash/webfetch) and the verifier's VERIFIER_PROBE_POLICY
     // (edit/write/webfetch/task) — see src/v2/subturn.ts.
     permission: { edit: "deny", write: "deny", bash: { "*": "deny" }, webfetch: "deny", task: "deny" },
     tools: { bash: false, edit: false, write: false, webfetch: false, read: false, task: false, "*": false },
@@ -112,7 +112,7 @@ function makeStubClient(
   opts: {
     promptText?: (agent: string | undefined) => string
     promptImpl?: (args: PromptArgs) => Promise<PromptResult>
-    /** `gate.ts`'s `fetchJudgeTranscriptFields` override — same escape-hatch
+    /** `gate.ts`'s `fetchVerifierTranscriptFields` override — same escape-hatch
      * pattern as `promptImpl` above. Defaults to the existing empty-history
      * stub (`{data: [], error: undefined}`) so every test that doesn't care
      * about transcript content is unaffected. */
@@ -140,7 +140,7 @@ function makeStubClient(
     return { data: [], error: undefined }
   })
   const appAgents = vi.fn(async () => ({
-    data: [denyAllAgent("vertex-judge"), denyAllAgent("vertex-intake")],
+    data: [denyAllAgent("vertex-verifier"), denyAllAgent("vertex-intake")],
     error: undefined,
   }))
   const toolIds = vi.fn(async () => ({ data: ["bash", "edit", "write", "webfetch", "read"], error: undefined }))
@@ -158,11 +158,11 @@ let dataDir: string
 let savedVertexData: string | undefined
 
 beforeEach(() => {
-  workDir = mkdtempSync(join(tmpdir(), "vertex-v2-judge-work-"))
-  dataDir = mkdtempSync(join(tmpdir(), "vertex-v2-judge-data-"))
+  workDir = mkdtempSync(join(tmpdir(), "vertex-v2-verifier-work-"))
+  dataDir = mkdtempSync(join(tmpdir(), "vertex-v2-verifier-data-"))
   savedVertexData = process.env.VERTEX_DATA
   process.env.VERTEX_DATA = dataDir
-  process.env.VERTEX_JUDGE = "1"
+  process.env.VERTEX_VERIFIER = "1"
 })
 
 afterEach(() => {
@@ -170,7 +170,7 @@ afterEach(() => {
   rmSync(dataDir, { recursive: true, force: true })
   if (savedVertexData === undefined) delete process.env.VERTEX_DATA
   else process.env.VERTEX_DATA = savedVertexData
-  delete process.env.VERTEX_JUDGE
+  delete process.env.VERTEX_VERIFIER
   delete process.env.VERTEX_V2
   vi.useRealTimers()
   vi.restoreAllMocks()
@@ -230,12 +230,12 @@ function idleContinuationTexts(client: StubClient, sessionID: string): string[] 
     })
 }
 
-/** `session.prompt` calls the judge subturn specifically issued (agent ===
- * "vertex-judge"), in call order. */
-function judgePromptCalls(client: StubClient): PromptArgs[] {
+/** `session.prompt` calls the verifier subturn specifically issued (agent ===
+ * "vertex-verifier"), in call order. */
+function verifierPromptCalls(client: StubClient): PromptArgs[] {
   return client.session.prompt.mock.calls
     .map((call: unknown[]) => call[0] as PromptArgs)
-    .filter((arg) => arg?.body?.agent === "vertex-judge")
+    .filter((arg) => arg?.body?.agent === "vertex-verifier")
 }
 
 function readEvents(): Array<Record<string, unknown>> {
@@ -311,14 +311,14 @@ async function setUpFinalStoryVerified(
 }
 
 // ===========================================================================
-// Test 29: judge_async_fail_open (FR-030 / FR-032)
+// Test 29: verifier_async_fail_open (FR-030 / FR-032)
 // ===========================================================================
 
-describe("test 29: judge_async_fail_open", () => {
-  it("a judge subturn that hangs past the 5s cap fails open without hanging the test, logs judge:unavailable, and cleans up its child session", async () => {
+describe("test 29: verifier_async_fail_open", () => {
+  it("a verifier subturn that hangs past the 5s cap fails open without hanging the test, logs verifier:unavailable, and cleans up its child session", async () => {
     const client = makeStubClient({
       promptImpl: async (args) => {
-        if (args.body?.agent === "vertex-judge") {
+        if (args.body?.agent === "vertex-verifier") {
           return new Promise(() => {
             /* never resolves — mirrors tests/v2/subturn.test.ts's hang-past-timeout stub */
           })
@@ -328,7 +328,7 @@ describe("test 29: judge_async_fail_open", () => {
     })
     const recordSpy = vi.spyOn(VerificationReceiptStore.prototype, "record")
     const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
-    const sid = "judge-fail-open-session"
+    const sid = "verifier-fail-open-session"
 
     const { taskId } = await setUpFinalStoryVerified(
       hooks,
@@ -350,20 +350,20 @@ describe("test 29: judge_async_fail_open", () => {
 
     vi.useFakeTimers()
     const idlePromise = idle(hooks, sid)
-    // Advance well past the judge's total budget so the hang-past-timeout
+    // Advance well past the verifier's total budget so the hang-past-timeout
     // subturn resolves via its own internal timeout instead of really
-    // waiting out JUDGE_TOTAL_BUDGET_MS in real time.
-    await vi.advanceTimersByTimeAsync(JUDGE_TOTAL_BUDGET_MS + 1000)
+    // waiting out VERIFIER_TOTAL_BUDGET_MS in real time.
+    await vi.advanceTimersByTimeAsync(VERIFIER_TOTAL_BUDGET_MS + 1000)
     await idlePromise // must not hang the test either way
     vi.useRealTimers()
 
     const events = readEvents()
-    // appendJudgeCloseOut IS reached (see this file's header for the
-    // storyId/getActiveStory fallback that makes this so) — the judge
+    // appendVerifierCloseOut IS reached (see this file's header for the
+    // storyId/getActiveStory fallback that makes this so) — the verifier
     // subturn is invoked, hangs past its budget, and fails open.
-    expect(events.some((e) => e.event_type === "judge:unavailable")).toBe(true)
+    expect(events.some((e) => e.event_type === "verifier:unavailable")).toBe(true)
 
-    // The vertex-judge child session is created and, on the hang-timeout
+    // The vertex-verifier child session is created and, on the hang-timeout
     // fail-open path, cleaned up.
     expect(client.session.create).toHaveBeenCalledTimes(1)
     expect(client.session.delete).toHaveBeenCalledTimes(1)
@@ -371,14 +371,14 @@ describe("test 29: judge_async_fail_open", () => {
 })
 
 // ===========================================================================
-// Test 36: judge_model_selection_and_fallback (FR-030a)
+// Test 36: verifier_model_selection_and_fallback (FR-030a)
 // ===========================================================================
 
-describe("test 36: judge_model_selection_and_fallback", () => {
-  it("(a) defaults to the session's own model when no judgeModel option is configured", async () => {
+describe("test 36: verifier_model_selection_and_fallback", () => {
+  it("(a) defaults to the session's own model when no verifierModel option is configured", async () => {
     const client = makeStubClient({
       promptImpl: async (args) => {
-        if (args.body?.agent === "vertex-judge") {
+        if (args.body?.agent === "vertex-verifier") {
           return {
             data: {
               info: {},
@@ -397,7 +397,7 @@ describe("test 36: judge_model_selection_and_fallback", () => {
     })
     const recordSpy = vi.spyOn(VerificationReceiptStore.prototype, "record")
     const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
-    const sid = "judge-model-default-session"
+    const sid = "verifier-model-default-session"
 
     const { taskId } = await setUpFinalStoryVerified(
       hooks,
@@ -416,7 +416,7 @@ describe("test 36: judge_model_selection_and_fallback", () => {
 
     await idle(hooks, sid)
 
-    const calls = judgePromptCalls(client)
+    const calls = verifierPromptCalls(client)
     expect(calls.length).toBe(1)
     expect(calls[0]?.body?.model).toEqual({ providerID: "minimax", modelID: "MiniMax-M3" })
 
@@ -425,15 +425,15 @@ describe("test 36: judge_model_selection_and_fallback", () => {
     expect(createArgs?.body?.parentID).toBe(sid)
 
     // Redesign point 2/4: a passed claim on the settled plan dispatches the
-    // close-out continuation (the judge verified every story).
+    // close-out continuation (the verifier verified every story).
     const continuationTexts = idleContinuationTexts(client, sid)
     expect(continuationTexts.some((t) => t.includes("passed audit"))).toBe(true)
   })
 
-  it("(b) falls back to the session model when the configured judgeModel's attempt rejects, appending the verdict on the retry's success", async () => {
+  it("(b) falls back to the session model when the configured verifierModel's attempt rejects, appending the verdict on the retry's success", async () => {
     const client = makeStubClient({
       promptImpl: async (args) => {
-        if (args.body?.agent !== "vertex-judge") {
+        if (args.body?.agent !== "vertex-verifier") {
           return { data: { info: {}, parts: [{ type: "text", text: '{"multiStory":false}' }] }, error: undefined }
         }
         if (args.body?.model?.providerID === "provider-x") {
@@ -454,8 +454,8 @@ describe("test 36: judge_model_selection_and_fallback", () => {
       },
     })
     const recordSpy = vi.spyOn(VerificationReceiptStore.prototype, "record")
-    const hooks = await ElicifyVertexPluginV2(pluginInput(client), { judgeModel: "provider-x/model-y" } as never)
-    const sid = "judge-model-fallback-session"
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), { verifierModel: "provider-x/model-y" } as never)
+    const sid = "verifier-model-fallback-session"
 
     const { taskId } = await setUpFinalStoryVerified(
       hooks,
@@ -474,7 +474,7 @@ describe("test 36: judge_model_selection_and_fallback", () => {
 
     await idle(hooks, sid)
 
-    const calls = judgePromptCalls(client)
+    const calls = verifierPromptCalls(client)
     expect(calls.length).toBe(2)
     expect(calls[0]?.body?.model).toEqual({ providerID: "provider-x", modelID: "model-y" })
     expect(calls[1]?.body?.model).toEqual({ providerID: "minimax", modelID: "MiniMax-M3" })
@@ -486,18 +486,18 @@ describe("test 36: judge_model_selection_and_fallback", () => {
 })
 
 // ===========================================================================
-// Test 51: judge_verdict_appended_happy_path (FR-030)
+// Test 51: verifier_verdict_appended_happy_path (FR-030)
 // ===========================================================================
 
-describe("test 51: judge_verdict_appended_happy_path", () => {
+describe("test 51: verifier_verdict_appended_happy_path", () => {
   it("a failed audit reverts the claimed story to active and dispatches a continuation naming the unmet acceptance item", async () => {
-    // Redesign points 2/4/8: the judge is the arbiter. A failing verdict on a
+    // Redesign points 2/4/8: the verifier is the arbiter. A failing verdict on a
     // claimed-complete story REVERTS it to "active" (the claim is rejected)
     // and dispatches a constructive continuation that names each unmet
-    // acceptance item and the judge's note for it — not a generic reminder.
+    // acceptance item and the verifier's note for it — not a generic reminder.
     const client = makeStubClient({
       promptImpl: async (args) => {
-        if (args.body?.agent === "vertex-judge") {
+        if (args.body?.agent === "vertex-verifier") {
           return {
             data: {
               info: {},
@@ -525,7 +525,7 @@ describe("test 51: judge_verdict_appended_happy_path", () => {
     })
     const recordSpy = vi.spyOn(VerificationReceiptStore.prototype, "record")
     const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
-    const sid = "judge-happy-path-session"
+    const sid = "verifier-happy-path-session"
 
     const { storyId, taskId, itemId } = await setUpFinalStoryVerified(
       hooks,
@@ -541,7 +541,7 @@ describe("test 51: judge_verdict_appended_happy_path", () => {
       sid,
     )
     const checkpointed = JSON.parse(checkpointRaw) as { stories: Array<{ status: string }> }
-    // A checkpoint is a claim — it always succeeds; the judge audits it next.
+    // A checkpoint is a claim — it always succeeds; the verifier audits it next.
     expect(checkpointed.stories[0].status).toBe("complete")
 
     await idle(hooks, sid)
@@ -553,9 +553,9 @@ describe("test 51: judge_verdict_appended_happy_path", () => {
     }
     expect(afterAudit.stories.find((s) => s.id === storyId)?.status).toBe("active")
 
-    // The continuation names the unmet item id and the judge's note verbatim.
+    // The continuation names the unmet item id and the verifier's note verbatim.
     const continuationTexts = idleContinuationTexts(client, sid)
-    expect(continuationTexts.some((t) => t.includes("[vertex:judge]"))).toBe(true)
+    expect(continuationTexts.some((t) => /verifier/i.test(t))).toBe(true)
     expect(continuationTexts.some((t) => t.includes(itemId))).toBe(true)
     expect(continuationTexts.some((t) => t.includes("no passing verifier observed for this criterion"))).toBe(true)
   })
@@ -563,26 +563,26 @@ describe("test 51: judge_verdict_appended_happy_path", () => {
 
 // ===========================================================================
 // Staggered-audit close-out (redesign point 2/4): the close-out continuation
-// fires once the WHOLE plan is settled and every story has a passing judge
+// fires once the WHOLE plan is settled and every story has a passing verifier
 // stamp — including when stories pass audit in SEPARATE idle audits, not only
 // when the final story is in the settling audit's set. Pins the gap a review
-// flagged (a final story passing while a non-final one is still unjudged).
+// flagged (a final story passing while a non-final one is still unverifiedStories).
 // ===========================================================================
-describe("judge close-out fires once every story has passed audit, across staggered audits", () => {
+describe("verifier close-out fires once every story has passed audit, across staggered audits", () => {
   it("final passes in audit 1, non-final passes in audit 2 -> close-out fires on audit 2", async () => {
-    let judgeCall = 0
+    let verifierCall = 0
     const client = makeStubClient({
       promptImpl: async (args) => {
-        if (args.body?.agent !== "vertex-judge") {
+        if (args.body?.agent !== "vertex-verifier") {
           return { data: { info: {}, parts: [{ type: "text", text: '{"multiStory":false}' }] }, error: undefined }
         }
-        // Audit 1 audits only S2 (the final story, the sole unjudged claim at
+        // Audit 1 audits only S2 (the final story, the sole unverifiedStories claim at
         // that point because S1 was claimed in the same batch but... see below);
         // audit 2 audits S1. Each returns a pass for the story it was asked
         // about. (The payload's `plan` field names the audit set; call order
-        // is deterministic since there is no judgeModel override.)
-        judgeCall += 1
-        const storyId = judgeCall === 1 ? "S2" : "S1"
+        // is deterministic since there is no verifierModel override.)
+        verifierCall += 1
+        const storyId = verifierCall === 1 ? "S2" : "S1"
         return {
           data: {
             info: {},
@@ -602,7 +602,7 @@ describe("judge close-out fires once every story has passed audit, across stagge
       },
     })
     const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
-    const sid = "judge-staggered-session"
+    const sid = "verifier-staggered-session"
     await activate(hooks, sid, "fix a typo in the readme", { providerID: "anthropic", id: "claude-fable-5" })
 
     await callTool(
@@ -623,14 +623,14 @@ describe("judge close-out fires once every story has passed audit, across stagge
     await callTool(hooks, "elicify_vertex_plan_checkpoint", { taskId: "S1.T1", status: "complete" }, sid)
     await callTool(hooks, "elicify_vertex_plan_checkpoint", { taskId: "S2.T1", status: "complete" }, sid)
 
-    // Audit 1: both are unjudged. The judge (stub) returns a pass for "S2"
+    // Audit 1: both are unverifiedStories. The verifier (stub) returns a pass for "S2"
     // only; the audit set is {S1,S2}, so S1 is left without a stamp -> NOT
     // settled+allPassed -> no close-out yet.
     await idle(hooks, sid)
     let continuations = idleContinuationTexts(client, sid)
     expect(continuations.some((t) => t.includes("passed audit"))).toBe(false)
 
-    // Audit 2: S1 is the sole remaining unjudged claim; it passes -> now every
+    // Audit 2: S1 is the sole remaining unverifiedStories claim; it passes -> now every
     // story has a passing stamp -> close-out fires.
     await idle(hooks, sid)
     continuations = idleContinuationTexts(client, sid)
@@ -639,33 +639,33 @@ describe("judge close-out fires once every story has passed audit, across stagge
 })
 
 // ===========================================================================
-// fetchJudgeTranscriptFields (gate.ts, docs/JUDGE-PROMPT.md §5) — test-quality
+// fetchVerifierTranscriptFields (gate.ts, docs/VERIFIER-PROMPT.md §5) — test-quality
 // review finding: this function (and its helpers extractEntryText/
 // isFieldsStyle) had ZERO coverage. Proof cited by the reviewer: mutating it
 // to select the last USER message instead of the last ASSISTANT message for
-// `lastResponse` left the full 1270-test suite green. `fetchJudgeTranscriptFields`
+// `lastResponse` left the full 1270-test suite green. `fetchVerifierTranscriptFields`
 // is not exported (gate.ts's SCOPE deliberately keeps it private — see this
 // file's helpers), so these drive it the same way every other test in this
 // file does: through the REAL wired hook set, via the new `messagesImpl`
 // escape hatch on `client.session.messages`, reading back what actually
-// reached the judge subturn's own `session.prompt` call (the JSON-stringified
-// payload built by `buildJudgePayload`).
+// reached the verifier subturn's own `session.prompt` call (the JSON-stringified
+// payload built by `buildVerifierPayload`).
 // ===========================================================================
 
-function judgePayloadFromCall(call: PromptArgs | undefined): { lastResponse?: string; recentTranscript?: string } {
+function verifierPayloadFromCall(call: PromptArgs | undefined): { lastResponse?: string; recentTranscript?: string } {
   const text = call?.body?.parts?.[0]?.text
-  if (typeof text !== "string") throw new Error("no vertex-judge prompt call captured")
+  if (typeof text !== "string") throw new Error("no vertex-verifier prompt call captured")
   return JSON.parse(text) as { lastResponse?: string; recentTranscript?: string }
 }
 
-/** A `client.session.messages` entry in the shape `fetchJudgeTranscriptFields`
- * reads (`JudgeTranscriptEntry` in gate.ts): `info.role` + one text part. */
+/** A `client.session.messages` entry in the shape `fetchVerifierTranscriptFields`
+ * reads (`VerifierTranscriptEntry` in gate.ts): `info.role` + one text part. */
 function entry(role: "user" | "assistant", text: string) {
   return { info: { id: `m-${role}-${Math.random()}`, role }, parts: [{ type: "text", text }] }
 }
 
-const passingJudgePromptImpl = async (args: PromptArgs): Promise<PromptResult> => {
-  if (args.body?.agent === "vertex-judge") {
+const passingVerifierPromptImpl = async (args: PromptArgs): Promise<PromptResult> => {
+  if (args.body?.agent === "vertex-verifier") {
     return {
       data: { info: {}, parts: [{ type: "text", text: '{"fit":"pass","summary":"ok","gaps":[]}' }] },
       error: undefined,
@@ -674,7 +674,7 @@ const passingJudgePromptImpl = async (args: PromptArgs): Promise<PromptResult> =
   return { data: { info: {}, parts: [{ type: "text", text: '{"multiStory":false}' }] }, error: undefined }
 }
 
-describe("fetchJudgeTranscriptFields: lastResponse is the last ASSISTANT message, never the last user message", () => {
+describe("fetchVerifierTranscriptFields: lastResponse is the last ASSISTANT message, never the last user message", () => {
   it("a transcript ending on a trailing USER message still resolves lastResponse to the earlier ASSISTANT message", async () => {
     const transcript = [
       entry("user", "please do X"),
@@ -687,12 +687,12 @@ describe("fetchJudgeTranscriptFields: lastResponse is the last ASSISTANT message
       entry("user", "one more thing please also handle the edge case"),
     ]
     const client = makeStubClient({
-      promptImpl: passingJudgePromptImpl,
+      promptImpl: passingVerifierPromptImpl,
       messagesImpl: async () => ({ data: transcript, error: undefined }),
     })
     const recordSpy = vi.spyOn(VerificationReceiptStore.prototype, "record")
     const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
-    const sid = "judge-transcript-lastresponse-session"
+    const sid = "verifier-transcript-lastresponse-session"
 
     const { taskId } = await setUpFinalStoryVerified(
       hooks,
@@ -704,15 +704,15 @@ describe("fetchJudgeTranscriptFields: lastResponse is the last ASSISTANT message
 
     await idle(hooks, sid)
 
-    const payload = judgePayloadFromCall(judgePromptCalls(client)[0])
+    const payload = verifierPayloadFromCall(verifierPromptCalls(client)[0])
     expect(payload.lastResponse).toBe("the agent's real final response, this is what lastResponse must equal")
     expect(payload.lastResponse).not.toContain("one more thing please also handle the edge case")
   })
 })
 
-describe("fetchJudgeTranscriptFields: recentTranscript is truncated to the turn window, not the full history", () => {
+describe("fetchVerifierTranscriptFields: recentTranscript is truncated to the turn window, not the full history", () => {
   it("with 12 turns and an 8-turn window, only the last 8 survive", async () => {
-    // gate.ts's JUDGE_RECENT_TRANSCRIPT_TURN_WINDOW = 8 (not exported — see
+    // gate.ts's VERIFIER_RECENT_TRANSCRIPT_TURN_WINDOW = 8 (not exported — see
     // that file's doc comment on the constant). Zero-padded, fixed-width
     // labels (TURN-00 .. TURN-11) avoid substring collisions between kept and
     // dropped turns (e.g. "TURN-1" would otherwise be a substring of
@@ -723,12 +723,12 @@ describe("fetchJudgeTranscriptFields: recentTranscript is truncated to the turn 
       entry(i % 2 === 0 ? "user" : "assistant", `TURN-${String(i).padStart(2, "0")}`),
     )
     const client = makeStubClient({
-      promptImpl: passingJudgePromptImpl,
+      promptImpl: passingVerifierPromptImpl,
       messagesImpl: async () => ({ data: transcript, error: undefined }),
     })
     const recordSpy = vi.spyOn(VerificationReceiptStore.prototype, "record")
     const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
-    const sid = "judge-transcript-window-session"
+    const sid = "verifier-transcript-window-session"
 
     const { taskId } = await setUpFinalStoryVerified(
       hooks,
@@ -740,7 +740,7 @@ describe("fetchJudgeTranscriptFields: recentTranscript is truncated to the turn 
 
     await idle(hooks, sid)
 
-    const payload = judgePayloadFromCall(judgePromptCalls(client)[0])
+    const payload = verifierPayloadFromCall(verifierPromptCalls(client)[0])
     expect(payload.recentTranscript).toBeDefined()
 
     const keptStart = totalTurns - windowSize // 4
@@ -757,17 +757,17 @@ describe("fetchJudgeTranscriptFields: recentTranscript is truncated to the turn 
   })
 })
 
-describe("fetchJudgeTranscriptFields: both client.session.messages response shapes parse identically", () => {
+describe("fetchVerifierTranscriptFields: both client.session.messages response shapes parse identically", () => {
   const transcript = [entry("user", "hello"), entry("assistant", "SHAPE_PARITY_RESPONSE")]
 
   async function driveAndReadPayload(messagesImpl: () => Promise<unknown>): Promise<{ lastResponse?: string; recentTranscript?: string }> {
     const client = makeStubClient({
-      promptImpl: passingJudgePromptImpl,
+      promptImpl: passingVerifierPromptImpl,
       messagesImpl: messagesImpl as never,
     })
     const recordSpy = vi.spyOn(VerificationReceiptStore.prototype, "record")
     const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
-    const sid = `judge-transcript-shape-${Math.random().toString(36).slice(2)}`
+    const sid = `verifier-transcript-shape-${Math.random().toString(36).slice(2)}`
 
     const { taskId } = await setUpFinalStoryVerified(
       hooks,
@@ -777,7 +777,7 @@ describe("fetchJudgeTranscriptFields: both client.session.messages response shap
     )
     await callTool(hooks, "elicify_vertex_plan_checkpoint", { taskId, status: "complete" }, sid)
     await idle(hooks, sid)
-    return judgePayloadFromCall(judgePromptCalls(client)[0])
+    return verifierPayloadFromCall(verifierPromptCalls(client)[0])
   }
 
   it("`{data: [...], error: undefined}`-wrapped response parses correctly (isFieldsStyle branch)", async () => {
@@ -793,29 +793,29 @@ describe("fetchJudgeTranscriptFields: both client.session.messages response shap
 
 // ===========================================================================
 // Sign-off finding: every existing secret-in-lastResponse/recentTranscript
-// test in judge.test.ts calls buildJudgePayload directly with a hand-built
+// test in verifier.test.ts calls buildVerifierPayload directly with a hand-built
 // object -- proving redaction works in isolation, never proving a secret
 // sitting in a real (mocked) client.session.messages transcript actually gets
-// scrubbed once it flows through the REAL fetchJudgeTranscriptFields wiring.
+// scrubbed once it flows through the REAL fetchVerifierTranscriptFields wiring.
 // This closes that gap: the secret lives in the mocked transcript, same as a
 // real subagent conversation would carry it, and the assertion reads the
-// judge's actual outgoing prompt -- the true blast-radius boundary.
+// verifier's actual outgoing prompt -- the true blast-radius boundary.
 // ===========================================================================
 
 describe("a secret in a real (mocked) transcript is redacted through the full fetch-then-payload path", () => {
-  it("a secret in the last ASSISTANT message never reaches the judge's outgoing prompt", async () => {
+  it("a secret in the last ASSISTANT message never reaches the verifier's outgoing prompt", async () => {
     const secret = "sk-live-abc123def456ghi789jkl012mno345pqr"
     const transcript = [
       entry("user", "please finish the task"),
       entry("assistant", `I finished the task. Here is the key I used: ${secret}`),
     ]
     const client = makeStubClient({
-      promptImpl: passingJudgePromptImpl,
+      promptImpl: passingVerifierPromptImpl,
       messagesImpl: async () => ({ data: transcript, error: undefined }),
     })
     const recordSpy = vi.spyOn(VerificationReceiptStore.prototype, "record")
     const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
-    const sid = "judge-transcript-secret-lastresponse-session"
+    const sid = "verifier-transcript-secret-lastresponse-session"
 
     const { taskId } = await setUpFinalStoryVerified(
       hooks,
@@ -826,11 +826,11 @@ describe("a secret in a real (mocked) transcript is redacted through the full fe
     await callTool(hooks, "elicify_vertex_plan_checkpoint", { taskId, status: "complete" }, sid)
     await idle(hooks, sid)
 
-    const call = judgePromptCalls(client)[0]
+    const call = verifierPromptCalls(client)[0]
     const rawText = call?.body?.parts?.[0]?.text
     expect(typeof rawText).toBe("string")
     expect(rawText).not.toContain(secret)
-    const payload = judgePayloadFromCall(call)
+    const payload = verifierPayloadFromCall(call)
     expect(payload.lastResponse).toBeUndefined()
   })
 
@@ -842,12 +842,12 @@ describe("a secret in a real (mocked) transcript is redacted through the full fe
       entry("user", "another clean line, also must survive"),
     ]
     const client = makeStubClient({
-      promptImpl: passingJudgePromptImpl,
+      promptImpl: passingVerifierPromptImpl,
       messagesImpl: async () => ({ data: transcript, error: undefined }),
     })
     const recordSpy = vi.spyOn(VerificationReceiptStore.prototype, "record")
     const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
-    const sid = "judge-transcript-secret-recenttranscript-session"
+    const sid = "verifier-transcript-secret-recenttranscript-session"
 
     const { taskId } = await setUpFinalStoryVerified(
       hooks,
@@ -858,10 +858,10 @@ describe("a secret in a real (mocked) transcript is redacted through the full fe
     await callTool(hooks, "elicify_vertex_plan_checkpoint", { taskId, status: "complete" }, sid)
     await idle(hooks, sid)
 
-    const call = judgePromptCalls(client)[0]
+    const call = verifierPromptCalls(client)[0]
     const rawText = call?.body?.parts?.[0]?.text
     expect(rawText).not.toContain(secret)
-    const payload = judgePayloadFromCall(call)
+    const payload = verifierPayloadFromCall(call)
     expect(payload.recentTranscript).toContain("clean line that must survive")
     expect(payload.recentTranscript).toContain("another clean line, also must survive")
     expect(payload.recentTranscript).not.toContain(secret)

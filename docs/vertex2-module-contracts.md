@@ -27,7 +27,7 @@ src/v2/pin.ts
 src/v2/story.ts
 src/v2/artifacts.ts
 src/v2/dosing.ts
-src/v2/judge.ts
+src/v2/verifier.ts
 src/v2/subturn.ts
 src/v2/plugin.ts        (wave 3 — wires the above into the v2 hook set)
 ```
@@ -321,12 +321,12 @@ equivalence matching yourself).
 
 ## 7. `src/v2/subturn.ts` — FR-030b infra, FR-036, FR-038
 
-This is shared infrastructure for **both** the judge subturn (US-9) and the intake
+This is shared infrastructure for **both** the verifier subturn (US-9) and the intake
 classification subturn (US-5) — highest-leverage module to get right since two other
 modules depend on it.
 
 ```ts
-/** Process-lifetime registry of every session id the harness created (judge/intake children), keyed also by parentID so a grandchild (if the host ever creates one) is still recognized. */
+/** Process-lifetime registry of every session id the harness created (verifier/intake children), keyed also by parentID so a grandchild (if the host ever creates one) is still recognized. */
 export class SelfCreatedSessions {
   record(sessionID: string, parentID: string | null): void
   isSelfCreated(sessionID: string, resolveParent: (id: string) => string | null): boolean
@@ -350,7 +350,7 @@ export async function buildDenyMap(client: OpencodeClient): Promise<Record<strin
 
 export interface SubturnRequest {
   parentSessionID: string
-  agent: string                                    // "vertex-judge" | "vertex-intake" — never opts.activeAgent
+  agent: string                                    // "vertex-verifier" | "vertex-intake" — never opts.activeAgent
   model?: { providerID: string; modelID: string }   // omit to use host default for that agent
   system: string
   parts: Array<{ type: "text"; text: string }>
@@ -376,8 +376,8 @@ for the exact shape of `session.create`, `session.prompt`, `session.delete`,
 numbers in that file, use them). In your unit tests, stub the client (`vi.fn()` per
 method) — do not spin up a real host.
 
-Own test 44 (probe + refusal — assert exact deny map + `agent: "vertex-judge"` on
-success path, zero `session.create`/`session.prompt` calls + one `judge:unsupported`
+Own test 44 (probe + refusal — assert exact deny map + `agent: "vertex-verifier"` on
+success path, zero `session.create`/`session.prompt` calls + one `verifier:unsupported`
 on probe failure) and test 47 (cleanup on all four exit paths, stub client).
 
 **Note for wave-3 wiring**: `self_created_session_is_inert` (test 43) needs the REAL
@@ -386,13 +386,13 @@ be written against this module alone and belongs to wave 3/4.
 
 ---
 
-## 8. `src/v2/judge.ts` — FR-030, FR-030a, FR-031, FR-032
+## 8. `src/v2/verifier.ts` — FR-030, FR-030a, FR-031, FR-032
 
 Depends on `subturn.ts` (wave 1) — if wave 1 hasn't landed when you start, work from
 this contract and integrate against the real file once it exists; do not block.
 
 ```ts
-export interface JudgePayload { criteria: string[]; diffSummary: string; verifierSummaries: string[] }
+export interface VerifierPayload { criteria: string[]; diffSummary: string; verifierSummaries: string[] }
 
 /**
  * FR-031: redactSecrets (src/redaction.ts) then the strict scan on EACH of the three
@@ -401,32 +401,32 @@ export interface JudgePayload { criteria: string[]; diffSummary: string; verifie
  * whitespace-delimited token >=32 chars with entropy >=4.0 bits/char is a secret. A
  * field that trips the scan has the offending hunk (diff) or line (criteria/verifier)
  * removed; if that empties the field, omit the field key entirely and log
- * judge:field-dropped. Never include chat narrative — the caller passes you exactly
+ * verifier:field-dropped. Never include chat narrative — the caller passes you exactly
  * the three raw fields, nothing else, so there is no narrative to exclude here, but
  * assert this in your tests via the NARRATIVE_CANARY dataset row.
  */
-export function buildJudgePayload(raw: { criteria: string[]; diffSummary: string; verifierSummaries: string[] }, logger: EventLogger): JudgePayload
+export function buildVerifierPayload(raw: { criteria: string[]; diffSummary: string; verifierSummaries: string[] }, logger: EventLogger): VerifierPayload
 
-export interface JudgeVerdict { fit: "pass" | "concern"; notes: string }
+export interface VerifierVerdict { fit: "pass" | "concern"; notes: string }
 
 /**
  * Uses subturn.ts's probeCapability + runSubturn. Model defaults to sessionModel;
- * judgeModelOverride is tried first if present, falling back to sessionModel on
+ * verifierModelOverride is tried first if present, falling back to sessionModel on
  * failure (retry counts against the shared 5s budget, not an additional 5s). Returns
  * null on any failure (probe fail, timeout, malformed JSON, thrown error) — caller
- * logs judge:unavailable/judge:malformed/judge:unsupported based on which; you just
+ * logs verifier:unavailable/verifier:malformed/verifier:unsupported based on which; you just
  * return null and let the caller decide which reason (or return a discriminated
  * reason string alongside null — your call, document it in your final report since
  * wave 3 wiring needs to know exactly what you return).
  */
-export async function runJudge(
+export async function runVerifier(
   client: OpencodeClient,
   deps: { selfCreated: SelfCreatedSessions; logger: EventLogger },
-  opts: { parentSessionID: string; sessionModel: { providerID: string; modelID: string }; judgeModelOverride?: { providerID: string; modelID: string }; payload: JudgePayload }
-): Promise<JudgeVerdict | null>
+  opts: { parentSessionID: string; sessionModel: { providerID: string; modelID: string }; verifierModelOverride?: { providerID: string; modelID: string }; payload: VerifierPayload }
+): Promise<VerifierVerdict | null>
 ```
 
-Own tests 18, 39 and Dataset: Judge payload hygiene (all 9 rows — this is the module
+Own tests 18, 39 and Dataset: Verifier payload hygiene (all 9 rows — this is the module
 most worth over-testing given CRIT-001/CRIT-002/MAJ-009 were the three critical/major
 findings closest to this area in the fresh review).
 
@@ -516,8 +516,8 @@ wiring can call them):
   `calibration`, `phase_transition`, `resolution:none`, `dosing:unknown-model`,
   `gate:multi-session-advisory`, `pins:disk-fallback-memory` / `pins:disk-recovered` /
   `pins:disk-unavailable`, `intake:classify-skipped` / `-fallback` / `-capped` /
-  `-unsupported`, `subturn:cleanup-failed`, `judge:unavailable` / `judge:malformed` /
-  `judge:unsupported` / `judge:field-dropped`, `criteria:re-pinned` /
+  `-unsupported`, `subturn:cleanup-failed`, `verifier:unavailable` / `verifier:malformed` /
+  `verifier:unsupported` / `verifier:field-dropped`, `criteria:re-pinned` /
   `criteria:truncated`, `expect:absent`.
 - Every writer accepts `{ sessionID, model, profile, ...payload }` and stamps
   `model` (or `"unknown"`) + the resolved dosing `profile` on every record (FR-033 —

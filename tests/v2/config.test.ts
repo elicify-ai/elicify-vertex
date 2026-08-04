@@ -72,28 +72,28 @@ describe("applyV2Config", () => {
     // the advisory-field test below for the probe evidence.
   })
 
-  it("registers vertex-judge with the HANDOVER.md point-3 read-only tool grant: read/grep/glob/list/bash allow, edit/write/webfetch/task deny", async () => {
+  it("registers vertex-verifier with the HANDOVER.md point-3 read-only tool grant: read/grep/glob/list/bash allow, edit/write/webfetch/task deny", async () => {
     const cfgInput: { command?: Record<string, unknown>; agent?: Record<string, unknown> } = {}
     await applyV2Config(cfgInput as never, {} as OpencodeClient, "elicify-vertex")
 
-    const judge = cfgInput.agent!["vertex-judge"] as { permission: Record<string, string> }
+    const verifier = cfgInput.agent!["vertex-verifier"] as { permission: Record<string, string> }
     // Base stays deny-everything; the five read-only tools are the explicit
-    // carve-out (bash so the judge can re-run declared verifiers itself).
-    expect(judge.permission["*"]).toBe("deny")
+    // carve-out (bash so the verifier can re-run declared verifiers itself).
+    expect(verifier.permission["*"]).toBe("deny")
     for (const allowed of ["read", "grep", "glob", "list", "bash"]) {
-      expect(judge.permission[allowed]).toBe("allow")
+      expect(verifier.permission[allowed]).toBe("allow")
     }
-    // Explicit deny entries are what JUDGE_PROBE_POLICY's denyPermissions
+    // Explicit deny entries are what VERIFIER_PROBE_POLICY's denyPermissions
     // read back to prove the denial.
     for (const denied of ["edit", "write", "webfetch", "task"]) {
-      expect(judge.permission[denied]).toBe("deny")
+      expect(verifier.permission[denied]).toBe("deny")
     }
   })
 
   // FR-008 (US-8 AS1/AS2, TDD row 26). The live probe of 2026-08-03
   // (spec Findings/FR-008) settled this empirically: `opencode debug agent`
   // resolves `maxSteps: None` for BOTH registrations on opencode 1.18.x,
-  // and the judge nonetheless ran 3 steps with 2 real tool calls. The
+  // and the verifier nonetheless ran 3 steps with 2 real tool calls. The
   // previous two assertions here (`toBe(12)` / `toBe(1)`) therefore asserted
   // a resolved value the host does not honour — exactly what AS2 forbids —
   // and are gone. What IS assertable is the shape: the field may be present
@@ -103,28 +103,28 @@ describe("applyV2Config", () => {
     const cfgInput: { command?: Record<string, unknown>; agent?: Record<string, unknown> } = {}
     await applyV2Config(cfgInput as never, {} as OpencodeClient, "elicify-vertex")
 
-    for (const name of ["vertex-judge", "vertex-intake"]) {
+    for (const name of ["vertex-verifier", "vertex-intake"]) {
       const agent = cfgInput.agent![name] as { maxSteps?: number; permission: Record<string, string> }
       if (agent.maxSteps !== undefined) expect(typeof agent.maxSteps).toBe("number")
       expect(agent.permission["*"]).toBe("deny")
     }
   })
 
-  it("static tools maps: intake's is fully denied; the judge's true entries are exactly the point-3 allowlist", async () => {
+  it("static tools maps: intake's is fully denied; the verifier's true entries are exactly the point-3 allowlist", async () => {
     const cfgInput: { command?: Record<string, unknown>; agent?: Record<string, unknown> } = {}
     await applyV2Config(cfgInput as never, {} as OpencodeClient, "elicify-vertex")
 
-    const judge = cfgInput.agent!["vertex-judge"] as { tools: Record<string, boolean> }
+    const verifier = cfgInput.agent!["vertex-verifier"] as { tools: Record<string, boolean> }
     const intake = cfgInput.agent!["vertex-intake"] as { tools: Record<string, boolean> }
     // The tools map is not the control of record (the host ignores it), but
     // it must never contradict the permission block if a host DOES honour it.
     expect(Object.values(intake.tools).every((v) => v === false)).toBe(true)
-    const enabled = Object.entries(judge.tools)
+    const enabled = Object.entries(verifier.tools)
       .filter(([, v]) => v === true)
       .map(([k]) => k)
       .sort()
     expect(enabled).toEqual(["bash", "glob", "grep", "list", "read"])
-    expect(judge.tools["*"]).toBe(false)
+    expect(verifier.tools["*"]).toBe(false)
   })
 
   // Sign-off finding: KNOWN_TOOL_NAMES (this file) is hand-maintained
@@ -149,9 +149,9 @@ describe("applyV2Config", () => {
 
     const cfgInput: { command?: Record<string, unknown>; agent?: Record<string, unknown> } = {}
     await applyV2Config(cfgInput as never, {} as OpencodeClient, "elicify-vertex")
-    const judge = cfgInput.agent!["vertex-judge"] as { tools: Record<string, boolean> }
+    const verifier = cfgInput.agent!["vertex-verifier"] as { tools: Record<string, boolean> }
 
-    const missing = Object.keys(tools).filter((name) => !(name in judge.tools))
+    const missing = Object.keys(tools).filter((name) => !(name in verifier.tools))
     expect(missing, "registered plan tools missing from the deny map").toEqual([])
   })
 })
