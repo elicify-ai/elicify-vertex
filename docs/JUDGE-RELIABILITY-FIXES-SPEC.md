@@ -1007,13 +1007,26 @@ findings; 3 were already closed by round 5, 12 were live.
 
 ### Two findings answered rather than "fixed"
 
-- **CR-9 (one-of-N verifier crediting mints a full receipt).** Real, and
-  deliberate. Reverting to the joined prescription reinstates the measured
-  production failure it was introduced to fix (146 relevance-gaps, 0 receipts,
-  which is also why the receipt-based cross-check had no data). The receipt
-  itself is honest — it records the command actually run — and story
-  completion is decided by the judge, not by receipts. Recorded as an accepted
-  trade-off, not closed.
+- **CR-9 (one-of-N verifier crediting mints a full receipt).** Not a defect —
+  it follows from a deliberate separation the harness is built on, which this
+  spec had failed to state:
+
+  > **Acceptance criteria are met by JUDGEMENT. Technical checks are
+  > evidence, and may be looser.**
+
+  A story's `verifiers` are technical checks. A receipt asserts exactly one
+  thing — "this command ran and exited 0" — which is true whether or not the
+  story's other verifiers also ran. It cannot approve a story: acceptance
+  items carry no receipt requirement (`AcceptanceItem.evidence` is deprecated
+  and read by nothing), and `story.ts` names the completion judge the "sole
+  arbiter of whether a checkpoint's claim was real". Verifier output reaches
+  the judge as `verifierSummaries` — input to its judgement, never a
+  substitute for it.
+
+  Demanding that one observed command cover ALL of a story's verifiers applied
+  acceptance-criteria strictness to a technical check, and the measured cost
+  was total: 146 relevance-gaps and 0 receipts in the audited session, which
+  is also why the receipt-based cross-check had no data to work with.
 - **CR-12 (no health alert on continuation timeout).** The informational-only
   timeout is a deliberate earlier fix: the harness was raising outages for its
   own successful continuations, masking real ones. The wedge half of the
