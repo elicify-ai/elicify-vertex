@@ -871,7 +871,16 @@ function toSubCommand(tokens: readonly string[]): SubCommand | null {
   // operator says so. Without that check `test -n research` — a string test —
   // credited `test -d research`.
   const isBracketTest = BRACKET_TEST_RUNNERS.has(runnerTokens[0])
-  const fileTestOperator = rest.find((token) => FILE_TEST_OPERATORS.has(token))
+  // CR-10 (round 5): `test ! -f x` succeeds precisely when the file is
+  // ABSENT, yet it was crediting a prescribed `test -f x` — a receipt saying
+  // the file was verified present, minted by a command asserting the
+  // opposite. Fold the negation into the identity so the two never match.
+  // `!` is neither a flag (no leading `-`) nor path-shaped, so the runner-word
+  // loop absorbs it: `test ! -f x` yields runnerTokens `["test","!"]` and rest
+  // `["-f","x"]`. Check both sides.
+  const negated = rest.includes("!") || runnerTokens.includes("!")
+  const rawOperator = rest.find((token) => FILE_TEST_OPERATORS.has(token))
+  const fileTestOperator = rawOperator === undefined ? undefined : negated ? `!${rawOperator}` : rawOperator
   // Two different rules, not one. A bracket/`test` command asserts about a
   // path only under a file-test operator; `ls`/`stat`/`readlink`/`realpath`
   // take paths unconditionally and have no such operator, so requiring one

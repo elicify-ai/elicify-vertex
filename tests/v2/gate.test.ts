@@ -1099,16 +1099,43 @@ describe("handleJudgeAudit — verdict reconciliation", () => {
   })
 
   // MAJ-3 (grill round 3): the close-out guard — the load-bearing half of C2 —
-  // had no test at all. Reverting `allPassed` to `story.judge?.pass === true`
-  // left the whole suite green, so the laundering could have been reinstated
-  // silently.
+  // had no test at all; reverting `allPassed` left the suite green.
   //
-  // The `pass:true` + `unapplied` shape is unreachable for ONE story
-  // (`isJudgeVerdictShape` rejects pass:true with an unmet item). It is
-  // reachable via the FR-014 BATCH sweep: the tool-call floor is evaluated
-  // across the whole batch, so one story failing an item bounds every verdict
-  // in it — including a sibling the judge genuinely passed.
-  it("MAJ-3: a pass:true stamp bounded by a failing sibling does NOT count toward the close-out", async () => {
+  // Round 5 changed which shape reaches it. The FR-014 floor used to sweep the
+  // whole batch, so a story the judge PASSED with every item met was stamped
+  // `unverified` too (CR-5) — now fixed, and a clean pass applies. The shape
+  // that remains, and the one worth guarding, is a pass with NOTHING BEHIND
+  // IT: `pass: true` with no items, produced without a single tool call.
+  // `isJudgeVerdictShape` accepts it (`[].every(...)` is vacuously true), so
+  // only this guard stops it satisfying the plan-complete claim.
+  it("MAJ-3: an unobserved pass:true with no items does NOT count toward the close-out", async () => {
+    const h = harness({ judgeEnabled: true })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid)
+
+    stubJudge(h, { stories: [{ storyId: "S1", pass: true, summary: "looks fine to me", items: [] }] }, [{ type: "text" }])
+    await handleSessionIdle(h.ctx, sid)
+
+    const stamp = h.storyEngine.getPlan(sid)!.stories[0].judge!
+    expect(stamp.pass).toBe(true)
+    expect(stamp.unapplied).toBe("unverified")
+
+    await handleSessionIdle(h.ctx, sid)
+    const said = continuations(h.prompt)
+      .map((c) => c.text)
+      .join("\n")
+    expect(said).not.toContain("independently verified")
+    expect(said).toContain("S1")
+  })
+
+  // CR-5: a story the judge genuinely passed, in a batch bounded because a
+  // SIBLING was unsubstantiated, must still be applied. It used to be stamped
+  // `unverified` too, which barred it from `allPassed` AND from re-audit (the
+  // selector skips a stamped story), so it could never become verified.
+  it("CR-5: a clean passing verdict is applied even when a sibling is bounded", async () => {
     const h = harness({ judgeEnabled: true })
     const sid = "s1"
     const state = quietSession(h, sid)
@@ -1129,48 +1156,66 @@ describe("handleJudgeAudit — verdict reconciliation", () => {
           { storyId: "S2", pass: true, summary: "chart is there", items: [{ itemId: "A1", met: true, note: "verified" }] },
         ],
       },
-      [{ type: "text" }], // judge observed nothing -> FR-014 bounds the batch
+      [{ type: "text" }],
     )
     await handleSessionIdle(h.ctx, sid)
 
-    const s2 = h.storyEngine.getPlan(sid)!.stories[1].judge!
-    expect(s2.pass).toBe(true)
-    expect(s2.unapplied).toBe("unverified")
+    const stories = h.storyEngine.getPlan(sid)!.stories
+    expect(stories[0].judge!.unapplied).toBe("unverified")
+    expect(stories[1].judge!.unapplied).toBeUndefined()
+    expect(stories[1].judge!.pass).toBe(true)
+  })
 
-    // S1 is re-opened and re-audited CLEANLY, so it ends with a genuine
-    // passing stamp. Every story now reads `pass: true` — and only the
-    // `unapplied` clause stands between S2's bounding stamp and a close-out
-    // claiming the judge independently verified the whole plan.
-    h.storyEngine.reopenStory(sid, "S1", { reason: "re-audit after the judge observed nothing" })
+  // CR-4: an empty `items` array made the floor's trigger vacuously false, so
+  // the least substantiated verdict possible — a bare `pass:false` with no
+  // items, produced with zero tool calls — bypassed it and reverted the story.
+  it("CR-4: an unobserved pass:false with NO items does not revert the story", async () => {
+    const h = harness({ judgeEnabled: true })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid)
+
+    stubJudge(h, { stories: [{ storyId: "S1", pass: false, summary: "the research files are missing", items: [] }] }, [
+      { type: "text" },
+    ])
+    await handleSessionIdle(h.ctx, sid)
+
+    expect(h.storyEngine.getPlan(sid)!.stories[0].status).toBe("complete")
+    expect(loggedEventTypes(h.logger)).toContain("judge:unverified")
+  })
+
+  // CR-8: `itemId` is LLM-authored and not unique. Matching the contradiction
+  // set by id let one disproven path claim clear a DIFFERENT item sharing the
+  // id, laundering a genuine content failure into a harness-derived pass.
+  it("CR-8: a duplicated itemId does not let one veto mask a real failure", async () => {
+    const h = harness({ judgeEnabled: true })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    writeFileSync(join(h.stateDir, "present.md"), "# real\n", "utf8")
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid)
+
     stubJudge(h, {
       stories: [
-        { storyId: "S1", pass: true, summary: "sources are cited", items: [{ itemId: "A1", met: true, note: "verified by reading the file" }] },
+        {
+          storyId: "S1",
+          pass: false,
+          summary: "mixed",
+          items: [
+            { itemId: "A1", met: false, note: "present.md does not exist on disk" },
+            { itemId: "A1", met: false, note: "no sources are cited anywhere in the document" },
+          ],
+        },
       ],
     })
-    await handleSessionIdle(h.ctx, sid) // the audit that settles the plan
-
-    const stories = h.storyEngine.getPlan(sid)!.stories
-    expect(stories.every((story) => story.judge?.pass === true)).toBe(true)
-    expect(stories[0].judge!.unapplied).toBeUndefined()
-    expect(stories[1].judge!.unapplied).toBe("unverified")
-
-    // THIS is the mutation-killing assertion: with the `unapplied` clause
-    // removed from `allPassed`, the settling audit above emits the
-    // independently-verified close-out for a plan half of which the judge
-    // never looked at.
-    const afterSettling = continuations(h.prompt)
-      .map((c) => c.text)
-      .join("\n")
-    expect(afterSettling).not.toContain("independently verified")
-
-    // On the next idle the selector is empty, and the escalation says plainly
-    // which story was never verified.
     await handleSessionIdle(h.ctx, sid)
-    const said = continuations(h.prompt)
-      .map((c) => c.text)
-      .join("\n")
-    expect(said).toContain("S2")
-    expect(said).not.toContain("independently verified")
+
+    // The path claim is disproven, but the content failure stands, so the
+    // story must be REVERTED rather than re-derived into a pass.
+    expect(h.storyEngine.getPlan(sid)!.stories[0].status).toBe("active")
   })
 
   it("C2: a plan settled only by unapplied stamps does NOT get the independently-verified close-out", async () => {

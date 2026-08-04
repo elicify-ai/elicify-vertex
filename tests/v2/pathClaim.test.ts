@@ -346,3 +346,33 @@ describe("CRIT-2 — a second claim in the same note keeps the whole item", () =
     expect([...reasons].sort()).toEqual(["asserts-existence", "second-negation"])
   })
 })
+
+// ---------------------------------------------------------------------------
+// CR-7 (round 5) — apostrophes.
+//
+// `stripQuoted` treated every `'` as a quote delimiter, so the span between
+// two contractions was deleted before path extraction ran. And the
+// EXISTENCE_ASSERTION lookbehinds matched only `not ` / `no `, never `n't`,
+// so "doesn't exist" — one of the two commonest ways to write the claim —
+// was classified as a POSITIVE existence assertion and could never be
+// overruled.
+// ---------------------------------------------------------------------------
+describe("CR-7: contractions", () => {
+  it.each([
+    "research/x.md doesn't exist",
+    "research/x.md doesn't exist on disk",
+    "research/x.md isn't present",
+  ])("recognises the contracted absence claim: %s", (note) => {
+    expect(parsePathAbsenceClaim(note).paths).toEqual(["research/x.md"])
+  })
+
+  it("does not let two contractions swallow the span between them", () => {
+    // A genuine mixed note: still kept, but for the RIGHT reason (a second
+    // claim), not because the text vanished.
+    expect(parsePathAbsenceClaim("research/x.md doesn't exist, the KPIs are fabricated").paths).toEqual([])
+  })
+
+  it("still treats a real single-quoted span as a command", () => {
+    expect(parsePathAbsenceClaim("declared verifier 'test -f research/x.md' would fail").reason).toBe("quoted-command")
+  })
+})

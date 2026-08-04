@@ -528,6 +528,24 @@ export type SubturnResult =
  * caller can distinguish "the judge did not look" from "we could not tell"
  * and fail open on the latter.
  */
+/** CR-14: cap on the observed-tool-call read (see its call site). */
+const OBSERVED_READ_TIMEOUT_MS = 5_000
+
+/** Resolve to `undefined` rather than hang. Never rejects. */
+async function withTimeout<T>(work: Promise<T>, ms: number): Promise<T | undefined> {
+  let handle: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      work.catch(() => undefined),
+      new Promise<undefined>((resolve) => {
+        handle = setTimeout(() => resolve(undefined), ms)
+      }),
+    ])
+  } finally {
+    if (handle) clearTimeout(handle)
+  }
+}
+
 async function readObservedToolCall(client: OpencodeClient, childID: string): Promise<boolean | undefined> {
   try {
     const raw = await client.session.messages({ path: { id: childID } } as never)
@@ -674,7 +692,12 @@ export async function runSubturn(
   try {
     const result = await promptChildSession(client, childID, req)
     // FR-014: read the tool-call fact BEFORE the `finally` deletes the child.
-    const observedToolCall = await readObservedToolCall(client, childID)
+    // CR-14 (round 5): this await sits on the `session.idle` path and had no
+    // bound of its own — a host whose `session.messages` hangs stalled the
+    // whole idle handler. The FR-014 floor already treats `undefined` as
+    // "could not tell" and fails open, so a timeout degrades to exactly the
+    // pre-existing unreadable-session behaviour.
+    const observedToolCall = await withTimeout(readObservedToolCall(client, childID), OBSERVED_READ_TIMEOUT_MS)
     return observedToolCall === undefined ? result : { ...result, observedToolCall }
   } finally {
     await deleteChildSession(client, childID, logger)

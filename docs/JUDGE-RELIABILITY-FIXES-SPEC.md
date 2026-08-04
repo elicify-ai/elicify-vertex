@@ -981,3 +981,48 @@ The round-4 change that let M9 preserve an own-session future-schema entry was
 decoration: `persistPlan` either overwrites `file[sessionID]` from the cached
 plan, or — with no cached plan, i.e. an explicit clear — drops it deliberately.
 A surviving mutant proved there is no path on which it matters. Reverted.
+
+
+---
+
+## Round-6: workflow code review (58 agents, xhigh), 2026-08-04
+
+Reviewed tip `bd731c3`, one commit behind the round-5 fixes. 15 CONFIRMED
+findings; 3 were already closed by round 5, 12 were live.
+
+| # | Finding | Outcome |
+|---|---------|---------|
+| CR-2 | `dewrap` strips `\n` only, so a surviving `\r` separates tokens and defeats the ENTIRE wrapped-secret machinery — per-unit scan, pair join and fragment strip all miss. Reproduced: a 40-char hex key wrapped across two CRLF lines transmitted whole where the identical LF input fully redacted. | Fixed — strips `[\r\n]`. 0 leaks over 2520 CRLF splits. |
+| CR-4 | An empty `items` array made the FR-014 trigger vacuously false, so the least substantiated verdict possible (`pass:false`, no items, zero tool calls) bypassed the floor and reverted the story. | Fixed — the trigger is now "would this verdict cost anything". |
+| CR-5 | The floor was story-blind: it stamped every story in the batch `unverified`, including ones the judge PASSED with all items met, barring them from `allPassed` AND re-audit forever. | Fixed — only unsubstantiated verdicts are bounded; a clean pass in the same batch is applied. |
+| CR-8 | `applyPathVeto` matched the contradiction set by `itemId`, which is LLM-authored and not unique — a duplicate id let one disproven path claim clear a genuine content failure. | Fixed — matched by object identity. |
+| CR-10 | `test ! -f x` succeeds precisely when the file is ABSENT and was crediting a prescribed `test -f x`. `!` is absorbed by the runner-word loop, so it had to be looked for on both sides. | Fixed. |
+| CR-6 | The join exoneration was a hard-coded 20-extension allowlist, so the production false positive recurred for `.sql`, `.proto`, `.tf`, … | Fixed — any dotted filename, with `looksLikeWord` as the general backstop. |
+| CR-7 | `stripQuoted` treated every apostrophe as a quote delimiter, deleting the span between two contractions; and `doesn't exist` was classified as a POSITIVE existence assertion because the lookbehinds matched only `not ` / `no `. | Fixed both; real single-quoted spans still read as commands. |
+| CR-11 | `resetTurnState` runs only on the activation branch, so an already-active session never reset `unauditedEscalated` (second unaudited plan → silence) or `storyReaudits` (accumulated across plans → cap tripped early). | Fixed at the message boundary. |
+| CR-13 | `reconcileWithDisk` re-raised `writeAborted`, so the checkpoint tool reported the CURRENT, successfully persisted write as unwritten. | Fixed — the loss is logged, not re-attributed. |
+| CR-14 | `readObservedToolCall` added an unbounded `session.messages` await on the `session.idle` path. | Fixed — 5s cap degrading to the existing fail-open `undefined`. |
+| CR-15 | `maxStoryReaudits: 0`, the documented way to disable the FR-007 cap, was unreachable because `0` is falsy in the `||` chain. | Fixed — coalesce on definedness. |
+| CR-1, CR-3 | Punctuation-adjacent fragments; base64 fragments read as word-shaped. | Already closed by round 5 (verified on the current tree). |
+
+### Two findings answered rather than "fixed"
+
+- **CR-9 (one-of-N verifier crediting mints a full receipt).** Real, and
+  deliberate. Reverting to the joined prescription reinstates the measured
+  production failure it was introduced to fix (146 relevance-gaps, 0 receipts,
+  which is also why the receipt-based cross-check had no data). The receipt
+  itself is honest — it records the command actually run — and story
+  completion is decided by the judge, not by receipts. Recorded as an accepted
+  trade-off, not closed.
+- **CR-12 (no health alert on continuation timeout).** The informational-only
+  timeout is a deliberate earlier fix: the harness was raising outages for its
+  own successful continuations, masking real ones. The wedge half of the
+  finding is closed by the M4 guard release, which runs for every
+  `chat.message` regardless of activation.
+
+### A defect the base64url probe found
+
+`looksLikeWord` still passed base64url fragments, which segment on their own
+`-`/`_` into runs like `Nvrf`, `fdgb`, `KBCdfv`. Added the obvious missing
+constraint: **a word has a vowel**. That closed the last 5 leaks in a
+12000-split sweep and keeps every prose token the earlier bars protected.

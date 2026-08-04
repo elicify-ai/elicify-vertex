@@ -168,6 +168,18 @@ function resolveStoryIdForPhase(storyEngine: StoryEngine, sessionID: string): st
 const DIFF_STAT_TIMEOUT_MS = 2000
 const DIFF_STAT_MAX_CHARS = 4000
 
+/**
+ * CR-15: pick the first DEFINED value, not the first truthy one. `0` is a
+ * meaningful setting for several of these knobs (it disables the FR-007
+ * re-audit cap), and a `||` chain silently replaced it with the default.
+ */
+function firstDefinedNumber(...values: Array<number | undefined>): number {
+  for (const value of values) {
+    if (typeof value === "number" && Number.isFinite(value)) return value
+  }
+  return 0
+}
+
 function computeBoundedDiffStat(cwd: string, changedPaths: readonly string[]): string {
   const realPaths = changedPaths.filter((p) => !NON_PATH_MUTATION_MARKERS.has(p))
   try {
@@ -236,7 +248,16 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
     visibility: userOpts.visibility,
     maxToastsPerMinute: userOpts.maxToastsPerMinute,
     maxNoProgressTurns: Number(process.env.VERTEX_MAX_NO_PROGRESS_TURNS) || userOpts.maxNoProgressTurns || 3,
-    maxStoryReaudits: Number(process.env.VERTEX_MAX_STORY_REAUDITS) || userOpts.maxStoryReaudits || 3,
+    // CR-15 (round 5): `0` is the DOCUMENTED way to disable the FR-007 cap
+    // (`<=0` disables — see `GateContext.maxStoryReaudits`), and `||` swallowed
+    // it, so the cap always applied. Coalesce on definedness, not truthiness.
+    maxStoryReaudits: firstDefinedNumber(
+      Number.isFinite(Number(process.env.VERTEX_MAX_STORY_REAUDITS))
+        ? Number(process.env.VERTEX_MAX_STORY_REAUDITS)
+        : undefined,
+      userOpts.maxStoryReaudits,
+      3,
+    ),
   }
   const activateCommandName = opts.activeSkillTrigger.replace(/^\//, "")
 
@@ -560,6 +581,20 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
         // `resetTurnState`, and leaving the guard up there is the wedge.
         state.idleContinuationInFlight = false
         logger("gate:continuation-guard-released", { sessionID: sid, reason: "real user message" })
+      }
+
+      // CR-11 (round 5): `resetTurnState` runs ONLY on the activation branch
+      // below, so a session that is already active and receives an ordinary
+      // follow-up (no trigger text, non-default agent — the normal shape of
+      // every turn after the first in a trigger-activated session) never
+      // reset these. `unauditedEscalated` then stayed spent, so a second
+      // unaudited plan ended in silence, and `storyReaudits` accumulated
+      // across unrelated plans, tripping the FR-007 cap early. Both are
+      // per-plan state whose boundary is a real user message, which is
+      // exactly what this is.
+      if (state.active) {
+        state.unauditedEscalated = false
+        state.storyReaudits = {}
       }
 
       const triggerEscaped = opts.activeSkillTrigger.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")

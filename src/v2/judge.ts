@@ -254,7 +254,14 @@ const ENTROPY_EFFECTIVE_THRESHOLD_BITS = ENTROPY_THRESHOLD_BITS - ENTROPY_TOLERA
  * elsewhere in the text are unaffected.
  */
 function dewrap(text: string): string {
-  return text.replace(/\n/g, "")
+  // CR-2 (round 5): `\r` must go too. Stripping only `\n` left a bare `\r`
+  // wherever content was CRLF, and `\r` is whitespace — so it separated
+  // tokens for `tripsEntropyScan`'s `split(/\s+/)`, blocked `SECRET_PATTERNS`
+  // from matching across a wrap, and broke the invariant this function exists
+  // to provide (`dewrap(a + b) === dewrap(a) + dewrap(b)` with the halves
+  // fused). Measured: a 40-char hex key wrapped across two CRLF lines was
+  // transmitted whole, where the identical LF input was fully redacted.
+  return text.replace(/[\r\n]/g, "")
 }
 
 /**
@@ -504,7 +511,13 @@ function hexRunStraddles(joined: string, joinIdx: number): boolean {
  * which errs toward redaction — the correct direction for a payload leaving
  * the process.
  */
-const LEFT_ENDS_IN_PATH = /[\w-]+\.(?:md|json|jsx|tsx|ts|js|mjs|cjs|css|html|ya?ml|toml|txt|lock|sh|py|go|rs|java|rb)$/i
+// CR-6 (round 5): a 20-extension allowlist meant the reproduced production
+// false positive recurred verbatim for any OTHER extension (`.sql`, `.proto`,
+// `.tf`, …) and silently deleted plan-digest lines. Any dotted filename
+// counts now; the extension is required to be alphabetic and short so a
+// version string or a sentence-ending period does not qualify. The
+// `looksLikeWord` check below is the general backstop.
+const LEFT_ENDS_IN_PATH = /[\w-]+\.[A-Za-z][A-Za-z0-9]{0,7}$/
 const RIGHT_STARTS_SHORT_WORD = /^[A-Za-z][\w-]{0,7}$/
 
 function entropyTokenStraddles(joined: string, joinIdx: number): boolean {
@@ -639,7 +652,12 @@ function looksLikeWord(token: string): boolean {
   if (segments.length === 0) return false
   // `+` and `=` are base64-only: no identifier or English word contains them.
   if (/[+=]/.test(token)) return false
-  const wordy = segments.filter((part) => /^[A-Za-z]{3,}$/.test(part))
+  // A word has a vowel. base64url survives the ratio and mean-length bars by
+  // segmenting on its own `-`/`_` into plausible-looking runs — but they are
+  // runs like `Nvrf`, `fdgb`, `KBCdfv`, which no English word or identifier
+  // resembles. Measured: this closed the last 5 leaks in a 12000-split sweep
+  // and keeps every prose token the earlier bars were protecting.
+  const wordy = segments.filter((part) => /^[A-Za-z]{3,}$/.test(part) && /[aeiouy]/i.test(part))
   // At least half the segments must be real alphabetic runs. Random material
   // fragments into one- and two-character shards; identifiers do not.
   if (wordy.length * 2 < segments.length) return false

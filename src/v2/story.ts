@@ -2241,9 +2241,15 @@ export class StoryEngine {
       // disk. It is real data loss (the judge stamps that vanished in the
       // audited session), and it was previously indistinguishable from an
       // ordinary merge.
+      // CR-13 (round 5): log the loss, but do NOT re-raise `writeAborted`.
+      // That flag answers "did THIS mutation reach disk", and the mutation
+      // running now is about to persist fine — setting it made the checkpoint
+      // tool report the current, successful write as unwritten and point the
+      // model at the wrong recovery. The lost change belongs to an EARLIER
+      // call that was already told about it; this event is the operator's
+      // record of the loss.
       this.logger("plan:unpersisted-change-lost", { sessionID, cachedRevision, diskRevision })
       this.pendingPersist.delete(sessionID)
-      this.writeAborted.add(sessionID)
     }
     assignPlanInPlace(cached, onDisk)
     this.logger("plan:concurrent-merge", {

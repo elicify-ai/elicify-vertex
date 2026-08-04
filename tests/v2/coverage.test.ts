@@ -959,3 +959,23 @@ describe("verifyGapComplied", () => {
     expect(verifyGapComplied(STORY, "npx eslint .", { storyScoped: true })).toBe(false)
   })
 })
+
+// CR-10 (round 5) — a NEGATED file test asserts the opposite of the
+// prescription it was crediting. `test ! -f x` succeeds precisely when the
+// file is absent; it was minting a receipt claiming the file was verified
+// present. `!` is neither a flag nor path-shaped, so the runner-word loop
+// absorbs it — the negation has to be looked for on both sides of the split.
+describe("CR-10: a negated file test never credits the positive one", () => {
+  const CASES: Array<[string, string, boolean]> = [
+    ["test -f package.json", "test ! -f package.json", false],
+    ["test -d research", "test ! -d research", false],
+    ["[[ -d research ]]", "[[ ! -d research ]]", false],
+    ["test ! -f x.md", "test ! -f x.md", true],
+    ["test -f package.json", "test -f package.json", true],
+  ]
+  for (const [prescribed, observed, expected] of CASES) {
+    it(`${expected ? "credits" : "refuses"}: ${prescribed} <- ${observed}`, () => {
+      expect(observedCoversPrescribed(prescribed, observed)).toBe(expected)
+    })
+  }
+})

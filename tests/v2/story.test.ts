@@ -1703,7 +1703,12 @@ describe("FR-002c/FR-010: lock contention retries, then aborts the write without
     se.checkpoint("s1", taskId, "complete") // triggers reconcileWithDisk
 
     expect(logger).toHaveBeenCalledWith("plan:unpersisted-change-lost", expect.objectContaining({ sessionID: "s1" }))
-    expect(se.consumeWriteAbort("s1")).toBe(true)
+    // CR-13 (round 5): the loss is LOGGED, but `writeAborted` is not
+    // re-raised. That flag answers "did THIS mutation reach disk", and the
+    // mutation that triggered the merge persisted fine — re-raising it made
+    // the checkpoint tool report a successful write as unwritten and point the
+    // model at the wrong recovery. The earlier call was already told.
+    expect(se.consumeWriteAbort("s1")).toBe(false)
   })
 
   // M8: `archiveV1IfPresent` took the lock with the RAW import, which throws

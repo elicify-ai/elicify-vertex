@@ -42,7 +42,7 @@
  * kept all five (caught by the corpus test, not by review).
  */
 const ABSENCE_PREDICATE =
-  /\b(?:does\s+not\s+exist|doesn't\s+exist|(?:is|are|was|were)\s+missing|missing\b|was\s+not\s+found|were\s+not\s+found|(?:is|are)\s+not\s+present|not\s+present|not\s+found|no\s+such\s+file|absent)\b/i
+  /\b(?:does\s+not\s+exist|doesn't\s+exist|(?:is|are|was|were)\s+missing|(?:isn't|aren't|wasn't|weren't)\s+(?:present|found|there)|missing\b|was\s+not\s+found|were\s+not\s+found|(?:is|are)\s+not\s+present|not\s+present|not\s+found|no\s+such\s+file|absent)\b/i
 
 /** Leading-negation form: "No src/App.tsx", "missing research/x.md". */
 const LEADING_ABSENCE = /\b(?:no|missing)\s+(?=[\w./-]*[./][\w./-]*)/i
@@ -60,8 +60,12 @@ const PATH_TOKEN =
  * same words, and matching them here would make every genuine absence claim
  * unrecognisable (caught by the corpus test on first run).
  */
+// CR-7: `n't` must count as a negation here. The lookbehinds matched only
+// `not ` and `no `, so "research/x.md doesn't exist" read as a POSITIVE
+// existence assertion and FR-001 could never overrule that phrasing — one of
+// the two most common ways to write the claim.
 const EXISTENCE_ASSERTION =
-  /(?<!\bnot\s)(?<!\bno\s)\b(?:exists|exist\s+(?:at|in|on)|is\s+present|was\s+found|found\s+at|present\s+on\s+disk)\b/i
+  /(?<!\bnot\s)(?<!\bno\s)(?<!n't\s)(?<!\bnever\s)\b(?:exists|exist\s+(?:at|in|on)|is\s+present|was\s+found|found\s+at|present\s+on\s+disk)\b/i
 
 /**
  * A second negation NOT attached to the path — the "…exists but contains no
@@ -97,7 +101,7 @@ const LEADING_ABSENCE_LEAD = /^\s*(?:(?:the|a|an|file|directory|folder|and|or|no
  * finding the harness must not touch.
  */
 const ABSENCE_TAIL =
-  /^[\s:,-]*(?:no\s+such\s+file|(?:(?:is|are|was|were|does|do|did|has|have|had|seems?|appears?|still|apparently|actually|simply|entirely|completely|currently|now|also|even|file|directory|dir|folder|path|itself)\s+)*(?:(?:not|never)\s+)?(?:exists?|present|found|missing|absent))(?:\s+(?:on\s+disk|from\s+disk|in\s+the\s+worktree|on\s+the\s+filesystem|anywhere|at\s+all|yet))*(?:\s*\([^)]*\))?[\s.!?;:,-]*$/i
+  /^[\s:,-]*(?:no\s+such\s+file|(?:(?:is|are|was|were|does|do|did|has|have|had|seems?|appears?|still|apparently|actually|simply|entirely|completely|currently|now|also|even|file|directory|dir|folder|path|itself|doesn't|don't|didn't|isn't|aren't|wasn't|weren't|hasn't|haven't)\s+)*(?:(?:not|never)\s+)?(?:exists?|present|found|missing|absent))(?:\s+(?:on\s+disk|from\s+disk|in\s+the\s+worktree|on\s+the\s+filesystem|anywhere|at\s+all|yet))*(?:\s*\([^)]*\))?[\s.!?;:,-]*$/i
 
 export interface PathClaim {
   /** Every path the note asserts to be absent. Empty when this is not a path claim. */
@@ -108,7 +112,17 @@ export interface PathClaim {
 
 /** Strip backtick/quote-wrapped spans: a path inside them names a command. */
 function stripQuoted(note: string): string {
-  return note.replace(/`[^`]*`/g, " ").replace(/"[^"]*"/g, " ").replace(/'[^']*'/g, " ")
+  return (
+    note
+      .replace(/`[^`]*`/g, " ")
+      .replace(/"[^"]*"/g, " ")
+      // CR-7 (round 5): an English apostrophe is not a quote delimiter. The
+      // bare `/'[^']*'/g` deleted everything between the two contractions in
+      // "the file doesn't exist so we can't verify it" — including any path
+      // token in between — before subject/path extraction ever ran. A real
+      // single-quoted span opens at a word boundary and closes before one.
+      .replace(/(^|[\s(\[{])'[^']*'(?=$|[\s).,;:\]}])/g, "$1 ")
+  )
 }
 
 /**

@@ -49,7 +49,7 @@ import type { PinStore } from "../pin.js"
 import type { StoryEngine } from "../story.js"
 import { resolveVerifier } from "../resolve.js"
 import { runJudge, buildJudgePayload, type JudgeStoryVerdict } from "../judge.js"
-import type { PlanV2 } from "../story.js"
+import type { JudgeItemNote, PlanV2 } from "../story.js"
 import type { SelfCreatedSessions } from "../subturn.js"
 import type { ManifestCache } from "./manifest.js"
 import { incompletePlanFinding } from "./findings.js"
@@ -858,6 +858,9 @@ function applyPathVeto(
   if (verdict.pass) return { verdict, contradicted: [] }
   const root = state.workspaceRoot
   const contradicted: string[] = []
+  // CR-8: identity of the items this veto actually disproved. `itemId` cannot
+  // serve as the key — it is LLM-authored and not unique.
+  const contradictedItems = new Set<JudgeItemNote>()
 
   const items = verdict.items.map((item) => {
     if (item.met) return item
@@ -888,7 +891,9 @@ function applyPathVeto(
     // finding in the durable record; the note is annotated instead so a reader
     // sees both what the judge claimed and that the harness disproved it.
     // `contradictedItemIds` on the stamp remains the machine-readable signal.
-    return { ...item, note: `${item.note} [harness: contradicted — path(s) exist: ${paths.join(", ")}]` }
+    const annotated = { ...item, note: `${item.note} [harness: contradicted — path(s) exist: ${paths.join(", ")}]` }
+    contradictedItems.add(annotated)
+    return annotated
   })
 
   if (contradicted.length === 0) return { verdict, contradicted }
@@ -898,8 +903,13 @@ function applyPathVeto(
   // A story passes only when EVERY failing item was individually disproven.
   // Derived from the contradiction set because `met` is deliberately left
   // untouched above (MIN-003).
-  const contradictedIds = new Set(contradicted)
-  const stillFailing = items.some((i) => !i.met && !contradictedIds.has(i.itemId))
+  // CR-8 (round 5): `verdict.items` is LLM-authored and has NO uniqueness
+  // guarantee on `itemId`. Matching by id through a Set let one disproven path
+  // claim clear a DIFFERENT item that merely shared the id — laundering a
+  // genuine content failure into a harness-derived pass, which is the exact
+  // outcome FR-001 was narrowed to prevent. Match by identity instead: the
+  // veto records the item objects it actually disproved.
+  const stillFailing = items.some((i) => !i.met && !contradictedItems.has(i))
   return { verdict: { ...verdict, items, pass: !stillFailing }, contradicted }
 }
 
@@ -1051,7 +1061,16 @@ async function handleJudgeAudit(ctx: GateContext, sid: string, state: V2SessionS
   // saw a deleted session, so this floor never fired against a real host).
   // `undefined` means "could not tell" and fails open, exactly as before.
   const observed = result.observedToolCall
-  if (observed === false && onTarget.some((v) => v.items.some((i) => !i.met))) {
+  // CR-4 (round 5): the trigger was `some(item => !item.met)`, which is
+  // VACUOUSLY FALSE for a verdict with an empty `items` array — so the most
+  // unsubstantiated verdict of all (a `pass:false` with no items at all,
+  // produced without a single tool call) sailed past the floor and reverted
+  // the story. `isJudgeVerdictShape` accepts `items: []`, FR-005 is gated on
+  // `items.length > 0`, and `applyPathVeto` maps an empty array, so nothing
+  // downstream caught it either. Any unobserved verdict that would COST
+  // something — a failing story, or one with nothing backing it — is bounded.
+  const wouldRevert = onTarget.some((v) => !v.pass || v.items.length === 0 || v.items.some((i) => !i.met))
+  if (observed === false && wouldRevert) {
     ctx.logger("judge:unverified", { sessionID: sid, stories: onTarget.map((v) => v.storyId) })
     void ctx.visibility?.notify("health", {
       sessionID: sid,
@@ -1062,7 +1081,25 @@ async function handleJudgeAudit(ctx: GateContext, sid: string, state: V2SessionS
     // MAJ-003: this drop-path must still count toward the re-audit cap and
     // stamp the story, or the audit selector re-selects it every idle forever
     // (measured: 8 judge subturns over 8 idles, cap never firing).
-    boundUnappliedVerdicts(ctx, sid, state, onTarget, "unverified")
+    // CR-5 (round 5): bound only the verdicts this floor is ABOUT. It used to
+    // sweep the whole batch, so a story the judge PASSED with every item met
+    // was stamped `unapplied:"unverified"` too — which bars it from
+    // `allPassed` AND from re-audit (the selector skips a stamped story), so
+    // it could never become verified for the rest of the run. A passing,
+    // fully-met verdict costs nothing to apply and is not what the tool-call
+    // floor exists to stop.
+    const unsubstantiated = onTarget.filter((v) => !v.pass || v.items.length === 0 || v.items.some((i) => !i.met))
+    const substantiated = onTarget.filter((v) => !unsubstantiated.includes(v))
+    boundUnappliedVerdicts(ctx, sid, state, unsubstantiated, "unverified")
+    if (substantiated.length > 0) {
+      // A clean pass in the same batch still applies, so a story the judge
+      // genuinely confirmed is not held hostage by a sibling's bad verdict.
+      try {
+        ctx.storyEngine.applyJudgeVerdicts(sid, substantiated)
+      } catch {
+        // Fail-open: applying the clean subset is best-effort.
+      }
+    }
     return false
   }
   if (observed === undefined) {
