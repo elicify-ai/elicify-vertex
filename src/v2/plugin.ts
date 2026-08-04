@@ -35,7 +35,7 @@ import { PLUGIN_STATE_DIR, VerificationReceiptStore, isProtectedStatePath, resol
 import { holdoutSuppresses, logHoldoutSuppress } from "../measurement.js"
 
 import { compareExpectation, parseCriteriaBlock, parseExpectArtifact } from "./artifacts.js"
-import { isNonExecutingCommand, isTestRunnerCommand, observedCoversPrescribed } from "./coverage.js"
+import { isNonExecutingCommand, isTestRunnerCommand, observedCoversPrescribed, verifyGapComplied } from "./coverage.js"
 import { VisibilityNotifier, resolveVisibilityMode, summarizeFinding } from "./visibility.js"
 import { InjectionComposer, type Finding } from "./composer.js"
 import { resolveProfile, type Profile } from "./dosing.js"
@@ -553,6 +553,11 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
           state.active = true
           return
         }
+        // Belt and braces: `resetTurnState`, reached a few lines below on the
+        // activation path, also clears this. A mutant deleting this line
+        // survives the suite for exactly that reason — kept anyway, because a
+        // message that does NOT re-activate the session never reaches
+        // `resetTurnState`, and leaving the guard up there is the wedge.
         state.idleContinuationInFlight = false
         logger("gate:continuation-guard-released", { sessionID: sid, reason: "real user message" })
       }
@@ -1184,18 +1189,20 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
         // verification is complete (that is the receipt path, which still
         // demands full coverage). Running one declared verifier of an
         // `&&` chain is acting on it.
-        const compliesWith = (prescription: string): boolean => {
-          if (observedCoversPrescribed(prescription, command, state.workspaceRoot)) return true
-          const parts = prescription.split(/\s*&&\s*/).filter((part) => part.trim() !== "")
-          return parts.length > 1 && parts.some((part) => observedCoversPrescribed(part, command, state.workspaceRoot))
-        }
         for (const rendered of state.renderedVerifyGaps) {
           // M6 (grill round 2): this call was the one site still omitting the
           // root, so an observed command spelled absolutely never matched a
           // relatively-spelled prescription and the verify-gap was never
           // marked complied — the same absolute-vs-relative mismatch FR-013
           // fixed for receipts.
-          if (compliesWith(rendered.command)) {
+          // MAJ-7: see `verifyGapComplied` — the `&&` split is credited only
+          // for a story's own verifiers, never for a mixed-ecosystem join.
+          if (
+            verifyGapComplied(rendered.command, command, {
+              workspaceRoot: state.workspaceRoot,
+              storyScoped: rendered.storyScoped,
+            })
+          ) {
             composer.recordCompliance(sid, "verify-gap", rendered.instanceId)
             state.compliedFamiliesEver.add("verify-gap")
           }
@@ -1280,7 +1287,7 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       }
       state.precommitmentPending = false // FR-023a: offered at most once per phase entry
 
-      let verifyGapCandidate: { instanceId: string; command: string | null } | null = null
+      let verifyGapCandidate: { instanceId: string; command: string | null; storyScoped?: boolean } | null = null
       const changedPaths = evidenceLedger.getChangedPaths(sid)
       const hasVerification = evidenceLedger.hasVerification(sid)
       // HANDOVER.md redesign point 7: the per-turn verify-gap nudge fired on
@@ -1303,7 +1310,11 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
         )
         if (resolutionResult.command !== null) {
           const instanceId = nextInstanceId(state)
-          verifyGapCandidate = { instanceId, command: resolutionResult.command }
+          verifyGapCandidate = {
+            instanceId,
+            command: resolutionResult.command,
+            storyScoped: resolutionResult.rationale === "story",
+          }
           findings.push(
             verifyGapFinding({
               instanceId,
@@ -1387,7 +1398,11 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       if (renderResult.renderedFamilies.includes("story-completion")) storyCompletionPending.delete(sid)
       if (renderResult.renderedFamilies.some((f) => f.startsWith("repeat-failure:"))) state.repeatFailurePending = null
       if (renderResult.renderedFamilies.includes("verify-gap") && verifyGapCandidate?.command) {
-        state.renderedVerifyGaps.push({ instanceId: verifyGapCandidate.instanceId, command: verifyGapCandidate.command })
+        state.renderedVerifyGaps.push({
+          instanceId: verifyGapCandidate.instanceId,
+          command: verifyGapCandidate.command,
+          storyScoped: verifyGapCandidate.storyScoped,
+        })
       }
 
       // FR-061: a turn in which nearly every directive was dropped means the

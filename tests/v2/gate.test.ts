@@ -1201,6 +1201,75 @@ describe("handleJudgeAudit — verdict reconciliation", () => {
     expect(said).toMatch(/were NOT verified|remain unverified/)
   })
 
+  // MAJ-4 (round 4): `unauditedEscalated` is per PLAN, not per session. It was
+  // initialised only in `freshSessionState`, so a SECOND unaudited plan in the
+  // same session found the flag already spent and the run ended in silence —
+  // the exact outcome the escalation exists to prevent. A surviving mutant
+  // showed the reset had no test.
+  it("MAJ-4: a second unaudited plan in the same session still escalates", async () => {
+    const h = harness({ judgeEnabled: true })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+
+    const unauditedRound = async (): Promise<void> => {
+      stubJudge(
+        h,
+        { stories: [{ storyId: "S1", pass: false, summary: "nope", items: [{ itemId: "A1", met: false, note: "not delivered" }] }] },
+        [{ type: "text" }], // judge observed nothing -> bounding stamp
+      )
+      await handleSessionIdle(h.ctx, sid)
+      await handleSessionIdle(h.ctx, sid) // settled -> escalation
+    }
+
+    claimedStory(h, sid)
+    await unauditedRound()
+    const first = continuations(h.prompt).filter((c) => c.text.includes("did not pass")).length
+    expect(first).toBeGreaterThan(0)
+
+    // A real user message begins the next plan — that is the boundary that
+    // re-arms the escalation.
+    resetTurnState(state)
+    claimedStory(h, sid)
+    await unauditedRound()
+
+    expect(continuations(h.prompt).filter((c) => c.text.includes("did not pass")).length).toBeGreaterThan(first)
+  })
+
+  // MAJ-4 (round 4), other half: the once-only flag must be spent only on a
+  // dispatch that HAPPENED. Setting it beforehand meant a stall-paused
+  // dispatch burned the single escalation and the run went silent — the
+  // outcome the branch exists to prevent.
+  it("MAJ-4: a stall-paused escalation is not counted as spent", async () => {
+    const h = harness({ judgeEnabled: true, maxNoProgressTurns: 1 })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid)
+    stubJudge(
+      h,
+      { stories: [{ storyId: "S1", pass: false, summary: "nope", items: [{ itemId: "A1", met: false, note: "not delivered" }] }] },
+      [{ type: "text" }],
+    )
+    await handleSessionIdle(h.ctx, sid) // bounding stamp written
+
+    // Stall the gate so the escalation's dispatch is refused.
+    state.stallPaused = false
+    state.consecutiveNoProgress = 99
+    state.markerAtLastContinuation = state.activityMarker
+    await handleSessionIdle(h.ctx, sid)
+    expect(continuations(h.prompt).some((c) => c.text.includes("did not pass"))).toBe(false)
+
+    // Un-stall: the escalation must still be available.
+    state.stallPaused = false
+    state.consecutiveNoProgress = 0
+    state.activityMarker += 1
+    await handleSessionIdle(h.ctx, sid)
+    expect(continuations(h.prompt).some((c) => c.text.includes("did not pass"))).toBe(true)
+  })
+
   it("FR-007: past the re-audit cap the story is escalated, not reverted again", async () => {
     const h = harness({ judgeEnabled: true, maxStoryReaudits: 1 })
     const sid = "s1"

@@ -938,3 +938,46 @@ before being fixed.
 - **`looksLikeSecretFragment` keeps word-shaped fragments by design.** A key whose split leaves "xQabcdefghijklmn" survives as a fragment. Random key material does not contain long alphabetic runs; judge evidence is made of nothing else, and deleting evidence is the failure that has actually occurred in production.
 - **`grep`/`wc`-style runners** still lose bare-word operands (`grep -q foo Makefile` is credited by `grep -q bar Dockerfile`). Pre-existing and unchanged by C4; fixing it needs per-runner argument grammar, since the operand could be the pattern rather than the path.
 - **The 49-note corpus does not exercise the M1 machinery at all** — measured: all 36 `keep` notes are decided by the two cheap pre-filters. A test now pins that fact so the coverage claim cannot be overread again.
+
+
+---
+
+## Round-5 corrections (third re-review, 2026-08-04)
+
+Verdict was BLOCK again, with three CRITICALs. **One was a regression this
+project introduced in round 4** by acting on a round-3 finding without
+checking it: the review said `ls`/`stat`/`readlink`/`realpath` were dead code
+in the predicate-runner set, and they were removed. They are not dead — the
+runner-word loop only swallows the operand of a BARE `ls research`, so every
+flagged invocation reached the target filter and started crediting unrelated
+directories.
+
+| # | Finding | Resolution |
+|---|---------|------------|
+| CRIT-1 | Removing the four path runners re-opened C4 in its flagged spelling: `ls -la research` credited by `ls -la src`, and by bare `ls -la`. | Restored, with the two rules separated (`test`/`[`/`[[` need a file-test operator; `ls`/`stat`/… do not). 9 regression cases pinned. |
+| CRIT-2 | The file-test-operator requirement gated only BARE operands, so `test -n package.json` and bare `test package.json` — neither of which touches the filesystem — credited `test -f package.json`. | The operator is now part of the runner identity: `test -f` and `test -n` are different runners, and a bare `test` covers neither. |
+| CRIT-3 | `stripFacingFragment` examined the whole `\S+` edge token, so any adjacent punctuation sheltered the fragment — the leaking shapes (`( [ " ' \` ; ) ,`) are JSON, markdown and quoted shell output, all of which reach the judge payload. | It now locates the maximal secret-alphabet RUN at the edge, skipping punctuation and newlines but never spaces. 0 leaks over 12400 bare + 224 punctuation-adjacent splits. |
+| MAJ-1/2 | 16 of 22 round-4 fixes had no test that died when reverted, and the new cascade tests were vacuous — their adjacent line led with `Authorization` (13 chars, under the 16-char floor), so the predicate never ran. | A 20-mutant battery now runs clean. Two survivors were investigated and found to be redundant code, not missing tests; both are documented as such in place. |
+| MAJ-3 | The `gc` fix guarded the lock acquisition but not the body — the identical half-fix MAJ-6 had called out in `story.ts`. | Body wrapped. Tested through the injectable `fsIO` seam, because a chmod-based test silently passes for root. |
+| MAJ-4 | The `&&` compliance credit applied to every prescription, including mixed-ecosystem joins whose whole point is that neither half covers the other — and marking the family complied suppresses verify-gap for the rest of the session. | Scoped to tier-1 story verifiers, and extracted as `verifyGapComplied` so it is testable at all; being inline in a hook is why it went unguarded. |
+
+### Two defects found by tests written for something else
+
+- **The FR-006a false positive was still live in the general case.** Two clean
+  prose lines — "…assigned correctly" + "tests/fixtures/judge-replay was
+  refreshed" — fuse into a 32+ char token over the entropy bar, and BOTH were
+  dropped. The round-3 exoneration only covered a left fragment ending in a
+  file extension. `looksLikeWord` now decides it, applied to both fragments
+  (applied to the whole token it re-opened 20 leaks: a 43-char base64 key can
+  itself segment into enough pseudo-words to pass).
+- **`looksLikeWord` was too weak for base64.** `Txob|Y+f|Dakt|WCr|SX|Rdw`
+  scored 4 wordy segments of 8 and passed. Two further guards: `+`/`=` never
+  occur in prose, and real words are longer (mean alphabetic-segment length
+  >= 4.5; `tests|fixtures|judge|replay` averages 6, base64 pseudo-words 3-4).
+
+### Dead code removed rather than kept
+
+The round-4 change that let M9 preserve an own-session future-schema entry was
+decoration: `persistPlan` either overwrites `file[sessionID]` from the cached
+plan, or — with no cached plan, i.e. an explicit clear — drops it deliberately.
+A surviving mutant proved there is no path on which it matters. Reverted.

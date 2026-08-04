@@ -1784,20 +1784,94 @@ describe("C1 — split-secret fragment adjacent to a unit dropped alone", () => 
   // lost, and a 40-char git SHA — a documented false positive of the hex-run
   // rule, no real secret involved — emptied the field outright, re-creating
   // the FR-006a failure this module exists to prevent.
-  it("does not cascade: ordinary identifier lines beside a secret all survive", () => {
+  // MAJ-2 (round 4): the first version of this test led the adjacent line with
+  // `Authorization` — 13 characters, under SECRET_FRAGMENT_MIN_CHARS — so the
+  // predicate was never reached, and lines 3-5 were never adjacent to a
+  // dropped unit at all. It asserted the fix's conclusion without exercising
+  // its mechanism: mutants making `looksLikeWord` always-true AND always-false
+  // both survived it. Every line here now leads with a >=16-char
+  // secret-alphabet token that only `looksLikeWord` distinguishes from key
+  // material.
+  it("does not cascade: long identifier lines beside a secret all survive", () => {
     const kept = scan([
       "tok AKIAIOSFODNN7EXAMPLEKEYMATERIAL01",
-      "Authorization header verified in tests",
-      "createPlanRequest validated end to end",
-      "snake_case_var_1 assigned correctly",
-      "ordinary short prose here",
+      "createPlanRequestValidator ran clean",
+      "snake_case_variable_name assigned correctly",
+      "tests/fixtures/judge-replay was refreshed",
+      "documentationBuilder finished",
     ])
     expect(kept).toEqual([
-      "Authorization header verified in tests",
-      "createPlanRequest validated end to end",
-      "snake_case_var_1 assigned correctly",
-      "ordinary short prose here",
+      "createPlanRequestValidator ran clean",
+      "snake_case_variable_name assigned correctly",
+      "tests/fixtures/judge-replay was refreshed",
+      "documentationBuilder finished",
     ])
+  })
+
+  // CRIT-3 (round 4): the edge test used to require a PURE `\S+` token, so any
+  // adjacent punctuation carried the fragment through untouched — and the
+  // leaking shapes are JSON, markdown and quoted shell output, i.e. exactly
+  // what reaches `recentTranscript` / `lastResponse` / `plan`.
+  describe("CRIT-3: punctuation and newlines do not shelter a fragment", () => {
+    const KEY = "91a0c1c67e98ec1e0b48db2e30e260ffc44f81c3c139"
+    const WRAPPERS: Array<[string, string]> = [
+      ["token `", "` used"],
+      ['"', '", rest'],
+      ["(", ") tail"],
+      ["[", "] tail"],
+      ["<", "> tail"],
+      ["**", "** bold"],
+      ["", " ; done"],
+      ["", "\n next"],
+    ]
+    for (const [left, right] of WRAPPERS) {
+      it(`leaks nothing for ${JSON.stringify(left)}…${JSON.stringify(right)}`, () => {
+        for (let i = 8; i < KEY.length - 8; i++) {
+          const kept = scan([left + KEY.slice(0, i), KEY.slice(i) + right]).join("\n")
+          const survivors = (kept.match(/[0-9a-f]{16,}/g) ?? []).filter((run) => KEY.includes(run))
+          expect(survivors, `split ${i} of ${JSON.stringify(left)}…`).toEqual([])
+        }
+      })
+    }
+
+    // The edge-strip regime proper: one unit is >=32 chars so it trips ALONE
+    // (the pair pass is skipped entirely), and the surviving unit ends in the
+    // fragment behind a quote/backtick/paren. Testing the whole `\S+` edge
+    // token — the round-3 behaviour — captures the punctuation too, fails the
+    // alphabet check, and strips nothing.
+    it.each(['tail "', "tail `", "tail ("])("strips a fragment behind %j", (prefix) => {
+      const hex = "4145244f7f8dbe2cf10123456789abcdef0123456789abcdef99887766554433"
+      expect(scan([prefix + hex.slice(0, 20), hex.slice(20)])).toEqual([prefix])
+    })
+
+    // A SPACE is a real separator, not punctuation: skipping past one would
+    // strip a token that was never part of the secret.
+    it("does not strip a token separated from the secret by a space", () => {
+      expect(scan(["tok AKIAIOSFODNN7EXAMPLEKEYMATERIAL01", " documentationBuilder finished"])).toEqual([
+        " documentationBuilder finished",
+      ])
+    })
+
+    // Examining `dewrap(unit)` and RETURNING it was tried and is wrong: it
+    // hands back the unit with its newlines gone. `criteria` is split on
+    // newlines anyway, so the damage only shows on `diffSummary`, whose units
+    // are whole multi-line hunks — caught by the existing sk-live hunk test,
+    // re-asserted here next to the fix it constrains.
+    it("preserves newlines inside a surviving diff hunk beside a dropped one", () => {
+      const payload = buildJudgePayload(
+        {
+          criteria: [],
+          diffSummary: "diff --git a/s b/s\n@@ -1,1 +1,1 @@\n-tok AKIAIOSFODNN7EXAMPLEKEYMATERIAL01\ndiff --git a/b b/b\n@@ -2,2 +2,2 @@\n-old\n+new",
+          verifierSummaries: [],
+          lastResponse: "",
+          recentTranscript: "",
+          plan: "",
+        },
+        () => {},
+      )
+      expect(payload.diffSummary).toContain("@@ -2,2 +2,2 @@\n-old\n+new")
+      expect(payload.diffSummary).not.toContain("AKIAIOSFODNN7EXAMPLEKEYMATERIAL01")
+    })
   })
 
   it("a git SHA false positive does not take the following lines with it", () => {
@@ -1822,6 +1896,54 @@ describe("C1 — split-secret fragment adjacent to a unit dropped alone", () => 
   it("still keeps the two plan-digest lines whose no-separator join manufactures a token", () => {
     expect(
       scan(["  verifiers: jq -e .kpis research/space-exploration.json", 'S2 (active): "Research Wave B"']),
+    ).toHaveLength(2)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// MAJ-1 (round 4) — mutation guards for the C1 predicate itself.
+//
+// A 37-mutant battery found that `looksLikeWord` could be replaced by
+// `always true` OR `always false` with the suite still green: the predicate
+// was load-bearing and untested from both directions.
+// ---------------------------------------------------------------------------
+describe("MAJ-1: looksLikeWord is pinned in both directions", () => {
+  const scan2 = (criteria: string[]) =>
+    buildJudgePayload(
+      { criteria, diffSummary: "", verifierSummaries: [], lastResponse: "", recentTranscript: "", plan: "" },
+      () => {},
+    ).criteria ?? []
+
+  // always-true would keep these: each is real key material adjacent to a
+  // dropped secret and must be stripped.
+  const SECRET_FRAGMENTS = [
+    "4145244f7f8dbe2cf1", // pure hex — LONG_HEX_RUN, segments into pseudo-words
+    "TxobYfDaktWCrSXRdwBM", // base64 alphabet, 3-4 char pseudo-words
+    "HMEr3sTxobYfDaktWCrSX", // ditto, mixed digits
+  ]
+  for (const fragment of SECRET_FRAGMENTS) {
+    it(`strips key material: ${fragment}`, () => {
+      expect(scan2(["tok AKIAIOSFODNN7EXAMPLEKEYMATERIAL01", `${fragment} trailing words here`])).toEqual([
+        " trailing words here",
+      ])
+    })
+  }
+
+  // always-false would strip these: each is ordinary content that must survive
+  // intact beside a dropped secret.
+  const PROSE_TOKENS = ["createPlanRequestValidator", "snake_case_variable_name", "tests/fixtures/judge-replay", "documentationBuilder"]
+  for (const token of PROSE_TOKENS) {
+    it(`keeps content: ${token}`, () => {
+      expect(scan2(["tok AKIAIOSFODNN7EXAMPLEKEYMATERIAL01", `${token} was updated`])).toEqual([`${token} was updated`])
+    })
+  }
+
+  // The FR-006a class, found by a test written for something else: two clean
+  // adjacent prose lines whose no-separator join manufactures a 32+ char
+  // high-entropy token. Both must survive.
+  it("keeps two prose lines whose join manufactures a high-entropy token", () => {
+    expect(
+      scan2(["snake_case_variable_name assigned correctly", "tests/fixtures/judge-replay was refreshed"]),
     ).toHaveLength(2)
   })
 })

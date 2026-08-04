@@ -2185,14 +2185,14 @@ export class StoryEngine {
       for (const [sid, value] of Object.entries(parsed)) {
         if (isPlanV2(value)) {
           file[sid] = coerceLoadedPlan(value)
-        } else if (isFutureSchemaEntry(value)) {
-          // Includes THIS session's own id. The audited configuration was two
-          // plugin runtimes driving one session, so "a newer peer wrote our
-          // session's entry" is not hypothetical — excluding it was excluding
-          // the measured case. `persistPlan` overwrites `file[sessionID]` from
-          // the cached plan whenever one exists, so preserving the raw value
-          // here can still never resurrect a stale copy of our own plan; it
-          // only protects the entry when this engine has nothing to write.
+        } else if (sid !== sessionID && isFutureSchemaEntry(value)) {
+          // OTHER sessions only. Including our own id was tried and is dead
+          // code (proved by a surviving mutant): `persistPlan` either
+          // overwrites `file[sessionID]` from the cached plan, or — with no
+          // cached plan, i.e. an explicit clear — drops it from the foreign
+          // map deliberately. There is no path on which an own-session
+          // future-schema entry survives, so pretending to preserve one was
+          // decoration.
           this.foreignEntries[sid] = value
           this.logger("plan:foreign-entry-preserved", {
             sessionID,

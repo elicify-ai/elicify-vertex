@@ -1,5 +1,6 @@
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -445,5 +446,45 @@ describe("pins_disk_corrupt_on_write (CRITICAL fix: a corrupt pins.json must not
     // The pre-existing schema-invalid blob is dropped (whole-file validation,
     // unchanged behavior) rather than blocking this session's write.
     expect((onDisk as Record<string, unknown>)["session-other"]).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// MAJ-3 (round 4) — `gc` is called bare from `chat.message` on every activated
+// turn, and `chat.message` has no try/catch of its own. A throw here aborts
+// the turn after `resetTurnState` has run but before intake classification.
+// Round 3 guarded the lock acquisition only; the body was left exposed —
+// the identical half-fix MAJ-6 called out in `story.ts`.
+// ---------------------------------------------------------------------------
+describe("MAJ-3: PinStore.gc is fail-open end to end", () => {
+  it("does not throw when the lock is held by a peer", () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "vertex-pin-gc-"))
+    mkdirSync(stateDir, { recursive: true })
+    writeFileSync(join(stateDir, "state.lock"), String(process.pid), { flag: "wx" })
+    const events: string[] = []
+    const store = new PinStore({ stateDir, logger: (event: string) => events.push(event) })
+
+    expect(() => store.gc(new Set(["s1"]))).not.toThrow()
+    expect(events).toContain("pins:gc-deferred")
+  })
+
+  // Driven through the injectable `fsIO` seam rather than file permissions:
+  // a chmod-based test silently passes for root, and the real failures here
+  // are EACCES / ENOSPC / EEXIST / TOCTOU, not just permissions.
+  it("does not throw when the BODY fails mid-way", () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "vertex-pin-gc-"))
+    mkdirSync(stateDir, { recursive: true })
+    const events: string[] = []
+    const store = new PinStore({ stateDir, logger: (event: string) => events.push(event) })
+    const boom = vi.spyOn(fsIO, "existsSync").mockImplementation(() => {
+      throw new Error("ENOSPC: no space left on device")
+    })
+
+    try {
+      expect(() => store.gc(new Set(["s1"]))).not.toThrow()
+      expect(events).toContain("pins:gc-failed")
+    } finally {
+      boom.mockRestore()
+    }
   })
 })

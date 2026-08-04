@@ -523,6 +523,20 @@ function entropyTokenStraddles(joined: string, joinIdx: number): boolean {
     const leftFragment = joined.slice(start, joinIdx)
     const rightFragment = joined.slice(joinIdx, end)
     if (LEFT_ENDS_IN_PATH.test(leftFragment) && RIGHT_STARTS_SHORT_WORD.test(rightFragment)) continue
+    // Round 4: the anchor above only exonerates a left fragment ending in a
+    // FILE EXTENSION, which left the general FR-006a false positive open —
+    // "…assigned correctly" + "tests/fixtures/judge-replay was refreshed"
+    // fuse into `correctlytests/fixtures/judge-replay`, over 32 chars and
+    // over the entropy bar, and BOTH innocent lines were dropped. Found by a
+    // test written for something else entirely.
+    //
+    // `looksLikeWord` is the same discriminator C1 uses and a far better one
+    // than the anchor: real key material does not decompose into words, and
+    // fused prose always does. Applied to BOTH FRAGMENTS, not the whole
+    // token: a 43-char base64 key can itself segment into enough pseudo-words
+    // to pass (measured — testing the whole token re-opened 32 leaks), while
+    // a split key always leaves at least one side that is plainly random.
+    if (looksLikeWord(leftFragment) && looksLikeWord(rightFragment)) continue
     return true
   }
   return false
@@ -617,13 +631,24 @@ const SECRET_FRAGMENT_MIN_CHARS = 16
  */
 function looksLikeWord(token: string): boolean {
   const segments = token
-    .split(/[_-]|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Za-z])(?=\d)|(?<=\d)(?=[A-Za-z])/)
+    // `/` is in `SECRET_ALPHABET_RUN`, so without splitting on it too an
+    // all-lowercase path like `tests/fixtures/replay` was read as key
+    // material and stripped — the FR-006a class again.
+    .split(/[_\-/]|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Za-z])(?=\d)|(?<=\d)(?=[A-Za-z])/)
     .filter((part) => part !== "")
   if (segments.length === 0) return false
+  // `+` and `=` are base64-only: no identifier or English word contains them.
+  if (/[+=]/.test(token)) return false
   const wordy = segments.filter((part) => /^[A-Za-z]{3,}$/.test(part))
   // At least half the segments must be real alphabetic runs. Random material
   // fragments into one- and two-character shards; identifiers do not.
-  return wordy.length * 2 >= segments.length
+  if (wordy.length * 2 < segments.length) return false
+  // ...and those runs must be word-LENGTH. Base64 clears the ratio test on
+  // 3-4 character pseudo-words (`Txob|Y+f|Dakt|WCr|SX|Rdw` scored 4 of 8 and
+  // leaked 20 fragments in a 10840-split probe); real prose does not
+  // (`tests|fixtures|judge|replay` averages 6, `correctly` 9).
+  const meanWordLength = wordy.reduce((sum, part) => sum + part.length, 0) / wordy.length
+  return meanWordLength >= 4.5
 }
 
 /**
@@ -653,9 +678,28 @@ function looksLikeSecretFragment(fragment: string): boolean {
  * stripped unit is never added to `toDrop`, so it never implicates anything.
  */
 function stripFacingFragment(unit: string, facing: "start" | "end"): string {
-  const edge = facing === "start" ? /^\S+/.exec(unit) : /\S+$/.exec(unit)
-  if (!edge || !looksLikeSecretFragment(edge[0])) return unit
-  return facing === "start" ? unit.slice(edge[0].length) : unit.slice(0, unit.length - edge[0].length)
+  // CRIT-3 (round 4): this used to test the whole `\S+` edge token, so ANY
+  // adjacent punctuation defeated it — `"db2e...c139", rest` kept 24 hex
+  // characters of a live key, and the shapes that leak (`( [ " ' < ` ; ) ,`)
+  // are exactly JSON, markdown and quoted shell output, all of which reach
+  // `recentTranscript` / `lastResponse` / `plan`. Locate the maximal
+  // secret-alphabet RUN at the facing edge instead, ignoring punctuation
+  // around it, and remove only that run.
+  // The skip class is punctuation and NEWLINES but not spaces/tabs. Newlines
+  // belong in it because `dewrap` removes them before any scan, so a unit
+  // beginning `"\n<fragment>"` really is fused to the secret; a SPACE is a
+  // genuine separator, and skipping past one would strip a token that was
+  // never part of the secret at all. (Examining `dewrap(unit)` instead was
+  // tried and is wrong: it returns the unit with its newlines gone, which
+  // collapses multi-line diff hunks.)
+  const SKIP = "(?:[\\n\\r]|[^\\sA-Za-z0-9+/=_-])*"
+  const run =
+    facing === "start"
+      ? new RegExp(`^${SKIP}([A-Za-z0-9+/=_-]+)`).exec(unit)
+      : new RegExp(`([A-Za-z0-9+/=_-]+)${SKIP}$`).exec(unit)
+  if (!run || !looksLikeSecretFragment(run[1])) return unit
+  const at = unit.indexOf(run[1], facing === "start" ? 0 : unit.length - run[0].length)
+  return unit.slice(0, at) + unit.slice(at + run[1].length)
 }
 
 function scanUnits(units: string[]): { kept: string[]; anyDropped: boolean } {

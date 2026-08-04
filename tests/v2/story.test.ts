@@ -2662,3 +2662,70 @@ describe("MAJ-008: a stamped-but-unenforced verdict is logged", () => {
     })
   })
 })
+
+// ---------------------------------------------------------------------------
+// MAJ-1 (round 4) — mutation guards for fixes that shipped without one.
+// A 37-mutant battery found each of these could be reverted with a green suite.
+// ---------------------------------------------------------------------------
+describe("MAJ-1: previously unguarded story-engine fixes", () => {
+  // MAJ-8: `verifiers` elements are LLM-authored; a non-string reached
+  // `.trim()`/`.join()` downstream and threw out of a synchronous tool hook.
+  it("MAJ-8: createPlan rejects a non-string verifier element", () => {
+    const { engine: se } = engine(temporaryRoot())
+    expect(() =>
+      se.createPlan("s1", [
+        { text: "t", acceptanceItems: ["A1"], verifiers: ["ok", 42 as unknown as string], tasks: [{ text: "do" }] },
+      ]),
+    ).toThrow(/verifiers must be an array of strings/)
+  })
+
+  // MAJ-6: the archive BODY was unguarded — only the lock acquisition was
+  // fixed. It runs at the top of four synchronous tool handlers.
+  it("MAJ-6: a failing archive body does not throw into the caller", () => {
+    const stateDir = temporaryRoot()
+    mkdirSync(stateDir, { recursive: true })
+    writeFileSync(join(stateDir, "goals.json"), JSON.stringify({ schemaVersion: 1, goals: [] }))
+    // `archive` exists as a FILE, so `mkdirSync(archiveDir)` throws EEXIST/ENOTDIR.
+    writeFileSync(join(stateDir, "archive"), "not a directory")
+    const { engine: se, logger } = engine(stateDir)
+
+    expect(() => se.archiveV1IfPresent()).not.toThrow()
+    expect(logger).toHaveBeenCalledWith("story:v1-archive-failed", expect.objectContaining({}))
+  })
+
+  // M9 trio: the foreign-entry map is per-read, covers this session too, and
+  // an explicit clear still clears an unreadable entry.
+  it("M9: a stale foreign entry does not resurrect after plan.json is deleted", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [story()])
+    const planPath = join(stateDir, "plan.json")
+    const onDisk = JSON.parse(readFileSync(planPath, "utf8")) as Record<string, unknown>
+    onDisk["peer"] = { schemaVersion: 3, stories: [] }
+    writeFileSync(planPath, JSON.stringify(onDisk))
+    se.checkpoint("s1", plan.stories[0].tasks[0].id, "complete") // reads + preserves `peer`
+
+    rmSync(planPath)
+    se.reopenStory("s1", "S1", { reason: "write again with no file on disk" })
+
+    const after = JSON.parse(readFileSync(planPath, "utf8")) as Record<string, unknown>
+    expect(after["peer"]).toBeUndefined()
+  })
+
+  it("M9: a newer-schema entry for ANOTHER session is preserved", () => {
+    const stateDir = temporaryRoot()
+    const { engine: se } = engine(stateDir)
+    const plan = se.createPlan("s1", [story()])
+    const planPath = join(stateDir, "plan.json")
+    // Another session's entry, written by a peer on a newer schema.
+    const onDisk = JSON.parse(readFileSync(planPath, "utf8")) as Record<string, unknown>
+    onDisk["s2-peer"] = { schemaVersion: 4, stories: [], future: true }
+    writeFileSync(planPath, JSON.stringify(onDisk))
+    se.checkpoint("s1", plan.stories[0].tasks[0].id, "complete")
+    expect((JSON.parse(readFileSync(planPath, "utf8")) as Record<string, unknown>)["s2-peer"]).toEqual({
+      schemaVersion: 4,
+      stories: [],
+      future: true,
+    })
+  })
+})

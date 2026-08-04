@@ -419,6 +419,15 @@ export class PinStore {
         return
       }
       this.atomicWrite(kept)
+    } catch (error) {
+      // MAJ-3 (round 4): the round-3 fix guarded only the lock ACQUISITION —
+      // exactly the half-fix MAJ-6 called out in `story.ts`. The body reads,
+      // unlinks and atomically rewrites `pins.json` (`mkdir`/`write wx`/
+      // `rename`/`chmod`), any of which throws on EACCES / ENOSPC / EEXIST /
+      // a TOCTOU race. `plugin.ts` calls this bare inside `chat.message`,
+      // which has no try/catch of its own, so a throw aborted the turn after
+      // `resetTurnState` had run but before intake classification.
+      this.logger("pins:gc-failed", { reason: error instanceof Error ? error.message : String(error) })
     } finally {
       lock.release()
     }

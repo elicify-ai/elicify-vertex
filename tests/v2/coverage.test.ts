@@ -7,6 +7,7 @@ import {
   subCommandCovers,
   targetCovers,
   targetsCover,
+  verifyGapComplied,
   WHOLE_SUITE_ALIASES,
 } from "../../src/v2/coverage.js"
 
@@ -753,19 +754,21 @@ describe("FR-013: an absolute cd is resolved against the root", () => {
 describe("FR-013: parseSubcommands rebases absolute targets only when asked", () => {
   it("leaves the parse byte-identical with no root", () => {
     expect(parseSubcommands(`test -f ${WORKTREE}/research/a.md`)).toEqual([
-      { runner: "test", targets: [`${WORKTREE}/research/a.md`], narrowing: [], nonExecuting: false },
+      // CRIT-2 (round 4): the file-test operator is part of the runner
+      // identity now, so `test -f` and `test -n` cannot cover each other.
+      { runner: "test -f", targets: [`${WORKTREE}/research/a.md`], narrowing: [], nonExecuting: false },
     ])
   })
 
   it("rebases onto the root when one is supplied", () => {
     expect(parseSubcommands(`test -f ${WORKTREE}/research/a.md`, WORKTREE)).toEqual([
-      { runner: "test", targets: ["research/a.md"], narrowing: [], nonExecuting: false },
+      { runner: "test -f", targets: ["research/a.md"], narrowing: [], nonExecuting: false },
     ])
   })
 
   it("maps the root itself to '.', never to a universal target", () => {
     expect(parseSubcommands(`test -d ${WORKTREE}`, WORKTREE)).toEqual([
-      { runner: "test", targets: ["."], narrowing: [], nonExecuting: false },
+      { runner: "test -d", targets: ["."], narrowing: [], nonExecuting: false },
     ])
   })
 
@@ -852,5 +855,107 @@ describe("C4 — bare-word operands of filesystem predicates", () => {
     // uses it to find where the runner ends.
     expect(parseSubcommands("npm run build")[0].targets).toEqual([])
     expect(observedCoversPrescribed("npm run build", "npm run build")).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Round-4 CRIT-1/CRIT-2 — false receipts from commands that assert nothing.
+//
+// A round-3 review reported these runners as dead code and they were removed;
+// that was a regression. `toSubCommand`'s runner-word loop only swallows the
+// operand of a BARE `ls research` — it stops at the first flag, so the flagged
+// spelling (the common one) reaches the target filter. Dropping the operand
+// there yields `targets: []`, which `targetsCover` treats as universal.
+// ---------------------------------------------------------------------------
+describe("CRIT-1: flagged path-runner invocations keep their operand", () => {
+  const CASES: Array<[string, string, boolean]> = [
+    ["ls -la research", "ls -la src", false],
+    ["ls -la research", "ls -la", false],
+    ["ls -la research", "ls -la research", true],
+    ["stat -c %s research", "stat -c %s src", false],
+    ["stat -c %s research", "stat -c %s research", true],
+    ["readlink -f research", "readlink -f build", false],
+    ["realpath research", "realpath src", false],
+    // The originally-reported C4 shape, in bash's idiomatic spelling.
+    ["[[ -d research ]]", "[[ -d src ]]", false],
+    ["[[ -d research ]]", "[[ -d research ]]", true],
+  ]
+  for (const [prescribed, observed, expected] of CASES) {
+    it(`${expected ? "credits" : "refuses"}: ${prescribed} <- ${observed}`, () => {
+      expect(observedCoversPrescribed(prescribed, observed)).toBe(expected)
+    })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// CRIT-2 — a string test is not a filesystem assertion.
+//
+// `test -n <path>` and bare `test <path>` touch no filesystem and always exit
+// 0. Gating only BARE operands left this open for every operand with a dot or
+// a slash, i.e. nearly every real file. The operator is part of WHICH
+// assertion was made, so it belongs in the runner identity.
+// ---------------------------------------------------------------------------
+describe("CRIT-2: the file-test operator is part of the runner identity", () => {
+  const CASES: Array<[string, string, boolean]> = [
+    ["test -f package.json", "test -n package.json", false],
+    ["test -e research/x.md", "test -n research/x.md", false],
+    ["test -f package.json", "test package.json", false],
+    ["test -d research", "test -n research", false],
+    ["test -f package.json", "test -f package.json", true],
+    ["test -d research", "test -d research", true],
+    // Quoting is shell syntax, not part of the path.
+    ['test -d "research"', "test -d research", true],
+  ]
+  for (const [prescribed, observed, expected] of CASES) {
+    it(`${expected ? "credits" : "refuses"}: ${prescribed} <- ${observed}`, () => {
+      expect(observedCoversPrescribed(prescribed, observed)).toBe(expected)
+    })
+  }
+
+  it("carries the operator into the parsed runner", () => {
+    expect(parseSubcommands("test -f package.json")[0].runner).toBe("test -f")
+    expect(parseSubcommands("test -d research")[0].runner).toBe("test -d")
+    // Every non-file-test spelling collapses to one identity, so `test -n`,
+    // bare `test` and `test -z` are all distinct from `test -f` and cover no
+    // filesystem assertion at all.
+    expect(parseSubcommands("test -n package.json")[0].runner).toBe("test (none)")
+    expect(parseSubcommands("test package.json")[0].runner).toBe("test (none)")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// MAJ-7 (round 4) — the verify-gap compliance credit, extracted from
+// `plugin.ts` so it can be tested at all. It went unguarded because it was
+// inline in a hook: a mutant removing the `storyScoped` gate survived.
+// ---------------------------------------------------------------------------
+describe("verifyGapComplied", () => {
+  const STORY = "test -f research/a.md && test -f research/b.md"
+  const MIXED = "go test ./... && npm test"
+
+  it("credits full coverage regardless of scope", () => {
+    expect(verifyGapComplied(STORY, STORY, { storyScoped: true })).toBe(true)
+    expect(verifyGapComplied(MIXED, MIXED, { storyScoped: false })).toBe(true)
+  })
+
+  it("credits ONE of a story's independent verifiers", () => {
+    expect(verifyGapComplied(STORY, "test -f research/a.md", { storyScoped: true })).toBe(true)
+    expect(verifyGapComplied(STORY, "test -f research/b.md", { storyScoped: true })).toBe(true)
+  })
+
+  // The invariant `resolve.ts` states explicitly: a Go suite is blind to a
+  // TypeScript change and vice versa. Crediting half marks the family
+  // complied, and `dosing.ts` then suppresses verify-gap for the whole
+  // session — so running the Go half would silence the TypeScript nudge.
+  it("refuses one half of a MIXED-ECOSYSTEM prescription", () => {
+    expect(verifyGapComplied(MIXED, "go test ./...", { storyScoped: false })).toBe(false)
+    expect(verifyGapComplied(MIXED, "npm test", { storyScoped: false })).toBe(false)
+  })
+
+  it("defaults to the strict reading when scope is unknown", () => {
+    expect(verifyGapComplied(STORY, "test -f research/a.md")).toBe(false)
+  })
+
+  it("still refuses an unrelated command", () => {
+    expect(verifyGapComplied(STORY, "npx eslint .", { storyScoped: true })).toBe(false)
   })
 })

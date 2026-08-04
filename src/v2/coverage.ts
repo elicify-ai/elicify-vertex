@@ -792,19 +792,21 @@ export function parseSubcommands(command: string, workspaceRoot?: string): SubCo
  * `test -d research` from parsing as a target-less command, not to widen path
  * detection generally.
  */
-const FILESYSTEM_PREDICATE_RUNNERS = new Set(["test", "["])
+const FILESYSTEM_PREDICATE_RUNNERS = new Set(["test", "[", "ls", "stat", "readlink", "realpath"])
 
 /**
  * CRIT-1 (grill round 3). The first version of this set omitted `[[`, bash's
  * idiomatic spelling, so the ORIGINAL C4 false receipt survived verbatim:
  * prescribed `[[ -d research ]]` was credited by observed `[[ -d src ]]`.
  *
- * It also listed `ls`, `stat`, `readlink` and `realpath`, which never did
- * anything: `toSubCommand`'s runner-word loop consumes tokens until it hits a
- * flag or a path-shaped token, so `ls research` parses as
- * `runner: "ls research"` and this code is never reached for them. They are
- * dropped rather than left as decoration — resurrecting them needs a change
- * to the runner loop, not to this set.
+ * A round-3 review claimed `ls`/`stat`/`readlink`/`realpath` were dead here,
+ * because the runner-word loop swallows the operand of a BARE `ls research`.
+ * Removing them was a regression (round-4 CRIT-1): the loop stops at the first
+ * flag, so `ls -la research` parses with `runner: "ls"` and `research` in
+ * `rest` — where dropping it yields `targets: []`, which `targetsCover` treats
+ * as universal. Measured: `ls -la research` was then credited by `ls -la src`
+ * and by bare `ls -la`. Flagged invocations are the common spelling, so these
+ * four are live and stay.
  */
 const BRACKET_TEST_RUNNERS = new Set(["[[", "[", "test"])
 
@@ -868,9 +870,15 @@ function toSubCommand(tokens: readonly string[]): SubCommand | null {
   // CRIT-1: a bracket/`test` command names a path only when a FILE-TEST
   // operator says so. Without that check `test -n research` — a string test —
   // credited `test -d research`.
-  const bareOperandsArePaths =
-    (FILESYSTEM_PREDICATE_RUNNERS.has(runnerTokens[0]) || BRACKET_TEST_RUNNERS.has(runnerTokens[0])) &&
-    rest.some((token) => FILE_TEST_OPERATORS.has(token))
+  const isBracketTest = BRACKET_TEST_RUNNERS.has(runnerTokens[0])
+  const fileTestOperator = rest.find((token) => FILE_TEST_OPERATORS.has(token))
+  // Two different rules, not one. A bracket/`test` command asserts about a
+  // path only under a file-test operator; `ls`/`stat`/`readlink`/`realpath`
+  // take paths unconditionally and have no such operator, so requiring one
+  // (as the first version of this line did) left them crediting each other.
+  const bareOperandsArePaths = isBracketTest
+    ? fileTestOperator !== undefined
+    : FILESYSTEM_PREDICATE_RUNNERS.has(runnerTokens[0])
   const targets = rest
     .filter((token) => !isFlagToken(token))
     // CRIT-1 (C4-5): `test -d "research"` kept its quotes as part of the
@@ -879,7 +887,16 @@ function toSubCommand(tokens: readonly string[]): SubCommand | null {
     .map((token) => token.replace(/^(['"])(.*)\1$/, "$2"))
     .filter((token) => bareOperandsArePaths || isPathShaped(token))
 
-  const runner = normalizeRunner(runnerTokens.join(" "))
+  // CRIT-2 (round 4): gating only BARE operands left the string-test bug open
+  // for every operand with a dot or a slash — i.e. nearly every real file.
+  // Measured: `test -n package.json` credited `test -f package.json`, and
+  // `test package.json` credited it too; both always exit 0 and touch no
+  // filesystem. The operator is part of WHICH ASSERTION was made, so it
+  // belongs in the runner identity: `test -f` and `test -n` are then simply
+  // different runners, and a bare `test` covers neither.
+  const runner = normalizeRunner(
+    isBracketTest ? [runnerTokens[0], fileTestOperator ?? "(none)"].join(" ") : runnerTokens.join(" "),
+  )
   const runnerScoped = scopedFlags(RUNNER_NON_EXECUTING_FLAGS, runner)
 
   return {
@@ -1236,4 +1253,32 @@ export function observedCoversPrescribed(prescribed: string, observed: string, w
   if (prescribedParts.length === 0 || observedParts.length === 0) return false
 
   return prescribedParts.every((part) => observedParts.some((candidate) => subCommandCovers(candidate, part)))
+}
+
+
+/**
+ * FR-034 compliance: did `observed` act on a rendered verify-gap prescription?
+ *
+ * Distinct from `observedCoversPrescribed`, which asks whether the observed
+ * command did EVERYTHING the prescription would — the bar for minting a
+ * receipt. Compliance asks only whether the nudge was acted on.
+ *
+ * `storyScoped` is load-bearing (MAJ-4/MAJ-7). A tier-1 prescription is a
+ * story's own declared verifiers `&&`-joined, i.e. a list of INDEPENDENT
+ * checks, and running one of them is acting on the nudge. `resolve.ts` also
+ * `&&`-joins MIXED-ECOSYSTEM prescriptions, but there the join means the
+ * opposite: "a Go suite is blind to a TypeScript change and vice versa", so
+ * crediting either half alone would mark the family complied — and
+ * `dosing.ts` then suppresses verify-gap for the REST OF THE SESSION, so
+ * running the Go half would silence the TypeScript nudge permanently.
+ */
+export function verifyGapComplied(
+  prescription: string,
+  observed: string,
+  opts: { workspaceRoot?: string; storyScoped?: boolean } = {},
+): boolean {
+  if (observedCoversPrescribed(prescription, observed, opts.workspaceRoot)) return true
+  if (opts.storyScoped !== true) return false
+  const parts = prescription.split(/\s*&&\s*/).filter((part) => part.trim() !== "")
+  return parts.length > 1 && parts.some((part) => observedCoversPrescribed(part, observed, opts.workspaceRoot))
 }

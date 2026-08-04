@@ -1828,5 +1828,51 @@ describe("M4: a real user message releases a stuck continuation guard", () => {
     // short-circuited — the harness inert for the rest of the session.
     await chatMessage(hooks, sid, "actually, do something else entirely")
     expect(releases()).toBe(1)
+
+    // MAJ-1 (round 4): assert the guard is actually DOWN, not merely that the
+    // event fired. A mutant that logs the release without clearing
+    // `idleContinuationInFlight` left the suite green — every later message
+    // would hit the guard again and log another release.
+    await chatMessage(hooks, sid, "and one more thing")
+    expect(releases()).toBe(1)
+  })
+
+  // MAJ-9 (round 4): the echo is identified by a one-shot consume, not by
+  // matching text. A mutant that gates the consume on
+  // `text.includes(lastContinuationText)` survives a test whose echo matches
+  // exactly — so this one models a host that NORMALISES the echoed prompt
+  // (trims it, re-wraps it, prefixes it). Under the mutant the guard releases
+  // and the continuation clobbers the ledger it was dispatched to act on.
+  it("consumes a normalised echo rather than treating it as user intent", async () => {
+    const client = makeStubClient()
+    client.session.prompt.mockImplementation(
+      (args: { body?: { agent?: string } }) =>
+        args?.body?.agent === undefined
+          ? new Promise(() => {})
+          : Promise.resolve({ data: { info: {}, parts: [{ type: "text", text: '{"multiStory":false}' }] }, error: undefined }),
+    )
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = `m4-normalised-${Date.now().toString(36)}`
+
+    await activate(hooks, sid, "build the reporting dashboard end to end")
+    await hooks.tool!.elicify_vertex_plan_create!.execute!(
+      { stories: [{ text: "ship it", acceptanceItems: ["A1"], scopeGlobs: [], verifiers: [], tasks: [{ text: "do the work" }] }] } as never,
+      { sessionID: sid } as never,
+    )
+    await toolAfter(hooks, sid, "edit", { filePath: "src/report.ts" }, "updated")
+    vi.useFakeTimers()
+    const idling = idle(hooks, sid)
+    await vi.advanceTimersByTimeAsync(31_000)
+    await idling
+    vi.useRealTimers()
+
+    const dispatched = idleContinuationTexts(client, sid)
+    expect(dispatched.length).toBeGreaterThan(0)
+    const normalised = `> ${dispatched[dispatched.length - 1].trim().slice(0, 40)}…`
+
+    const releases = (): number =>
+      readEvents().filter((e) => e.event_type === "gate:continuation-guard-released" && e.session_id === sid).length
+    await chatMessage(hooks, sid, normalised)
+    expect(releases(), "a normalised echo must still be consumed, not treated as user intent").toBe(0)
   })
 })

@@ -29,6 +29,13 @@ export interface PendingAnomaly {
 export interface RenderedVerifyGap {
   instanceId: string
   command: string
+  /**
+   * MAJ-4: was this prescription tier 1 (a story's own declared verifiers)?
+   * Only then is its `&&` chain a list of INDEPENDENT checks that may be
+   * credited one at a time. A mixed-ecosystem prescription is also
+   * `&&`-joined, but there neither half covers the other by design.
+   */
+  storyScoped?: boolean
 }
 
 export interface V2SessionState {
