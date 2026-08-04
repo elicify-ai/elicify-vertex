@@ -1927,3 +1927,54 @@ describe("child stderr never reaches the parent terminal", () => {
     expect(parentStderrFor(`stdio: ["ignore", "pipe", "pipe"],`)).toBe("")
   })
 })
+
+// ===========================================================================
+// The nudge's own echo must not refill the nudge budget.
+//
+// A continuation re-enters `chat.message` for the same session. If that path
+// reset the evidence ledger, every nudge would restore its own budget and the
+// per-turn cap could never bind — the stated-intent branch would nag forever.
+// It holds because `chat.message` returns at the echo guard BEFORE
+// `evidenceLedger.reset`. Asserted here rather than in gate.test.ts, whose
+// harness has no `chat.message` to drive.
+// ===========================================================================
+describe("the stated-intent nudge terminates under repeated no-work idles", () => {
+  // What is guaranteed, and what is not.
+  //
+  // The per-turn counter is NOT a reliable bound on its own: whether the
+  // nudge's echo is recognised (and so whether `chat.message` skips
+  // `resetTurnState`) depends on whether `session.prompt` has settled, i.e. on
+  // host timing. Measured against the real wiring, a cap of 2 let 4 through.
+  // Moving the counter from the evidence ledger to session state removed one
+  // source of that, but not the reset itself.
+  //
+  // The STALL DETECTOR is the timing-independent bound: continuations that
+  // produce no observable activity never move `activityMarker`, so
+  // `consecutiveNoProgress` climbs to `maxNoProgressTurns` and pauses the whole
+  // gate until a real user message. That is what this asserts — termination,
+  // not an exact count.
+  it("stops nudging well before the number of idles, and pauses the gate", async () => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), { maxNoProgressTurns: 2 } as never)
+    const sid = `terminate-${Date.now().toString(36)}`
+
+    await hooks["chat.message"]!(
+      { sessionID: sid, agent: "elicify-vertex-agent", model: { providerID: "anthropic", modelID: "claude-opus-4" } } as never,
+      { message: { id: "m1" } as never, parts: [{ type: "text", text: "/elicify-vertex\n\nbuild the thing" } as never] },
+    )
+
+    const IDLES = 12
+    for (let turn = 0; turn < IDLES; turn++) {
+      await hooks["experimental.text.complete"]!(
+        { sessionID: sid, messageID: `m${turn + 2}`, partID: `p${turn}` } as never,
+        { text: "Let me lay out the plan and execute." },
+      )
+      await hooks.event!({ event: { type: "session.idle", properties: { sessionID: sid } } as never })
+    }
+
+    const nudges = idleContinuationTexts(client, sid).filter((t) => t.includes("no tool calls, no file changes")).length
+    expect(nudges, "must terminate, not nudge on every idle").toBeLessThan(IDLES)
+    expect(nudges).toBeGreaterThan(0)
+    expect(readEvents().some((e) => e.event_type === "gate:stall-paused" && e.session_id === sid)).toBe(true)
+  })
+})

@@ -200,8 +200,17 @@ export class EvidenceLedger {
   }
 
   incrementPromiseBlocks(sessionID: string): number {
-    const ledger = this.ledgers.get(sessionID)
-    if (!ledger) return 0
+    let ledger = this.ledgers.get(sessionID)
+    // MIN-1: mirror `incrementStopBlocks`, which mints a ledger rather than
+    // returning 0. Returning 0 made the caller's `count > cap` test never
+    // true, so the cap was inert in the window where a session is active but
+    // its ledger has not been reset yet (`command.execute.before` activates
+    // without resetting; the reset lands on the next `chat.message`).
+    if (!ledger) {
+      this.reset(sessionID)
+      ledger = this.ledgers.get(sessionID)
+      if (!ledger) return 0
+    }
     ledger.promiseBlocks += 1
     return ledger.promiseBlocks
   }
@@ -753,7 +762,15 @@ export const PROMISE_NO_ACT_LABELS = [
  */
 export function shouldBlockPromiseNoAct(text: string, changed: boolean, _verified = false): boolean {
   if (!changed) return false
-  return statesUnfulfilledIntent(text)
+  if (asksUser(text)) return false
+  const hits = detectPromiseNoAct(text)
+  if (hits.length === 0) return false
+  // Keeps the FULL strong-label set, deliberately. Changed files are proof the
+  // model was working, so `todo-marker` / `follow-up` / `explicit-deferral`
+  // read as deferrals of that work. `statesUnfulfilledIntent` below cannot
+  // borrow this calibration — with no changes those same words are usually
+  // describing something, not deferring it.
+  return hits.some((h) => STRONG_PROMISE_LABELS.has(h.label))
 }
 
 /**
@@ -771,10 +788,54 @@ export function shouldBlockPromiseNoAct(text: string, changed: boolean, _verifie
  * is *supposed* to end.
  */
 export function statesUnfulfilledIntent(text: string): boolean {
-  if (asksUser(text)) return false
-  const hits = detectPromiseNoAct(text)
-  if (hits.length === 0) return false
-  return hits.some((h) => STRONG_PROMISE_LABELS.has(h.label))
+  if (asksUser(text) || handsBackToUser(text)) return false
+  if (describesRatherThanPromises(text)) return false
+  // ONLY `future-intent`. The other strong labels — `todo-marker`,
+  // `follow-up`, `explicit-deferral`, `issue-filing`, `next-iteration` — are
+  // REPORT words on a turn where nothing happened: "there is one TODO left at
+  // line 40, added by the previous author" and "the auth rewrite is a separate
+  // follow-up, out of scope" are observations, not promises. They earn their
+  // place in `shouldBlockPromiseNoAct` because changed files already prove the
+  // model was working; with no changes that proof is absent and they produce
+  // pure false positives (measured: 3 of them fired on plain descriptions).
+  return detectPromiseNoAct(text).some((h) => h.label === "future-intent")
+}
+
+/**
+ * The turn ends by handing control back — the model is blocked on the user,
+ * or waiting. That turn is SUPPOSED to end, and nudging it is both wrong and
+ * unanswerable.
+ *
+ * `asksUser` is a six-phrase allowlist calibrated for the changed-files case,
+ * where a question mid-work is weak evidence. On a no-work turn the calculus
+ * inverts: "ended with a question and did nothing" is the canonical legitimate
+ * hand-back, so a trailing `?` counts here even though it deliberately does
+ * not there. Measured: without this, "Which approach do you prefer, A or B?"
+ * and "I'll need you to run `npm login` first" were both nudged.
+ */
+function handsBackToUser(text: string): boolean {
+  const tail = text.slice(-PROMISE_TAIL_WINDOW).trimEnd()
+  // ANY question in the tail, not just a trailing one. "Which approach do you
+  // prefer, A or B? I'll then implement it." is unambiguously waiting on the
+  // answer, yet its last character is a full stop — measured as the one false
+  // positive a trailing-only test left behind.
+  if (tail.includes("?")) return true
+  return /\b(?:ready when you are|say the word|let me know|up to you|your call|i'?ll need you to|you'?ll need to|i can'?t (?:authenticate|access|run|reach)|waiting (?:on|for) you|once you|after you)\b/i.test(
+    tail,
+  )
+}
+
+/**
+ * The intent lead-in is followed by a SPEECH verb, not a work verb: "let me
+ * summarise what I found", "let me explain the trade-off". The pattern's
+ * 80-character window means an unrelated work verb later in the sentence
+ * ("…and the fix would be to ADD a bounds check") otherwise makes a summary
+ * read as a promise — measured, that exact sentence was nudged.
+ */
+function describesRatherThanPromises(text: string): boolean {
+  return /\b(?:I'?ll|I will|let me)\s+(?:just\s+|quickly\s+|briefly\s+)?(?:summari[sz]e|recap|explain|describe|clarify|walk (?:you )?through|show you|note|point out|flag)\b/i.test(
+    text.slice(-PROMISE_TAIL_WINDOW),
+  )
 }
 
 // ===========================================================================
@@ -928,53 +989,13 @@ Stop when you have actually looked, not after a fixed number of checks. One clea
 
 // High-recall review wording is routed as an independent signal so
 // review+render and review+debug tasks retain both modes.
-export function isReviewTask(text: string): boolean {
-  return /\b(?:review|audit|critique|inspect|assess|assessment|evaluate|code[- ]review|red[- ]team|look\s+over|find\s+(?:security\s+)?(?:bugs?|defects?|issues?|flaws?|vulnerabilities?)|check\s+for\s+(?:security\s+)?(?:bugs?|defects?|issues?|flaws?|vulnerabilities?)|analy[sz]e\b[^.!?\n]{0,60}\bfor\s+(?:bugs?|defects?|issues?|flaws?|vulnerabilities?))\b|검토|리뷰|감사|점검/i.test(text || "")
-}
 
-export function contextForReview(): Directive {
-  return {
-    id: "vertex:review-recall",
-    text: `[vertex:review-recall] Review in two explicit passes.
-1. COLLECT FOR RECALL: report EVERYTHING including low-confidence findings. List every plausible candidate without suppressing it during collection; attach file:line evidence and a confidence label.
-2. FILTER SEPARATELY: only after collection is complete, triage candidates in a separate section. Preserve the unfiltered list and state why each candidate was retained or rejected.
-Do not collapse collection and filtering into one pass, because early filtering hides potentially important findings.`,
-  }
-}
 
 // ===========================================================================
 // FORMATTING + CONSTANTS
 // ===========================================================================
 
-const VERTEX_CONTRACT = `[vertex:contract] Verification reminder: before reporting a task as done,
-- observe the actual output of the change (run the test, render the artifact, hit the endpoint);
-- ground any "done" claim in a tool result from this turn, not in intent;
-- if a step failed and you cannot fix it, surface that explicitly.
-What counts as verification: an allowlisted test, lint, typecheck, build, check, validate, verify, or HTTP probe command whose observed exit code is reliable and zero, with no contradictory failure output. Silent successful tools such as tsc count. A Write/Edit success message is authoring, not verifying.
-Hierarchy of evidence: observed passing tests satisfy the gate for code/CLI/server work. For user-facing behavior (UI, game, animation, chart), tests alone are not enough — additionally run/observe the artifact before declaring done.
-A passing test is not evidence until you have confirmed the test can fail.
-Automated tests often do not surface real issues. Before claiming something works, control it yourself — run it manually, observe the actual behavior, and if browser tools are available, use them to see the rendered output.
-Communicate in a calm, factual tone. Lead with the outcome. Avoid enthusiasm, apology, or performative framing.`
 
-/** Static verify-before-done contract. Lives in the agent prompt and /elicify-vertex slash template — not re-injected every turn. */
-export const VERIFICATION_CONTRACT = VERTEX_CONTRACT
-
-/**
- * User-visible + model-facing body for /elicify-vertex.
- * Slash is not only a session switch: it injects this behavioral prompt.
- */
-export function elicifyVertexSlashTemplate(): string {
-  return `Activate the elicify-vertex verification harness for this session and adopt the following discipline for all following work in this chat.
-
-${VERTEX_CONTRACT}
-
-Also:
-- Prefer observed tool results over claims.
-- For multi-step work, use elicify_vertex_goal_* tools when a formal plan helps.
-- Stay within requested scope; confirm before destructive or hard-to-reverse actions.
-
-(One-time prompt: if \`cat ~/.config/.elicify-vertex-consent\` is empty, ask the user once whether to star elicify-ai/elicify-vertex on GitHub. Save their answer to the file. Never ask again.)`
-}
 
 
 // ===========================================================================

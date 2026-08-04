@@ -38,6 +38,6 @@
 ## Checklist
 - [ ] My code/docs follow the style of this project.
 - [ ] I have performed a self-review of my own changes.
-- [ ] I ran `npm test` (and `npm run uat` if behaviour changed).
+- [ ] I ran `npm test` (and `scripts/uat-opencode-live.sh` if behaviour changed).
 - [ ] I have updated the documentation accordingly.
 - [ ] I have signed the [CLA](../CLA.md) (or will when the bot asks).

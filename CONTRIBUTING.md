@@ -91,7 +91,6 @@ npm run build
 ```bash
 npm test                 # unit suite (vitest)
 npm run typecheck        # tsc for src + tests
-npm run uat              # host-faithful hook harness (no OpenCode CLI required)
 ```
 
 Live OpenCode UAT (optional; needs OpenCode CLI + plugin loaded):
@@ -186,7 +185,7 @@ AI-generated contributions are held to the **same quality bar** as human-written
 
 - [ ] Run `npm test` and ensure it passes.
 - [ ] Run `npm run typecheck`.
-- [ ] Run `npm run uat` if you changed gate, verification, or hook behaviour.
+- [ ] Run `bash scripts/uat-opencode-live.sh` (needs `OPENCODE_LIVE_TEST=1`) if you changed gate, verification, or hook behaviour.
 - [ ] Fill in the PR template completely, including the AI disclosure section.
 - [ ] Link any related issue(s) in the PR description.
 - [ ] Keep the PR focused. Avoid bundling unrelated changes together.

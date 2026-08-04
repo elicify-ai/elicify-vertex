@@ -539,6 +539,14 @@ async function handlePromiseNoAct(ctx: GateContext, sid: string, state: V2Sessio
 async function handleStatedIntentNoWork(ctx: GateContext, sid: string, state: V2SessionState): Promise<boolean> {
   const lastText = state.lastAssistantText
   if (!lastText) return false
+  // MAJ-1: the quick/normal exemption every other deterministic branch
+  // honours — `handleCriteriaReplay` bails unless deep, and
+  // `shouldBlockStop` documents "quick and normal never hard-block". It
+  // matters most HERE: this branch fires precisely when nothing changed,
+  // which is the normal shape of a quick turn ("explain this, don't edit
+  // anything"). Without the gate, asking for an explanation earns a
+  // "Do that work now." that reads as a user instruction.
+  if (ctx.evidenceLedger.getMode(sid) === "quick") return false
   if (ctx.evidenceLedger.hasChangedFiles(sid)) return false // promise-no-act's job
   if (ctx.storyEngine.getPlan(sid)) return false // handleIncompletePlan's job
   if (!statesUnfulfilledIntent(lastText)) return false
@@ -548,8 +556,14 @@ async function handleStatedIntentNoWork(ctx: GateContext, sid: string, state: V2
     return false
   }
 
-  const count = ctx.evidenceLedger.incrementPromiseBlocks(sid)
-  if (count > ctx.maxCriteriaBlocks) return false
+  // Session-state counter, not the evidence ledger's — see
+  // `statedIntentNudges`. The ledger is replaced by `chat.message` whenever
+  // the echo is not recognised as such, which is host-timing dependent, so a
+  // ledger-based cap is not a reliable bound for a branch that fires when
+  // nothing happened.
+  state.statedIntentNudges += 1
+  if (state.statedIntentNudges > ctx.maxCriteriaBlocks) return false
+  const count = state.statedIntentNudges
 
   const labels = detectPromiseNoAct(lastText)
     .map((h) => h.label)

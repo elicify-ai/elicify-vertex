@@ -43,6 +43,19 @@ export interface V2SessionState {
   active: boolean
   /** One-time user-visible activation cue (mirrors v1's `activateCueShown`). */
   activateCueShown: boolean
+  /**
+   * How many stated-intent nudges this turn has already spent.
+   *
+   * Deliberately NOT the shared `EvidenceLedger.promiseBlocks` counter. That
+   * one lives in the evidence ledger, which `chat.message` replaces wholesale
+   * on any message that is not recognised as the continuation's own echo — and
+   * whether the echo IS recognised depends on whether `session.prompt` has
+   * settled yet, i.e. on host timing. Measured against the real wiring: a cap
+   * of 2 let 4 nudges through. Session state is not reset by that path, so the
+   * bound here is deterministic; `resetTurnState` clears it on a real user
+   * message, which is the turn boundary that should restore the budget.
+   */
+  statedIntentNudges: number
   /** In-flight guard: a `client.session.prompt` idle-gate continuation is pending for this session. */
   idleContinuationInFlight: boolean
   /**
@@ -142,6 +155,7 @@ export function freshSessionState(workspaceRoot: string): V2SessionState {
   return {
     active: false,
     activateCueShown: false,
+    statedIntentNudges: 0,
     idleContinuationInFlight: false,
     lastContinuationText: null,
     unauditedEscalated: false,
@@ -202,8 +216,17 @@ export function resetTurnState(state: V2SessionState): void {
   // the session: `plugin.ts`'s `chat.message` returns early while it is set.
   // A real user message is the turn boundary that genuinely ends any
   // outstanding continuation.
+  state.statedIntentNudges = 0
   state.idleContinuationInFlight = false
   state.lastContinuationText = null
+  // MAJ-3: a real user message ends the turn that text belonged to. It was
+  // cleared only by `tool.execute.after`, and `text.complete` skips
+  // whitespace-only output — so on a turn with neither, LAST turn's
+  // "I'll add the tests next" survived into a freshly-refilled budget and
+  // could be nudged all over again. `handlePromiseNoAct` is shielded from
+  // this by its changed-files requirement; the stated-intent branch is not,
+  // and a no-work turn is exactly where stale text survives.
+  state.lastAssistantText = null
   // MAJ-4: the once-only settled-but-unaudited escalation is per PLAN, not
   // per session. It was only ever initialised in `freshSessionState`, so a
   // second unaudited plan in the same session found it already spent and the

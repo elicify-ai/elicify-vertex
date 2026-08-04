@@ -44,6 +44,7 @@ import type { Hooks, PluginInput, ToolContext } from "@opencode-ai/plugin"
 import type { Agent } from "@opencode-ai/sdk"
 
 import { eventsPath, holdoutArm } from "../../src/measurement.js"
+import { MultiStoryGoalEngine } from "../../src/goals.js"
 import { ElicifyVertexPluginV2 } from "../../src/v2/plugin.js"
 
 // ---------------------------------------------------------------------------
@@ -416,14 +417,17 @@ describe("test 53: archival_is_reversible (integration)", () => {
     // compatibility assertion against a deleted engine proves nothing. The
     // property that still matters — the archived plan round-trips as a valid
     // v1 document — is asserted directly.
-    const restored = JSON.parse(readFileSync(goalsPath, "utf8")) as {
-      schemaVersion: number
-      brief: string
-      stories: unknown[]
-    }
-    expect(restored.schemaVersion).toBe(1)
-    expect(restored.brief).toBe(v1Plan.brief)
-    expect(restored.stories).toHaveLength(2)
+    // MIN-4: `JSON.parse` + field checks cannot tell a valid plan from a
+    // structurally-invalid-but-parseable one, which is exactly what "round
+    // trips as a valid document" is supposed to mean. The v1 plugin that used
+    // to prove this is gone, but its validator is not — `MultiStoryGoalEngine`
+    // is still live in `wiring/tools.ts`, so load the restored file through
+    // the real thing.
+    const restoredPlan = new MultiStoryGoalEngine(workDir).status()
+    expect(restoredPlan, "the restored file must load through the real validator").not.toBeNull()
+    expect(restoredPlan!.schemaVersion).toBe(1)
+    expect(restoredPlan!.brief).toBe(v1Plan.brief)
+    expect(restoredPlan!.stories).toHaveLength(2)
   })
 
   it("does not archive a v2 (schemaVersion 2+) goals.json — not ours to touch", async () => {

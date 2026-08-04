@@ -1547,11 +1547,12 @@ describe("handleSessionIdle — stated intent with nothing done", () => {
     expect(familyTexts(h, "stated-intent").length).toBeLessThanOrEqual(2)
   })
 
-  // The counter must survive the continuation's OWN echo, or every nudge
-  // resets its own budget and the cap never binds. `chat.message` returns at
-  // the echo guard before `evidenceLedger.reset`, which is what makes this
-  // hold — assert the behaviour, not the implementation detail.
-  it("bound 1b: the cap is not reset by the nudge's own echo", async () => {
+  // MIN-2, stated honestly: this asserts only that the cap binds across
+  // repeated idles. It does NOT exercise the echo — the gate harness builds a
+  // GateContext and has no `chat.message`, so an echo cannot pass through it
+  // here. The echo-does-not-refill-the-budget property is covered where
+  // `chat.message` actually exists, in plugin.integration.test.ts.
+  it("bound 1b: the cap binds across repeated idles", async () => {
     const h = harness({ maxCriteriaBlocks: 3 })
     const sid = "s1"
     const state = quietSession(h, sid)
@@ -1562,6 +1563,56 @@ describe("handleSessionIdle — stated intent with nothing done", () => {
       await handleSessionIdle(h.ctx, sid)
     }
     expect(familyTexts(h, "stated-intent").length).toBe(3)
+  })
+
+  // ...and the converse: a REAL user message is a new turn and legitimately
+  // refills the budget. Without this the cap could be permanent, which is a
+  // different bug (the harness going silent for the rest of the session).
+  it("bound 1c: a real user message refills the budget", async () => {
+    const h = harness({ maxCriteriaBlocks: 1 })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.lastAssistantText = "I'll draw up a plan for this next."
+
+    await handleSessionIdle(h.ctx, sid)
+    state.idleContinuationInFlight = false
+    await handleSessionIdle(h.ctx, sid) // capped
+    expect(familyTexts(h, "stated-intent")).toHaveLength(1)
+
+    // New user turn: ledger reset, stale intent cleared, budget restored.
+    h.evidenceLedger.reset(sid)
+    resetTurnState(state)
+    state.lastAssistantText = "I'll draw up a plan for this next."
+    await handleSessionIdle(h.ctx, sid)
+    expect(familyTexts(h, "stated-intent")).toHaveLength(2)
+  })
+
+  // MAJ-3: stale intent from a PREVIOUS turn must not be re-nudged.
+  it("does not re-fire on last turn's text after a new user message", async () => {
+    const h = harness({})
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.lastAssistantText = "I'll draw up a plan for this next."
+    await handleSessionIdle(h.ctx, sid)
+    expect(familyTexts(h, "stated-intent")).toHaveLength(1)
+
+    resetTurnState(state) // a real user message
+    state.idleContinuationInFlight = false
+    await handleSessionIdle(h.ctx, sid)
+
+    expect(familyTexts(h, "stated-intent"), "stale intent must not survive the turn").toHaveLength(1)
+  })
+
+  // MAJ-1: quick mode is where "nothing changed" is the NORMAL shape.
+  it("stays quiet in quick mode (explain-only turns)", async () => {
+    const h = harness({})
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    h.evidenceLedger.reset(sid, "quick")
+    state.lastAssistantText = "I'll walk through the architecture and then outline the fix."
+
+    await handleSessionIdle(h.ctx, sid)
+    expect(familyTexts(h, "stated-intent")).toHaveLength(0)
   })
 
   // The backstop for the case the phrase check cannot see: the model is

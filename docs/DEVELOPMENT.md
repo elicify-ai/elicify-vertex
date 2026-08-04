@@ -32,21 +32,6 @@ Useful scripts (`package.json`):
 
 `postinstall` runs `install-skill.sh` with `|| true` (install does not fail the npm install if setup fails).
 
-## Host UAT (Node harness)
-
-Drives the real built plugin with OpenCode-shaped hook calls (no full OpenCode binary required for the harness itself):
-
-```bash
-npm run build
-```
-
-Optional:
-
-```bash
-```
-
-Default dist module: `<repo>/dist/index.js` (lib export with helpers the harness asserts on). The harness sets isolated `VERTEX_DATA` / `HOME` and enables `VERTEX_DEBUG`.
-
 ## Live OpenCode UAT
 
 End-to-end against a real OpenCode CLI (`opencode run`):
