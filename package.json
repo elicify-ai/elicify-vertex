@@ -1,7 +1,7 @@
 {
   "name": "@elicify-ai/elicify-vertex",
   "version": "0.9.9",
-  "description": "Opencode plugin that injects harness directives into the LLM input via the official chat.transform hooks — verification, evidence, and communication discipline as procedure, not luck.",
+  "description": "OpenCode plugin that makes any coding model behave like a mythos-class engineer: a behavioural contract, live in-loop detection and correction, and an independent judge that verifies the work against your repo. Self-validating, evidence-driven agent loops \u2014 'done' means proven, not claimed.",
   "type": "module",
   "main": "./dist/plugin.cjs",
   "module": "./dist/plugin.js",
@@ -58,9 +58,17 @@
     "elicify",
     "elicify-vertex",
     "vertex",
-    "harness",
+    "agentic",
+    "agent-loop",
+    "self-validating",
+    "evidence-driven",
+    "ai-coding-agent",
+    "llm",
+    "judge",
     "verification",
-    "directives"
+    "harness",
+    "directives",
+    "code-quality"
   ],
   "author": {
     "name": "elicify.ai Pte. Ltd.",

@@ -2,6 +2,8 @@
 
 **Make every model behave like a mythos-class model — the way people describe Claude Fable 5.**
 
+*A behavioural contract, live in-loop correction, and an independent judge that checks the work against your repo. Self-validating, evidence-driven agent loops — so "done" means **proven**, not **claimed**.*
+
 [![GitHub stars](https://img.shields.io/github/stars/elicify-ai/elicify-vertex?style=social)](https://github.com/elicify-ai/elicify-vertex)
 [![npm version](https://img.shields.io/npm/v/@elicify-ai/elicify-vertex)](https://www.npmjs.com/package/@elicify-ai/elicify-vertex)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green)](./LICENSE)
@@ -44,6 +46,25 @@ It does **not** pretend to be Fable. It encodes the **behaviors** that make that
 | Own the full arc | Optional multi-story goals with verification receipts |
 
 You keep your preferred model. Vertex raises the floor of how it *works*.
+
+---
+
+## How it works: three layers
+
+Most "prompt engineering" stops at the first one. The interesting part is that the loop **checks its own work**.
+
+**1. A behavioural contract — before the work starts.**
+A compact set of working habits is injected into the session: ground yourself in the code before asking, prove it before claiming it, stop thrashing after two failures, report calmly with evidence. This is the part everyone already does.
+
+**2. Live detection and correction — while the work happens.**
+Vertex watches the loop as it runs: what was edited, which commands ran, what exited non-zero, whether the same error just repeated, whether a promise was made and quietly dropped. When the run drifts, the correction is injected **at that moment** — not raised in a post-mortem after the damage is done.
+
+**3. An independent judge — before the work can be called done.**
+When the model says a story is finished, a **separate judge session** opens your actual worktree — real files, real commands, real output — and rules on each acceptance criterion one by one. It can reject the claim, reopen the work, and name exactly what is missing. The model does not get to mark its own homework.
+
+Layer 1 is a prompt. Layer 2 is a control loop. Layer 3 is an audit. Together they make the loop **self-validating**: the model proposes, the harness observes, and an independent judge decides.
+
+> **Checks vs. criteria.** Technical checks (did the command pass?) are *evidence* and can be loose. Acceptance criteria (is the story actually delivered?) are settled by **judgement**, against your repo. Vertex keeps those two things apart on purpose.
 
 ---
 
