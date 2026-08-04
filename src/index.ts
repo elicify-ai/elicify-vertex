@@ -579,7 +579,15 @@ const PROMISE_NO_ACT_KEYWORDS = [
 // Avoids FPs on "tracked down", "later section", "see you later", "tracking ticket".
 const PROMISE_INTENT_PATTERNS = [
   {
-    pattern: /\b(I'?ll|I will|let me|next,?\s*I|now\s*I'?ll)\b[^.!?\n]{0,80}\b(now|next|then|implement|create|write|add|run|fix|save|build|start|proceed|address|handle|investigate|review)\b/i,
+    // The verb list is what makes this an INTENT rather than a mention, so it
+    // has to cover how models actually announce work. The original set missed
+    // the single most common opening in a real stalled session — "Let me lay
+    // out the plan and execute." — because neither `lay out`, `plan` nor
+    // `execute` was in it, and the nudge that exists for exactly that case
+    // therefore never fired. Every addition still requires one of the intent
+    // lead-ins above, so "let me <verb>" carries the meaning, not the verb
+    // alone.
+    pattern: /\b(I'?ll|I will|let me|next,?\s*I|now\s*I'?ll)\b[^.!?\n]{0,80}\b(now|next|then|implement|create|write|add|run|fix|save|build|start|get started|proceed|continue|address|handle|investigate|review|plan|lay out|draft|draw up|outline|scaffold|set up|execute|carry out|go ahead|replace|delete|remove|update|refactor|wire|generate|migrate)\b/i,
     label: "future-intent",
     locale: "en",
   },

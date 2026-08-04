@@ -1451,6 +1451,24 @@ describe("handleVerifierAudit — verdict reconciliation", () => {
 // and `handleIncompletePlan` requires a plan to exist.
 // ===========================================================================
 describe("handleSessionIdle — stated intent with nothing done", () => {
+  // The verbatim text from the stalled session. The branch shipped without
+  // catching it: `detectPromiseNoAct`'s verb list had no `lay out`, `plan` or
+  // `execute`, so the nudge built for exactly this case never fired. Caught by
+  // replaying the real message end to end, not by the unit tests — which had
+  // all used phrasings the detector already knew.
+  it("nudges on the REAL stalled message from the live session", async () => {
+    const h = harness({})
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.lastAssistantText =
+      "Got it — current portal has **Tetris, Asteroids, Snake**. I'll replace it with **Breakout, 2048, " +
+      "Minesweeper** (good genre spread: arcade action, number puzzle, logic puzzle). Let me lay out the plan and execute."
+
+    await handleSessionIdle(h.ctx, sid)
+
+    expect(familyTexts(h, "stated-intent")).toHaveLength(1)
+  })
+
   it("nudges when the turn announces work but changed nothing and recorded no plan", async () => {
     const h = harness({})
     const sid = "s1"
