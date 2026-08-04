@@ -43,7 +43,6 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import type { Hooks, PluginInput, ToolContext } from "@opencode-ai/plugin"
 import type { Agent } from "@opencode-ai/sdk"
 
-import { ElicifyVertexPlugin } from "../../src/index.js"
 import { eventsPath, holdoutArm } from "../../src/measurement.js"
 import { ElicifyVertexPluginV2 } from "../../src/v2/plugin.js"
 
@@ -411,24 +410,20 @@ describe("test 53: archival_is_reversible (integration)", () => {
     expect(existsSync(goalsPath)).toBe(true)
     expect(readFileSync(goalsPath, "utf8")).toBe(originalContents)
 
-    // v1 compatibility: under VERTEX_V2=0, a FRESH import of ElicifyVertexPlugin
-    // (v1) reads the restored file through the real v1 tool
-    // (elicify_vertex_goal_status) and must load it successfully — proving
-    // the restored file is not just byte-identical but still structurally
-    // valid against v1's own strict validatePlan().
-    process.env.VERTEX_V2 = "0"
-    const v1Client = { session: { prompt: vi.fn(async () => ({})) } }
-    const v1Hooks = await ElicifyVertexPlugin(
-      { client: v1Client, directory: workDir, worktree: workDir } as unknown as PluginInput,
-      undefined,
-    )
-    const v1Status = await v1Hooks.tool!.elicify_vertex_goal_status!.execute({}, toolCtx)
-    const v1StatusText = typeof v1Status === "string" ? v1Status : v1Status.output
-    const parsed = JSON.parse(v1StatusText)
-    expect(parsed).not.toBeNull()
-    expect(parsed.schemaVersion).toBe(1)
-    expect(parsed.brief).toBe(v1Plan.brief)
-    expect(parsed.stories).toHaveLength(2)
+    // The restored file must be structurally intact, not merely
+    // byte-identical. This used to be proven by loading it through the v1
+    // plugin under VERTEX_V2=0; that plugin no longer exists, and a
+    // compatibility assertion against a deleted engine proves nothing. The
+    // property that still matters — the archived plan round-trips as a valid
+    // v1 document — is asserted directly.
+    const restored = JSON.parse(readFileSync(goalsPath, "utf8")) as {
+      schemaVersion: number
+      brief: string
+      stories: unknown[]
+    }
+    expect(restored.schemaVersion).toBe(1)
+    expect(restored.brief).toBe(v1Plan.brief)
+    expect(restored.stories).toHaveLength(2)
   })
 
   it("does not archive a v2 (schemaVersion 2+) goals.json — not ours to touch", async () => {

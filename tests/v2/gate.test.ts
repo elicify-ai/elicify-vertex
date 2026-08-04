@@ -1441,6 +1441,150 @@ describe("handleVerifierAudit — verdict reconciliation", () => {
 // and recorded as the family in the event log, which is how an operator still
 // distinguishes harness steering from their own words.
 // ===========================================================================
+// ===========================================================================
+// The idle nobody caught (live session ses_03385da6…, 2026-08-04).
+//
+// The model said it would draw up a plan and stopped: no tool calls, no file
+// changes, no plan. `gate_fire` logged {decision:"allow", changed:false} and
+// the session sat there. Every existing branch lets this through by
+// construction — promise-no-act and the stop gate both require changed files,
+// and `handleIncompletePlan` requires a plan to exist.
+// ===========================================================================
+describe("handleSessionIdle — stated intent with nothing done", () => {
+  it("nudges when the turn announces work but changed nothing and recorded no plan", async () => {
+    const h = harness({})
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.lastAssistantText = "Good idea. I'll draw up a plan for this next."
+
+    await handleSessionIdle(h.ctx, sid)
+
+    const texts = familyTexts(h, "stated-intent")
+    expect(texts).toHaveLength(1)
+    expect(texts[0]).toMatch(/no tool calls, no file changes and no recorded plan/)
+    expect(loggedEventTypes(h.logger)).toContain("gate:stated-intent-no-work")
+  })
+
+  // Each of the three guards, so the branch stays the narrowest in the tree.
+  it("stays quiet when files DID change (promise-no-act owns that case)", async () => {
+    const h = harness({})
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.lastAssistantText = "I'll add the tests next."
+    h.evidenceLedger.recordChangedFiles(sid, "src/app.ts")
+
+    await handleSessionIdle(h.ctx, sid)
+    expect(familyTexts(h, "stated-intent")).toHaveLength(0)
+  })
+
+  it("stays quiet when a plan exists (handleIncompletePlan owns that case)", async () => {
+    const h = harness({})
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.lastAssistantText = "I'll draw up a plan for this next."
+    h.storyEngine.createPlan(sid, [
+      { text: "Ship it", acceptanceItems: ["A1"], scopeGlobs: [], verifiers: [], tasks: [{ text: "do it" }] },
+    ])
+
+    await handleSessionIdle(h.ctx, sid)
+    expect(familyTexts(h, "stated-intent")).toHaveLength(0)
+  })
+
+  it("stays quiet when the model asked the user a direct question", async () => {
+    const h = harness({})
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.lastAssistantText = "I could go with Postgres or SQLite here. Which option would you like?"
+
+    await handleSessionIdle(h.ctx, sid)
+    expect(familyTexts(h, "stated-intent")).toHaveLength(0)
+  })
+
+  it("stays quiet on an ordinary answer with no stated intent", async () => {
+    const h = harness({})
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.lastAssistantText = "The function returns the parsed config object."
+
+    await handleSessionIdle(h.ctx, sid)
+    expect(familyTexts(h, "stated-intent")).toHaveLength(0)
+  })
+
+  // ---------------------------------------------------------------------
+  // Loop safety. A branch that nudges on "no work done" is the easiest way
+  // to build an infinite nagger: the nudge itself produces no work, so it
+  // re-qualifies immediately. Three independent bounds stop that, and the
+  // tests below exercise each — a walked-away user must end in silence.
+  // ---------------------------------------------------------------------
+  it("bound 1: the per-turn cap stops it becoming its own nag loop", async () => {
+    const h = harness({ maxCriteriaBlocks: 2 })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.lastAssistantText = "I'll draw up a plan for this next."
+
+    for (let i = 0; i < 8; i++) {
+      state.idleContinuationInFlight = false
+      await handleSessionIdle(h.ctx, sid)
+    }
+    expect(familyTexts(h, "stated-intent").length).toBeLessThanOrEqual(2)
+  })
+
+  // The counter must survive the continuation's OWN echo, or every nudge
+  // resets its own budget and the cap never binds. `chat.message` returns at
+  // the echo guard before `evidenceLedger.reset`, which is what makes this
+  // hold — assert the behaviour, not the implementation detail.
+  it("bound 1b: the cap is not reset by the nudge's own echo", async () => {
+    const h = harness({ maxCriteriaBlocks: 3 })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.lastAssistantText = "I'll draw up a plan for this next."
+
+    for (let i = 0; i < 10; i++) {
+      state.idleContinuationInFlight = false
+      await handleSessionIdle(h.ctx, sid)
+    }
+    expect(familyTexts(h, "stated-intent").length).toBe(3)
+  })
+
+  // The backstop for the case the phrase check cannot see: the model is
+  // actually waiting on the user and keeps restating it, or the user walked
+  // away. Continuations that produce no observable activity trip the stall
+  // detector, which silences the WHOLE gate until a real user message.
+  it("bound 2: repeated no-progress nudges pause the gate entirely", async () => {
+    const h = harness({ maxCriteriaBlocks: 99, maxNoProgressTurns: 2 })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.lastAssistantText = "I'll draw up a plan for this next."
+
+    for (let i = 0; i < 10; i++) {
+      state.idleContinuationInFlight = false
+      await handleSessionIdle(h.ctx, sid)
+    }
+
+    expect(state.stallPaused, "the gate must pause itself when nudging changes nothing").toBe(true)
+    expect(loggedEventTypes(h.logger)).toContain("gate:stall-paused")
+    // Terminated: a high cap did NOT produce ten nudges.
+    expect(familyTexts(h, "stated-intent").length).toBeLessThan(10)
+  })
+
+  // Bound 3 is the re-entrancy guard: while a nudge's prompt is STILL
+  // OUTSTANDING, idle is a no-op, so a slow turn cannot stack nudges on top of
+  // each other. (Once the prompt settles the guard releases and the cap above
+  // is what bounds things — the two bounds cover different windows.)
+  it("bound 3: an OUTSTANDING nudge suppresses further idles", async () => {
+    const h = harness({})
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.lastAssistantText = "I'll draw up a plan for this next."
+    state.idleContinuationInFlight = true // a dispatch is in flight
+
+    await handleSessionIdle(h.ctx, sid)
+    await handleSessionIdle(h.ctx, sid)
+
+    expect(familyTexts(h, "stated-intent")).toHaveLength(0)
+  })
+})
+
 describe("dispatched continuations carry no harness marker", () => {
   it("strips the marker from the text the model receives", async () => {
     const h = harness({ verifierEnabled: true })

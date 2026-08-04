@@ -38,13 +38,11 @@ Drives the real built plugin with OpenCode-shaped hook calls (no full OpenCode b
 
 ```bash
 npm run build
-node scripts/uat-harness.mjs
 ```
 
 Optional:
 
 ```bash
-VERTEX_UAT_DIST=/path/to/dist/index.js node scripts/uat-harness.mjs
 ```
 
 Default dist module: `<repo>/dist/index.js` (lib export with helpers the harness asserts on). The harness sets isolated `VERTEX_DATA` / `HOME` and enables `VERTEX_DEBUG`.

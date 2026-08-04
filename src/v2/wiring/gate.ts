@@ -37,7 +37,7 @@
 import { existsSync } from "node:fs"
 import { resolve as resolvePath, sep } from "node:path"
 
-import { detectPromiseNoAct, shouldBlockPromiseNoAct } from "../../index.js"
+import { detectPromiseNoAct, shouldBlockPromiseNoAct, statesUnfulfilledIntent } from "../../index.js"
 import type { EvidenceLedger } from "../../index.js"
 import { classifyFileKind, formatChangedPathsForReason, formatGateContinuationText } from "../../index.js"
 import { verifyWaiverSignature } from "../../goals.js"
@@ -512,6 +512,58 @@ async function handlePromiseNoAct(ctx: GateContext, sid: string, state: V2Sessio
   const labels = hits.map((h) => h.label).join(", ")
   const reason = `[vertex:promise-no-act] Your last message states an intent to do further work (${labels}) after changing files, without doing it. Do that work now with tool calls. End the turn only when the work is complete, or ask the user a direct question if you are blocked on input only they can provide.`
   await dispatchContinuation(ctx, sid, state, reason)
+  return true
+}
+
+/**
+ * The turn ended on a stated intent with NOTHING done — no files changed, no
+ * plan recorded. Every other branch lets this through by construction:
+ * promise-no-act requires changed files, the zero-criteria stop gate requires
+ * changed files, and `handleIncompletePlan` requires a plan to exist. So the
+ * most common opening failure — "I'll draw up a plan" and then silence — was
+ * the one case the harness never caught.
+ *
+ * Observed live (session ses_03385da6…): the model announced a plan and
+ * stopped; `gate_fire` logged `{decision:"allow", changed:false}` and the
+ * session sat idle.
+ *
+ * Deliberately the narrowest branch in the tree:
+ *  - runs only when there is NO plan (with one, `handleIncompletePlan` owns
+ *    the nudge and says something far more specific);
+ *  - runs only when NOTHING changed (with changes, promise-no-act owns it);
+ *  - requires a STRONG intent phrase, and never fires when the model asked
+ *    the user a direct question — that turn is meant to end;
+ *  - shares the promise-block counter, so it cannot add a new nag loop on top
+ *    of the existing cap.
+ */
+async function handleStatedIntentNoWork(ctx: GateContext, sid: string, state: V2SessionState): Promise<boolean> {
+  const lastText = state.lastAssistantText
+  if (!lastText) return false
+  if (ctx.evidenceLedger.hasChangedFiles(sid)) return false // promise-no-act's job
+  if (ctx.storyEngine.getPlan(sid)) return false // handleIncompletePlan's job
+  if (!statesUnfulfilledIntent(lastText)) return false
+
+  if (holdoutSuppresses(sid, "promise-no-act")) {
+    logHoldoutSuppress(sid, "v2 stated-intent nudge skipped (holdout arm=off)", { family: "promise-no-act" })
+    return false
+  }
+
+  const count = ctx.evidenceLedger.incrementPromiseBlocks(sid)
+  if (count > ctx.maxCriteriaBlocks) return false
+
+  const labels = detectPromiseNoAct(lastText)
+    .map((h) => h.label)
+    .join(", ")
+  ctx.logger("gate:stated-intent-no-work", { sessionID: sid, labels, attempt: count })
+  await dispatchContinuation(
+    ctx,
+    sid,
+    state,
+    `[vertex:stated-intent] Your last message says you will do further work (${labels}) but the turn ended with ` +
+      "no tool calls, no file changes and no recorded plan. Do that work now. If it is a multi-story build, record " +
+      "the plan with elicify_vertex_plan_create first; otherwise just carry on and finish it. End the turn only " +
+      "when the work is done, or ask a direct question if you are blocked on something only the user can answer.",
+  )
   return true
 }
 
@@ -1360,6 +1412,10 @@ export async function handleSessionIdle(ctx: GateContext, sid: string): Promise<
   // v1 ordering: promise-no-act is checked BEFORE the criteria/zero-criteria
   // branches and short-circuits the rest of the tree when it fires.
   if (await handlePromiseNoAct(ctx, sid, state)) return
+
+  // ...and the case promise-no-act cannot see, because it requires changed
+  // files: a turn that announced work and did nothing at all.
+  if (await handleStatedIntentNoWork(ctx, sid, state)) return
 
   const criteria = ctx.pinStore.get(sid)
   const activeStory = ctx.storyEngine.getActiveStory(sid)
