@@ -17,6 +17,7 @@ import { handleSessionIdle, type GateContext } from "../../src/v2/wiring/gate.js
 import { ManifestCache } from "../../src/v2/wiring/manifest.js"
 import { freshSessionState, resetTurnState } from "../../src/v2/wiring/state.js"
 import { cancelPauseJudge } from "../../src/v2/wiring/gate.js"
+import { holdoutSuppresses } from "../../src/measurement.js"
 import { PAUSE_JUDGE_DELAY_MS } from "../../src/v2/pauseJudge.js"
 import { DelegationTracker } from "../../src/v2/wiring/watchdog.js"
 
@@ -1468,7 +1469,7 @@ describe("handleSessionIdle — pause judge", () => {
   })
 
   it("does NOT nudge at idle — it only arms a timer", async () => {
-    const h = harness({})
+    const h = harness({ verifierEnabled: true })
     const sid = "s1"
     const state = quietSession(h, sid)
     state.lastAssistantText = "Let me lay out the plan and execute."
@@ -1492,7 +1493,7 @@ describe("handleSessionIdle — pause judge", () => {
         ]),
     ],
   ])("does not arm on %s", async (_label, setup) => {
-    const h = harness({})
+    const h = harness({ verifierEnabled: true })
     const sid = "s1"
     const state = quietSession(h, sid)
     state.lastAssistantText = "Let me lay out the plan and execute."
@@ -1503,7 +1504,7 @@ describe("handleSessionIdle — pause judge", () => {
   })
 
   it("arms only once, however many idles arrive", async () => {
-    const h = harness({})
+    const h = harness({ verifierEnabled: true })
     const sid = "s1"
     const state = quietSession(h, sid)
     state.lastAssistantText = "Let me lay out the plan and execute."
@@ -1517,7 +1518,7 @@ describe("handleSessionIdle — pause judge", () => {
 
   it("cancelPauseJudge stops a pending judgement", async () => {
     vi.useFakeTimers()
-    const h = harness({})
+    const h = harness({ verifierEnabled: true })
     const sid = "s1"
     const state = quietSession(h, sid)
     state.lastAssistantText = "Let me lay out the plan and execute."
@@ -1532,7 +1533,7 @@ describe("handleSessionIdle — pause judge", () => {
 
   it("does not judge when activity happened after arming", async () => {
     vi.useFakeTimers()
-    const h = harness({})
+    const h = harness({ verifierEnabled: true })
     const sid = "s1"
     const state = quietSession(h, sid)
     state.lastAssistantText = "Let me lay out the plan and execute."
@@ -1543,6 +1544,43 @@ describe("handleSessionIdle — pause judge", () => {
 
     expect(loggedEventTypes(h.logger)).toContain("pause:cancelled")
     expect(continuations(h.prompt)).toHaveLength(0)
+  })
+
+  // MAJ-003: the judge drives the `vertex-verifier` agent, so the documented
+  // way to switch the verifier off must switch this off too.
+  it("does not arm when the verifier is disabled", async () => {
+    const h = harness({ verifierEnabled: false })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.lastAssistantText = "Let me lay out the plan and execute."
+
+    await handleSessionIdle(h.ctx, sid)
+    expect(loggedEventTypes(h.logger)).not.toContain("pause:armed")
+  })
+
+  // MAJ-005: every other dispatching branch honours the holdout. Without it
+  // the "off" arm receives nudges and the A/B measurement is corrupted.
+  it("does not arm for a holdout-off session", async () => {
+    const previous = process.env.VERTEX_HOLDOUT
+    process.env.VERTEX_HOLDOUT = "1"
+    try {
+      const h = harness({ verifierEnabled: true })
+      // Find a session id that lands in the off arm for this holdout config.
+      let sid: string | null = null
+      for (let i = 0; i < 200 && sid === null; i++) {
+        const candidate = `holdout-probe-${i}`
+        if (holdoutSuppresses(candidate, "promise-no-act")) sid = candidate
+      }
+      expect(sid, "no off-arm session id found").not.toBeNull()
+      const state = quietSession(h, sid!)
+      state.lastAssistantText = "Let me lay out the plan and execute."
+
+      await handleSessionIdle(h.ctx, sid!)
+      expect(loggedEventTypes(h.logger)).not.toContain("pause:armed")
+    } finally {
+      if (previous === undefined) delete process.env.VERTEX_HOLDOUT
+      else process.env.VERTEX_HOLDOUT = previous
+    }
   })
 })
 

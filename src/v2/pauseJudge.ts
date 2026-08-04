@@ -42,14 +42,19 @@
  * is what this module exists to stop happening again.
  */
 
-import { probeCapabilityBounded, runSubturn, VERIFIER_PROBE_POLICY, type SelfCreatedSessions } from "./subturn.js"
+import { buildDenyMap, runSubturn, type SelfCreatedSessions } from "./subturn.js"
+import { scanProseField } from "./verifier.js"
 import type { EventLogger, OpencodeClient } from "./types.js"
 
 /** How long a session must be genuinely silent before the question is worth a model call. */
 export const PAUSE_JUDGE_DELAY_MS = 60_000
 
-/** Bound on the judge subturn itself. Nobody is waiting on this, but a hung host must not leak a timer. */
-const PAUSE_JUDGE_TIMEOUT_MS = 30_000
+/**
+ * TOTAL budget for one judgement, tool map + subturn together. Spending it
+ * twice (once per phase) let a single run outlast the 60s arming interval,
+ * which is how two judges ended up in flight for one session.
+ */
+const PAUSE_JUDGE_TOTAL_MS = 30_000
 
 const PAUSE_JUDGE_AGENT = "vertex-verifier"
 
@@ -86,8 +91,15 @@ export function parsePauseVerdict(text: string): PauseVerdict | null {
   } catch {
     // fall through to extraction
   }
-  const match = /"verdict"\s*:\s*"(awaiting-user|stopped-mid-work)"/i.exec(text)
-  return match ? (match[1].toLowerCase() as PauseVerdict) : null
+  // A reply that mentions BOTH ("I would not say stopped-mid-work… final:
+  // awaiting-user") is unreadable, not a vote for whichever came first —
+  // taking the first match inverted the prompt's deliberate awaiting-user
+  // bias. Unreadable means silence.
+  const all = [...text.matchAll(/"verdict"\s*:\s*"(awaiting-user|stopped-mid-work)"/gi)].map((m) =>
+    m[1].toLowerCase(),
+  )
+  const unique = new Set(all)
+  return unique.size === 1 ? (all[0] as PauseVerdict) : null
 }
 
 export interface PauseJudgeInput {
@@ -110,19 +122,28 @@ export interface PauseJudgeInput {
  */
 export async function judgePause(input: PauseJudgeInput): Promise<PauseVerdict | null> {
   try {
-    // Same capability probe the completion verifier uses: it establishes the
-    // agent really is registered and resolves the tool map. A refusal is a
-    // silent no, exactly like every other failure here.
-    const probe = await probeCapabilityBounded(
-      input.client,
-      PAUSE_JUDGE_AGENT,
-      PAUSE_JUDGE_TIMEOUT_MS,
-      VERIFIER_PROBE_POLICY,
-    )
-    if (!probe.ok) {
-      input.logger("pause:judge-unavailable", { sessionID: input.parentSessionID, reason: probe.reason })
+    // ZERO TOOLS, like the intake classifier — this is a text classification,
+    // not an investigation. Reusing the verifier's probe policy granted
+    // read/grep/glob/list/BASH, and `wiring/config.ts` documents from a live
+    // probe that the host ignores `maxSteps` and that this agent was observed
+    // running `bash ls -la`. An unattended background timer must not be able
+    // to hand a model a shell to answer "is this waiting for me?".
+    const started = Date.now()
+    const tools = await buildDenyMap(input.client)
+    // MAJ-001: both fields are model output and go to the SAME destination as
+    // the verifier payload — and to a different provider entirely when
+    // `verifierModelOverride` is set. `buildVerifierPayload` routes its prose
+    // through `scanProseField` (secret patterns, entropy, adjacent-unit
+    // boundary check, oversize and length caps) and FR-031 treats that as a
+    // safety control; interpolating raw prose here would have walked around it.
+    const lastMessage = scanProseField(input.lastAssistantText, "lastResponse", input.logger, 2_000) ?? ""
+    const transcript = scanProseField(input.recentTranscript, "recentTranscript", input.logger, 4_000) ?? ""
+    if (!lastMessage) {
+      // The one input the judgement cannot be made without was dropped.
+      input.logger("pause:judge-unavailable", { sessionID: input.parentSessionID, reason: "last message redacted" })
       return null
     }
+
     const result = await runSubturn(input.client, input.selfCreated, input.logger, {
       parentSessionID: input.parentSessionID,
       agent: PAUSE_JUDGE_AGENT,
@@ -132,13 +153,13 @@ export async function judgePause(input: PauseJudgeInput): Promise<PauseVerdict |
         {
           type: "text",
           text:
-            `The assistant's last message was:\n---\n${input.lastAssistantText}\n---\n\n` +
-            (input.recentTranscript ? `Recent context:\n---\n${input.recentTranscript}\n---\n\n` : "") +
+            `The assistant's last message was:\n---\n${lastMessage}\n---\n\n` +
+            (transcript ? `Recent context:\n---\n${transcript}\n---\n\n` : "") +
             "Did this turn end awaiting the user, or stop mid-work?",
         },
       ],
-      tools: probe.tools,
-      timeoutMs: PAUSE_JUDGE_TIMEOUT_MS,
+      tools,
+      timeoutMs: Math.max(1_000, PAUSE_JUDGE_TOTAL_MS - (Date.now() - started)),
     })
     if (!result.ok) {
       input.logger("pause:judge-unavailable", { sessionID: input.parentSessionID, reason: result.reason })

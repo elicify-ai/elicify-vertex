@@ -1551,6 +1551,16 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
         // fingerprint in `goals.ts`.
         return
       }
+      // MIN-006: a session that ends, errors, or is aborted is not a pause.
+      // The abort case matters most — a user pressing ESC mid-work leaves
+      // exactly the shape the judge is trained to call "stopped-mid-work",
+      // so without this the harness would restart the work the user just
+      // killed. Cancellation is idempotent and safe for unknown sessions.
+      if (event.type === "session.deleted" || event.type === "session.error") {
+        const endedSid = (event.properties as { sessionID?: unknown } | undefined)?.sessionID
+        if (typeof endedSid === "string") cancelPauseJudge(endedSid)
+        return
+      }
       if (event.type !== "session.idle") return
       const sid = event.properties?.sessionID
       if (typeof sid !== "string" || isSelf(sid)) return

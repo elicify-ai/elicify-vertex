@@ -534,15 +534,24 @@ async function handlePromiseNoAct(ctx: GateContext, sid: string, state: V2Sessio
  */
 function armPauseJudge(ctx: GateContext, sid: string, state: V2SessionState): boolean {
   if (!state.lastAssistantText) return false
+  // MAJ-003: `VERTEX_VERIFIER=0` is the documented way to switch the verifier
+  // off, and this drives the same agent. It must obey the same switch.
+  if (!ctx.verifierEnabled) return false
+  // MAJ-005: every other dispatching branch honours the holdout; the deleted
+  // branch did too. Without it the "off" arm receives nudges and the A/B
+  // measurement for this family is corrupted.
+  if (holdoutSuppresses(sid, "promise-no-act")) return false
   if (ctx.evidenceLedger.getMode(sid) === "quick") return false
   if (ctx.evidenceLedger.hasChangedFiles(sid)) return false // promise-no-act's job
   if (ctx.storyEngine.getPlan(sid)) return false // handleIncompletePlan's job
-  if (state.statedIntentNudges > ctx.maxCriteriaBlocks) return false
+  // `>=`, not `>`: the increment happens after the model call, so `>` armed
+  // one extra judgement per turn purely to discard its verdict at the cap.
+  if (state.statedIntentNudges >= ctx.maxCriteriaBlocks) return false
 
   // Re-arming on every idle would let a chatty session hold the timer open
   // forever without it ever expiring. One armed timer per session; the
   // activity marker recorded with it is how expiry tells silence from work.
-  if (pauseTimers.has(sid)) return false
+  if (pauseTimers.has(sid) || pauseInFlight.has(sid)) return false
 
   const armedAtMarker = state.activityMarker
   try {
@@ -556,9 +565,11 @@ function armPauseJudge(ctx: GateContext, sid: string, state: V2SessionState): bo
 }
 
 function armTimer(ctx: GateContext, sid: string, state: V2SessionState, armedAtMarker: number): void {
+  const armedAtEpoch = currentPauseEpoch(sid)
   const timer = setTimeout(() => {
     pauseTimers.delete(sid)
-    void runPauseJudge(ctx, sid, state, armedAtMarker)
+    pauseInFlight.add(sid)
+    void runPauseJudge(ctx, sid, state, armedAtMarker, armedAtEpoch).finally(() => pauseInFlight.delete(sid))
   }, PAUSE_JUDGE_DELAY_MS)
   // Never hold the host process open for this.
   if (typeof timer.unref === "function") timer.unref()
@@ -570,11 +581,38 @@ function armTimer(ctx: GateContext, sid: string, state: V2SessionState, armedAtM
 const pauseTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
 /**
+ * CRIT-001. Clearing the timer cannot stop a judgement that has already
+ * started, and the judgement takes a model call — so between "timer fires" and
+ * "nudge dispatched" the user can send a message the harness then talks over.
+ * Reproduced: the user typed "Actually forget that" while the judge was in
+ * flight, and the harness still told the model to resume the abandoned work.
+ * That is the exact failure this feature exists to prevent, reappearing as a
+ * race instead of a phrasing bug.
+ *
+ * So cancellation bumps a per-session epoch. The judge captures it at arm time
+ * and re-checks it after every await; a bump means "the world moved on" and
+ * the whole run is abandoned, including after the verdict is known.
+ */
+const pauseEpochs = new Map<string, number>()
+
+/** In-flight guard (MAJ-002): the map entry above is deleted when the timer
+ *  FIRES, so without this the next idle re-arms while the first judge is still
+ *  running — two subturns for one session, both able to dispatch. */
+const pauseInFlight = new Set<string>()
+
+function currentPauseEpoch(sid: string): number {
+  return pauseEpochs.get(sid) ?? 0
+}
+
+/**
  * Any real activity means this was not a pause. Called from the hooks that
  * observe work and user input, so a timer never outlives the silence it was
  * measuring.
  */
 export function cancelPauseJudge(sid: string): void {
+  // Bump FIRST and unconditionally: a judge already in flight has no timer to
+  // clear, and it is exactly the case that needs cancelling.
+  pauseEpochs.set(sid, currentPauseEpoch(sid) + 1)
   const timer = pauseTimers.get(sid)
   if (!timer) return
   clearTimeout(timer)
@@ -591,17 +629,24 @@ async function runPauseJudge(
   sid: string,
   state: V2SessionState,
   armedAtMarker: number,
+  armedAtEpoch: number,
 ): Promise<void> {
+  /** The world moved on while we were thinking — see `pauseEpochs`. */
+  const stale = (): boolean =>
+    currentPauseEpoch(sid) !== armedAtEpoch ||
+    !state.active ||
+    state.stallPaused ||
+    state.idleContinuationInFlight ||
+    state.activityMarker !== armedAtMarker ||
+    ctx.evidenceLedger.hasChangedFiles(sid) ||
+    ctx.storyEngine.getPlan(sid) !== null
   try {
-    if (!state.active || state.stallPaused || state.idleContinuationInFlight) return
-    // Something happened after the timer was armed: not a pause.
-    if (state.activityMarker !== armedAtMarker) {
+    if (stale()) {
       ctx.logger("pause:cancelled", { sessionID: sid, reason: "activity after arming" })
       return
     }
     const lastText = state.lastAssistantText
     if (!lastText) return
-    if (ctx.evidenceLedger.hasChangedFiles(sid) || ctx.storyEngine.getPlan(sid)) return
     if (!state.modelId) return
     const [providerID, ...rest] = state.modelId.split("/")
     const modelID = rest.join("/")
@@ -621,6 +666,14 @@ async function runPauseJudge(
     ctx.logger("pause:verdict", { sessionID: sid, verdict: verdict ?? "none" })
     if (verdict !== "stopped-mid-work") return // awaiting-user, or unreadable: stay silent
 
+    // CRIT-001: the judgement took a model call. Re-validate immediately
+    // before speaking — a verdict about a message the user has already moved
+    // past is worse than no verdict at all.
+    if (stale()) {
+      ctx.logger("pause:cancelled", { sessionID: sid, reason: "session moved on during judgement" })
+      return
+    }
+
     state.statedIntentNudges += 1
     if (state.statedIntentNudges > ctx.maxCriteriaBlocks) return
     await dispatchContinuation(
@@ -636,7 +689,7 @@ async function runPauseJudge(
   }
 }
 
-/** FR-015 zero-criteria fallback:/** FR-015 zero-criteria fallback: v1's `EvidenceLedger.shouldBlockStop`, verbatim semantics, reused not reimplemented. */
+/** FR-015 zero-criteria fallback: v1's `EvidenceLedger.shouldBlockStop`, verbatim semantics, reused not reimplemented. */
 async function handleZeroCriteriaFallback(ctx: GateContext, sid: string, state: V2SessionState): Promise<void> {
   if (!ctx.evidenceLedger.shouldBlockStop(sid)) return
 

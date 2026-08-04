@@ -1938,6 +1938,62 @@ describe("child stderr never reaches the parent terminal", () => {
 // `evidenceLedger.reset`. Asserted here rather than in gate.test.ts, whose
 // harness has no `chat.message` to drive.
 // ===========================================================================
+// ===========================================================================
+// CRIT-001 — the judgement takes a model call, and the user can speak during
+// it. Clearing the timer cannot stop a judge already in flight, so without an
+// epoch check the harness issues a user-authority instruction OVER the user's
+// own message — the exact failure this whole feature exists to prevent,
+// reappearing as a race instead of a phrasing bug.
+// ===========================================================================
+describe("pause judge — a message during the judgement cancels it", () => {
+  it("does not nudge when the user speaks while the judge is in flight", async () => {
+    vi.useFakeTimers()
+    try {
+      // The race, made deterministic: the user's message is delivered from
+      // INSIDE the judge's own prompt call, i.e. exactly while the judgement
+      // is in flight. Holding the promise across fake timers deadlocks, so
+      // the interleaving is expressed this way instead.
+      let userSpeaks: (() => Promise<void>) | null = null
+      const client = makeStubClient()
+      client.session.prompt.mockImplementation(async (args: { body?: { agent?: string } }) => {
+        if (args?.body?.agent) {
+          if (userSpeaks) await userSpeaks()
+          return { data: { info: {}, parts: [{ type: "text", text: '{"verdict":"stopped-mid-work"}' }] }, error: undefined }
+        }
+        return { data: { info: {}, parts: [] }, error: undefined }
+      })
+
+      const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+      const sid = `race-${Math.random().toString(36).slice(2)}`
+
+      await hooks["chat.message"]!(
+        { sessionID: sid, agent: "elicify-vertex-agent", model: { providerID: "anthropic", modelID: "claude-opus-4" } } as never,
+        { message: { id: "m1" } as never, parts: [{ type: "text", text: "/elicify-vertex\n\nbuild the portal" } as never] },
+      )
+      await hooks["experimental.text.complete"]!(
+        { sessionID: sid, messageID: "m2", partID: "p1" } as never,
+        { text: "Let me lay out the plan and execute." },
+      )
+
+      userSpeaks = async () => {
+        await hooks["chat.message"]!(
+          { sessionID: sid, agent: "elicify-vertex-agent" } as never,
+          { message: { id: "m3" } as never, parts: [{ type: "text", text: "Actually forget that — what is Vite?" } as never] },
+        )
+      }
+
+      await hooks.event!({ event: { type: "session.idle", properties: { sessionID: sid } } as never })
+      await vi.advanceTimersByTimeAsync(70_000)
+      await vi.advanceTimersByTimeAsync(1_000)
+
+      const nudges = idleContinuationTexts(client, sid).filter((t) => t.includes("part-way through work"))
+      expect(nudges, "the harness must not talk over the user's own turn").toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
 describe("pause judge — verdict decides, and failure is silent", () => {
   /** Drive one armed pause to expiry with a stubbed verifier reply. */
   async function runPause(judgeReply: string | null): Promise<{ nudges: number; events: string[] }> {

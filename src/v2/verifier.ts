@@ -939,7 +939,7 @@ function scanDiffSummaryField(rawDiff: string, logger: EventLogger): string | un
  * (`VERIFIER_TRANSCRIPT_FIELD_CHAR_CAP`) and `plan`
  * (`VERIFIER_PLAN_FIELD_CHAR_CAP`, HANDOVER.md point 4).
  */
-function scanProseField(
+export function scanProseField(
   text: string,
   field: "lastResponse" | "recentTranscript" | "plan",
   logger: EventLogger,

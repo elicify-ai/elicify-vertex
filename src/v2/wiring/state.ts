@@ -46,6 +46,9 @@ export interface V2SessionState {
   /**
    * How many stated-intent nudges this turn has already spent.
    *
+   * Caps nudges from the PAUSE JUDGE (`pauseJudge.ts`), which replaced the
+   * phrase-based branch this counter was introduced for.
+   *
    * Deliberately NOT the shared `EvidenceLedger.promiseBlocks` counter. That
    * one lives in the evidence ledger, which `chat.message` replaces wholesale
    * on any message that is not recognised as the continuation's own echo — and
