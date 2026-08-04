@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process"
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -1874,5 +1875,52 @@ describe("M4: a real user message releases a stuck continuation guard", () => {
       readEvents().filter((e) => e.event_type === "gate:continuation-guard-released" && e.session_id === sid).length
     await chatMessage(hooks, sid, normalised)
     expect(releases(), "a normalised echo must still be consumed, not treated as user intent").toBe(0)
+  })
+})
+
+// ===========================================================================
+// The TUI flood (2026-08-04, reported from a live session).
+//
+// `computeBoundedDiffStat` shells out to `git diff --stat` to build the
+// verifier's payload. Node INHERITS a child's stderr by default for
+// `execFileSync`, so that output goes straight to the terminal running
+// opencode — past the TUI's renderer, which then draws over a frame it does
+// not know was overwritten. Pointed at a directory that is not a git repo,
+// `git diff` prints a warning plus its whole usage page (measured: 7,393
+// bytes) and wrecked the display on every idle. The `catch` around the call
+// swallowed the exception but never the output, so the event log stayed clean
+// while the screen was destroyed.
+//
+// Asserted across a process boundary, because inherited stderr is only
+// observable from the parent. The control case proves the test can fail.
+// ===========================================================================
+describe("child stderr never reaches the parent terminal", () => {
+  const NON_REPO = mkdtempSync(join(tmpdir(), "vertex-nonrepo-"))
+
+  /** Run one `git diff --stat` the way the harness does, return parent stderr. */
+  function parentStderrFor(stdioOption: string): string {
+    const script = `
+      const { execFileSync } = require("node:child_process");
+      try {
+        execFileSync("git", ["diff", "--stat"], {
+          cwd: ${JSON.stringify(NON_REPO)},
+          encoding: "utf8",
+          timeout: 5000,
+          maxBuffer: 1048576,
+          ${stdioOption}
+        });
+      } catch {}
+    `
+    const res = spawnSync(process.execPath, ["-e", script], { encoding: "utf8" })
+    return res.stderr ?? ""
+  }
+
+  it("control: without the stdio option, git floods the parent (the bug)", () => {
+    // If this ever goes quiet, the assertion below has stopped proving anything.
+    expect(parentStderrFor("").length).toBeGreaterThan(1000)
+  })
+
+  it("with stdio piped, nothing reaches the parent", () => {
+    expect(parentStderrFor(`stdio: ["ignore", "pipe", "pipe"],`)).toBe("")
   })
 })

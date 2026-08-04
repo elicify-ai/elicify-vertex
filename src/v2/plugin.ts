@@ -189,6 +189,15 @@ function computeBoundedDiffStat(cwd: string, changedPaths: readonly string[]): s
       encoding: "utf8",
       timeout: DIFF_STAT_TIMEOUT_MS,
       maxBuffer: 1024 * 1024,
+      // Node inherits the child's stderr by default for execFileSync, so it
+      // is written STRAIGHT to the terminal running opencode — past the TUI's
+      // renderer, which then has no idea the screen changed and draws over a
+      // corrupted frame. Outside a git repo `git diff` prints a warning plus
+      // its entire usage page (measured: 7,393 bytes) to stderr, so pointing
+      // the harness at a non-repo folder wrecked the display on every idle.
+      // The `catch` below swallowed the exception but never the output, which
+      // is why the event log looked perfectly healthy throughout.
+      stdio: ["ignore", "pipe", "pipe"],
     })
     const trimmed = out.trim()
     if (trimmed.length === 0) return ""
