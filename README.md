@@ -98,7 +98,28 @@ Details: [docs/USAGE.md](./docs/USAGE.md) · [docs/ARCHITECTURE.md](./docs/ARCHI
 npm install @elicify-ai/elicify-vertex
 ```
 
-Requires Node **≥ 20**. Current package: **`@elicify-ai/elicify-vertex@0.9.9`**.
+Requires Node **≥ 20**. Current package: **`@elicify-ai/elicify-vertex@0.10.0`**.
+
+> ### Upgrading from 0.9.x — the Judge is now the **Verifier**
+>
+> One rename, applied everywhere, with no compatibility shim. Nothing is
+> required of you unless you touched one of these directly:
+>
+> | If you… | Change |
+> |---|---|
+> | set `VERTEX_JUDGE=0` to disable it | use `VERTEX_VERIFIER=0` |
+> | parse `.vertex-events.jsonl` | the `judge:*` events are now `verifier:*`, and `story:judge-audit` is `story:verifier-audit` |
+> | have a plan mid-flight | the stamp field `story.judge` is now `story.verifier`; an existing plan keeps its stories and simply gets re-audited once |
+>
+> The `vertex-judge` subagent is registered automatically and becomes
+> `vertex-verifier` on restart — nothing to do.
+>
+> Also in this release: harness continuations no longer carry a `[vertex:…]`
+> prefix. They are dispatched as ordinary user messages so the model treats
+> them as instructions rather than as automated output it can discount; every
+> dispatch is still recorded as `gate:continuation-dispatched` in the event
+> log. And a `git diff` run outside a git repository no longer floods the
+> terminal past the TUI renderer.
 
 `postinstall` runs `scripts/install-skill.sh` (skill + agent into `~/.config/opencode/…`). Restart OpenCode after install.
 
