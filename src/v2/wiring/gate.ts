@@ -37,7 +37,7 @@
 import { existsSync } from "node:fs"
 import { resolve as resolvePath, sep } from "node:path"
 
-import { detectPromiseNoAct, shouldBlockPromiseNoAct, statesUnfulfilledIntent } from "../../index.js"
+import { detectPromiseNoAct, shouldBlockPromiseNoAct } from "../../index.js"
 import type { EvidenceLedger } from "../../index.js"
 import { classifyFileKind, formatChangedPathsForReason, formatGateContinuationText } from "../../index.js"
 import { verifyWaiverSignature } from "../../goals.js"
@@ -56,6 +56,7 @@ import { incompletePlanFinding } from "./findings.js"
 import { bindSession } from "./logger.js"
 import { nextInstanceId, type V2SessionState } from "./state.js"
 import { parsePathAbsenceClaim } from "./pathClaim.js"
+import { judgePause, PAUSE_JUDGE_DELAY_MS } from "../pauseJudge.js"
 import { evaluateStall, hasBusyChildren, type DelegationTracker } from "./watchdog.js"
 
 export interface GateContext {
@@ -516,72 +517,116 @@ async function handlePromiseNoAct(ctx: GateContext, sid: string, state: V2Sessio
 }
 
 /**
- * The turn ended on a stated intent with NOTHING done — no files changed, no
- * plan recorded. Every other branch lets this through by construction:
- * promise-no-act requires changed files, the zero-criteria stop gate requires
- * changed files, and `handleIncompletePlan` requires a plan to exist. So the
- * most common opening failure — "I'll draw up a plan" and then silence — was
- * the one case the harness never caught.
+ * A turn ended with nothing done. Do NOT judge that here — arm a timer.
  *
- * Observed live (session ses_03385da6…): the model announced a plan and
- * stopped; `gate_fire` logged `{decision:"allow", changed:false}` and the
- * session sat idle.
+ * This replaced a phrase detector that was wrong in both directions inside two
+ * live sessions: silent on "Let me lay out the plan and execute", and nudging
+ * "Green-light this and I'll create the plan and start" — a model correctly
+ * pausing for the approval the agent contract *requires* before a plan is
+ * recorded. See `pauseJudge.ts` for why a word list cannot answer this.
  *
- * Deliberately the narrowest branch in the tree:
- *  - runs only when there is NO plan (with one, `handleIncompletePlan` owns
- *    the nudge and says something far more specific);
- *  - runs only when NOTHING changed (with changes, promise-no-act owns it);
- *  - requires a STRONG intent phrase, and never fires when the model asked
- *    the user a direct question — that turn is meant to end;
- *  - shares the promise-block counter, so it cannot add a new nag loop on top
- *    of the existing cap.
+ * The structural pre-filter survives, because it is free and it is what keeps
+ * the model call rare: no plan, nothing changed, not quick mode. What is gone
+ * is any attempt to read intent from the text. `session.idle` fires the moment
+ * a turn ends, which is not evidence of anything — a human reading the reply
+ * looks exactly like a stall. Only real silence is evidence, so the question
+ * is deferred to `PAUSE_JUDGE_DELAY_MS` of it, and any activity cancels.
  */
-async function handleStatedIntentNoWork(ctx: GateContext, sid: string, state: V2SessionState): Promise<boolean> {
-  const lastText = state.lastAssistantText
-  if (!lastText) return false
-  // MAJ-1: the quick/normal exemption every other deterministic branch
-  // honours — `handleCriteriaReplay` bails unless deep, and
-  // `shouldBlockStop` documents "quick and normal never hard-block". It
-  // matters most HERE: this branch fires precisely when nothing changed,
-  // which is the normal shape of a quick turn ("explain this, don't edit
-  // anything"). Without the gate, asking for an explanation earns a
-  // "Do that work now." that reads as a user instruction.
+function armPauseJudge(ctx: GateContext, sid: string, state: V2SessionState): boolean {
+  if (!state.lastAssistantText) return false
   if (ctx.evidenceLedger.getMode(sid) === "quick") return false
   if (ctx.evidenceLedger.hasChangedFiles(sid)) return false // promise-no-act's job
   if (ctx.storyEngine.getPlan(sid)) return false // handleIncompletePlan's job
-  if (!statesUnfulfilledIntent(lastText)) return false
-
-  if (holdoutSuppresses(sid, "promise-no-act")) {
-    logHoldoutSuppress(sid, "v2 stated-intent nudge skipped (holdout arm=off)", { family: "promise-no-act" })
-    return false
-  }
-
-  // Session-state counter, not the evidence ledger's — see
-  // `statedIntentNudges`. The ledger is replaced by `chat.message` whenever
-  // the echo is not recognised as such, which is host-timing dependent, so a
-  // ledger-based cap is not a reliable bound for a branch that fires when
-  // nothing happened.
-  state.statedIntentNudges += 1
   if (state.statedIntentNudges > ctx.maxCriteriaBlocks) return false
-  const count = state.statedIntentNudges
 
-  const labels = detectPromiseNoAct(lastText)
-    .map((h) => h.label)
-    .join(", ")
-  ctx.logger("gate:stated-intent-no-work", { sessionID: sid, labels, attempt: count })
-  await dispatchContinuation(
-    ctx,
-    sid,
-    state,
-    `[vertex:stated-intent] Your last message says you will do further work (${labels}) but the turn ended with ` +
-      "no tool calls, no file changes and no recorded plan. Do that work now. If it is a multi-story build, record " +
-      "the plan with elicify_vertex_plan_create first; otherwise just carry on and finish it. End the turn only " +
-      "when the work is done, or ask a direct question if you are blocked on something only the user can answer.",
-  )
-  return true
+  // Re-arming on every idle would let a chatty session hold the timer open
+  // forever without it ever expiring. One armed timer per session; the
+  // activity marker recorded with it is how expiry tells silence from work.
+  if (pauseTimers.has(sid)) return false
+
+  const armedAtMarker = state.activityMarker
+  const timer = setTimeout(() => {
+    pauseTimers.delete(sid)
+    void runPauseJudge(ctx, sid, state, armedAtMarker)
+  }, PAUSE_JUDGE_DELAY_MS)
+  // Never hold the host process open for this.
+  if (typeof timer.unref === "function") timer.unref()
+  pauseTimers.set(sid, timer)
+  ctx.logger("pause:armed", { sessionID: sid, afterMs: PAUSE_JUDGE_DELAY_MS })
+  return false // arming is not a continuation; the rest of the idle tree runs
 }
 
-/** FR-015 zero-criteria fallback: v1's `EvidenceLedger.shouldBlockStop`, verbatim semantics, reused not reimplemented. */
+/** Timers are per session and cancelled by any activity — see `cancelPauseJudge`. */
+const pauseTimers = new Map<string, ReturnType<typeof setTimeout>>()
+
+/**
+ * Any real activity means this was not a pause. Called from the hooks that
+ * observe work and user input, so a timer never outlives the silence it was
+ * measuring.
+ */
+export function cancelPauseJudge(sid: string): void {
+  const timer = pauseTimers.get(sid)
+  if (!timer) return
+  clearTimeout(timer)
+  pauseTimers.delete(sid)
+}
+
+/**
+ * The timer fired. Confirm the session really is still silent, ask the judge,
+ * and nudge ONLY on an explicit "stopped-mid-work". Every other outcome —
+ * awaiting-user, unavailable, malformed, thrown — is silence.
+ */
+async function runPauseJudge(
+  ctx: GateContext,
+  sid: string,
+  state: V2SessionState,
+  armedAtMarker: number,
+): Promise<void> {
+  try {
+    if (!state.active || state.stallPaused || state.idleContinuationInFlight) return
+    // Something happened after the timer was armed: not a pause.
+    if (state.activityMarker !== armedAtMarker) {
+      ctx.logger("pause:cancelled", { sessionID: sid, reason: "activity after arming" })
+      return
+    }
+    const lastText = state.lastAssistantText
+    if (!lastText) return
+    if (ctx.evidenceLedger.hasChangedFiles(sid) || ctx.storyEngine.getPlan(sid)) return
+    if (!state.modelId) return
+    const [providerID, ...rest] = state.modelId.split("/")
+    const modelID = rest.join("/")
+    if (!providerID || !modelID) return
+
+    const verdict = await judgePause({
+      client: ctx.client,
+      selfCreated: ctx.selfCreated,
+      logger: ctx.logger,
+      parentSessionID: sid,
+      lastAssistantText: lastText,
+      recentTranscript: (await fetchVerifierTranscriptFields(ctx.client, sid)).recentTranscript,
+      sessionModel: { providerID, modelID },
+      verifierModelOverride: ctx.verifierModelOverride,
+    })
+
+    ctx.logger("pause:verdict", { sessionID: sid, verdict: verdict ?? "none" })
+    if (verdict !== "stopped-mid-work") return // awaiting-user, or unreadable: stay silent
+
+    state.statedIntentNudges += 1
+    if (state.statedIntentNudges > ctx.maxCriteriaBlocks) return
+    await dispatchContinuation(
+      ctx,
+      sid,
+      state,
+      "[vertex:stalled] This turn ended part-way through work you had started, with no question for the user " +
+        "and nothing to respond to. Continue and finish it. If it is a multi-story build, propose the plan and " +
+        "get agreement before recording it.",
+    )
+  } catch {
+    // Fail-open: a background timer must never throw into the host.
+  }
+}
+
+/** FR-015 zero-criteria fallback:/** FR-015 zero-criteria fallback: v1's `EvidenceLedger.shouldBlockStop`, verbatim semantics, reused not reimplemented. */
 async function handleZeroCriteriaFallback(ctx: GateContext, sid: string, state: V2SessionState): Promise<void> {
   if (!ctx.evidenceLedger.shouldBlockStop(sid)) return
 
@@ -1428,8 +1473,9 @@ export async function handleSessionIdle(ctx: GateContext, sid: string): Promise<
   if (await handlePromiseNoAct(ctx, sid, state)) return
 
   // ...and the case promise-no-act cannot see, because it requires changed
-  // files: a turn that announced work and did nothing at all.
-  if (await handleStatedIntentNoWork(ctx, sid, state)) return
+  // files: a turn that ended with nothing done. Never judged here — this only
+  // arms a timer and always returns false, so the rest of the tree still runs.
+  armPauseJudge(ctx, sid, state)
 
   const criteria = ctx.pinStore.get(sid)
   const activeStory = ctx.storyEngine.getActiveStory(sid)

@@ -765,78 +765,16 @@ export function shouldBlockPromiseNoAct(text: string, changed: boolean, _verifie
   if (asksUser(text)) return false
   const hits = detectPromiseNoAct(text)
   if (hits.length === 0) return false
-  // Keeps the FULL strong-label set, deliberately. Changed files are proof the
-  // model was working, so `todo-marker` / `follow-up` / `explicit-deferral`
-  // read as deferrals of that work. `statesUnfulfilledIntent` below cannot
-  // borrow this calibration — with no changes those same words are usually
-  // describing something, not deferring it.
+  // Keeps the FULL strong-label set. Changed files are proof the model was
+  // working, so `todo-marker` / `follow-up` / `explicit-deferral` read as
+  // deferrals of that work. That calibration does NOT transfer to a turn where
+  // nothing happened — the no-work case is judged by `pauseJudge.ts`, not by
+  // words, precisely because it was twice wrong here.
   return hits.some((h) => STRONG_PROMISE_LABELS.has(h.label))
 }
 
-/**
- * Does this text announce work the model then did not do?
- *
- * The same judgement `shouldBlockPromiseNoAct` makes, minus its changed-files
- * precondition. Split out for the idle branch that catches a turn ending on a
- * stated intent with NOTHING done — no files touched, no plan recorded — which
- * every existing branch let through: promise-no-act requires changed files,
- * the stop gate requires changed files, and the plan branch requires a plan.
- * Observed in a live session: the model said it would draw up a plan and
- * stopped, and `gate_fire` logged `{decision:"allow", changed:false}`.
- *
- * Asking the user a direct question is not an unfulfilled intent — that turn
- * is *supposed* to end.
- */
-export function statesUnfulfilledIntent(text: string): boolean {
-  if (asksUser(text) || handsBackToUser(text)) return false
-  if (describesRatherThanPromises(text)) return false
-  // ONLY `future-intent`. The other strong labels — `todo-marker`,
-  // `follow-up`, `explicit-deferral`, `issue-filing`, `next-iteration` — are
-  // REPORT words on a turn where nothing happened: "there is one TODO left at
-  // line 40, added by the previous author" and "the auth rewrite is a separate
-  // follow-up, out of scope" are observations, not promises. They earn their
-  // place in `shouldBlockPromiseNoAct` because changed files already prove the
-  // model was working; with no changes that proof is absent and they produce
-  // pure false positives (measured: 3 of them fired on plain descriptions).
-  return detectPromiseNoAct(text).some((h) => h.label === "future-intent")
-}
 
-/**
- * The turn ends by handing control back — the model is blocked on the user,
- * or waiting. That turn is SUPPOSED to end, and nudging it is both wrong and
- * unanswerable.
- *
- * `asksUser` is a six-phrase allowlist calibrated for the changed-files case,
- * where a question mid-work is weak evidence. On a no-work turn the calculus
- * inverts: "ended with a question and did nothing" is the canonical legitimate
- * hand-back, so a trailing `?` counts here even though it deliberately does
- * not there. Measured: without this, "Which approach do you prefer, A or B?"
- * and "I'll need you to run `npm login` first" were both nudged.
- */
-function handsBackToUser(text: string): boolean {
-  const tail = text.slice(-PROMISE_TAIL_WINDOW).trimEnd()
-  // ANY question in the tail, not just a trailing one. "Which approach do you
-  // prefer, A or B? I'll then implement it." is unambiguously waiting on the
-  // answer, yet its last character is a full stop — measured as the one false
-  // positive a trailing-only test left behind.
-  if (tail.includes("?")) return true
-  return /\b(?:ready when you are|say the word|let me know|up to you|your call|i'?ll need you to|you'?ll need to|i can'?t (?:authenticate|access|run|reach)|waiting (?:on|for) you|once you|after you)\b/i.test(
-    tail,
-  )
-}
 
-/**
- * The intent lead-in is followed by a SPEECH verb, not a work verb: "let me
- * summarise what I found", "let me explain the trade-off". The pattern's
- * 80-character window means an unrelated work verb later in the sentence
- * ("…and the fix would be to ADD a bounds check") otherwise makes a summary
- * read as a promise — measured, that exact sentence was nudged.
- */
-function describesRatherThanPromises(text: string): boolean {
-  return /\b(?:I'?ll|I will|let me)\s+(?:just\s+|quickly\s+|briefly\s+)?(?:summari[sz]e|recap|explain|describe|clarify|walk (?:you )?through|show you|note|point out|flag)\b/i.test(
-    text.slice(-PROMISE_TAIL_WINDOW),
-  )
-}
 
 // ===========================================================================
 // TASK CLASSIFIER — signal-routed injection

@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { afterEach, describe, expect, it, vi } from "vitest"
+import { afterEach, describe, expect, it, vi, beforeEach } from "vitest"
 
 import { EvidenceLedger } from "../../src/index.js"
 import { holdoutArm } from "../../src/measurement.js"
@@ -16,6 +16,8 @@ import type { OpencodeClient } from "../../src/v2/types.js"
 import { handleSessionIdle, type GateContext } from "../../src/v2/wiring/gate.js"
 import { ManifestCache } from "../../src/v2/wiring/manifest.js"
 import { freshSessionState, resetTurnState } from "../../src/v2/wiring/state.js"
+import { cancelPauseJudge } from "../../src/v2/wiring/gate.js"
+import { PAUSE_JUDGE_DELAY_MS } from "../../src/v2/pauseJudge.js"
 import { DelegationTracker } from "../../src/v2/wiring/watchdog.js"
 
 const roots: string[] = []
@@ -1442,215 +1444,105 @@ describe("handleVerifierAudit — verdict reconciliation", () => {
 // distinguishes harness steering from their own words.
 // ===========================================================================
 // ===========================================================================
-// The idle nobody caught (live session ses_03385da6…, 2026-08-04).
+// The pause judge (replaces the phrase detector, 2026-08-04).
 //
-// The model said it would draw up a plan and stopped: no tool calls, no file
-// changes, no plan. `gate_fire` logged {decision:"allow", changed:false} and
-// the session sat there. Every existing branch lets this through by
-// construction — promise-no-act and the stop gate both require changed files,
-// and `handleIncompletePlan` requires a plan to exist.
+// A turn ending with nothing done is NOT judged at idle any more. `session.idle`
+// fires the instant a turn ends, which is not evidence — a human reading the
+// reply looks exactly like a stall. The gate arms a timer instead; only real
+// silence earns the model call, and only an explicit "stopped-mid-work"
+// verdict earns a nudge.
+//
+// The detector this replaced was wrong in both directions in two live
+// sessions: silent on "Let me lay out the plan and execute", and nudging
+// "Green-light this and I'll create the plan and start" — a model correctly
+// waiting for the approval the agent contract requires.
 // ===========================================================================
-describe("handleSessionIdle — stated intent with nothing done", () => {
-  // The verbatim text from the stalled session. The branch shipped without
-  // catching it: `detectPromiseNoAct`'s verb list had no `lay out`, `plan` or
-  // `execute`, so the nudge built for exactly this case never fired. Caught by
-  // replaying the real message end to end, not by the unit tests — which had
-  // all used phrasings the detector already knew.
-  it("nudges on the REAL stalled message from the live session", async () => {
+describe("handleSessionIdle — pause judge", () => {
+  // The timer map is module-level and keyed by session id, which these tests
+  // reuse. Production ids are unique and a fired timer deletes its own entry,
+  // but a test that arms and never advances would otherwise block the next.
+  beforeEach(() => cancelPauseJudge("s1"))
+  afterEach(() => {
+    cancelPauseJudge("s1")
+    vi.useRealTimers()
+  })
+
+  it("does NOT nudge at idle — it only arms a timer", async () => {
     const h = harness({})
     const sid = "s1"
     const state = quietSession(h, sid)
-    state.lastAssistantText =
-      "Got it — current portal has **Tetris, Asteroids, Snake**. I'll replace it with **Breakout, 2048, " +
-      "Minesweeper** (good genre spread: arcade action, number puzzle, logic puzzle). Let me lay out the plan and execute."
+    state.lastAssistantText = "Let me lay out the plan and execute."
 
     await handleSessionIdle(h.ctx, sid)
 
-    expect(familyTexts(h, "stated-intent")).toHaveLength(1)
+    expect(continuations(h.prompt)).toHaveLength(0)
+    expect(loggedEventTypes(h.logger)).toContain("pause:armed")
   })
 
-  it("nudges when the turn announces work but changed nothing and recorded no plan", async () => {
+  // The structural pre-filter is what keeps the model call rare; it must still
+  // hold, because each of these cases belongs to another branch.
+  it.each([
+    ["quick mode", (h: ReturnType<typeof harness>, sid: string) => h.evidenceLedger.reset(sid, "quick")],
+    ["changed files", (h: ReturnType<typeof harness>, sid: string) => h.evidenceLedger.recordChangedFiles(sid, "src/a.ts")],
+    [
+      "an existing plan",
+      (h: ReturnType<typeof harness>, sid: string) =>
+        void h.storyEngine.createPlan(sid, [
+          { text: "Ship", acceptanceItems: ["A1"], scopeGlobs: [], verifiers: [], tasks: [{ text: "do" }] },
+        ]),
+    ],
+  ])("does not arm on %s", async (_label, setup) => {
     const h = harness({})
     const sid = "s1"
     const state = quietSession(h, sid)
-    state.lastAssistantText = "Good idea. I'll draw up a plan for this next."
+    state.lastAssistantText = "Let me lay out the plan and execute."
+    setup(h, sid)
 
     await handleSessionIdle(h.ctx, sid)
-
-    const texts = familyTexts(h, "stated-intent")
-    expect(texts).toHaveLength(1)
-    expect(texts[0]).toMatch(/no tool calls, no file changes and no recorded plan/)
-    expect(loggedEventTypes(h.logger)).toContain("gate:stated-intent-no-work")
+    expect(loggedEventTypes(h.logger)).not.toContain("pause:armed")
   })
 
-  // Each of the three guards, so the branch stays the narrowest in the tree.
-  it("stays quiet when files DID change (promise-no-act owns that case)", async () => {
+  it("arms only once, however many idles arrive", async () => {
     const h = harness({})
     const sid = "s1"
     const state = quietSession(h, sid)
-    state.lastAssistantText = "I'll add the tests next."
-    h.evidenceLedger.recordChangedFiles(sid, "src/app.ts")
+    state.lastAssistantText = "Let me lay out the plan and execute."
 
-    await handleSessionIdle(h.ctx, sid)
-    expect(familyTexts(h, "stated-intent")).toHaveLength(0)
-  })
-
-  it("stays quiet when a plan exists (handleIncompletePlan owns that case)", async () => {
-    const h = harness({})
-    const sid = "s1"
-    const state = quietSession(h, sid)
-    state.lastAssistantText = "I'll draw up a plan for this next."
-    h.storyEngine.createPlan(sid, [
-      { text: "Ship it", acceptanceItems: ["A1"], scopeGlobs: [], verifiers: [], tasks: [{ text: "do it" }] },
-    ])
-
-    await handleSessionIdle(h.ctx, sid)
-    expect(familyTexts(h, "stated-intent")).toHaveLength(0)
-  })
-
-  it("stays quiet when the model asked the user a direct question", async () => {
-    const h = harness({})
-    const sid = "s1"
-    const state = quietSession(h, sid)
-    state.lastAssistantText = "I could go with Postgres or SQLite here. Which option would you like?"
-
-    await handleSessionIdle(h.ctx, sid)
-    expect(familyTexts(h, "stated-intent")).toHaveLength(0)
-  })
-
-  it("stays quiet on an ordinary answer with no stated intent", async () => {
-    const h = harness({})
-    const sid = "s1"
-    const state = quietSession(h, sid)
-    state.lastAssistantText = "The function returns the parsed config object."
-
-    await handleSessionIdle(h.ctx, sid)
-    expect(familyTexts(h, "stated-intent")).toHaveLength(0)
-  })
-
-  // ---------------------------------------------------------------------
-  // Loop safety. A branch that nudges on "no work done" is the easiest way
-  // to build an infinite nagger: the nudge itself produces no work, so it
-  // re-qualifies immediately. Three independent bounds stop that, and the
-  // tests below exercise each — a walked-away user must end in silence.
-  // ---------------------------------------------------------------------
-  it("bound 1: the per-turn cap stops it becoming its own nag loop", async () => {
-    const h = harness({ maxCriteriaBlocks: 2 })
-    const sid = "s1"
-    const state = quietSession(h, sid)
-    state.lastAssistantText = "I'll draw up a plan for this next."
-
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < 5; i++) {
       state.idleContinuationInFlight = false
       await handleSessionIdle(h.ctx, sid)
     }
-    expect(familyTexts(h, "stated-intent").length).toBeLessThanOrEqual(2)
+    expect(h.logger.mock.calls.filter((c) => c[0] === "pause:armed")).toHaveLength(1)
   })
 
-  // MIN-2, stated honestly: this asserts only that the cap binds across
-  // repeated idles. It does NOT exercise the echo — the gate harness builds a
-  // GateContext and has no `chat.message`, so an echo cannot pass through it
-  // here. The echo-does-not-refill-the-budget property is covered where
-  // `chat.message` actually exists, in plugin.integration.test.ts.
-  it("bound 1b: the cap binds across repeated idles", async () => {
-    const h = harness({ maxCriteriaBlocks: 3 })
-    const sid = "s1"
-    const state = quietSession(h, sid)
-    state.lastAssistantText = "I'll draw up a plan for this next."
-
-    for (let i = 0; i < 10; i++) {
-      state.idleContinuationInFlight = false
-      await handleSessionIdle(h.ctx, sid)
-    }
-    expect(familyTexts(h, "stated-intent").length).toBe(3)
-  })
-
-  // ...and the converse: a REAL user message is a new turn and legitimately
-  // refills the budget. Without this the cap could be permanent, which is a
-  // different bug (the harness going silent for the rest of the session).
-  it("bound 1c: a real user message refills the budget", async () => {
-    const h = harness({ maxCriteriaBlocks: 1 })
-    const sid = "s1"
-    const state = quietSession(h, sid)
-    state.lastAssistantText = "I'll draw up a plan for this next."
-
-    await handleSessionIdle(h.ctx, sid)
-    state.idleContinuationInFlight = false
-    await handleSessionIdle(h.ctx, sid) // capped
-    expect(familyTexts(h, "stated-intent")).toHaveLength(1)
-
-    // New user turn: ledger reset, stale intent cleared, budget restored.
-    h.evidenceLedger.reset(sid)
-    resetTurnState(state)
-    state.lastAssistantText = "I'll draw up a plan for this next."
-    await handleSessionIdle(h.ctx, sid)
-    expect(familyTexts(h, "stated-intent")).toHaveLength(2)
-  })
-
-  // MAJ-3: stale intent from a PREVIOUS turn must not be re-nudged.
-  it("does not re-fire on last turn's text after a new user message", async () => {
+  it("cancelPauseJudge stops a pending judgement", async () => {
+    vi.useFakeTimers()
     const h = harness({})
     const sid = "s1"
     const state = quietSession(h, sid)
-    state.lastAssistantText = "I'll draw up a plan for this next."
-    await handleSessionIdle(h.ctx, sid)
-    expect(familyTexts(h, "stated-intent")).toHaveLength(1)
+    state.lastAssistantText = "Let me lay out the plan and execute."
 
-    resetTurnState(state) // a real user message
-    state.idleContinuationInFlight = false
     await handleSessionIdle(h.ctx, sid)
+    cancelPauseJudge(sid) // a message or tool call arrived
+    await vi.advanceTimersByTimeAsync(PAUSE_JUDGE_DELAY_MS + 5_000)
 
-    expect(familyTexts(h, "stated-intent"), "stale intent must not survive the turn").toHaveLength(1)
+    expect(loggedEventTypes(h.logger)).not.toContain("pause:verdict")
+    expect(continuations(h.prompt)).toHaveLength(0)
   })
 
-  // MAJ-1: quick mode is where "nothing changed" is the NORMAL shape.
-  it("stays quiet in quick mode (explain-only turns)", async () => {
+  it("does not judge when activity happened after arming", async () => {
+    vi.useFakeTimers()
     const h = harness({})
     const sid = "s1"
     const state = quietSession(h, sid)
-    h.evidenceLedger.reset(sid, "quick")
-    state.lastAssistantText = "I'll walk through the architecture and then outline the fix."
+    state.lastAssistantText = "Let me lay out the plan and execute."
 
     await handleSessionIdle(h.ctx, sid)
-    expect(familyTexts(h, "stated-intent")).toHaveLength(0)
-  })
+    state.activityMarker += 1 // work landed without cancelling the timer
+    await vi.advanceTimersByTimeAsync(PAUSE_JUDGE_DELAY_MS + 5_000)
 
-  // The backstop for the case the phrase check cannot see: the model is
-  // actually waiting on the user and keeps restating it, or the user walked
-  // away. Continuations that produce no observable activity trip the stall
-  // detector, which silences the WHOLE gate until a real user message.
-  it("bound 2: repeated no-progress nudges pause the gate entirely", async () => {
-    const h = harness({ maxCriteriaBlocks: 99, maxNoProgressTurns: 2 })
-    const sid = "s1"
-    const state = quietSession(h, sid)
-    state.lastAssistantText = "I'll draw up a plan for this next."
-
-    for (let i = 0; i < 10; i++) {
-      state.idleContinuationInFlight = false
-      await handleSessionIdle(h.ctx, sid)
-    }
-
-    expect(state.stallPaused, "the gate must pause itself when nudging changes nothing").toBe(true)
-    expect(loggedEventTypes(h.logger)).toContain("gate:stall-paused")
-    // Terminated: a high cap did NOT produce ten nudges.
-    expect(familyTexts(h, "stated-intent").length).toBeLessThan(10)
-  })
-
-  // Bound 3 is the re-entrancy guard: while a nudge's prompt is STILL
-  // OUTSTANDING, idle is a no-op, so a slow turn cannot stack nudges on top of
-  // each other. (Once the prompt settles the guard releases and the cap above
-  // is what bounds things — the two bounds cover different windows.)
-  it("bound 3: an OUTSTANDING nudge suppresses further idles", async () => {
-    const h = harness({})
-    const sid = "s1"
-    const state = quietSession(h, sid)
-    state.lastAssistantText = "I'll draw up a plan for this next."
-    state.idleContinuationInFlight = true // a dispatch is in flight
-
-    await handleSessionIdle(h.ctx, sid)
-    await handleSessionIdle(h.ctx, sid)
-
-    expect(familyTexts(h, "stated-intent")).toHaveLength(0)
+    expect(loggedEventTypes(h.logger)).toContain("pause:cancelled")
+    expect(continuations(h.prompt)).toHaveLength(0)
   })
 })
 

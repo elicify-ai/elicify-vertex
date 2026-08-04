@@ -48,7 +48,7 @@ import type { OpencodeClient } from "./types.js"
 
 import { applyV2Config } from "./wiring/config.js"
 import { applyDosing } from "./wiring/dosing.js"
-import { GateContext, handleSessionIdle } from "./wiring/gate.js"
+import { cancelPauseJudge, GateContext, handleSessionIdle } from "./wiring/gate.js"
 import {
   anomalyInterruptFinding,
   elevateFinding,
@@ -544,6 +544,11 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
         }
       }
 
+      // A message of any kind means the silence ended — the pause timer is
+      // measuring quiet, and this is the opposite of quiet. Cancelled before
+      // the echo guard so it also clears on the continuation's own echo.
+      cancelPauseJudge(sid)
+
       const text = (output.parts || [])
         .filter((p) => p && p.type === "text" && typeof (p as { text?: unknown }).text === "string")
         .map((p) => (p as { text: string }).text)
@@ -818,6 +823,8 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
 
     // ── TOOL.EXECUTE.AFTER: mutation/verification observation ──────────────
     async "tool.execute.after"(toolInput, toolOutput) {
+      // Work happened: whatever the timer was measuring, it was not a pause.
+      if (typeof toolInput?.sessionID === "string") cancelPauseJudge(toolInput.sessionID)
       const sid = toolInput.sessionID
       if (isSelf(sid)) return
       const state = states.get(sid)

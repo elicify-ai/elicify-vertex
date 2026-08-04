@@ -3,7 +3,6 @@ import {
   detectPromiseNoAct,
   PROMISE_NO_ACT_LABELS,
   shouldBlockPromiseNoAct,
-  statesUnfulfilledIntent,
 } from "../src/index.js"
 
 // ---------------------------------------------------------------------------
@@ -312,36 +311,5 @@ describe("detectPromiseNoAct — comprehensive coverage", () => {
     const padded2 = "x".repeat(500) + " TODO at the tail"
     const hits2 = detectPromiseNoAct(padded2)
     expect(hits2.some((h) => h.label === "todo-marker")).toBe(true)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// The verb list in `future-intent` is what turns a mention into an INTENT, so
-// it has to cover how models actually announce work. It originally missed the
-// commonest opening in a real stalled session — "Let me lay out the plan and
-// execute." — and the idle nudge built for that case therefore never fired.
-// ---------------------------------------------------------------------------
-describe("statesUnfulfilledIntent — announcement vocabulary", () => {
-  it.each([
-    "Got it. I'll replace it with Breakout, 2048, Minesweeper. Let me lay out the plan and execute.",
-    "Great — I'll draw up a plan for the snake game and get started.",
-    "Let me outline the approach and execute.",
-    "I'll scaffold the project next.",
-    "Let me set up the migration and run it.",
-  ])("detects: %s", (text) => {
-    expect(statesUnfulfilledIntent(text)).toBe(true)
-  })
-
-  // The lead-in ("I'll" / "let me") is doing the work, so a bare mention of
-  // one of these verbs must not qualify.
-  it.each([
-    "The function returns the parsed config object.",
-    "Done — all 12 tests pass and the build is clean.",
-    "Here is the plan we agreed: three files, two tests.",
-    "The migrate script already ran last week.",
-    "That error comes from a missing peer dependency.",
-    "I could go with Postgres or SQLite here. Which option would you like?",
-  ])("does not fire on: %s", (text) => {
-    expect(statesUnfulfilledIntent(text)).toBe(false)
   })
 })

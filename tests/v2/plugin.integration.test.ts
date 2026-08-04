@@ -1938,43 +1938,61 @@ describe("child stderr never reaches the parent terminal", () => {
 // `evidenceLedger.reset`. Asserted here rather than in gate.test.ts, whose
 // harness has no `chat.message` to drive.
 // ===========================================================================
-describe("the stated-intent nudge terminates under repeated no-work idles", () => {
-  // What is guaranteed, and what is not.
-  //
-  // The per-turn counter is NOT a reliable bound on its own: whether the
-  // nudge's echo is recognised (and so whether `chat.message` skips
-  // `resetTurnState`) depends on whether `session.prompt` has settled, i.e. on
-  // host timing. Measured against the real wiring, a cap of 2 let 4 through.
-  // Moving the counter from the evidence ledger to session state removed one
-  // source of that, but not the reset itself.
-  //
-  // The STALL DETECTOR is the timing-independent bound: continuations that
-  // produce no observable activity never move `activityMarker`, so
-  // `consecutiveNoProgress` climbs to `maxNoProgressTurns` and pauses the whole
-  // gate until a real user message. That is what this asserts — termination,
-  // not an exact count.
-  it("stops nudging well before the number of idles, and pauses the gate", async () => {
-    const client = makeStubClient()
-    const hooks = await ElicifyVertexPluginV2(pluginInput(client), { maxNoProgressTurns: 2 } as never)
-    const sid = `terminate-${Date.now().toString(36)}`
+describe("pause judge — verdict decides, and failure is silent", () => {
+  /** Drive one armed pause to expiry with a stubbed verifier reply. */
+  async function runPause(judgeReply: string | null): Promise<{ nudges: number; events: string[] }> {
+    vi.useFakeTimers()
+    try {
+      const client = makeStubClient()
+      client.session.prompt.mockImplementation((args: { body?: { agent?: string } }) =>
+        args?.body?.agent === "vertex-verifier" && judgeReply !== null
+          ? Promise.resolve({ data: { info: {}, parts: [{ type: "text", text: judgeReply }] }, error: undefined })
+          : args?.body?.agent
+            ? Promise.reject(new Error("verifier unavailable"))
+            : Promise.resolve({ data: { info: {}, parts: [] }, error: undefined }),
+      )
+      const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+      const sid = `pause-${Math.random().toString(36).slice(2)}`
 
-    await hooks["chat.message"]!(
-      { sessionID: sid, agent: "elicify-vertex-agent", model: { providerID: "anthropic", modelID: "claude-opus-4" } } as never,
-      { message: { id: "m1" } as never, parts: [{ type: "text", text: "/elicify-vertex\n\nbuild the thing" } as never] },
-    )
-
-    const IDLES = 12
-    for (let turn = 0; turn < IDLES; turn++) {
+      await hooks["chat.message"]!(
+        { sessionID: sid, agent: "elicify-vertex-agent", model: { providerID: "anthropic", modelID: "claude-opus-4" } } as never,
+        { message: { id: "m1" } as never, parts: [{ type: "text", text: "/elicify-vertex\n\nbuild the gaming portal" } as never] },
+      )
       await hooks["experimental.text.complete"]!(
-        { sessionID: sid, messageID: `m${turn + 2}`, partID: `p${turn}` } as never,
-        { text: "Let me lay out the plan and execute." },
+        { sessionID: sid, messageID: "m2", partID: "p1" } as never,
+        { text: "Green-light this and I'll create the plan and start." },
       )
       await hooks.event!({ event: { type: "session.idle", properties: { sessionID: sid } } as never })
-    }
+      await vi.advanceTimersByTimeAsync(90_000)
+      await vi.runOnlyPendingTimersAsync()
 
-    const nudges = idleContinuationTexts(client, sid).filter((t) => t.includes("no tool calls, no file changes")).length
-    expect(nudges, "must terminate, not nudge on every idle").toBeLessThan(IDLES)
-    expect(nudges).toBeGreaterThan(0)
-    expect(readEvents().some((e) => e.event_type === "gate:stall-paused" && e.session_id === sid)).toBe(true)
+      const nudges = idleContinuationTexts(client, sid).filter((t) => t.includes("part-way through work")).length
+      return { nudges, events: readEvents().filter((e) => e.session_id === sid).map((e) => e.event_type) }
+    } finally {
+      vi.useRealTimers()
+    }
+  }
+
+  // The exact case that misfired in the live session: a plan proposal waiting
+  // for approval. The agent contract REQUIRES that pause, so nudging it told
+  // the model to violate its own contract.
+  it("stays silent on awaiting-user", async () => {
+    const { nudges } = await runPause('{"verdict":"awaiting-user"}')
+    expect(nudges).toBe(0)
+  })
+
+  it("nudges on stopped-mid-work", async () => {
+    const { nudges } = await runPause('{"verdict":"stopped-mid-work"}')
+    expect(nudges).toBe(1)
+  })
+
+  it("stays silent when the verdict is unreadable", async () => {
+    const { nudges } = await runPause("I think it is probably waiting?")
+    expect(nudges).toBe(0)
+  })
+
+  it("stays silent when the judge is unavailable", async () => {
+    const { nudges } = await runPause(null)
+    expect(nudges).toBe(0)
   })
 })
