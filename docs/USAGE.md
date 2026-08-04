@@ -115,6 +115,43 @@ Detection hardening (no regressions vs fablize):
 - Stop-loop: in-flight guard prevents duplicate `session.prompt` on a second idle
 - Prompts: single `[id]` header, no envelope timestamp, "follow these directives; do not quote"; deep/normal advisory no longer instructs the model to ignore it; promise text gives an actually satisfiable escape
 
+## The completion judge
+
+The stop gate above is layer two — it corrects the loop while it runs. Layer
+three decides whether the work is actually **done**.
+
+When you use the plan tools, checkpointing a task is a **claim**, not a close.
+Once every task in a story is complete, at the next idle the harness opens a
+**separate `vertex-judge` session** that:
+
+1. reads the real worktree — files, commands, output — not the model's summary of it;
+2. rules on each of the story's `acceptanceItems` individually;
+3. either confirms the story, or **reverts it** and names the exact items that failed and why.
+
+The session that did the work has no vote. The judge is registered with
+`write`, `edit` and `task` denied and `read`/`grep`/`glob`/`list`/`bash`
+allowed — it can read the tree and run your verifiers, but it has no edit tool
+to quietly "fix" what it is auditing.
+
+**What you'll see.** A reverted story reopens with its tasks active again and a
+message naming the unmet items. Fix those, verify, checkpoint again. Repeated
+reverts of the same story are capped (`maxStoryReaudits`) and escalate to you
+rather than looping.
+
+**Two things the harness keeps apart:**
+
+| | What it is | How strict |
+|---|---|---|
+| **Technical checks** (`verifiers`, receipts) | Evidence: "this command ran and exited 0" | Loose — any declared verifier the observed command covers counts |
+| **Acceptance criteria** | Whether the story was actually delivered | Settled by **judgement**, against the repo |
+
+A passing check never approves a story. That is the judge's job, and only the
+judge's.
+
+**Writing acceptance criteria the judge can use.** Write them so an independent
+auditor could check each one without asking you anything. "It works" is not an
+acceptance criterion; "`npm test` passes and `/health` returns 200" is.
+
 ## Goals tools
 
 Optional multi-story plan with a final verification gate. **Not required** for normal harness use (stop/promise gates work without a plan).

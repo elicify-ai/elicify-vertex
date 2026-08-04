@@ -3,6 +3,11 @@
 End-user install and “how to use” stay in the root [README](../README.md).  
 This directory holds developer and power-user detail, grounded in the package source.
 
+Vertex is three mechanisms, not one: a **behavioural contract** before the work,
+**live detection and correction** during it, and an **independent judge** that
+rules on the outcome against your repo. [ARCHITECTURE.md](./ARCHITECTURE.md)
+explains how they fit together.
+
 | Doc | Purpose |
 |-----|---------|
 | [USAGE.md](./USAGE.md) | Activation, stop gate, promise-no-act, verification, goals tools, env vars |
@@ -12,7 +17,7 @@ This directory holds developer and power-user detail, grounded in the package so
 
 **Package:** `@elicify-ai/elicify-vertex` (see root `package.json`)
 
-**Primary sources:** `src/index.ts`, `src/plugin.ts`, `src/goals.ts`, `src/measurement.ts`, `src/redaction.ts`
+**Primary sources:** `src/v2/*` (current harness — plugin, gate, judge, story, coverage), `src/plugin.ts` (host entry), and `src/index.ts`, `src/goals.ts`, `src/measurement.ts`, `src/redaction.ts` (v1 loop and shared primitives)
 
 ## Governance & legal
 
@@ -26,5 +31,11 @@ This directory holds developer and power-user detail, grounded in the package so
 | [SUPPORT.md](../SUPPORT.md) | Where to get help |
 | [TRADEMARKS.md](../TRADEMARKS.md) | Brand / name policy |
 
+## Reference
+
+| Doc | Purpose |
+|-----|---------|
+| [JUDGE-PROMPT.md](./JUDGE-PROMPT.md) | The completion judge's prompt and contract |
+| [JUDGE-RELIABILITY-FIXES-SPEC.md](./JUDGE-RELIABILITY-FIXES-SPEC.md) | Judge reliability spec + the review rounds behind it |
 | [REQUIREMENTS-INJECTION-VISIBILITY.md](./REQUIREMENTS-INJECTION-VISIBILITY.md) | Operator-agreed visibility of harness inject/steering |
 | [keyword-inject.html](./keyword-inject.html) | Keyword detection → when inject fires |
