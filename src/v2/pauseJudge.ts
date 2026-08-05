@@ -46,8 +46,19 @@ import { buildDenyMap, runSubturn, type SelfCreatedSessions } from "./subturn.js
 import { scanProseField } from "./verifier.js"
 import type { EventLogger, OpencodeClient } from "./types.js"
 
-/** How long a session must be genuinely silent before the question is worth a model call. */
-export const PAUSE_JUDGE_DELAY_MS = 60_000
+/**
+ * How long a session must be genuinely silent before the question is worth a
+ * model call.
+ *
+ * Overridable via `VERTEX_PAUSE_DELAY_MS` so the UAT harness can exercise the
+ * real timer path in seconds rather than minutes — waiting 60s per scenario
+ * would mean the pause judge simply never got end-to-end coverage. Operators
+ * can also use it to tune how patient the harness is.
+ */
+export const PAUSE_JUDGE_DELAY_MS = (() => {
+  const raw = Number(process.env.VERTEX_PAUSE_DELAY_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : 60_000
+})()
 
 /**
  * TOTAL budget for one judgement, tool map + subturn together. Spending it
