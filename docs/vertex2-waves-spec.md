@@ -2081,17 +2081,18 @@ mode this addendum is designed to prevent recurring.
 
 `src/v2/pauseJudge.ts`, `armPauseJudge`/`runPauseJudge` in `wiring/gate.ts`.
 Tests: `tests/v2/pauseJudge.test.ts`, `tests/v2/gate.test.ts`,
-`tests/v2/plugin.integration.test.ts`, UAT section C.
+`tests/v2/plugin.integration.test.ts`, UAT section C. (`promise.test.ts` is at
+`tests/promise.test.ts`, not `tests/v2/`.)
 
 | # | Test | Level | Property | Must fail when |
 |---|---|---|---|---|
 | 90 | `parsePauseVerdict` (17 cases) | Unit | Fenced, prose-wrapped and clean JSON parse; unreadable input returns null | The regex fallback takes the FIRST match — a reply naming both verdicts then resolves to whichever came first, inverting the prompt's awaiting-user bias |
 | 91 | `does NOT nudge at idle — it only arms a timer` | Unit | `session.idle` never judges; it arms and returns | Judgement moves back onto the idle path, where a human still reading the reply is indistinguishable from a stall |
-| 92 | `does not arm on <changed files / plan / verifier disabled / holdout>` | Unit | The structural pre-filter still gates the model call | Any gate is dropped — each belongs to another branch, and `VERTEX_VERIFIER=0` must switch this off too |
+| 92 | `does not arm on %s` (2 cases) + `does not arm when the verifier is disabled` + `does not arm for a holdout-off session` | Unit | The structural pre-filter still gates the model call | Any gate is dropped — each belongs to another branch, and `VERTEX_VERIFIER=0` must switch this off too |
 | 93 | `arms only once, however many idles arrive` | Unit | One timer per session; no overlap | The in-flight guard is removed and two judges run for one session |
 | 94 | `stays silent on awaiting-user` / `nudges on stopped-mid-work` | Integration | The verdict decides, and the pair discriminates | The verdict is ignored — a pass/pass pair proves nothing |
 | 95 | `does not nudge when the user speaks while the judge is in flight` | Integration | Epoch re-check before dispatch | The post-await re-validation is removed; the harness then talks over the user's own turn, which is the exact bug the feature exists to prevent |
-| 96 | UAT `C1`–`C6` | E2E | All four verdict paths on the real timer against the shipped dist | The built artefact diverges from source |
+| 96 | UAT `C1`–`C6` | E2E | Both verdicts, plus activity-cancellation and an unreadable reply, on the real timer against the shipped dist | The built artefact diverges from source |
 
 ### 97–98. Two stop modes (`quick` removed)
 
@@ -2100,7 +2101,7 @@ Tests: `tests/v2/pauseJudge.test.ts`, `tests/v2/gate.test.ts`,
 
 | # | Test | Level | Property | Must fail when |
 |---|---|---|---|---|
-| 97 | `only normal and deep` (11 cases) | Unit | Unrecognised input falls back to `normal`; no input can produce `quick`; risk flags still promote | The fallback returns the least protective mode again — measured live, `hi` classified `quick` and the harness stayed off for the session |
+| 97 | `only normal and deep` (13 tests) | Unit | Unrecognised input falls back to `normal`; no input can produce `quick`; risk flags still promote | The fallback returns the least protective mode again — measured live, `hi` classified `quick` and the harness stayed off for the session |
 | 98 | UAT `B2`–`B4` | E2E | The activation cue reports the mode the shipped build actually chose | Source and build disagree |
 
 ### 99. Judge → Verifier rename

@@ -305,25 +305,31 @@ describe("test 21: criteria_compaction_reinjection", () => {
 // Test 22: quick_session_untouched (FR-011, FR-016)
 // ===========================================================================
 
-describe("test 22: quick_session_untouched", () => {
-  it("a quick/read-only session sees no intake demand, no block, and no session.prompt continuation", async () => {
+describe("test 22: read-only session is never blocked", () => {
+  // Renamed from `quick_session_untouched`: `quick` mode no longer exists, and
+  // "untouched" is no longer the contract. A read-only ask DOES now receive the
+  // intake scaffold — an advisory directive, not a block.
+  //
+  // Suppressing it by ask text was tried and reverted: `TRIVIAL_ASK_RE` matched
+  // "describe a plan to migrate the database and then do it" (deep, database
+  // risk) while still missing the read-only question via the documented
+  // trigger route, because the regex is `^`-anchored. Silencing the
+  // highest-risk class to spare one directive on a question is the wrong
+  // trade, so the guarantee is the one that actually matters: advisory, never
+  // blocking, never a continuation.
+  it("a read-only session is never hard-blocked and gets no continuation", async () => {
     const client = makeStubClient()
     const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
     const sid = "test22-session"
 
-    // Matches both TRIVIAL_ASK_RE (skips the classification subturn) and
-    // classifyStopMode's "quick" default (no readOnlyIntent/DEEP/QUICK/NORMAL
-    // keyword hit falls through to the quick default).
     await activate(hooks, sid, "what does this function do?")
 
     const out = await transform(hooks, sid)
-    expect(out.system).toEqual([])
+    // Advisory guidance may render; a BLOCK may not.
+    expect(out.system.join("\n")).not.toMatch(/verification-required|stop-block/)
 
     await idle(hooks, sid)
-    expect(idleContinuationTexts(client, sid).length).toBe(0)
-    // Nothing in this scenario should ever call session.prompt at all: no
-    // classification subturn (TRIVIAL_ASK_RE-skipped) and no idle block.
-    expect(client.session.prompt.mock.calls.length).toBe(0)
+    expect(idleContinuationTexts(client, sid).length, "a question must never earn a continuation").toBe(0)
   })
 
   // FIXED (src/v2/wiring/gate.ts `handleCriteriaReplay`): FR-016 states

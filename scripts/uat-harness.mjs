@@ -87,11 +87,16 @@ const eventTypes = () => events().map((e) => e.event_type)
 const clearEvents = () => writeFileSync(join(dataRoot, ".vertex-events.jsonl"), "")
 
 /**
- * A fresh worktree + a fresh plugin instance per scenario. Module state
- * (session maps, timers, the star sets) is per-instance, so scenarios must not
- * share one or they leak into each other.
+ * A fresh worktree + a fresh plugin instance per scenario.
+ *
+ * Note what this does NOT isolate: `dist/plugin.js` is a thin re-export, so
+ * `?t=` re-instantiates only the shim — everything under `dist/v2/**`,
+ * including gate.ts's module-level `pauseTimers` / `pauseEpochs` /
+ * `pauseInFlight` / `continuationTicket`, is shared for the whole run.
+ * Isolation actually comes from the random session id, which is why every
+ * scenario must use its own.
  */
-async function scenario({ subturn, files } = {}) {
+async function scenario({ subturn, files, echoContinuations = false } = {}) {
   const work = mkdtempSync(join(uatRoot, "work-"))
   writeFileSync(join(work, "package.json"), JSON.stringify({ name: "uat", scripts: { test: "echo ok" } }, null, 2))
   for (const [name, body] of Object.entries(files ?? {})) {
@@ -100,6 +105,8 @@ async function scenario({ subturn, files } = {}) {
   }
 
   const prompts = []
+  const echoed = new Set()
+  let api = null
   const client = {
     session: {
       prompt: async (args) => {
@@ -108,6 +115,15 @@ async function scenario({ subturn, files } = {}) {
         if (agent && subturn) {
           const text = subturn(agent, args)
           if (text !== undefined) return { data: { info: {}, parts: [{ type: "text", text }] }, error: undefined }
+        }
+        // Host-faithful echo: a continuation comes back as a chat.message
+        // BEFORE this promise settles.
+        if (!agent && echoContinuations && api) {
+          const text = String(args?.body?.parts?.[0]?.text ?? "")
+          if (text && !echoed.has(text)) {
+            echoed.add(text)
+            await api.say(text)
+          }
         }
         return { data: { info: {}, parts: [] }, error: undefined }
       },
@@ -147,7 +163,7 @@ async function scenario({ subturn, files } = {}) {
   const hooks = await entry({ client, directory: work, worktree: work, project: { id: "uat" } }, undefined)
 
   const sid = `uat-${Math.random().toString(36).slice(2)}`
-  const api = {
+  api = {
     hooks,
     sid,
     work,
@@ -214,7 +230,7 @@ if (section("B. Activation and stop modes")) {
 
 // --- C. Pause judge --------------------------------------------------------
 if (section("C. Pause judge (real timer path)")) {
-  // C1: awaiting-user -> silence. This is the live misfire that motivated it.
+  // C1/C2: awaiting-user -> silence. This is the live misfire that motivated it.
   clearEvents()
   const quiet = await scenario({ subturn: () => '{"verdict":"awaiting-user"}' })
   await quiet.say("/elicify-vertex\n\nbuild the gaming portal")
@@ -224,7 +240,7 @@ if (section("C. Pause judge (real timer path)")) {
   assert("C1-awaiting-user-silent", quiet.sent().filter((t) => t.includes("part-way through work")).length === 0)
   assert("C2-verdict-logged", eventTypes().includes("pause:verdict"), eventTypes().slice(-4).join(","))
 
-  // C2: stopped-mid-work -> exactly one nudge.
+  // C3/C4: stopped-mid-work -> exactly one nudge, no marker.
   const stalled = await scenario({ subturn: () => '{"verdict":"stopped-mid-work"}' })
   await stalled.say("/elicify-vertex\n\nbuild the gaming portal")
   await stalled.assistant("Let me lay out the plan and execute.")
@@ -234,7 +250,7 @@ if (section("C. Pause judge (real timer path)")) {
   assert("C3-stopped-mid-work-nudges", nudges.length === 1, `${nudges.length} nudges`)
   assert("C4-no-harness-marker", !nudges.some((t) => /\[vertex/.test(t)))
 
-  // C3: activity cancels the pending judgement.
+  // C5: activity cancels the pending judgement.
   const busy = await scenario({ subturn: () => '{"verdict":"stopped-mid-work"}' })
   await busy.say("/elicify-vertex\n\nbuild it")
   await busy.assistant("Let me lay out the plan and execute.")
@@ -243,7 +259,7 @@ if (section("C. Pause judge (real timer path)")) {
   await sleep(PAUSE_MS + 400)
   assert("C5-activity-cancels", busy.sent().filter((t) => t.includes("part-way through work")).length === 0)
 
-  // C4: an unreadable verdict is silence, not a licence to nudge.
+  // C6: an unreadable verdict is silence, not a licence to nudge.
   const garbled = await scenario({ subturn: () => "probably waiting? hard to say" })
   await garbled.say("/elicify-vertex\n\nbuild it")
   await garbled.assistant("Let me lay out the plan and execute.")
@@ -266,15 +282,106 @@ if (section("D. One-time star ask")) {
   await sleep(PAUSE_MS + 400)
   const asks = s.sent().filter((t) => t.includes("star elicify-ai/elicify-vertex"))
   assert("D3-asked-on-quiet-turn", asks.length === 1, `${asks.length} asks`)
-  assert("D4-still-not-burned", !existsSync(consentPath))
 
-  // An unrelated question must not count as the ask.
-  await s.tool("question", { questions: [{ question: "Which games?" }] })
-  assert("D5-unrelated-question-ignored", !existsSync(consentPath))
+  // The record now holds `{state, attempts}`: the attempt count persists (it
+  // bounds retries across sessions and restarts) but the one-shot is NOT spent
+  // until an ask is observed. Assert the STATE, not the file's existence.
+  const consentState = () => {
+    if (!existsSync(consentPath)) return null
+    const raw = readFileSync(consentPath, "utf8").trim()
+    try {
+      return JSON.parse(raw).state ?? null
+    } catch {
+      return raw || null
+    }
+  }
+  assert("D4-still-not-burned", consentState() === null, String(consentState()))
+
+  // A question mentioning "star" but not OUR repo must not count — a bare
+  // substring check burned the one-shot on exactly this shape.
+  await s.tool("question", { questions: [{ question: "Which star rating should the widget default to?" }] })
+  assert("D5-star-word-question-ignored", consentState() === null, String(consentState()))
 
   // The real ask closes the loop.
   await s.tool("question", { questions: [{ question: "Would you like to star elicify-ai/elicify-vertex on GitHub?" }] })
-  assert("D6-observed-ask-recorded", existsSync(consentPath) && readFileSync(consentPath, "utf8").trim() === "asked")
+  assert("D6-observed-ask-recorded", consentState() === "asked", String(consentState()))
+
+  // MAJ-007: a legacy arm-time "prompted" marker must not suppress the fix.
+  writeFileSync(consentPath, "prompted")
+  const legacy = await scenario()
+  await legacy.say("/elicify-vertex\n\nbuild it")
+  await legacy.idle()
+  await sleep(PAUSE_MS + 400)
+  assert(
+    "D7-legacy-prompted-ignored",
+    legacy.sent().filter((t) => t.includes("star elicify-ai/elicify-vertex")).length === 1,
+  )
+  rmSync(consentPath, { force: true })
+}
+
+// --- D8-D10. Star ask: the mutations the first version of this harness missed
+if (!ONLY || "D".startsWith(ONLY)) {
+  const consentPath = join(configRoot, "opencode", ".elicify-vertex-consent")
+  rmSync(consentPath, { force: true })
+
+  // CRIT-001: the ask must go through the continuation path, so its echo is
+  // consumed. Dispatching it raw made the host redeliver it as a real user
+  // message, which resets the ledger and downgrades `deep` to `normal`.
+  // ORDERING MATTERS. A real host delivers the echoed `chat.message` while
+  // `session.prompt` is STILL PENDING — that is when the in-flight guard is
+  // up. A stub that resolves instantly inverts it and every continuation,
+  // including the gate's own, then looks like user intent. So the echo is
+  // delivered from inside the prompt call.
+  const echo = await scenario({ echoContinuations: true })
+  await echo.say("/elicify-vertex\n\ndeploy the auth migration to production")
+  await echo.tool("edit", { filePath: join(echo.work, "a.ts") })
+  await echo.idle()
+  await sleep(PAUSE_MS + 400)
+  await echo.idle()
+  await sleep(PAUSE_MS + 400)
+  const asksAfterEcho = echo.sent().filter((t) => t.includes("star elicify-ai/elicify-vertex")).length
+  assert("D8-star-ask-dispatched-for-echo-test", asksAfterEcho > 0)
+  assert("D9-echo-does-not-re-ask", asksAfterEcho === 1, `${asksAfterEcho} asks after echo`)
+
+  // MAJ-002: it must not speak in the same idle as a real continuation.
+  rmSync(consentPath, { force: true })
+  const busy = await scenario({
+    subturn: (a) =>
+      a === "vertex-verifier"
+        ? '{"stories":[{"storyId":"S1","pass":false,"summary":"nope","items":[{"itemId":"A1","met":false,"note":"missing"}]}]}'
+        : undefined,
+  })
+  await busy.say("/elicify-vertex\n\nbuild the research portal")
+  await busy.hooks.tool.elicify_vertex_plan_create.execute(
+    { stories: [{ text: "Ship", acceptanceItems: ["A1"], scopeGlobs: [], verifiers: [], tasks: [{ text: "do" }] }] },
+    { sessionID: busy.sid },
+  )
+  await busy.tool("edit", { filePath: join(busy.work, "x.md") })
+  await busy.hooks.tool.elicify_vertex_plan_checkpoint.execute({ taskId: "S1.T1", status: "complete" }, { sessionID: busy.sid })
+  await busy.idle()
+  const sameIdle = busy.sent()
+  assert(
+    "D10-not-in-same-idle-as-a-continuation",
+    sameIdle.some((t) => t.includes("completion verifier")) && !sameIdle.some((t) => t.includes("star elicify-ai")),
+    sameIdle.length + " continuations",
+  )
+  rmSync(consentPath, { force: true })
+}
+
+// --- H. Intake scaffold ----------------------------------------------------
+if (section("H. Intake scaffold")) {
+  // MAJ-004: suppressing the scaffold by ask text silenced deep, risk-flagged
+  // work. It must render for anything that looks like work, whichever route
+  // activated the session.
+  for (const [id, ask] of [
+    ["H1", "describe a plan to migrate the database and then do it"],
+    ["H2", "read the spec and implement the whole payment flow"],
+  ]) {
+    const s2 = await scenario()
+    await s2.say(`/elicify-vertex\n\n${ask}`)
+    const sys = await s2.system()
+    assert(`${id}-scaffold-on-work`, sys.includes("acceptance") || sys.includes("criteria"), ask.slice(0, 40))
+  }
 }
 
 // --- E. Verifier audit -----------------------------------------------------
@@ -349,8 +456,21 @@ if (section("F. TUI safety")) {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   })
-  const stderr = String(run.stderr ?? "")
+  // BOTH pipes: the section is "no subprocess output reaches the terminal",
+  // and stdout reaches it just as readily as stderr.
+  const stderr = String(run.stderr ?? "") + String(run.stdout ?? "")
   assert("F1-no-stderr-flood", stderr.length === 0, `${stderr.length} bytes: ${stderr.slice(0, 80)}`)
+  // POSITIVE CONTROL. F1 passed twice against a broken build because the probe
+  // never reached the subprocess. Prove the path is live: the same git call,
+  // unguarded, in the same directory, must flood.
+  const control = spawnSync(process.execPath, ["-e",
+    `const {execFileSync}=require('node:child_process');try{execFileSync('git',['diff','--stat'],{cwd:${JSON.stringify(uatRoot)},encoding:'utf8',timeout:5000})}catch(e){}`,
+  ], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })
+  assert(
+    "F2-control-path-is-live",
+    String(control.stderr ?? "").length > 1000,
+    `${String(control.stderr ?? "").length} bytes — if 0, F1 proves nothing`,
+  )
 }
 
 // --- G. Fail-open ----------------------------------------------------------
@@ -374,6 +494,12 @@ if (section("G. Fail-open")) {
 }
 
 // ===========================================================================
+process.on("uncaughtException", (err) => {
+  console.log(`\n  FAIL  harness crashed — ${err?.message ?? err}`)
+  console.log(`Artefacts left for inspection: ${uatRoot}`)
+  process.exit(1)
+})
+
 console.log("")
 if (failures.length === 0) {
   console.log(`All UAT scenarios passed. (${passed} assertions)`)

@@ -50,7 +50,7 @@
     "setup": "bash scripts/install-skill.sh",
     "uninstall": "bash scripts/uninstall.sh",
     "postinstall": "bash scripts/install-skill.sh || true",
-    "uat": "node scripts/uat-harness.mjs"
+    "uat": "npm run build && node scripts/uat-harness.mjs"
   },
   "keywords": [
     "opencode",

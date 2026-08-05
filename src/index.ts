@@ -67,7 +67,7 @@ interface SessionLedger {
   changedFileKinds: Set<FileKind>
   /** Distinct changed paths this turn (capped) — surfaced in stop-block reasons. */
   changedFilePaths: string[]
-  /** Set per-prompt to the classified mode (quick/normal/deep) — stop-mode classifier */
+  /** Set per-prompt to the classified mode (normal/deep) — stop-mode classifier */
   taskMode: StopMode
   riskFlags: Set<RiskFlag>
   verificationResults: Array<{ command: string; exitCode: number; success: boolean }>

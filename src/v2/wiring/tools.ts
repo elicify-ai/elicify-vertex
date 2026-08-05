@@ -78,10 +78,71 @@ export function starConsentPath(): string {
 }
 
 /** Read the consent marker. `null` = no file (never asked). */
+export interface StarState {
+  state: StarConsent
+  attempts: number
+}
+
+/**
+ * Read the consent record.
+ *
+ * Two compatibility rules, both load-bearing:
+ *
+ *  - the file used to hold a bare word, so a plain string still parses;
+ *  - a legacy `"prompted"` is treated as NO RECORD. That value was written at
+ *    ARM time by the previous build — the exact bug this closed loop fixes —
+ *    so honouring it would leave the fix inert on precisely the machines where
+ *    the defect was measured, including the one it was reported from.
+ */
+export function readStarState(): StarState | null {
+  try {
+    const path = starConsentPath()
+    if (!existsSync(path)) return null
+    const raw = readFileSync(path, "utf8").trim()
+    if (!raw) return null
+    if (raw.startsWith("{")) {
+      const parsed = JSON.parse(raw) as { state?: string; attempts?: unknown }
+      if (parsed.state === "prompted" || !parsed.state) return null
+      return { state: parsed.state as StarConsent, attempts: Number(parsed.attempts) || 0 }
+    }
+    if (raw === "prompted") return null // legacy arm-time burn: not a real ask
+    return { state: raw as StarConsent, attempts: 0 }
+  } catch {
+    return null
+  }
+}
+
+/** Attempts made so far, ACROSS sessions and process restarts. */
+export function readStarAttempts(): number {
+  try {
+    const path = starConsentPath()
+    if (!existsSync(path)) return 0
+    const raw = readFileSync(path, "utf8").trim()
+    if (!raw.startsWith("{")) return 0
+    return Number((JSON.parse(raw) as { attempts?: unknown }).attempts) || 0
+  } catch {
+    return 0
+  }
+}
+
+/** Record an attempt without ending the loop — survives restarts (MAJ-001). */
+export function recordStarAttempt(): number {
+  const next = readStarAttempts() + 1
+  try {
+    mkdirSync(dirname(starConsentPath()), { recursive: true, mode: 0o700 })
+    writeFileSync(starConsentPath(), JSON.stringify({ attempts: next }), { mode: 0o600 })
+  } catch {
+    // Non-fatal: the in-memory counter still bounds this session.
+  }
+  return next
+}
+
 export function readStarConsent(): string | null {
   try {
     const path = starConsentPath()
-    return existsSync(path) ? readFileSync(path, "utf8").trim() || null : null
+    if (!existsSync(path)) return null
+    const st = readStarState()
+    return st ? st.state : null
   } catch {
     return null
   }
@@ -120,7 +181,10 @@ export function starRepoHidden(): boolean {
  *   asked     — the `question` tool ACTUALLY fired for our ask. Observed, not
  *               assumed. Only this ends the retry loop successfully.
  *   yes       — the user said yes and the repo was starred.
- *   declined  — asked, and the turn ended without a star. Never ask again.
+ *   declined  — asked, and the user said no. Written by `elicify_vertex_star`
+ *               is not possible (it is only called on yes), so this is
+ *               reserved for a future explicit-no signal; `asked` already
+ *               ends the loop, so nothing is lost by not writing it today.
  *   gave-up   — retried `STAR_MAX_ATTEMPTS` times without ever observing the
  *               ask. Stop trying; the model is not going to comply.
  */
@@ -136,7 +200,7 @@ export function writeStarConsent(value: StarConsent): void {
     // the catch swallows it, and consent silently never persists: the ask
     // would repeat forever with no record of it.
     mkdirSync(dirname(starConsentPath()), { recursive: true, mode: 0o700 })
-    writeFileSync(starConsentPath(), value, { mode: 0o600 })
+    writeFileSync(starConsentPath(), JSON.stringify({ state: value, attempts: readStarAttempts() }), { mode: 0o600 })
   } catch {
     // Non-fatal: worst case the user is asked again next run.
   }

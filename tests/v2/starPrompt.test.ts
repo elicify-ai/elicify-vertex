@@ -16,9 +16,9 @@
  * `starConsentPath()` honours `XDG_CONFIG_HOME`, so every test here runs
  * against its own throwaway config root and never touches the real machine.
  */
-import { existsSync, mkdtempSync, readFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
@@ -131,12 +131,14 @@ describe("star ask — the one-shot is spent only on an OBSERVED ask", () => {
     expect(existsSync(starConsentPath()), "arming must not burn the one-shot").toBe(false)
   })
 
-  it("still writes nothing after dispatch, before the model complies", async () => {
+  it("records an attempt but no CONSENT after dispatch, before the model complies", async () => {
     const h = await harness()
     await userTurn(h, "/elicify-vertex\n\nbuild the thing")
     await idle(h)
     expect(h.starAsks()).toHaveLength(1)
-    expect(existsSync(starConsentPath())).toBe(false)
+    // The attempt count persists (it has to bound retries across sessions and
+    // restarts), but the one-shot is NOT spent: consent is still unanswered.
+    expect(readStarConsent(), "dispatch must not count as an ask").toBeNull()
   })
 
   // The exact live failure: the model used its one question call for something
@@ -212,12 +214,26 @@ describe("star ask — never disturbs the session", () => {
     expect(first).toBeLessThanOrEqual(1)
   })
 
-  it("writes a consent file that is readable and one of the known states", async () => {
+  it("persists a readable record with a known state", async () => {
     const h = await harness()
     await userTurn(h, "/elicify-vertex\n\nbuild the thing")
     await idle(h)
     await questionTool(h, OUR_ASK)
-    const raw = readFileSync(starConsentPath(), "utf8").trim()
-    expect(["asked", "yes", "declined", "gave-up"]).toContain(raw)
+    expect(readStarConsent()).toBe("asked")
+    expect(JSON.parse(readFileSync(starConsentPath(), "utf8"))).toMatchObject({ state: "asked" })
+  })
+
+  // MAJ-007: the previous build wrote "prompted" at ARM time — the very bug
+  // this closed loop fixes. Honouring it would leave the fix inert on exactly
+  // the machines where the defect was measured.
+  it("ignores a legacy 'prompted' marker and asks anyway", async () => {
+    mkdirSync(dirname(starConsentPath()), { recursive: true })
+    writeFileSync(starConsentPath(), "prompted")
+    expect(readStarConsent(), "legacy arm-time burn is not a real ask").toBeNull()
+
+    const h = await harness()
+    await userTurn(h, "/elicify-vertex\n\nbuild the thing")
+    await idle(h)
+    expect(h.starAsks()).toHaveLength(1)
   })
 })
