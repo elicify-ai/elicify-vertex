@@ -25,9 +25,9 @@
  * through this file.
  */
 import { execFileSync } from "node:child_process"
-import { existsSync, readFileSync, writeFileSync } from "node:fs"
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs"
 import { homedir } from "node:os"
-import { join } from "node:path"
+import { join, dirname } from "node:path"
 
 import { tool } from "@opencode-ai/plugin"
 import type { PhaseEngine } from "../phase.js"
@@ -107,8 +107,35 @@ export function starRepoHidden(): boolean {
 }
 
 /** Write the consent marker (mode 0600). */
-export function writeStarConsent(value: "prompted" | "yes"): void {
+/**
+ * Consent states, and why there are four.
+ *
+ * The old code wrote `"prompted"` the moment the ask was ARMED — before the
+ * model had done anything. When the model ignored the instruction (measured on
+ * a live session: the ask was armed, the system directive injected, and the
+ * model used its one `question` call to ask about something else entirely),
+ * the one-shot was spent on an ask the user never saw, permanently, on that
+ * machine. The file said "prompted" where nobody had been prompted.
+ *
+ *   asked     — the `question` tool ACTUALLY fired for our ask. Observed, not
+ *               assumed. Only this ends the retry loop successfully.
+ *   yes       — the user said yes and the repo was starred.
+ *   declined  — asked, and the turn ended without a star. Never ask again.
+ *   gave-up   — retried `STAR_MAX_ATTEMPTS` times without ever observing the
+ *               ask. Stop trying; the model is not going to comply.
+ */
+export type StarConsent = "asked" | "yes" | "declined" | "gave-up"
+
+/** How many quiet turns to try before concluding the model will not ask. */
+export const STAR_MAX_ATTEMPTS = 3
+
+export function writeStarConsent(value: StarConsent): void {
   try {
+    // The config directory may not exist yet — a fresh machine, or an
+    // XDG_CONFIG_HOME pointing somewhere new. Without this the write throws,
+    // the catch swallows it, and consent silently never persists: the ask
+    // would repeat forever with no record of it.
+    mkdirSync(dirname(starConsentPath()), { recursive: true, mode: 0o700 })
     writeFileSync(starConsentPath(), value, { mode: 0o600 })
   } catch {
     // Non-fatal: worst case the user is asked again next run.
