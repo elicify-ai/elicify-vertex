@@ -98,6 +98,11 @@ async function questionTool(h: Harness, args: Record<string, unknown>): Promise<
 
 const OUR_ASK = { questions: [{ question: "Would you like to star elicify-ai/elicify-vertex on GitHub?" }] }
 const OTHER_ASK = { questions: [{ question: "Which 3 games should the portal ship?" }] }
+/** Mentions "star" but is not our ask — a bare substring check burned the one-shot on these. */
+const STAR_WORD_ASKS = [
+  { questions: [{ question: "Which star rating should the widget default to?" }] },
+  { questions: [{ question: "Should I use a star schema for the warehouse?" }] },
+]
 
 describe("star ask — delivery", () => {
   it("is NOT injected into the system prompt", async () => {
@@ -142,6 +147,14 @@ describe("star ask — the one-shot is spent only on an OBSERVED ask", () => {
     await idle(h)
     await questionTool(h, OTHER_ASK)
     expect(readStarConsent()).toBeNull()
+  })
+
+  it.each(STAR_WORD_ASKS)("does not count a question that merely says 'star': %j", async (args) => {
+    const h = await harness()
+    await userTurn(h, "/elicify-vertex\n\nbuild the thing")
+    await idle(h)
+    await questionTool(h, args)
+    expect(readStarConsent(), "only OUR ask may spend the one-shot").toBeNull()
   })
 
   it("records `asked` when the model actually asks", async () => {

@@ -70,7 +70,7 @@ import {
   type V2SessionState,
 } from "./wiring/state.js"
 import { injectSubagentPreamble } from "./wiring/subagentInjection.js"
-import { buildPlanTools, readStarConsent, STAR_MAX_ATTEMPTS, writeStarConsent } from "./wiring/tools.js"
+import { buildPlanTools, readStarConsent, STAR_MAX_ATTEMPTS, STAR_REPO, writeStarConsent } from "./wiring/tools.js"
 import { DelegationTracker } from "./wiring/watchdog.js"
 
 export interface ElicifyVertexV2Options {
@@ -901,7 +901,14 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       if (toolInput?.tool === "question" && typeof toolInput.sessionID === "string") {
         const askSid = toolInput.sessionID
         if (starAskDispatched.has(askSid) && readStarConsent() === null) {
-          const asked = JSON.stringify(toolInput.args ?? {}).toLowerCase().includes("star")
+          // Match the REPO, not the word "star". A bare substring check burned
+          // the machine's one-shot on any question mentioning stars —
+          // "which star rating should the widget default to?", "should I use a
+          // star schema?" — recording an ask the user never saw, which is the
+          // same class of bug this closed loop exists to fix.
+          const asked = JSON.stringify(toolInput.args ?? {})
+            .toLowerCase()
+            .includes(STAR_REPO.toLowerCase())
           if (asked) {
             writeStarConsent("asked")
             starAskDispatched.delete(askSid)
