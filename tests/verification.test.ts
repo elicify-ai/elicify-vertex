@@ -128,15 +128,18 @@ describe("shouldBlockPromiseNoAct — weak labels never hard-block", () => {
   })
 })
 
-describe("classifyStopMode — read-only intent stays quick (with risks kept advisory)", () => {
+describe("classifyStopMode — read-only intent is normal (risks still promote to deep)", () => {
   it.each([
-    ["explain only how this works", "quick"],
-    ["describe only the bug", "quick"],
-    ["describe how to fix the parser", "normal"],  // describe alone → not read-only
-    ["describe the deploy pipeline", "deep"],      // 'deploy' is a DEEP keyword
-    ["no edits, just explain", "quick"],
-    ["do not code; explain the fix", "quick"],
-    ["do not code and explain", "quick"],
+    // Read-only asks used to earn `quick`, which suppressed the harness. They
+    // are `normal` now: nudges still apply, hard-blocking still does not, and
+    // whether the turn is waiting on the user is the pause judge's call.
+    ["explain only how this works", "normal"],
+    ["describe only the bug", "normal"],
+    ["describe how to fix the parser", "normal"],
+    ["describe the deploy pipeline", "deep"], // 'deploy' is a DEEP keyword
+    ["no edits, just explain", "normal"],
+    ["do not code; explain the fix", "normal"],
+    ["do not code and explain", "normal"],
   ])("%j → %s", (text, want) => {
     expect(classifyStopMode(text).mode).toBe(want)
   })

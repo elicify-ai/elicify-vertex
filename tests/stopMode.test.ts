@@ -58,13 +58,15 @@ describe("classifyFileKind — docs-only exemption", () => {
 })
 
 describe("classifyStopMode — stop-mode classifier", () => {
-  it("classifies 'quick' prompts", () => {
-    expect(classifyStopMode("just explain how this works").mode).toBe("quick")
-    expect(classifyStopMode("review only, no edits").mode).toBe("quick")
-    expect(classifyStopMode("brief overview").mode).toBe("quick")
-    // Note: 'check if the test exists' contains the 'test' keyword which
-    // matches NORMAL_RE. The QUICK pattern requires 'check only' as a
-    // contiguous phrase.
+  // TWO MODES. `quick` is gone: it was the FALLBACK, so every phrasing the
+  // keyword lists did not recognise silently disabled the harness. Read-only
+  // asks now land in `normal`, which nudges but never hard-blocks; whether a
+  // conversational turn is waiting on the user is decided by the pause judge,
+  // not by a keyword.
+  it("read-only asks are normal, not a separate suppressed mode", () => {
+    expect(classifyStopMode("just explain how this works").mode).toBe("normal")
+    expect(classifyStopMode("review only, no edits").mode).toBe("normal")
+    expect(classifyStopMode("brief overview").mode).toBe("normal")
     expect(classifyStopMode("check if the test exists").mode).toBe("normal")
   })
 
@@ -83,8 +85,8 @@ describe("classifyStopMode — stop-mode classifier", () => {
     expect(classifyStopMode("large complex rewrite").mode).toBe("deep")
   })
 
-  it("matches Korean quick/normal/deep annotations", () => {
-    expect(classifyStopMode("설명만 해주세요").mode).toBe("quick")
+  it("matches Korean normal/deep annotations", () => {
+    expect(classifyStopMode("설명만 해주세요").mode).toBe("normal")
     expect(classifyStopMode("이 버그를 수정해주세요").mode).toBe("normal")
     expect(classifyStopMode("끝까지 철저하게 검증해주세요").mode).toBe("deep")
   })
@@ -113,8 +115,9 @@ describe("classifyStopMode — stop-mode classifier", () => {
     expect(classifyStopMode("brief security overview").mode).toBe("deep")
   })
 
-  it("empty input defaults to quick", () => {
-    expect(classifyStopMode("").mode).toBe("quick")
+  // The default is the mode most sessions get, so it must be the safe one.
+  it("empty input defaults to normal, the protective floor", () => {
+    expect(classifyStopMode("").mode).toBe("normal")
     expect(classifyStopMode("").risks).toEqual([])
   })
 
@@ -140,9 +143,9 @@ describe("classifyStopMode — stop-mode classifier", () => {
 import { EvidenceLedger } from "../src/index.js"
 
 describe("EvidenceLedger.shouldBlockStop — mode-aware", () => {
-  it("mode=quick → never block, even when changed and unverified", () => {
+  it("mode=normal → never block, even when changed and unverified", () => {
     const l = new EvidenceLedger()
-    l.reset("s1", "quick")
+    l.reset("s1", "normal")
     l.recordChangedFiles("s1", "src/whatever.ts")
     expect(l.shouldBlockStop("s1")).toBe(false)
   })
@@ -211,7 +214,57 @@ describe("contextForStopMode — mode-aware guidance", () => {
     expect(directive?.text).toContain("database")
   })
 
-  it("does not inject verification guidance for quick mode", () => {
-    expect(contextForStopMode({ mode: "quick", risks: [] })).toBeNull()
+  // With `quick` gone there is no longer a mode that injects nothing: the
+  // floor is advisory. That is the point of the collapse — an unrecognised
+  // ask now gets guidance instead of silence.
+  it("injects advisory guidance for normal mode", () => {
+    const d = contextForStopMode({ mode: "normal", risks: [] })
+    expect(d?.id).toBe("vertex:verification-advisory")
+  })
+
+  it("injects required-verification guidance for deep mode", () => {
+    const d = contextForStopMode({ mode: "deep", risks: [] })
+    expect(d?.id).toBe("vertex:verification-required")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Two modes. The fallback is what most sessions actually get, because keyword
+// lists always miss phrasings — measured on a live session, "hi" classified
+// `quick` and nothing promoted it back, so the harness stayed off. The floor
+// is `normal` now: it nudges, it never hard-blocks, and only an explicit deep
+// signal or a risk flag opts into enforcement.
+// ---------------------------------------------------------------------------
+describe("classifyStopMode — only normal and deep", () => {
+  it.each([
+    "hi",
+    "can you check the logs of the current session",
+    "we need a new gaming portal, the old one must be deleted",
+    "explain only, no edits",
+    "just a brief overview",
+    "",
+    "설명만 해주세요",
+  ])("falls back to normal, never a suppressed mode: %j", (text) => {
+    expect(classifyStopMode(text).mode).toBe("normal")
+  })
+
+  it.each([
+    "deploy to production",
+    "refactor the auth module",
+    "run the database migration",
+    "thorough end-to-end review",
+  ])("opts into deep on an explicit signal or risk: %j", (text) => {
+    expect(classifyStopMode(text).mode).toBe("deep")
+  })
+
+  it("never returns the removed quick mode, for any input", () => {
+    const samples = ["", "hi", "quick", "briefly", "just explain", "review only", "check only", "간단히", "deploy"]
+    for (const s of samples) expect(["normal", "deep"]).toContain(classifyStopMode(s).mode)
+  })
+
+  it("risk flags still promote, and are still reported", () => {
+    const r = classifyStopMode("explain how the production secret rotation works")
+    expect(r.mode).toBe("deep")
+    expect(r.risks.length).toBeGreaterThan(0)
   })
 })

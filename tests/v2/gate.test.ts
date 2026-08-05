@@ -1483,7 +1483,6 @@ describe("handleSessionIdle — pause judge", () => {
   // The structural pre-filter is what keeps the model call rare; it must still
   // hold, because each of these cases belongs to another branch.
   it.each([
-    ["quick mode", (h: ReturnType<typeof harness>, sid: string) => h.evidenceLedger.reset(sid, "quick")],
     ["changed files", (h: ReturnType<typeof harness>, sid: string) => h.evidenceLedger.recordChangedFiles(sid, "src/a.ts")],
     [
       "an existing plan",

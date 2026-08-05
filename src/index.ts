@@ -68,7 +68,7 @@ interface SessionLedger {
   /** Distinct changed paths this turn (capped) — surfaced in stop-block reasons. */
   changedFilePaths: string[]
   /** Set per-prompt to the classified mode (quick/normal/deep) — stop-mode classifier */
-  taskMode: "quick" | "normal" | "deep"
+  taskMode: StopMode
   riskFlags: Set<RiskFlag>
   verificationResults: Array<{ command: string; exitCode: number; success: boolean }>
   failures: Array<{ signature: string; timestamp: string }>
@@ -102,7 +102,7 @@ export class EvidenceLedger {
   /** Reset per-turn state (called on each new user message). */
   reset(
     sessionID: string,
-    mode: "quick" | "normal" | "deep" = "normal",
+    mode: StopMode = "normal",
     risks: readonly RiskFlag[] = [],
   ): void {
     this.ledgers.set(sessionID, this.freshLedger(mode, risks))
@@ -117,12 +117,8 @@ export class EvidenceLedger {
     if (filePath && !l.changedFilePaths.includes(filePath) && l.changedFilePaths.length < MAX_TRACKED_CHANGED_PATHS) {
       l.changedFilePaths.push(filePath)
     }
-    // Evidence-driven mode promotion: the prompt text said "quick", but the
-    // model mutated non-docs files — what it DID outranks what was asked.
-    // Promote quick → normal (advisory) only; never auto-escalate to deep.
-    if (kind !== "docs" && l.taskMode === "quick") {
-      l.taskMode = "normal"
-    }
+    // (The old quick -> normal evidence promotion lived here. With `quick`
+    // gone, `normal` IS the floor, so there is nothing to promote from.)
     // Post-mutation evidence is stale: a prior green verifier does not cover
     // edits that land after it. Mirror receipt invalidation for the stop gate.
     l.verificationResults = l.verificationResults.filter((v) => !v.success)
@@ -268,7 +264,7 @@ export class EvidenceLedger {
     return l.changedFilesSeen && !l.verificationResults.some((v) => v.success)
   }
 
-  getMode(sessionID: string): "quick" | "normal" | "deep" | null {
+  getMode(sessionID: string): StopMode | null {
     return this.ledgers.get(sessionID)?.taskMode ?? null
   }
 
@@ -800,14 +796,10 @@ export function classifyTask(text: string): TaskMode {
 // mode advisories via system.transform.
 // ----------------------------------------------------------------------------
 
-export type StopMode = "quick" | "normal" | "deep"
+export type StopMode = "normal" | "deep"
 
-const QUICK_RE =
-  /\b(quick|brief|briefly|simple|simply|just explain|explain only|review only|direction|check only|no edits|do not edit)\b|간단히|빠르게|설명만|검토만|방향|확인만/i
 const DEEP_RE =
   /\b(deep|thorough|thoroughly|exhaustive|end-to-end|production[- ]ready|deploy|deployment|migration|database|auth|security|refactor|large|complex|implement the plan)\b|끝까지|철저|전부|전체|배포|마이그레이션|인증|보안|리팩터/i
-const NORMAL_RE =
-  /\b(implement|fix|debug|change|edit|create|build|test|lint|review|update)\b|구현|수정|고쳐|디버그|작성|생성|테스트|검증/i
 
 export type RiskFlag = "production" | "database" | "secret-or-auth" | "remote-write"
 
@@ -840,27 +832,21 @@ export function classifyStopMode(text: string): StopModeResult {
   const t = text || ""
   const risks = detectRiskFlags(t)
 
-  // Read-only intent (explain-only / no-edits) keeps quick mode but only when
-  // it doesn't look like actual work AND no risk flag is set. Risks promote
-  // to deep regardless of intent wording (a "quick deploy to production" is
-  // still deep). `describe` alone is too broad — it triggers on "describe how
-  // to refactor auth", which is real work — require an explicit read-only
-  // qualifier (`describe only` / `explain only`) for it.
-  const readOnlyIntent = /\b(?:explain(?:\s+only)?|describe\s+only|what\s+is|how\s+does\s+\S+\s+work|walk\s+me\s+through|no\s+edits?|do\s+not\s+edit|review\s+only|do\s+not\s+code)\b/i.test(t)
-  if (readOnlyIntent && risks.length === 0 && !DEEP_RE.test(t)) {
-    return { mode: "quick", risks }
-  }
-  // deep wins: any deep keyword OR any risk flag → deep
-  if (DEEP_RE.test(t) || risks.length > 0) {
-    return { mode: "deep", risks }
-  }
-  if (QUICK_RE.test(t) && risks.length === 0) {
-    return { mode: "quick", risks }
-  }
-  if (NORMAL_RE.test(t)) {
-    return { mode: "normal", risks }
-  }
-  return { mode: "quick", risks }
+  // TWO MODES. `quick` is gone, and with it the whole class of failure it
+  // caused: it was the FALLBACK, so every phrasing the keyword lists did not
+  // recognise silently disabled the harness. Measured on a real session,
+  // "hi" classified quick and nothing has ever promoted it back.
+  //
+  // `normal` is now the floor — soft nudges and the pause judge, never a hard
+  // block — so an unrecognised message gets watched rather than ignored.
+  // `deep` is the only opt-in, because hard-blocking a turn is the one
+  // genuinely intrusive behaviour and deserves an explicit signal.
+  //
+  // What used to earn `quick` (explain-only, review-only, "just briefly") now
+  // earns `normal`, which is the right answer: the harness may still nudge,
+  // but it cannot block, and the pause judge — not a keyword — decides
+  // whether a conversational turn is waiting on the user.
+  return { mode: DEEP_RE.test(t) || risks.length > 0 ? "deep" : "normal", risks }
 }
 
 /** Mode guidance is injected independently from signal routing. Normal mode is
@@ -1129,7 +1115,7 @@ export function formatDirectives(directives: readonly Directive[]): string | nul
  * Kept short on purpose (REQUIREMENTS-INJECTION-VISIBILITY.md).
  */
 export function formatActivateCue(input: {
-  stopMode: "quick" | "normal" | "deep"
+  stopMode: StopMode
   taskMode?: TaskMode
   agent?: string
 }): string {

@@ -533,25 +533,31 @@ async function handlePromiseNoAct(ctx: GateContext, sid: string, state: V2Sessio
  * is deferred to `PAUSE_JUDGE_DELAY_MS` of it, and any activity cancels.
  */
 function armPauseJudge(ctx: GateContext, sid: string, state: V2SessionState): boolean {
-  if (!state.lastAssistantText) return false
+  // Every branch below used to return silently, so "nothing fired" was
+  // indistinguishable from "fired and decided not to act" — a real question a
+  // user asked that the logs could not answer. Each refusal now names itself.
+  const decline = (reason: string): boolean => {
+    ctx.logger("pause:not-armed", { sessionID: sid, reason })
+    return false
+  }
+  if (!state.lastAssistantText) return decline("no assistant text")
   // MAJ-003: `VERTEX_VERIFIER=0` is the documented way to switch the verifier
   // off, and this drives the same agent. It must obey the same switch.
-  if (!ctx.verifierEnabled) return false
+  if (!ctx.verifierEnabled) return decline("verifier disabled")
   // MAJ-005: every other dispatching branch honours the holdout; the deleted
   // branch did too. Without it the "off" arm receives nudges and the A/B
   // measurement for this family is corrupted.
-  if (holdoutSuppresses(sid, "promise-no-act")) return false
-  if (ctx.evidenceLedger.getMode(sid) === "quick") return false
-  if (ctx.evidenceLedger.hasChangedFiles(sid)) return false // promise-no-act's job
-  if (ctx.storyEngine.getPlan(sid)) return false // handleIncompletePlan's job
+  if (holdoutSuppresses(sid, "promise-no-act")) return decline("holdout off-arm")
+  if (ctx.evidenceLedger.hasChangedFiles(sid)) return decline("files changed") // promise-no-act's job
+  if (ctx.storyEngine.getPlan(sid)) return decline("plan exists") // handleIncompletePlan's job
   // `>=`, not `>`: the increment happens after the model call, so `>` armed
   // one extra judgement per turn purely to discard its verdict at the cap.
-  if (state.statedIntentNudges >= ctx.maxCriteriaBlocks) return false
+  if (state.statedIntentNudges >= ctx.maxCriteriaBlocks) return decline("nudge cap reached")
 
   // Re-arming on every idle would let a chatty session hold the timer open
   // forever without it ever expiring. One armed timer per session; the
   // activity marker recorded with it is how expiry tells silence from work.
-  if (pauseTimers.has(sid) || pauseInFlight.has(sid)) return false
+  if (pauseTimers.has(sid) || pauseInFlight.has(sid)) return decline("already armed or in flight")
 
   const armedAtMarker = state.activityMarker
   try {

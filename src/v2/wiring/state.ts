@@ -147,6 +147,13 @@ export interface V2SessionState {
    * by `resetTurnState` when a real user message re-engages. */
   storyReaudits: Record<string, number>
 
+  /**
+   * The user's most recent ask, as classified. Held so
+   * `system.transform` can apply the same `TRIVIAL_ASK_RE` pre-filter the
+   * intake subturn uses, instead of demanding acceptance criteria for
+   * "what does this function do?".
+   */
+  lastUserAsk: string | null
   /** Last completed assistant text (mirrors v1's `lastAssistantText`, used nowhere safety-critical in v2 wiring today but kept for parity / future use). */
   lastAssistantText: string | null
 
@@ -187,6 +194,7 @@ export function freshSessionState(workspaceRoot: string): V2SessionState {
     consecutiveNoProgress: 0,
     stallPaused: false,
     storyReaudits: {},
+    lastUserAsk: null,
     lastAssistantText: null,
     instanceCounter: 0,
   }

@@ -42,7 +42,7 @@ import { resolveProfile, type Profile } from "./dosing.js"
 import { PhaseEngine } from "./phase.js"
 import { PinStore } from "./pin.js"
 import { resolveVerifier } from "./resolve.js"
-import { classifyMultiStory, StoryEngine, type StoryV2 } from "./story.js"
+import { classifyMultiStory, StoryEngine, TRIVIAL_ASK_RE, type StoryV2 } from "./story.js"
 import { SelfCreatedSessions } from "./subturn.js"
 import type { OpencodeClient } from "./types.js"
 
@@ -673,6 +673,7 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
           state.multiStoryPending = false
         }
 
+        state.lastUserAsk = text
         const sigMode = classifyStopMode(text)
         evidenceLedger.reset(sid, sigMode.mode, sigMode.risks)
         manifests.invalidate(state.workspaceRoot)
@@ -1312,8 +1313,15 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
         )
       }
 
-      const mode = evidenceLedger.getMode(sid) ?? "normal"
-      if (mode !== "quick" && pinStore.get(sid).length === 0) {
+      // The scaffold demands acceptance criteria, which is the wrong thing to
+      // ask of "what does this function do?". That used to be suppressed by
+      // `quick` mode — but mode was the wrong lever: it was a keyword bucket
+      // that also swallowed every unrecognised phrasing, which is why it is
+      // gone. The right lever is the ask itself, and the harness already has
+      // a signal for it: `TRIVIAL_ASK_RE`, the same pre-filter that skips the
+      // intake classification subturn for exactly this class of message.
+      const trivialAsk = TRIVIAL_ASK_RE.test(state.lastUserAsk ?? "")
+      if (!trivialAsk && pinStore.get(sid).length === 0) {
         findings.push(intakeScaffoldFinding(nextInstanceId(state)))
       }
 
@@ -1351,7 +1359,7 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       // idle stop-block (gate.ts's zero-criteria fallback) still catches
       // genuinely unverified work at turn end. The composer cap table's
       // per-turn ceiling is the "capped" half of the redesign point.
-      if (mode !== "quick" && evidenceLedger.hasChangedFiles(sid) && !hasVerification) {
+      if (evidenceLedger.hasChangedFiles(sid) && !hasVerification) {
         const realPaths = changedPaths.filter((p) => !NON_PATH_MUTATION_MARKERS.has(p))
         const manifest = manifests.get(state.workspaceRoot)
         const activeStory = storyEngine.getActiveStory(sid)
