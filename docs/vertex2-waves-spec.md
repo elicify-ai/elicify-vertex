@@ -2062,3 +2062,80 @@ Two review passes produced **64 findings, 14 CRITICAL** (`vertex2-waves-spec-rev
 - Q: What happens to surviving unknowns? → A: **Interactive sessions must ask via the `question` tool** — plain English, ≥2 concrete options, exactly one `(Recommended)` listed first; `plan_create` is blocked until they are asked (FR-078/079). **Autonomous sessions must not ask** (nobody can answer and the tool blocks the turn) — unknowns resolve as `ASSUMED` with risk and are surfaced to the verifier at close (FR-080).
 - Q: Can the harness time out an unanswered question? → A: **No, and it is explicitly out of scope (FR-081).** The host exposes no timeout/expiry field on questions, and the reply/reject endpoints that would let the harness auto-answer exist only on the v2 SDK surface — the plugin receives the v1 client, which does not expose `question.*`. The interactive/autonomous split replaces the timeout.
 - Q: Are the three field-observed defects in scope for this spec? → A: **Yes — D1 and D4 block evaluation of everything else.** D1 (covering verifiers) suppresses all evidence; D4 (turn freeze) throttles directive delivery to ~2%. Both are specified here (US-11, US-14) and should land before the wave model is built on top of them.
+
+---
+
+## Test-Driven Development Plan — Addendum (2026-08-05)
+
+The table above stops at test 89. Four features have landed since, each driven
+by a defect observed in a live session rather than by the spec, so they have no
+BDD scenario upstream. This addendum records them with the same traceability,
+and — because every one of them exists to correct a *previous* test that passed
+while the behaviour was broken — states for each what the test must fail on.
+
+The last column is the important one. Three of the four features shipped with
+tests that passed against the bug they were written for; that is the failure
+mode this addendum is designed to prevent recurring.
+
+### 90–96. Pause judge (replaces the phrase-based stall detector)
+
+`src/v2/pauseJudge.ts`, `armPauseJudge`/`runPauseJudge` in `wiring/gate.ts`.
+Tests: `tests/v2/pauseJudge.test.ts`, `tests/v2/gate.test.ts`,
+`tests/v2/plugin.integration.test.ts`, UAT section C.
+
+| # | Test | Level | Property | Must fail when |
+|---|---|---|---|---|
+| 90 | `parsePauseVerdict` (17 cases) | Unit | Fenced, prose-wrapped and clean JSON parse; unreadable input returns null | The regex fallback takes the FIRST match — a reply naming both verdicts then resolves to whichever came first, inverting the prompt's awaiting-user bias |
+| 91 | `does NOT nudge at idle — it only arms a timer` | Unit | `session.idle` never judges; it arms and returns | Judgement moves back onto the idle path, where a human still reading the reply is indistinguishable from a stall |
+| 92 | `does not arm on <changed files / plan / verifier disabled / holdout>` | Unit | The structural pre-filter still gates the model call | Any gate is dropped — each belongs to another branch, and `VERTEX_VERIFIER=0` must switch this off too |
+| 93 | `arms only once, however many idles arrive` | Unit | One timer per session; no overlap | The in-flight guard is removed and two judges run for one session |
+| 94 | `stays silent on awaiting-user` / `nudges on stopped-mid-work` | Integration | The verdict decides, and the pair discriminates | The verdict is ignored — a pass/pass pair proves nothing |
+| 95 | `does not nudge when the user speaks while the judge is in flight` | Integration | Epoch re-check before dispatch | The post-await re-validation is removed; the harness then talks over the user's own turn, which is the exact bug the feature exists to prevent |
+| 96 | UAT `C1`–`C6` | E2E | All four verdict paths on the real timer against the shipped dist | The built artefact diverges from source |
+
+### 97–98. Two stop modes (`quick` removed)
+
+`classifyStopMode` in `src/index.ts`. Tests: `tests/stopMode.test.ts`,
+`tests/verification.test.ts`, UAT section B.
+
+| # | Test | Level | Property | Must fail when |
+|---|---|---|---|---|
+| 97 | `only normal and deep` (11 cases) | Unit | Unrecognised input falls back to `normal`; no input can produce `quick`; risk flags still promote | The fallback returns the least protective mode again — measured live, `hi` classified `quick` and the harness stayed off for the session |
+| 98 | UAT `B2`–`B4` | E2E | The activation cue reports the mode the shipped build actually chose | Source and build disagree |
+
+### 99. Judge → Verifier rename
+
+Clean break: `story.verifier`, `verifier:*` events, `vertex-verifier` agent,
+`VERTEX_VERIFIER`. Test: UAT `A3`/`A4`, `E4`.
+
+| # | Test | Level | Property | Must fail when |
+|---|---|---|---|---|
+| 99 | UAT `A3`/`A4`/`E4` | E2E | The shipped build registers `vertex-verifier`, never `vertex-judge`, and writes no legacy `judge` field | A stale build ships — this is exactly how a cached 0.9.8 kept loading after 0.10.0 was installed |
+
+### 100–102. Star ask — closed loop
+
+`maybeAskForStar` in `plugin.ts`, consent states in `wiring/tools.ts`.
+Tests: `tests/v2/starPrompt.test.ts` (isolated via `XDG_CONFIG_HOME`), UAT D.
+
+| # | Test | Level | Property | Must fail when |
+|---|---|---|---|---|
+| 100 | `writes nothing when merely armed` / `still writes nothing after dispatch` | Unit | The one-shot is spent only on an OBSERVED ask | Consent is written at arm time — the original bug: a model that ignored the instruction burned the machine's only chance on an ask the user never saw |
+| 101 | `does not count an unrelated question call` | Unit | Only *our* question closes the loop | Any `question` call counts, which is precisely what happened live (the model asked which games to build) |
+| 102 | `gives up permanently after the attempt cap` | Unit | Bounded retry, then a terminal state | The retry is unbounded, turning a one-time ask into a recurring nag |
+
+### Standing requirement: tests must discriminate
+
+Every entry above states a *must fail when*, because on this feature set a
+green suite has repeatedly not meant working code:
+
+- the stated-intent branch passed 21 tests and was inert on the message that
+  motivated it — the verb list had no `lay out`/`execute`;
+- the UAT TUI probe passed with the stderr guard removed, twice: first because
+  it created no plan so `git diff` never ran, then because `execFileSync`
+  surfaces stderr only on the throw path;
+- a malformed import made `promise.test.ts` fail to collect while the suite
+  still reported all-green, at a *lower* total.
+
+So: for any new behaviour, mutate the thing it protects and confirm the test
+goes red. `npm run uat` is the layer that does this against the built artefact;
+the mutation battery in the commit history is the pattern for unit tests.
