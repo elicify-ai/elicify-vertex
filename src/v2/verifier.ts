@@ -54,6 +54,7 @@
  */
 
 import { redactSecrets } from "../redaction.js"
+import { isPathListAnnouncementOnly } from "./diffstat.js"
 import { VERIFIER_PROBE_POLICY, probeCapabilityBounded, runSubturn, type SelfCreatedSessions, type SubturnResult } from "./subturn.js"
 import type { EventLogger, OpencodeClient } from "./types.js"
 
@@ -579,21 +580,85 @@ function entropyTokenStraddles(joined: string, joinIdx: number): boolean {
 }
 
 /**
- * FR-006a gate for the adjacent-pair pass: the concatenation tripped, but may
- * the pair be dropped for it? Only when the offending match is genuinely a
- * boundary phenomenon (see `ENTROPY_PAIR_MIN_FRAGMENT_CHARS`).
+ * FR-006a gate for the adjacent-pair pass and (B-3b) the N-way span pass: the
+ * concatenation tripped, but may the span be dropped for it? Only when EVERY
+ * join inside it is genuinely a boundary phenomenon.
+ *
+ * For two units this is exactly the original pair rule (one join, one test).
+ * For three or more it is the natural generalisation, and the "every join"
+ * quantifier is what keeps the FR-006a false-positive class closed as the
+ * window widens: a genuine wrapped secret is continuous random material at
+ * every break, whereas fused prose has at least one break where two ordinary
+ * words meet — and that one exonerated join spares the whole span. Requiring
+ * only SOME join to trip would have re-opened FR-006a at width 3 with
+ * interest, since a wider window has more chances to manufacture one bad
+ * boundary.
  *
  * Offsets are computed in DEWRAPPED space because that is the space every
- * scan matches in (`dewrap` strips `\n` only, so
- * `dewrap(a + b) === dewrap(a) + dewrap(b)` and the join index is exactly
- * `dewrap(a).length`).
+ * scan matches in (`dewrap` strips `\n`/`\r` only, so
+ * `dewrap(a + b) === dewrap(a) + dewrap(b)` and each join index is exactly
+ * the running length of the units to its left).
  */
+function spanTripsOnEveryJoin(dewrappedUnits: readonly string[]): boolean {
+  const joined = dewrappedUnits.join("")
+  let joinIdx = 0
+  for (let k = 0; k + 1 < dewrappedUnits.length; k++) {
+    joinIdx += dewrappedUnits[k].length
+    if (joinIdx === 0 || joinIdx === joined.length) return false
+    if (
+      !(patternMatchStraddles(joined, joinIdx) || hexRunStraddles(joined, joinIdx) || entropyTokenStraddles(joined, joinIdx))
+    ) {
+      return false
+    }
+  }
+  return true
+}
+
 function pairTripsOnJoin(a: string, b: string): boolean {
-  const left = dewrap(a)
-  const joined = left + dewrap(b)
-  const joinIdx = left.length
-  if (joinIdx === 0 || joinIdx === joined.length) return false
-  return patternMatchStraddles(joined, joinIdx) || hexRunStraddles(joined, joinIdx) || entropyTokenStraddles(joined, joinIdx)
+  return spanTripsOnEveryJoin([dewrap(a), dewrap(b)])
+}
+
+/**
+ * B-3b: the single `\S+` token that crosses every join of a candidate span.
+ * Exactly one exists by the span pass's own construction — the interior units
+ * hold no whitespace, so the last token of the first unit runs through all of
+ * them and into the first token of the last unit.
+ */
+function spanFusedToken(dewrappedSpan: readonly string[]): string {
+  const head = /\S*$/.exec(dewrappedSpan[0])?.[0] ?? ""
+  const tail = /^\S*/.exec(dewrappedSpan[dewrappedSpan.length - 1])?.[0] ?? ""
+  return head + dewrappedSpan.slice(1, dewrappedSpan.length - 1).join("") + tail
+}
+
+/**
+ * Is this fused token shaped like ONE key that got wrapped, rather than like
+ * structured text that happens to have run together?
+ *
+ * Key material — hex, base64 (`+/=`), base64url (`-_`), a JWT's dotted
+ * segments — is one uninterrupted run of a single alphabet. Punctuation may
+ * sit at its EDGES (the quotes around a string literal, a trailing comma) but
+ * never in its middle. Structured text is the opposite: its punctuation is
+ * interior and load-bearing.
+ *
+ * Measured need, not theory. Without this the span pass dropped all three
+ * lines of unindented compact JSON —
+ *
+ *     {"storyId":"S1",  /  "pass":true,  /  "summary":"done"}
+ *
+ * which fuses to a 45-char token at over 4 bits/char with no join that reads
+ * as word-meets-word. That is the FR-006a class again (innocent evidence
+ * deleted, field emptied), one width up.
+ *
+ * Applied ONLY to an entropy-driven span hit. A `SECRET_PATTERNS` match or a
+ * 32-char hex run is shape-specific — structured text cannot manufacture
+ * `postgres://user:pw@host` by accident — so those are never exonerated here,
+ * which matters because a wrapped connection string is exactly a token whose
+ * middle is full of `:/@`.
+ */
+const WRAPPED_KEY_TOKEN = /^[^A-Za-z0-9+/=_.-]*[A-Za-z0-9+/=_.-]+[^A-Za-z0-9+/=_.-]*$/
+
+function spanLooksLikeOneWrappedToken(dewrappedSpan: readonly string[]): boolean {
+  return WRAPPED_KEY_TOKEN.test(spanFusedToken(dewrappedSpan))
 }
 
 /**
@@ -611,19 +676,50 @@ function pairTripsOnJoin(a: string, b: string): boolean {
  *     one boundary at a time keeps the algorithm linear and its behavior
  *     easy to reason about.
  *
- *     KNOWN, MEASURED LIMIT of that choice: a secret split into THREE or
- *     more units where no two consecutive pieces reach
- *     ENTROPY_MIN_TOKEN_LENGTH is invisible to both passes — e.g. a 44-char
- *     base64 key as [16][6][22] leaks its 16-char head, at 135 of 1005
- *     probed three-way splits. Two-way splits are clean (0 of 5800). Closing
- *     this needs a span pass that attributes an offending token back to the
- *     units it crosses, which is a larger change than C1 called for; it is
- *     recorded here rather than left to be rediscovered.
- *
  *     FR-006a: a pair may only be dropped when the
  *     offending match is genuinely ON the join — see `pairTripsOnJoin`,
  *     whose doc comment carries the reproduced production failure this
  *     second condition exists to stop.
+ *  3. B-3b — each *span* of THREE OR MORE consecutive units that a single
+ *     token can cross, checked jointly. This closes what the previous
+ *     revision recorded as a "KNOWN, MEASURED LIMIT" and then left open: a
+ *     secret split into three or more units where no two CONSECUTIVE pieces
+ *     reach ENTROPY_MIN_TOKEN_LENGTH is invisible to passes 1 and 2 alike.
+ *     Reproduced verbatim: the units
+ *
+ *       ["+  HMEr3sTxo", "bYfDak", "tWCrSXRdwBMkQvZpNjLgUeIoA"]
+ *
+ *     transmit all 40 characters of a 5.12 bits/char base64 key (recoverable
+ *     by stripping the newlines, which is what `dewrap` does and therefore
+ *     what any reader can do), with NO event logged — the field looks
+ *     perfectly healthy. No unit trips alone (12 / 6 / 25 chars) and neither
+ *     adjacent pair fuses a token that reaches the 32-char entropy floor
+ *     (`HMEr3sTxobYfDak` is 15, `bYfDaktWCrSXRdwBMkQvZpNjLgUeIoA` is 31).
+ *
+ *     Fixed for ALL SIX FIELDS, not for `diffSummary` alone. The hole is not
+ *     `diffSummary`'s: `computeBoundedDiffStat` only ever emits `--stat`
+ *     lines and filenames, so a three-way-wrapped secret is barely
+ *     producible there, whereas `recentTranscript`, `lastResponse` and
+ *     `plan` carry free-form model and user text where a pasted key
+ *     hard-wrapped by a terminal across three lines is ordinary. Hardening
+ *     the least exposed field (by restoring "the whole blob is one unit",
+ *     which is precisely the B-3 production failure — the harness's own file
+ *     list eaten, the verifier judging with no file evidence) while leaving
+ *     the three most exposed ones open would have traded a reachable,
+ *     measured availability failure for an unreachable confidentiality one.
+ *
+ *     The false-positive cost of going general is bounded BY CONSTRUCTION,
+ *     which is why this is affordable where a naive "glue three lines
+ *     together" pass would not be. A single `\S+` token can only cross three
+ *     units if every INTERIOR unit is non-empty and contains no whitespace
+ *     at all — one wrapped token and nothing else. Ordinary prose, plan
+ *     digests and `git diff --stat` lines all contain spaces, so they never
+ *     form a candidate span and never reach the expensive test; the pass is
+ *     a pair of array lookups per unit for every realistic field. On top of
+ *     that, a candidate span is still only dropped when EVERY join in it
+ *     survives the same FR-006a exoneration pass 2 uses
+ *     (`spanTripsOnEveryJoin`), so a span containing one ordinary
+ *     word-meets-word boundary is spared.
  *
  * A unit already dropped individually is excluded from pairwise
  * consideration so an innocent neighbor of a standalone secret is never
@@ -743,6 +839,18 @@ function stripFacingFragment(unit: string, facing: "start" | "end"): string {
   return unit.slice(0, at) + unit.slice(at + run[1].length)
 }
 
+/**
+ * B-3b: how many consecutive units one span pass will consider. A token
+ * crossing more than this many line breaks means the wrapping width is under
+ * ~6 characters per line, which no terminal, editor or serializer produces;
+ * the bound exists so a pathological input (say a base64 blob emitted one
+ * short line at a time) cannot turn the pass superlinear. Widths are tried
+ * narrowest-first so the blast radius of a real hit is the smallest span that
+ * explains it, and any wider span containing an already-dropped unit is then
+ * skipped.
+ */
+const SPAN_MAX_UNITS = 6
+
 function scanUnits(units: string[]): { kept: string[]; anyDropped: boolean } {
   const toDrop = new Set<number>()
 
@@ -758,6 +866,56 @@ function scanUnits(units: string[]): { kept: string[]; anyDropped: boolean } {
     if (unitTrips(units[i] + units[i + 1]) && pairTripsOnJoin(units[i], units[i + 1])) {
       toDrop.add(i)
       toDrop.add(i + 1)
+    }
+  }
+
+  // B-3b: the span pass, for a secret wrapped across THREE OR MORE units —
+  // the case passes 1 and 2 both miss because no single unit and no single
+  // adjacent pair carries enough of it to trip. See `scanUnits`' doc comment
+  // for the reproduced leak and for why this is applied to every field.
+  //
+  // A `\S+` token can only reach a third unit if the unit(s) between the two
+  // ends are entirely whitespace-free, the left end finishes on a non-space
+  // and the right end starts on one. Those three cheap, precomputed tests are
+  // what keep this pass off ordinary evidence text entirely: they are false
+  // for any line containing a single space.
+  if (units.length >= 3) {
+    const dewrapped = units.map(dewrap)
+    const tight = dewrapped.map((u) => u.length > 0 && !/\s/.test(u))
+    const endsTight = dewrapped.map((u) => /\S$/.test(u))
+    const startsTight = dewrapped.map((u) => /^\S/.test(u))
+
+    for (let width = 3; width <= SPAN_MAX_UNITS; width++) {
+      for (let i = 0; i + width <= units.length; i++) {
+        const last = i + width - 1
+        if (!endsTight[i] || !startsTight[last]) continue
+        let spanIsCandidate = true
+        for (let k = i + 1; k < last; k++) {
+          if (!tight[k]) {
+            spanIsCandidate = false
+            break
+          }
+        }
+        if (!spanIsCandidate) continue
+        // Same discipline as the pair pass: a span touching a unit already
+        // dropped for holding a secret is left to `stripFacingFragment`
+        // below, so an innocent neighbour is never dragged down by proximity.
+        for (let k = i; k <= last && spanIsCandidate; k++) {
+          if (toDrop.has(k)) spanIsCandidate = false
+        }
+        if (!spanIsCandidate) continue
+        const span = dewrapped.slice(i, last + 1)
+        // Cheap gate first, exactly as in the pair pass, then the FR-006a
+        // join-locality check at EVERY join in the span.
+        const fused = span.join("")
+        if (!unitTrips(fused)) continue
+        if (!spanTripsOnEveryJoin(span)) continue
+        // ...and, for an entropy-only hit, the fused token must actually be
+        // shaped like one wrapped key rather than like run-together
+        // structured text (see `spanLooksLikeOneWrappedToken`).
+        if (!tripsPatternScan(fused) && !tripsHexRunScan(fused) && !spanLooksLikeOneWrappedToken(span)) continue
+        for (let k = i; k <= last; k++) toDrop.add(k)
+      }
     }
   }
 
@@ -872,10 +1030,27 @@ function truncateField(
 ): string {
   if (text.length <= cap) return text
   logger("verifier:field-truncated", { field, originalLength: text.length, cap, keep })
-  if (keep === "head") return text.slice(0, cap)
+  if (keep === "head") return text.slice(0, Math.max(0, cap))
   // The marker is part of the budget, not on top of it — otherwise a "capped"
   // field ships slightly over its cap and the bound stops being a bound.
-  const room = Math.max(0, cap - TRUNCATION_MARKER.length)
+  //
+  // ...which is exactly what the old `Math.max(0, cap - MARKER.length)` did at
+  // a small cap, in the worst possible way. With `cap <= 28` the room for
+  // content was clamped to 0 and the function returned the MARKER ALONE — 28
+  // characters for a cap of 1, i.e. OVER the cap, carrying 0% of the field's
+  // content, while still reporting a present, non-empty field to the judge.
+  // No live cap reaches that range (2000/4000/16000), so this was latent, not
+  // firing — but a "bound" that inverts below 28 is a trap for the next
+  // person who tunes a cap or adds a small-cap field, and the failure mode is
+  // silent (a field that says nothing but is not `undefined`, so the
+  // insufficient-evidence guard cannot see the hole). Below the marker's own
+  // length there is no room to both mark the cut and say anything, so the
+  // content wins and the marker is dropped: the cap is respected, the field is
+  // either honest content or nothing, and `verifier:field-truncated` is still
+  // logged so the cut is never silent. Redaction is unaffected — everything
+  // here has already been through `scanUnits`.
+  if (cap <= TRUNCATION_MARKER.length) return cap <= 0 ? "" : text.slice(text.length - cap)
+  const room = cap - TRUNCATION_MARKER.length
   return TRUNCATION_MARKER + text.slice(text.length - room)
 }
 
@@ -984,7 +1159,17 @@ function scanLineField(rawLines: string[], field: "criteria" | "verifierSummarie
 }
 
 /** C-9 fix: scan-then-truncate — see `scanLineField`'s doc comment for the
- * rationale; identical shape, applied to diff hunks instead of lines. */
+ * rationale; identical shape, applied to diff hunks instead of lines.
+ *
+ * B-3c: a field the scan has reduced to nothing but the HEADER of a file list
+ * is treated as absent, not as present-but-empty. `isPathListAnnouncementOnly`
+ * carries the reproduced failure — three paths outside the workspace root
+ * leave the judge holding `"changed paths (no diff available):"` and nothing
+ * else, while `diffSummary` stays DEFINED so `runVerifier`'s
+ * `insufficient-evidence` guard cannot fire. Logged as
+ * `verifier:field-dropped`, the same event a scan-emptied field already logs,
+ * because that is what it is: the field carried evidence, the scan removed all
+ * of it, and only the label survived. */
 function scanDiffSummaryField(rawDiff: string, logger: EventLogger): string | undefined {
   if (rawDiff.length > VERIFIER_PAYLOAD_RAW_FIELD_SAFETY_CAP) {
     logger("verifier:field-oversized", { field: "diffSummary", rawLength: rawDiff.length, cap: VERIFIER_PAYLOAD_RAW_FIELD_SAFETY_CAP })
@@ -992,7 +1177,7 @@ function scanDiffSummaryField(rawDiff: string, logger: EventLogger): string | un
   }
   const hunks = splitDiffIntoHunks(rawDiff)
   const { kept, anyDropped } = scanUnits(hunks)
-  if (hunks.length > 0 && kept.length === 0) {
+  if (hunks.length > 0 && (kept.length === 0 || isPathListAnnouncementOnly(kept.join("\n")))) {
     logger("verifier:field-dropped", { field: "diffSummary" })
     return undefined
   }

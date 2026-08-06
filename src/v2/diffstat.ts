@@ -141,6 +141,58 @@ export function toWorkspaceRelative(path: string, cwd: string): string {
   return rel
 }
 
+/** The one line `formatChangedPathsSummary` prints above its path list. */
+export const CHANGED_PATHS_HEADER = "changed paths (no diff available):"
+
+/** The one line `computeBoundedDiffStat` prints above its untracked list. */
+export const UNTRACKED_FILES_HEADER =
+  "new files, untracked — `git diff --stat` never lists these, so their content is NOT in the diff above:"
+
+/** The `  … and N more` line that closes a truncated untracked list. */
+const LIST_OVERFLOW_LINE = /^…\s+and\s+\d+\s+more$/
+
+/**
+ * Is this diff summary nothing but the ANNOUNCEMENT of a file list, with no
+ * file left in it?
+ *
+ * A verifier-payload field is scanned line by line before it is transmitted,
+ * and the header lines above are ordinary English while the path lines are
+ * long, slashy, high-entropy tokens — so the scan can delete every path and
+ * keep every header. Reproduced, and it is not exotic: three `/tmp`-style
+ * paths (which `toWorkspaceRelative` deliberately leaves ABSOLUTE, because
+ * they resolve outside the workspace root and a `../../..` chain would be
+ * worse to read) reduce the whole field to the 34-character string
+ *
+ *     "changed paths (no diff available):"
+ *
+ * The same happens for every path when the workspace root is `/`, where
+ * relativising only strips the leading slash. The result is worse than having
+ * no field at all: `diffSummary` is DEFINED, so `runVerifier`'s
+ * `insufficient-evidence` guard cannot fire, only `verifier:field-partial-drop`
+ * is logged, and the judge is handed a colon and a promise of a file list
+ * containing nothing — which reads as "these are all the files that changed:
+ * none".
+ *
+ * Callers use this to treat an emptied list as ABSENT rather than as
+ * present-but-empty. Deliberately narrow: it says yes only when a recognised
+ * header is present AND nothing but headers, blank lines and the overflow
+ * marker survives, so a field that still names one real path is untouched.
+ */
+export function isPathListAnnouncementOnly(text: string): boolean {
+  let sawHeader = false
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim()
+    if (trimmed.length === 0) continue
+    if (trimmed === CHANGED_PATHS_HEADER || trimmed === UNTRACKED_FILES_HEADER) {
+      sawHeader = true
+      continue
+    }
+    if (LIST_OVERFLOW_LINE.test(trimmed)) continue
+    return false
+  }
+  return sawHeader
+}
+
 /**
  * The fallback file-level evidence: the paths the ledger recorded, one per
  * indented line, workspace-relative. See this module's header for why the
@@ -149,7 +201,7 @@ export function toWorkspaceRelative(path: string, cwd: string): string {
 export function formatChangedPathsSummary(paths: readonly string[], cwd: string): string {
   if (paths.length === 0) return "no changed paths recorded"
   const lines = paths.map((p) => `  ${toWorkspaceRelative(p, cwd)}`)
-  return ["changed paths (no diff available):", ...lines].join("\n")
+  return [CHANGED_PATHS_HEADER, ...lines].join("\n")
 }
 
 /**
@@ -213,7 +265,7 @@ export function computeBoundedDiffStat(cwd: string, changedPaths: readonly strin
     // adjacent-unit boundary check). See this module's header.
     sections.push(
       [
-        "new files, untracked — `git diff --stat` never lists these, so their content is NOT in the diff above:",
+        UNTRACKED_FILES_HEADER,
         ...shown.map((p) => `  ${p}`),
         ...(overflow > 0 ? [`  … and ${overflow} more`] : []),
       ].join("\n"),
