@@ -31,6 +31,12 @@ vi.mock("../../src/v2/subturn.js", async (importOriginal) => {
 
 import { buildVerifierPayload, VERIFIER_TOTAL_BUDGET_MS, runVerifier, parseVerifierResponse } from "../../src/v2/verifier.js"
 import { VERIFIER_PROBE_POLICY, probeCapabilityBounded, runSubturn, SelfCreatedSessions } from "../../src/v2/subturn.js"
+import {
+  DIFF_UNAVAILABLE_GIT_FAILED,
+  DIFF_UNAVAILABLE_NOT_A_REPO,
+  DIFF_UNAVAILABLE_NO_CHANGES,
+  formatChangedPathsSummary,
+} from "../../src/v2/diffstat.js"
 import type { OpencodeClient } from "../../src/v2/types.js"
 
 const mockProbeCapabilityBounded = vi.mocked(probeCapabilityBounded)
@@ -1945,5 +1951,276 @@ describe("MAJ-1: looksLikeWord is pinned in both directions", () => {
     expect(
       scan2(["snake_case_variable_name assigned correctly", "tests/fixtures/verifier-replay was refreshed"]),
     ).toHaveLength(2)
+  })
+})
+
+// ===========================================================================
+// BACKLOG B-3 — "the one verifier run judged without the diff".
+//
+// The audited session logged `verifier:field-dropped {field:"diffSummary"}`
+// and the verifier then formed a verdict with NO file evidence at all. The
+// cause was not git and not the model: the harness's own FR-031 secret scan
+// ate the harness's own file list. Reproduced end to end, measured:
+//
+//   the workspace was not a git repository -> `git diff --stat` threw ->
+//   the caller fell back to a comma-joined list of ABSOLUTE paths -> that
+//   list has no `@@` hunk header, so the scan treated the WHOLE list as one
+//   removal unit -> the entropy rule (>= 3.95 bits/char, tokens >= 32 chars)
+//   fired on
+//       "/workspace/vertextest4/src/games/memory.js,"   43 chars  3.979 bits
+//       "/workspace/vertextest4/src/games/index.html,"  44 chars  4.190 bits
+//       "/workspace/vertextest4/src/games/breakout.js"  44 chars  3.971 bits
+//   -> the single unit was emptied -> the entire field was dropped.
+//
+// The scan is a SAFETY control (FR-031) and is not weakened here: the fixes
+// change the removal UNIT (whole blob -> one line) and the INPUT (absolute
+// -> workspace-relative), never the threshold or the patterns. The SAFETY
+// block below is the proof, and it must keep passing whatever else changes.
+// ===========================================================================
+
+/** The three paths from the audited session, verbatim. */
+const B3_FIELD_PATHS = [
+  "/workspace/vertextest4/src/games/memory.js",
+  "/workspace/vertextest4/src/games/index.html",
+  "/workspace/vertextest4/src/games/breakout.js",
+]
+const B3_WORKSPACE = "/workspace/vertextest4"
+
+function b3Raw(diffSummary: string, extra: Partial<{ diffSummaryUnavailable: string }> = {}) {
+  return { criteria: [], diffSummary, verifierSummaries: [], lastResponse: "", recentTranscript: "", plan: "", ...extra }
+}
+
+describe("B-3: the diff summary the harness produces survives the harness's own scan", () => {
+  it("REPRODUCES the field failure: the OLD shape (absolute paths, comma-joined onto one line) empties the field", () => {
+    // Not a mutation guard — the disease, pinned. It is still true after the
+    // fix, because one line of absolute paths is still one removal unit
+    // holding a 44-char, 4.190-bits/char token. That is exactly why fix (a)
+    // changes what the harness EMITS and does not merely re-slice it.
+    const logger = vi.fn()
+    const payload = buildVerifierPayload(b3Raw(B3_FIELD_PATHS.join(", ")), logger)
+    expect(payload.diffSummary).toBeUndefined()
+    expect(logger).toHaveBeenCalledWith("verifier:field-dropped", { field: "diffSummary" })
+  })
+
+  it("FIX (a): the SAME paths, emitted by formatChangedPathsSummary, reach the verifier intact", () => {
+    // Dies if `formatChangedPathsSummary` goes back to absolute paths (the
+    // tokens clear the entropy threshold again) or to a single comma-joined
+    // line (one unit, same total loss).
+    const logger = vi.fn()
+    const payload = buildVerifierPayload(b3Raw(formatChangedPathsSummary(B3_FIELD_PATHS, B3_WORKSPACE)), logger)
+    expect(payload.diffSummary).toBeDefined()
+    expect(payload.diffSummary).toContain("src/games/memory.js")
+    expect(payload.diffSummary).toContain("src/games/index.html")
+    expect(payload.diffSummary).toContain("src/games/breakout.js")
+    expect(logger).not.toHaveBeenCalled()
+  })
+
+  it("FIX (c): a hunk-less summary loses only the offending LINE, never the whole field", () => {
+    // Dies if `splitDiffIntoHunks` goes back to `return [diffSummary]` for a
+    // field with no `@@` header: the one high-entropy line takes the two
+    // innocent ones with it and the field is dropped whole.
+    const logger = vi.fn()
+    const summary = [
+      "  src/games/memory.js",
+      "  /workspace/vertextest4/src/games/index.html", // 43 chars, 4.127 bits/char — trips
+      "  src/games/breakout.js",
+    ].join("\n")
+    const payload = buildVerifierPayload(b3Raw(summary), logger)
+    expect(payload.diffSummary).toBe(["  src/games/memory.js", "  src/games/breakout.js"].join("\n"))
+    expect(logger).toHaveBeenCalledWith("verifier:field-partial-drop", { field: "diffSummary", kept: 2, dropped: 1 })
+    expect(logger).not.toHaveBeenCalledWith("verifier:field-dropped", expect.anything())
+  })
+
+  it("FIX (c): a REAL `git diff --stat` (which also has no `@@` header) is untouched", () => {
+    const logger = vi.fn()
+    // The `+++/---` bar measures 0.732 bits/char — this shape never tripped,
+    // which is why the defect only ever showed up outside a repository.
+    const stat = [
+      " src/v2/plugin.ts    | 42 ++++++++++++++++++++++++++++++--------",
+      " src/v2/verifier.ts  |  8 ++++----",
+      " 2 files changed, 40 insertions(+), 10 deletions(-)",
+    ].join("\n")
+    const payload = buildVerifierPayload(b3Raw(stat), logger)
+    expect(payload.diffSummary).toBe(stat)
+    expect(logger).not.toHaveBeenCalled()
+  })
+
+  it("hunk splitting is unchanged when `@@` headers ARE present (one unit per hunk, not per line)", () => {
+    // Guards the other direction: fix (c) must not turn hunk-shaped input
+    // into line-shaped input, or a secret split across two lines of one hunk
+    // stops being a single unit's problem.
+    const logger = vi.fn()
+    const clean = "@@ -1,1 +1,1 @@\n-old\n+new"
+    const withSecret = '@@ -2,1 +2,1 @@\n+const key = "sk-live-abc123def456ghi789jkl012mno345pqr"'
+    const payload = buildVerifierPayload(b3Raw([clean, withSecret].join("\n")), logger)
+    expect(payload.diffSummary).toBe(clean)
+    expect(logger).toHaveBeenCalledWith("verifier:field-partial-drop", { field: "diffSummary", kept: 1, dropped: 1 })
+  })
+})
+
+describe("B-3 SAFETY (FR-031): per-line scanning of a hunk-less diff summary still catches real secrets", () => {
+  it("a complete sk-live token on one line of a `git diff --stat`-shaped summary is removed", () => {
+    const logger = vi.fn()
+    const summary = [
+      " src/config.ts | 2 +-",
+      '+const key = "sk-live-abc123def456ghi789jkl012mno345pqr"',
+      " 1 file changed, 1 insertion(+), 1 deletion(-)",
+    ].join("\n")
+    const payload = buildVerifierPayload(b3Raw(summary), logger)
+    expect(payload.diffSummary).toBeDefined()
+    expect(payload.diffSummary).not.toContain("sk-live")
+    expect(payload.diffSummary).toContain("src/config.ts")
+    expect(logger).toHaveBeenCalledWith("verifier:field-partial-drop", { field: "diffSummary", kept: 2, dropped: 1 })
+  })
+
+  it("a secret SPLIT across two adjacent lines is still caught — the adjacent-pair pass survives the unit change", () => {
+    // This is the property per-line scanning could plausibly have broken:
+    // with the whole blob as one unit the split token was reunited by
+    // `dewrap`; with lines as units it is only reunited by `scanUnits`'
+    // adjacent-pair pass. Both halves must go.
+    const logger = vi.fn()
+    const summary = ['+const key = "sk-live-abc123', 'def456ghi789jklmno"', " src/config.ts | 2 +-"].join("\n")
+    const payload = buildVerifierPayload(b3Raw(summary), logger)
+    expect(payload.diffSummary).toBe(" src/config.ts | 2 +-")
+    expect(payload.diffSummary).not.toContain("sk-live")
+    expect(payload.diffSummary).not.toContain("def456ghi789")
+  })
+
+  it("an unlabelled 40-char hex token on its own line still trips the entropy rule", () => {
+    const logger = vi.fn()
+    // 3.971 bits/char over 40 chars — redactSecrets alone misses this; the
+    // entropy rule is the only thing that catches it, and it still does.
+    const summary = [" src/config.ts | 2 +-", "+const token = 4702a3465c59e203612b5411f9dc37870f86aebd"].join("\n")
+    const payload = buildVerifierPayload(b3Raw(summary), logger)
+    expect(payload.diffSummary).toBe(" src/config.ts | 2 +-")
+  })
+
+  it("an UNLABELLED, non-hex high-entropy key — the case only the entropy rule can catch — is still removed", () => {
+    // 40 chars, 5.122 bits/char, base64 alphabet: no SECRET_PATTERNS entry
+    // matches it and it is not a hex run, so the entropy rule is its only
+    // catcher. This is the control the B-3 change touches (it re-units what
+    // the rule is applied to), so it needs its own isolated proof.
+    const logger = vi.fn()
+    const summary = [" src/config.ts | 2 +-", "+const k = HMEr3sTxobYfDaktWCrSXRdwBMkQvZpNjLgUeIoA"].join("\n")
+    const payload = buildVerifierPayload(b3Raw(summary), logger)
+    expect(payload.diffSummary).toBe(" src/config.ts | 2 +-")
+  })
+
+  it("a LOW-entropy LABELLED secret — the case only the pattern scan can catch — is still removed", () => {
+    // Deliberately below every other tripwire: "hunter2hunter2" is 14 chars
+    // (the entropy rule ignores anything under 32) and is not hex, so if
+    // `redactSecrets` ever stopped being consulted this line would sail
+    // through. The three cases above all have a second catcher and would
+    // not notice.
+    const logger = vi.fn()
+    const summary = [" src/config.ts | 2 +-", "+password: hunter2hunter2", " 1 file changed, 1 insertion(+)"].join("\n")
+    const payload = buildVerifierPayload(b3Raw(summary), logger)
+    expect(payload.diffSummary).not.toContain("hunter2")
+    expect(payload.diffSummary).toContain("src/config.ts")
+  })
+
+  it("a hunk-less summary that is NOTHING but a secret is still dropped in full", () => {
+    const logger = vi.fn()
+    const payload = buildVerifierPayload(
+      b3Raw('AKIAIOSFODNN7EXAMPLE aws_secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"'),
+      logger,
+    )
+    expect(payload.diffSummary).toBeUndefined()
+    expect(logger).toHaveBeenCalledWith("verifier:field-dropped", { field: "diffSummary" })
+  })
+})
+
+describe("B-3 (d): the payload STATES why there is no diff instead of hiding the hole", () => {
+  it("carries the reason through as its own field", () => {
+    const logger = vi.fn()
+    const payload = buildVerifierPayload(
+      b3Raw("changed paths (no diff available):\n  src/games/breakout.js", {
+        diffSummaryUnavailable: DIFF_UNAVAILABLE_NOT_A_REPO,
+      }),
+      logger,
+    )
+    expect(payload.diffSummaryUnavailable).toBe(DIFF_UNAVAILABLE_NOT_A_REPO)
+    expect(payload.diffSummary).toContain("src/games/breakout.js")
+  })
+
+  it("is absent when the diff is real — no reason is invented", () => {
+    const payload = buildVerifierPayload(b3Raw("@@ -1,1 +1,1 @@\n+ok"), vi.fn())
+    expect(payload.diffSummaryUnavailable).toBeUndefined()
+    expect("diffSummaryUnavailable" in payload).toBe(false)
+  })
+
+  for (const [name, reason] of [
+    ["not-a-repo", DIFF_UNAVAILABLE_NOT_A_REPO],
+    ["git-failed", DIFF_UNAVAILABLE_GIT_FAILED],
+    ["no-changes", DIFF_UNAVAILABLE_NO_CHANGES],
+  ] as const) {
+    it(`the ${name} reason survives the payload scan whole (a reason that is itself redacted is another silent hole)`, () => {
+      const logger = vi.fn()
+      const payload = buildVerifierPayload(b3Raw("", { diffSummaryUnavailable: reason }), logger)
+      expect(payload.diffSummaryUnavailable).toBe(reason)
+      expect(logger).not.toHaveBeenCalledWith("verifier:field-dropped", { field: "diffSummaryUnavailable" })
+    })
+  }
+})
+
+describe("B-3 (d): runVerifier will not judge with neither a diff nor a transcript", () => {
+  it("returns insufficient-evidence WITHOUT prompting a model", async () => {
+    const logger = vi.fn()
+    const result = await runVerifier(
+      makeClient(),
+      { selfCreated: new SelfCreatedSessions(), logger },
+      {
+        parentSessionID: "parent-1",
+        sessionModel: { providerID: "minimax", modelID: "MiniMax-M3" },
+        payload: { criteria: ["c1"], plan: "S1 complete" },
+      },
+    )
+    expect(result).toEqual({ verdict: null, reason: "insufficient-evidence" })
+    expect(mockRunSubturn).not.toHaveBeenCalled()
+    expect(mockProbeCapabilityBounded).not.toHaveBeenCalled()
+    expect(logger).toHaveBeenCalledWith("verifier:insufficient-evidence", { fields: ["criteria", "plan"] })
+  })
+
+  it("a diff summary ALONE is enough to proceed — a missing transcript must never disable the verifier", async () => {
+    const result = await runVerifier(
+      makeClient(),
+      { selfCreated: new SelfCreatedSessions(), logger: vi.fn() },
+      {
+        parentSessionID: "parent-1",
+        sessionModel: { providerID: "minimax", modelID: "MiniMax-M3" },
+        payload: { diffSummary: "changed paths (no diff available):\n  src/games/breakout.js" },
+      },
+    )
+    expect(result).toEqual({ verdict: PASS_VERDICT })
+    expect(mockRunSubturn).toHaveBeenCalledTimes(1)
+  })
+
+  it("a transcript ALONE is enough to proceed — outside a git repository there may never be a diff", async () => {
+    const result = await runVerifier(
+      makeClient(),
+      { selfCreated: new SelfCreatedSessions(), logger: vi.fn() },
+      {
+        parentSessionID: "parent-1",
+        sessionModel: { providerID: "minimax", modelID: "MiniMax-M3" },
+        payload: { recentTranscript: "assistant: I implemented the three games and ran the tests" },
+      },
+    )
+    expect(result).toEqual({ verdict: PASS_VERDICT })
+    expect(mockRunSubturn).toHaveBeenCalledTimes(1)
+  })
+
+  it("the system prompt tells the judge to cite the stated reason rather than infer nothing changed", async () => {
+    await runVerifier(
+      makeClient(),
+      { selfCreated: new SelfCreatedSessions(), logger: vi.fn() },
+      {
+        parentSessionID: "parent-1",
+        sessionModel: { providerID: "minimax", modelID: "MiniMax-M3" },
+        payload: { diffSummary: "  src/a.ts", diffSummaryUnavailable: DIFF_UNAVAILABLE_NOT_A_REPO },
+      },
+    )
+    const system = mockRunSubturn.mock.calls[0][3].system
+    expect(system).toContain("diffSummaryUnavailable")
+    expect(system).toContain("not as evidence that nothing changed")
   })
 })

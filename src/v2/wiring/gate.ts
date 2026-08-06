@@ -43,6 +43,7 @@ import { classifyFileKind, formatChangedPathsForReason, formatGateContinuationTe
 import { verifyWaiverSignature } from "../../goals.js"
 import { holdoutSuppresses, logHoldoutSuppress } from "../../measurement.js"
 import type { InjectionComposer } from "../composer.js"
+import type { DiffStatResult } from "../diffstat.js"
 import type { EventLogger, OpencodeClient } from "../types.js"
 import type { PhaseEngine } from "../phase.js"
 import type { PinStore } from "../pin.js"
@@ -89,7 +90,11 @@ export interface GateContext {
   isValidReceipt: (sessionID: string, receiptID: string) => boolean
   /** Recent verifier output summaries this session, for the verifier payload (best-effort, bounded). */
   recentVerifierSummaries: (sessionID: string) => string[]
-  diffSummary: (sessionID: string) => string
+  /** B-3: file-level evidence for the verifier payload, plus the stated
+   * reason when there is no real diff behind it (not a repo, git failed, no
+   * change recorded). The reason is carried into the payload as its own
+   * field so the judge CITES the hole instead of judging around it. */
+  diffSummary: (sessionID: string) => DiffStatResult
   /** `promptContinuation` opens a new composer turn per dispatched
    * continuation — see that function for the rationale and the reverted
    * alternatives. */
@@ -1354,12 +1359,16 @@ async function handleVerifierAudit(ctx: GateContext, sid: string, state: V2Sessi
   const auditIds = new Set(unverifiedStories.map((story) => story.id))
   const criteria = ctx.pinStore.get(sid).map((c) => c.text)
   const verifierSummaries = ctx.recentVerifierSummaries(sid)
-  const diffSummary = ctx.diffSummary(sid)
+  const diff = ctx.diffSummary(sid)
   const { lastResponse, recentTranscript } = await fetchVerifierTranscriptFields(ctx.client, sid)
   const payload = buildVerifierPayload(
     {
       criteria,
-      diffSummary,
+      diffSummary: diff.text,
+      // B-3 (d): when there is no real diff behind `diffSummary`, say WHY in
+      // the payload. A silent absence is what let the audited session's
+      // verdict form with no file evidence at all.
+      ...(diff.unavailableReason === undefined ? {} : { diffSummaryUnavailable: diff.unavailableReason }),
       verifierSummaries,
       lastResponse,
       recentTranscript,
