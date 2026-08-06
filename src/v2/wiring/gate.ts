@@ -1336,11 +1336,10 @@ async function handleVerifierAudit(ctx: GateContext, sid: string, state: V2Sessi
         // The code moved under the verdict — re-audit rather than re-litigate.
         verdictOutdatedByEdits(ctx, sid, state, story)),
   )
-  // A staleness-driven re-audit spends cap budget like any other, or the cap
-  // is decorative on exactly the branch that can loop.
-  for (const story of unverifiedStories) {
-    if (verdictOutdatedByEdits(ctx, sid, state, story)) bumpReaudit(state, story.id)
-  }
+  // NO bump here. `boundUnappliedVerdicts` already bumps once per bounded
+  // verdict and the revert path bumps once per failing one, so counting the
+  // selection too would double-charge a staleness re-audit and halve the
+  // effective cap. The selector's job is to READ the cap, not to charge it.
   if (unverifiedStories.length === 0) return emitUnauditedEscalation(ctx, sid, state, plan)
 
   const [providerID, ...rest] = state.modelId.split("/")
