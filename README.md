@@ -98,7 +98,7 @@ Details: [docs/USAGE.md](./docs/USAGE.md) · [docs/ARCHITECTURE.md](./docs/ARCHI
 npm install @elicify-ai/elicify-vertex
 ```
 
-Requires Node **≥ 20**. Current package: **`@elicify-ai/elicify-vertex@0.13.0`**.
+Requires Node **≥ 20**. Current package: **`@elicify-ai/elicify-vertex@0.13.1`**.
 
 > ### Upgrading from 0.9.x — the Judge is now the **Verifier**
 >
