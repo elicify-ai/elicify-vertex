@@ -76,17 +76,84 @@ re-entry is generating duplicate findings. Not yet diagnosed. Note this is
 
 ---
 
-## B-3 — The verifier ran once in 51 minutes, and judged without the diff
+## B-3 — The one verifier run judged without the diff
 
-One `story:verifier-audit` across the whole session, and that single run had a
-hole in its evidence:
+> **Operator ruling (2026-08-06):** "the checker should only run at the end or
+> when the worker stops working — that is correct."
+
+So **running once is NOT the bug** and is not to be "fixed". One
+`story:verifier-audit` in the session is the intended design. What is wrong is
+the *quality of evidence* that one run had:
 
 - `verifier:field-dropped` — `diffSummary`
 - `verifier:field-truncated` — `recentTranscript`, 5923 → 4000 cap
 
 A verifier forming a verdict without the diff is the failure mode that produced
 the worker/verifier standoffs already fixed this round. Find out why
-`diffSummary` was dropped (empty? redacted? `git diff` failed?).
+`diffSummary` was dropped (empty? redacted? `git diff` failed?), and make the
+verifier say so rather than judging around the hole.
+
+---
+
+## B-3a — The transcript is truncated from the WRONG END
+
+`truncateField` (`src/v2/verifier.ts:812`) is:
+
+```ts
+return text.slice(0, cap)
+```
+
+It keeps the **beginning** of the transcript and discards the end.
+
+> **Operator ruling:** "raise the conversation character limit and certainly it
+> needs to cut at the top not the bottom — the last messages are the relevant
+> ones."
+
+That is exactly right and the current code does the opposite: in the measured
+session the verifier was handed the first 4,000 characters and never saw the
+most recent 1,923 — the part describing the work it was being asked to judge.
+
+**Do:**
+1. Cut from the top: `text.slice(-cap)`, with a leading `…[earlier transcript
+   trimmed]…` marker so the verifier knows it is seeing a tail, not a whole.
+2. Raise the cap for `recentTranscript` from 4,000 to **16,000** characters
+   (operator decision, 2026-08-06 — 4× today, chosen over 32k/uncapped to keep
+   the per-audit prompt cost and the secret-redaction scan bounded).
+
+**Care:** this field is model-visible and goes through `scanProseField`. The
+redaction scan must run over the *kept* tail, and the FR-031 adjacent-unit
+boundary check must still hold at the new cut point — a secret straddling the
+boundary is the exact leak that check exists for. Do not reorder them.
+
+**Check the other fields too:** four more share
+`VERIFIER_PAYLOAD_FIELD_CHAR_CAP` and the same head-keeping `slice(0, cap)`.
+Head-keeping is probably right for `plan` and `diffSummary`; it is wrong for
+anything chronological. Decide per field rather than flipping all five.
+
+---
+
+## B-3b — The judge must judge the GOAL, not exit codes
+
+> **Operator ruling:** "the judge should not go by exit codes — they are an
+> information but not a real criteria for the judge. The judge needs simply to
+> judge if the goal was achieved, all stories delivered, and generally
+> validated."
+
+Exit codes stay in the payload as *evidence the judge may cite*. They stop
+being *criteria the verdict is derived from*. The question the verifier answers
+is: was the goal achieved, is every story delivered, does it hold up.
+
+This continues the direction already taken this round — the tool-call floor was
+replaced by `verdictIsSubstantiated`, and `VERIFIER_SYSTEM_PROMPT` already
+leads with "the session transcript is your leading evidence… you are not
+required to run a command to be believed". Finish the job: remove any remaining
+place where a command result decides the verdict rather than informing it.
+
+**Scope (operator decision, 2026-08-06): the JUDGE only.** `verify-gap` — the
+worker-facing nudge — is explicitly out of scope and stays as it is. It is the
+one directive family with measured effect in this session (9 rendered, 14
+complied) while `intake-scaffold` and `scope-watchdog` scored 0. Do not
+"harmonise" it away.
 
 ---
 
@@ -109,14 +176,56 @@ PORT=8081 HOST=0.0.0.0 npm run dev > /tmp/neon-arcade-server.log 2>&1 &
 A backgrounded long-running server has no meaningful exit code. This will recur
 in every web project; it needs a rule, not a per-case judgement.
 
+Largely dissolved by **B-3b**: once the judge stops deriving verdicts from exit
+codes, "ambiguous exit" stops being a verdict problem. What remains is the
+worker-facing side — decide whether `verify-gap` should still flag it, or
+whether a backgrounded process is simply not exit-verifiable and should be
+checked by probing that the server responds.
+
 ---
 
 ## B-6 — The star one-shot is unwinnable on weaker models
 
 `star:armed-for-injection` → `star:injected` → `star:gave-up` after 3 attempts.
 The bounded-retry logic behaved exactly as designed; the model simply never made
-the ask. If `gave-up` is the normal outcome on non-frontier models, the feature
-is spending three injections per machine to reliably achieve nothing.
+the ask. Three injections spent per machine to reliably achieve nothing.
+
+> **Operator ruling (2026-08-06):** "the GitHub star should go back in the agent
+> prompt / skill as a first step after harness start. It needs to check the tool
+> whether consent was provided already or not."
+
+**Do — move it from the idle tree into the agent contract:**
+
+1. **Delete the runtime machinery.** The arm/inject/retry loop
+   (`maybeAskForStar`, `starAskPendingInjection`, `STAR_MAX_ATTEMPTS`,
+   `recordStarAttempt`, the `tool.execute.after` observation that matches
+   `STAR_REPO`, and the `system.transform` injection) all goes. It exists only
+   to nag a model into asking, and it does not work.
+
+2. **Add a read-only status tool** (operator decision, 2026-08-06):
+   `elicify_vertex_star_status`, no arguments, returns the consent state — e.g.
+   `{consent: "none" | "asked" | "yes" | "gave-up"}` — and **stars nothing**.
+
+   Chosen over adding a `{check: true}` flag to the existing tool because
+   `elicify_vertex_star` (tools.ts:637-648) takes no arguments and stars
+   immediately on call. A model that forgets the flag would star the repo while
+   trying to check — a silent, irreversible, outward-facing action. Keep the two
+   verbs in two tools.
+
+3. **Put the step in the agent prompt / skill**, as one of the first actions
+   after harness start: call `elicify_vertex_star_status`; if `none`, ask the
+   user once via the `question` tool; if they agree, call
+   `elicify_vertex_star`; anything other than `none` means say nothing and never
+   raise it again.
+
+**Keep:** `starConsentPath()` and the durable marker, the `readStarConsent()`
+legacy-`"prompted"` handling, and the uninstaller's removal of the file
+(UAT section K). Only the nagging loop goes.
+
+**Note:** `gave-up` states already written by the current build should be
+treated as "never actually asked" — the marker records a model's failure to
+comply, not a user's decision. Consider migrating `gave-up` → `none` so those
+machines get their one real ask.
 
 ---
 
