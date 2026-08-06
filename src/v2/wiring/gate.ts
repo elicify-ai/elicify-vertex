@@ -1201,22 +1201,68 @@ function applyPathVeto(
  * from the audit that settled it.
  */
 /**
+ * `itemId` is LLM-authored: "A1", "a1", "A1.", "A-1" all mean the same
+ * acceptance item. Compare on the alphanumerics only, so the substantiation
+ * rules below turn on whether the judge named a DECLARED item, never on how
+ * it punctuated the id.
+ */
+function normalizeItemId(id: string): string {
+  return id.trim().toLowerCase().replace(/[^a-z0-9]/g, "")
+}
+
+/**
  * Is this verdict backed by something, or invented?
  *
  * A failing verdict must name the acceptance items it failed and say why. That
  * is what distinguishes judgement from fabrication — not whether a shell
  * command ran. A passing verdict with every item met costs nothing to apply.
+ *
+ * B-3b (operator ruling, 2026-08-06) — "the judge should not go by exit codes
+ * … the judge needs simply to judge if the goal was achieved, all stories
+ * delivered, and generally validated". The prompt half of that lives in
+ * `VERIFIER_SYSTEM_PROMPT`; this is the half that binds. Two rules, both
+ * turning on the story's DECLARED acceptance items, because those are the
+ * contract the ruling names — and both are exactly the shape a
+ * verdict-from-a-command-result takes:
+ *
+ *  - A FAILURE must name a declared acceptance item. `{itemId: "verifier",
+ *    met: false, note: "npm test exited 1"}` fails a story on the shell rather
+ *    than on its contract; the old rule accepted it because the note was
+ *    non-empty. At least ONE failing item must be a declared one — not all of
+ *    them, so an extra observation the judge volunteers alongside a real
+ *    finding never discards the finding.
+ *  - A PASS must have judged every declared acceptance item. A green suite
+ *    plus one blanket `{itemId: "A1", met: true}` on a three-item story is
+ *    a verdict about the command, not about the story; the two unexamined
+ *    items are precisely where "delivered" and "the tests are green" diverge.
+ *
+ * `story` is optional and a story with NO declared acceptance items skips both
+ * rules: there is nothing to name and nothing to cover, so the pre-B-3b
+ * behaviour stands rather than freezing such a story permanently (the worker
+ * is separately told to amend it — `findings.ts`).
  */
-function verdictIsSubstantiated(v: VerifierStoryVerdict): boolean {
+function verdictIsSubstantiated(v: VerifierStoryVerdict, story?: StoryV2): boolean {
   // ORDER MATTERS. `[].every()` is vacuously TRUE, so testing `pass` first
   // made a `pass:true` with no items read as substantiated — the same
   // vacuous-truth trap that let an empty `items` array bypass the old floor.
   // Nothing behind the verdict means unsubstantiated, whichever way it points.
   if (v.items.length === 0) return false
-  if (v.pass && v.items.every((i) => i.met)) return true
+  const declared = new Set((story?.acceptanceItems ?? []).map((i) => normalizeItemId(i.id)))
+  if (v.pass && v.items.every((i) => i.met)) {
+    if (declared.size === 0) return true
+    const judged = new Set(v.items.map((i) => normalizeItemId(i.itemId)))
+    return [...declared].every((id) => judged.has(id))
+  }
   // Every failed item must carry a reason. An empty note is an assertion, not
   // a finding.
-  return v.items.filter((i) => !i.met).every((i) => (i.note ?? "").trim().length > 0)
+  const failing = v.items.filter((i) => !i.met)
+  if (!failing.every((i) => (i.note ?? "").trim().length > 0)) return false
+  // `pass:false` with nothing failing is FR-005's contradictory case, bounded
+  // (and logged) further down as `"contradictory"`. Leave it to that branch
+  // rather than relabelling it here.
+  if (failing.length === 0) return true
+  if (declared.size === 0) return true
+  return failing.some((i) => declared.has(normalizeItemId(i.itemId)))
 }
 
 /**
@@ -1458,13 +1504,18 @@ async function handleVerifierAudit(ctx: GateContext, sid: string, state: V2Sessi
   // checks the worktree whenever the verifier claims a path is missing. That
   // is the defence that actually works; a tool call proves nothing about
   // whether the verdict was reasoned.
-  const unsubstantiated = onTarget.some((v) => !verdictIsSubstantiated(v))
+  const storyById = new Map(plan.stories.map((s) => [s.id, s]))
+  const unsubstantiated = onTarget.some((v) => !verdictIsSubstantiated(v, storyById.get(v.storyId)))
   if (unsubstantiated) {
     ctx.logger("verifier:unverified", { sessionID: sid, stories: onTarget.map((v) => v.storyId) })
     void ctx.visibility?.notify("health", {
       sessionID: sid,
       family: "verifier:unverified",
-      message: "the completion verifier failed stories without observing the worktree — verdict not applied",
+      // B-3b: the old wording ("failed stories without observing the
+      // worktree") described the deleted tool-call floor, not the rule that
+      // actually fires here.
+      message:
+        "the completion verifier's verdict is not substantiated against the story's acceptance items — verdict not applied",
       variant: "warning",
     })
     // MAJ-003: this drop-path must still count toward the re-audit cap and
@@ -1477,7 +1528,14 @@ async function handleVerifierAudit(ctx: GateContext, sid: string, state: V2Sessi
     // it could never become verified for the rest of the run. A passing,
     // fully-met verdict costs nothing to apply and is not what the tool-call
     // floor exists to stop.
-    const unsubstantiated = onTarget.filter((v) => !v.pass || v.items.length === 0 || v.items.some((i) => !i.met))
+    // B-3b: `!verdictIsSubstantiated(...)` FIRST, or the new pass rule is
+    // inert — a `pass:true` that skipped acceptance items satisfies every
+    // clause below and would be applied by the very branch that just refused
+    // the batch. The remaining clauses are unchanged and still decide the
+    // failing/empty/partial shapes.
+    const unsubstantiated = onTarget.filter(
+      (v) => !verdictIsSubstantiated(v, storyById.get(v.storyId)) || !v.pass || v.items.length === 0 || v.items.some((i) => !i.met),
+    )
     const substantiated = onTarget.filter((v) => !unsubstantiated.includes(v))
     boundUnappliedVerdicts(ctx, sid, state, unsubstantiated, "unverified")
     if (substantiated.length > 0) {

@@ -155,6 +155,49 @@ one directive family with measured effect in this session (9 rendered, 14
 complied) while `intake-scaffold` and `scope-watchdog` scored 0. Do not
 "harmonise" it away.
 
+### DONE (2026-08-06)
+
+**What the audit actually found.** Only ONE place in the judge path derived a
+verdict from a command result, and it was the prompt: `VERIFIER_SYSTEM_PROMPT`
+never stated any criteria at all, and its single criterion-shaped sentence was
+the re-run-your-verifiers instruction, framed entirely around making an *exit
+code reliable*. Everything downstream (`applyPathVeto`, FR-005, the re-audit
+cap, `applyVerifierVerdicts`) turns on filesystem fact or on the verdict's own
+shape — none of it reads an exit code. `parseVerification`/`exitCodeReliable`
+(`index.ts`), the receipt writer (`plugin.ts`) and the `verify-gap`
+prescription (`findings.ts`) are all worker-facing and were left alone.
+
+**Prompt (`verifier.ts`).** Extended, not replaced — the transcript-leading
+lead-in stands. Added: the three criteria verbatim (goal achieved / every story
+delivered against its declared acceptance items / holds up under scrutiny);
+exit codes, command results and verifier summaries named as *evidence you may
+cite — never the test*, in both directions (a red command does not make an item
+unmet, a green one does not make it met); and an instruction to judge every
+acceptance item by the digest's own item id. The re-run instruction survives
+with its standing demoted: "the result informs your verdict; it does not decide
+it."
+
+**Deterministic half (`gate.ts`, `verdictIsSubstantiated`).** A prompt is not
+an enforcement, so the two shapes a command-derived verdict actually takes are
+now rejected:
+
+- a `pass:false` must name at least one **declared** acceptance item —
+  `{itemId:"verifier", met:false, note:"npm test exited 1"}` fails a story on
+  the shell, not on its contract. *At least one*, not all, so an extra
+  observation volunteered next to a real finding never discards the finding.
+- a `pass:true` must have judged **every** declared acceptance item — a green
+  suite plus one blanket item is a verdict about the command, and the
+  unexamined items are exactly where "delivered" and "the tests pass" diverge.
+
+`itemId` is matched on alphanumerics only (`a1.` = `A-1` = `A1`). A story with
+no declared acceptance items skips both rules rather than freezing. The
+`verifier:unverified` notify text, which still described the deleted tool-call
+floor, now says what the rule is.
+
+Nine mutations, each confirmed red and restored: fail-side rule, pass-side
+coverage, the substantiation clause in the bounding filter, id normalisation,
+an over-strict `some`→`every` variant, and the four prompt sentences.
+
 ---
 
 ## B-4 — `resolution:none` × 65, including turns with real edits
