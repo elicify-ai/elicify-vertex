@@ -34,7 +34,7 @@ import {
 import { PLUGIN_STATE_DIR, VerificationReceiptStore, isProtectedStatePath, resolveGoalWorkspaceRoot } from "../goals.js"
 import { holdoutSuppresses, logHoldoutSuppress } from "../measurement.js"
 
-import { compareExpectation, parseCriteriaBlock, parseExpectArtifact } from "./artifacts.js"
+import { compareExpectation, findCriteriaKeyLine, parseCriteriaBlock, parseExpectArtifact } from "./artifacts.js"
 import { isNonExecutingCommand, isTestRunnerCommand, observedCoversPrescribed, verifyGapComplied } from "./coverage.js"
 import { VisibilityNotifier, resolveVisibilityMode, summarizeFinding } from "./visibility.js"
 import { InjectionComposer, type Finding } from "./composer.js"
@@ -462,6 +462,17 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       // IS the plan-proposal prescription's compliance.
       composer.recordCompliance(sessionID, "plan-proposal", "plan-created")
       state.compliedFamiliesEver.add("plan-proposal")
+    },
+    // B-2: the ONLY `scope-watchdog` compliance signal in the codebase.
+    // Before this, the family had no `recordCompliance` call anywhere, so its
+    // measured "3 rendered, 0 complied" was a structural artefact — it would
+    // have read 0 under perfect compliance. Mirrors the verify-gap join in
+    // `tool.execute.after`: record on the composer AND on the session's
+    // ever-complied set, which is what the FR-029 dosing decay reads.
+    onScopeAmended: (sessionID, resolution) => {
+      composer.recordCompliance(sessionID, "scope-watchdog", `scope-${resolution}`)
+      const state = states.get(sessionID)
+      if (state) state.compliedFamiliesEver.add("scope-watchdog")
     },
   })
 
@@ -1343,7 +1354,23 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       // than one extra directive on a question, so the gate is gone rather
       // than patched. If the noise matters, the fix is a signal that actually
       // tracks "has the user asked for work" — not a regex over the ask text.
-      if (pinStore.get(sid).length === 0) {
+      //
+      // B-2: ONE OFFER PER TURN, not per invocation. This hook runs after
+      // every tool result, so the unconditional `pinStore.get(sid).length
+      // === 0` test above re-minted the scaffold on every step of the agent
+      // loop. Measured in one field session: 179 `per-turn-cap:dropped`
+      // events, every one `intake-scaffold` — the finding was rebuilt ~180
+      // times and the composer's cap of 1 discarded all but the first. The
+      // cap was never the bug; this producer was.
+      //
+      // The emission gate is keyed on the COMPOSER's turn index rather than a
+      // boolean cleared in `resetTurnState`, because `wiring/gate.ts`'s
+      // continuation path advances the turn without touching wiring state — a
+      // boolean would have gone permanently spent on any continuation-driven
+      // run. See `V2SessionState.intakeScaffoldOfferedForTurn`.
+      const scaffoldTurn = composer.currentTurn(sid)
+      if (pinStore.get(sid).length === 0 && state.intakeScaffoldOfferedForTurn !== scaffoldTurn) {
+        state.intakeScaffoldOfferedForTurn = scaffoldTurn
         findings.push(intakeScaffoldFinding(nextInstanceId(state)))
       }
 
@@ -1531,6 +1558,19 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
         // pinning criteria IS the intake-scaffold prescription's compliance.
         composer.recordCompliance(sid, "intake-scaffold", "criteria-pinned")
         state.compliedFamiliesEver.add("intake-scaffold")
+      } else {
+        // B-2: the model wrote a CRITERIA: line the grammar could not read.
+        //
+        // This used to be indistinguishable from never answering at all, and
+        // the consequences are not symmetric: nothing gets pinned, so the
+        // scaffold's emission gate (`pinStore.get(sid).length === 0`) stays
+        // open and re-offers forever, while its compliance signal — pinning —
+        // never fires. The field numbers this backlog item started from (9
+        // intake-scaffold directives rendered, 0 complied) could not be read
+        // as "the model ignored us" precisely because this case was silent.
+        // Now it is an event, so the next session's numbers are decidable.
+        const keyLine = findCriteriaKeyLine(textOutput.text)
+        if (keyLine !== null) logger("criteria:parse-miss", { sessionID: sid, keyLine: keyLine.slice(0, 200) })
       }
 
       const expect = parseExpectArtifact(textOutput.text)

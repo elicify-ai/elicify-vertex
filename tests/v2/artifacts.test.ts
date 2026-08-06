@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 
 import {
+  findCriteriaKeyLine,
   parseCriteriaBlock,
   parseExpectArtifact,
   compareExpectation,
@@ -36,6 +37,65 @@ describe("artifact_parse_criteria (test 10)", () => {
 
   it("returns null when no CRITERIA block is present", () => {
     expect(parseCriteriaBlock("just some prose, no directive here")).toBeNull()
+  })
+
+  // -------------------------------------------------------------------------
+  // B-2: bullets. A model that answered the intake scaffold with "- item"
+  // used to pin NOTHING and, because the pin store is both the scaffold's
+  // emission gate and its only compliance signal, score as non-compliant
+  // forever with no event explaining why (9 rendered / 0 complied in the
+  // field). These die if `CRITERIA_ITEM_RE` goes back to numbers only.
+  // -------------------------------------------------------------------------
+  it("B-2: parses a dash-bulleted CRITERIA block (a bullet list is compliance, not silence)", () => {
+    const result = parseCriteriaBlock("CRITERIA:\n- parser handles nesting\n- errors point at inner token")
+    expect(result).not.toBeNull()
+    expect(result!.criteria).toEqual(["parser handles nesting", "errors point at inner token"])
+  })
+
+  it("B-2: parses a star-bulleted CRITERIA block", () => {
+    const result = parseCriteriaBlock("CRITERIA:\n* first thing\n* second thing")
+    expect(result).not.toBeNull()
+    expect(result!.criteria).toEqual(["first thing", "second thing"])
+  })
+
+  it("B-2: a mixed numbered/bulleted list does not stop at the first bullet", () => {
+    const result = parseCriteriaBlock("CRITERIA:\n1. numbered first\n- bulleted second\n2. numbered third")
+    expect(result).not.toBeNull()
+    expect(result!.criteria).toEqual(["numbered first", "bulleted second", "numbered third"])
+  })
+
+  it("B-2: bold prose is still not a bullet — `**done**` after the key parses nothing", () => {
+    expect(parseCriteriaBlock("CRITERIA:\n**done** — nothing itemised here")).toBeNull()
+  })
+
+  it("B-2: bullets are capped and redacted like numbered items", () => {
+    const bullets = Array.from({ length: 12 }, (_, i) => `- item ${i + 1}`).join("\n")
+    const result = parseCriteriaBlock(`CRITERIA:\n${bullets}`)
+    expect(result!.truncated).toBe(true)
+    expect(result!.criteria).toHaveLength(10)
+  })
+
+  // -------------------------------------------------------------------------
+  // B-2: a parse miss must be TELLABLE from "the model never answered".
+  // -------------------------------------------------------------------------
+  it("B-2: findCriteriaKeyLine reports the unparseable key line so the miss can be logged", () => {
+    const text = "CRITERIA: everything works\nand then some prose"
+    expect(parseCriteriaBlock(text)).toBeNull()
+    expect(findCriteriaKeyLine(text)).toBe("CRITERIA: everything works")
+  })
+
+  it("B-2: findCriteriaKeyLine returns null when criteria were never mentioned", () => {
+    expect(findCriteriaKeyLine("just some prose, no directive here")).toBeNull()
+  })
+
+  it("B-2: findCriteriaKeyLine ignores a fenced CRITERIA key (same fence rule as the parser)", () => {
+    expect(findCriteriaKeyLine("```\nCRITERIA:\n1. quoted grammar\n```")).toBeNull()
+  })
+
+  it("B-2: findCriteriaKeyLine reports the LAST key line and redacts it", () => {
+    const text = "CRITERIA: first attempt\nprose\nCRITERIA: token sk-abcdefghijklmnopqrstuvwxyz012345"
+    expect(findCriteriaKeyLine(text)).toContain("CRITERIA:")
+    expect(findCriteriaKeyLine(text)).not.toContain("sk-abcdefghijklmnopqrstuvwxyz012345")
   })
 
   it("returns null for an empty/malformed CRITERIA block (no parseable items)", () => {

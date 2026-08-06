@@ -51,6 +51,8 @@ interface Harness {
   storyEngine: StoryEngine
   tools: ReturnType<typeof buildPlanTools>
   phaseEngine: PhaseEngine
+  /** B-2: every `onScopeAmended` callback fired, in order. */
+  scopeAmendments: Array<{ sessionID: string; resolution: string }>
 }
 
 /** Build the whole wiring over one worktree. */
@@ -60,6 +62,7 @@ function boot(root: string): Harness {
   const storyEngine = new StoryEngine({ stateDir, logger })
   const states = new Map<string, V2SessionState>([[SESSION, freshSessionState(root)]])
   const phaseEngine = new PhaseEngine(logger)
+  const scopeAmendments: Array<{ sessionID: string; resolution: string }> = []
   const tools = buildPlanTools({
     storyEngine,
     pinStore: new PinStore({ stateDir, logger }),
@@ -67,8 +70,9 @@ function boot(root: string): Harness {
     states,
     phaseEngine,
     onPlanCreated: () => {},
+    onScopeAmended: (sessionID, resolution) => scopeAmendments.push({ sessionID, resolution }),
   })
-  return { storyEngine, tools, phaseEngine }
+  return { storyEngine, tools, phaseEngine, scopeAmendments }
 }
 
 /** Input shape for `elicify_vertex_plan_create` — each story MUST carry tasks. */
@@ -494,6 +498,7 @@ describe("elicify_vertex_plan_reopen tool", () => {
       "elicify_vertex_plan_next",
       "elicify_vertex_plan_reopen",
       "elicify_vertex_plan_status",
+      "elicify_vertex_scope_amend",
       "elicify_vertex_star",
       "elicify_vertex_star_status",
     ])
@@ -710,5 +715,104 @@ describe("MAJ-1: the plan tools surface an aborted write", () => {
       (await h.tools.elicify_vertex_plan_checkpoint.execute({ taskId: "S1.T2", status: "complete" }, { sessionID: SESSION } as never)) as string,
     ) as { persisted?: boolean }
     expect(out.persisted).toBeUndefined()
+  })
+})
+
+// ===========================================================================
+// B-2 — elicify_vertex_scope_amend: the answer to a scope-watchdog directive.
+//
+// The directive has always offered "fold / amend / revert"; until B-2 none of
+// the three was reachable (`StoryEngine.amendStory` was exposed by no tool)
+// and nothing recorded compliance, which is why the family measured "3
+// rendered, 0 complied" — a structural zero, not a behavioural one.
+// ===========================================================================
+
+describe("elicify_vertex_scope_amend tool (B-2)", () => {
+  async function scopedStory(harness: Harness): Promise<void> {
+    await createStories(harness, [
+      { text: "narrow story", acceptanceItems: ["one"], tasks: [{ text: "a" }], scopeGlobs: ["src/in-scope/**"] },
+    ])
+  }
+
+  async function amend(
+    harness: Harness,
+    args: { resolution: "fold" | "amend" | "revert"; reason: string; scopeGlobs?: string[] },
+  ): Promise<{ scopeGlobs: string[]; amendments: Array<{ reason: string }> }> {
+    const raw = (await harness.tools.elicify_vertex_scope_amend.execute(
+      { storyId: "S1", scopeGlobs: [], ...args },
+      { sessionID: SESSION } as never,
+    )) as string
+    return JSON.parse(raw) as { scopeGlobs: string[]; amendments: Array<{ reason: string }> }
+  }
+
+  it("fold ADDS globs to the story's existing scope and reports compliance", async () => {
+    const harness = boot(temporaryRoot())
+    await scopedStory(harness)
+
+    const out = await amend(harness, { resolution: "fold", reason: "the helper belongs here", scopeGlobs: ["src/helpers/**"] })
+
+    expect(out.scopeGlobs).toEqual(["src/in-scope/**", "src/helpers/**"])
+    expect(harness.scopeAmendments).toEqual([{ sessionID: SESSION, resolution: "fold" }])
+  })
+
+  it("fold does not duplicate a glob the story already declares", async () => {
+    const harness = boot(temporaryRoot())
+    await scopedStory(harness)
+
+    const out = await amend(harness, { resolution: "fold", reason: "already covered", scopeGlobs: ["src/in-scope/**"] })
+
+    expect(out.scopeGlobs).toEqual(["src/in-scope/**"])
+  })
+
+  it("amend REPLACES the declared globs wholesale (the stale-globs case) and reports compliance", async () => {
+    const harness = boot(temporaryRoot())
+    await scopedStory(harness)
+
+    const out = await amend(harness, {
+      resolution: "amend",
+      reason: "branch switched, globs stale",
+      scopeGlobs: ["packages/api/**"],
+    })
+
+    expect(out.scopeGlobs).toEqual(["packages/api/**"])
+    expect(harness.scopeAmendments).toEqual([{ sessionID: SESSION, resolution: "amend" }])
+  })
+
+  it("revert leaves the scope alone, logs the amendment, and still reports compliance", async () => {
+    const harness = boot(temporaryRoot())
+    await scopedStory(harness)
+
+    const out = await amend(harness, { resolution: "revert", reason: "undid the stray edit" })
+
+    expect(out.scopeGlobs).toEqual(["src/in-scope/**"])
+    expect(out.amendments.map((a) => a.reason)).toEqual(["revert: undid the stray edit"])
+    expect(harness.scopeAmendments).toEqual([{ sessionID: SESSION, resolution: "revert" }])
+  })
+
+  it("refuses fold/amend with no globs — an empty list would silently DISABLE the watchdog for that story", async () => {
+    const harness = boot(temporaryRoot())
+    await scopedStory(harness)
+
+    await expect(amend(harness, { resolution: "amend", reason: "no globs given" })).rejects.toThrow(
+      /requires at least one glob/,
+    )
+    await expect(amend(harness, { resolution: "fold", reason: "no globs given" })).rejects.toThrow(
+      /requires at least one glob/,
+    )
+    expect(harness.storyEngine.getPlan(SESSION)?.stories[0].scopeGlobs).toEqual(["src/in-scope/**"])
+    expect(harness.scopeAmendments).toEqual([])
+  })
+
+  it("throws on an unknown story id and records no compliance", async () => {
+    const harness = boot(temporaryRoot())
+    await scopedStory(harness)
+
+    await expect(
+      harness.tools.elicify_vertex_scope_amend.execute(
+        { storyId: "S99", resolution: "revert", reason: "nope", scopeGlobs: [] },
+        { sessionID: SESSION } as never,
+      ),
+    ).rejects.toThrow(/unknown story/)
+    expect(harness.scopeAmendments).toEqual([])
   })
 })

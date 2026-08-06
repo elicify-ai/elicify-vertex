@@ -2052,3 +2052,147 @@ describe("pause judge — verdict decides, and failure is silent", () => {
     expect(nudges).toBe(0)
   })
 })
+
+// ===========================================================================
+// B-2: the two families whose measured compliance was UNDECIDABLE.
+//
+//  - `scope-watchdog` reported "3 rendered, 0 complied" in the field. That 0
+//    was structural: no `recordCompliance(…, "scope-watchdog", …)` call
+//    existed anywhere, so the counter would have read 0 under perfect
+//    compliance too. The directive's "fold / amend / revert" offer also named
+//    three things no tool could do — `StoryEngine.amendStory` was exposed by
+//    nothing.
+//  - `intake-scaffold` reported "9 rendered, 0 complied", and a parse miss
+//    (a `CRITERIA:` line the grammar could not read) was SILENT, so that 0
+//    could not be read as "the model ignored the directive".
+// ===========================================================================
+
+describe("B-2: scope-watchdog compliance is actually recorded", () => {
+  async function planWithScope(hooks: Hooks, sid: string): Promise<string> {
+    const plan = await hooks.tool!.elicify_vertex_plan_create!.execute!(
+      {
+        stories: [
+          {
+            text: "narrow story",
+            acceptanceItems: ["A1"],
+            scopeGlobs: ["src/in-scope/**"],
+            verifiers: [],
+            tasks: [{ text: "do the work" }],
+          },
+        ],
+      } as never,
+      { sessionID: sid } as never,
+    )
+    return (JSON.parse(plan as string) as { stories: Array<{ id: string }> }).stories[0].id
+  }
+
+  function complianceEvents(sid: string) {
+    return readEvents().filter(
+      (e) => e.event_type === "directive_complied" && e.session_id === sid && e.payload.family === "scope-watchdog",
+    )
+  }
+
+  it("logs directive_complied for scope-watchdog when the model folds the file into the story's scope", async () => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "b2-scope-fold-session"
+
+    await activate(hooks, sid, "refactor the auth database migration end to end")
+    const storyId = await planWithScope(hooks, sid)
+    // An edit outside the declared scope — this is what raises the watchdog.
+    await toolAfter(hooks, sid, "edit", { filePath: "src/elsewhere/foo.ts" }, "updated")
+    await transform(hooks, sid)
+    expect(complianceEvents(sid)).toHaveLength(0)
+
+    const result = await hooks.tool!.elicify_vertex_scope_amend!.execute!(
+      { storyId, resolution: "fold", reason: "the helper genuinely belongs to this story", scopeGlobs: ["src/elsewhere/**"] } as never,
+      { sessionID: sid } as never,
+    )
+
+    // Pre-fix this was 0 no matter what the model did.
+    expect(complianceEvents(sid)).toHaveLength(1)
+    expect(JSON.parse(result as string).scopeGlobs).toEqual(["src/in-scope/**", "src/elsewhere/**"])
+  })
+
+  it("records compliance for a revert too — undoing the change is one of the three prescribed answers", async () => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "b2-scope-revert-session"
+
+    await activate(hooks, sid, "refactor the auth database migration end to end")
+    const storyId = await planWithScope(hooks, sid)
+    await hooks.tool!.elicify_vertex_scope_amend!.execute!(
+      { storyId, resolution: "revert", reason: "undid the stray edit to src/elsewhere/foo.ts" } as never,
+      { sessionID: sid } as never,
+    )
+
+    expect(complianceEvents(sid)).toHaveLength(1)
+    // A revert leaves the declared scope alone — it did not need widening.
+    const plan = JSON.parse((await hooks.tool!.elicify_vertex_plan_status!.execute!({} as never, { sessionID: sid } as never)) as string)
+    expect(plan.stories[0].scopeGlobs).toEqual(["src/in-scope/**"])
+    expect(plan.stories[0].amendments).toHaveLength(1)
+  })
+
+  it("the rendered scope-watchdog directive names the tool that resolves it", async () => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "b2-scope-directive-session"
+
+    await activate(hooks, sid, "refactor the auth database migration end to end")
+    await planWithScope(hooks, sid)
+    await toolAfter(hooks, sid, "edit", { filePath: "src/elsewhere/foo.ts" }, "updated")
+    const out = await transform(hooks, sid)
+
+    expect(out.system.join("\n")).toContain("elicify_vertex_scope_amend")
+  })
+})
+
+describe("B-2: an unreadable CRITERIA block is logged instead of vanishing", () => {
+  function parseMisses(sid: string) {
+    return readEvents().filter((e) => e.event_type === "criteria:parse-miss" && e.session_id === sid)
+  }
+
+  it("logs criteria:parse-miss when the model writes a CRITERIA line the grammar cannot read", async () => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "b2-parse-miss-session"
+
+    await activate(hooks, sid, "implement the parser feature")
+    await completeText(hooks, sid, "CRITERIA: it should all just work\n\nOn with the code.")
+
+    // Pre-fix: nothing pinned, nothing logged, and the scaffold re-offered
+    // forever with the compliance count stuck at 0 for no discoverable reason.
+    const misses = parseMisses(sid)
+    expect(misses).toHaveLength(1)
+    expect(misses[0].payload.keyLine).toBe("CRITERIA: it should all just work")
+  })
+
+  it("stays silent when the model simply never mentioned criteria", async () => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "b2-no-criteria-session"
+
+    await activate(hooks, sid, "implement the parser feature")
+    await completeText(hooks, sid, "Here is what I changed and why.")
+
+    expect(parseMisses(sid)).toHaveLength(0)
+  })
+
+  it("a BULLETED answer now pins, records intake-scaffold compliance, and logs no parse miss", async () => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "b2-bullet-criteria-session"
+
+    await activate(hooks, sid, "implement the parser feature")
+    await completeText(hooks, sid, "CRITERIA:\n- parser handles nesting\n- errors point at the inner token")
+
+    expect(parseMisses(sid)).toHaveLength(0)
+    const complied = readEvents().filter(
+      (e) => e.event_type === "directive_complied" && e.session_id === sid && e.payload.family === "intake-scaffold",
+    )
+    expect(complied).toHaveLength(1)
+    // ...and the scaffold stops firing, because the pin store is no longer empty.
+    const out = await transform(hooks, sid)
+    expect(out.system.join("\n")).not.toContain("OUTCOME:")
+  })
+})

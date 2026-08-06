@@ -200,7 +200,15 @@ console.log(`VERTEX_DATA=${dataRoot}  XDG_CONFIG_HOME=${configRoot}`)
 if (section("A. Shipped artefact")) {
   const s = await scenario()
   assert("A1-hooks", typeof s.hooks["chat.message"] === "function" && typeof s.hooks.event === "function")
-  assert("A2-tools", Object.keys(s.hooks.tool ?? {}).length === 8, `${Object.keys(s.hooks.tool ?? {}).length} tools`)
+  // 9. Two tools were added in the same round by separate workstreams, and
+  // BOTH branches independently wrote `8` — so git merged them without a
+  // conflict on the number itself. The real count is 6 plan tools + star +
+  // star_status + scope_amend.
+  //   B-6: `elicify_vertex_star_status` — read-only consent check.
+  //   B-2: `elicify_vertex_scope_amend` — makes the scope-watchdog directive's
+  //        "fold / amend / revert" offer actionable, and its compliance
+  //        measurable at all.
+  assert("A2-tools", Object.keys(s.hooks.tool ?? {}).length === 9, `${Object.keys(s.hooks.tool ?? {}).length} tools`)
   const cfg = { agent: {}, command: {} }
   await s.hooks.config?.(cfg)
   const agents = Object.keys(cfg.agent)

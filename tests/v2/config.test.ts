@@ -145,6 +145,7 @@ describe("applyV2Config", () => {
       states: new Map(),
       phaseEngine: new PhaseEngine(logger),
       onPlanCreated: () => {},
+      onScopeAmended: () => {},
     })
 
     const cfgInput: { command?: Record<string, unknown>; agent?: Record<string, unknown> } = {}
@@ -177,6 +178,7 @@ describe("elicify_vertex_plan_clear tool", () => {
       states: new Map(),
       phaseEngine,
       onPlanCreated: () => {},
+      onScopeAmended: () => {},
     })
     return { tools, storyEngine, pinStore }
   }
