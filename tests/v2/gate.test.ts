@@ -1346,8 +1346,14 @@ describe("handleVerifierAudit — verdict reconciliation", () => {
   // IT: `pass: true` with no items, produced without a single tool call.
   // `isVerifierVerdictShape` accepts it (`[].every(...)` is vacuously true), so
   // only this guard stops it satisfying the plan-complete claim.
+  // `maxStoryReaudits: 1` (here and in the three tests below): an ANSWERLESS
+  // stamp — `unapplied:"unverified"` with no items — is retried until the cap
+  // now, so the escalation is reached when the cap binds rather than on the
+  // idle after the first bound round. The fixture's default cap of 999 would
+  // mean 999 retries before anything is said. The behaviour under test is
+  // unchanged; only the number of rounds it takes to get there is.
   it("MAJ-3: an unobserved pass:true with no items does NOT count toward the close-out", async () => {
-    const h = harness({ verifierEnabled: true })
+    const h = harness({ verifierEnabled: true, maxStoryReaudits: 1 })
     const sid = "s1"
     const state = quietSession(h, sid)
     state.modelId = "anthropic/claude-opus-4"
@@ -1458,7 +1464,7 @@ describe("handleVerifierAudit — verdict reconciliation", () => {
   })
 
   it("C2: a plan settled only by unapplied stamps does NOT get the independently-verified close-out", async () => {
-    const h = harness({ verifierEnabled: true })
+    const h = harness({ verifierEnabled: true, maxStoryReaudits: 1 })
     const sid = "s1"
     const state = quietSession(h, sid)
     state.modelId = "anthropic/claude-opus-4"
@@ -1491,7 +1497,7 @@ describe("handleVerifierAudit — verdict reconciliation", () => {
   // the exact outcome the escalation exists to prevent. A surviving mutant
   // showed the reset had no test.
   it("MAJ-4: a second unaudited plan in the same session still escalates", async () => {
-    const h = harness({ verifierEnabled: true })
+    const h = harness({ verifierEnabled: true, maxStoryReaudits: 1 })
     const sid = "s1"
     const state = quietSession(h, sid)
     state.modelId = "anthropic/claude-opus-4"
@@ -1528,7 +1534,7 @@ describe("handleVerifierAudit — verdict reconciliation", () => {
   // dispatch burned the single escalation and the run went silent — the
   // outcome the branch exists to prevent.
   it("MAJ-4: a stall-paused escalation is not counted as spent", async () => {
-    const h = harness({ verifierEnabled: true, maxNoProgressTurns: 1 })
+    const h = harness({ verifierEnabled: true, maxNoProgressTurns: 1, maxStoryReaudits: 1 })
     const sid = "s1"
     const state = quietSession(h, sid)
     state.modelId = "anthropic/claude-opus-4"
@@ -1986,6 +1992,279 @@ describe("handleVerifierAudit — an answerless round still bounds the story", (
     const said = continuations(h.prompt).map((c) => c.text).join("\n")
     expect(said, "a capped story was audited — calling it unverified would be false").toContain("DISPUTED")
     expect(escalations(h)).toHaveLength(1)
+  })
+})
+
+// ===========================================================================
+// ...AND THE BOUND MUST NOT BE A LIFE SENTENCE (sign-off review, 2026-08-06).
+//
+// The fix above over-corrected. A bounded story's ONLY route back into the
+// audit set was `verdictOutdatedByEdits`, which requires a file mutation
+// landing after `verifiedAt` — and at plan end nothing edits files. Measured
+// on that build, verifier broken on call 1 and healthy from call 2, 6 idles,
+// no edits: ONE subturn, `storyReaudits.S1 = 1` against a cap of 3, the stamp
+// frozen at `unverified` and the escalation fired immediately. The healthy
+// verifier was never consulted once. The same shape condemned a story the
+// verifier merely DEFERRED — named in round 2, stamped and escalated after
+// round 1.
+//
+// So: an ANSWERLESS bound (no verdict / story not named / insufficient
+// evidence) is re-asked on the next idle with no edit required, until the cap
+// binds. An ANSWER — substantiated or not — is not re-asked, because re-asking
+// an answer is the standoff this whole area exists to end.
+// ===========================================================================
+describe("handleVerifierAudit — an answerless bound is retried, not frozen", () => {
+  const escalations = (h: ReturnType<typeof harness>): string[] =>
+    continuations(h.prompt).map((c) => c.text).filter((t) => t.includes("did not pass") && t.includes("audit"))
+
+  /** Idle N times with NOTHING changed in between — the plan-end shape, where
+   * the model has stopped editing and only the harness is still running. */
+  async function quietIdles(
+    h: ReturnType<typeof harness>,
+    sid: string,
+    state: ReturnType<typeof freshSessionState>,
+    rounds: number,
+  ): Promise<void> {
+    for (let i = 0; i < rounds; i++) {
+      state.idleContinuationInFlight = false
+      await handleSessionIdle(h.ctx, sid)
+    }
+  }
+
+  it("consults a verifier that recovered on the next call, with no edit in between", async () => {
+    const h = harness({ verifierEnabled: true, maxStoryReaudits: 3 })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid)
+    // `stubVerifier` serialises this object at CALL time, so mutating it
+    // between rounds is how the verifier "recovers". `{}` has no `stories`
+    // array, which is the malformed/no-verdict shape.
+    const verdict: { stories?: unknown[] } = {}
+    stubVerifier(h, verdict)
+
+    await quietIdles(h, sid, state, 1) // the blip: one answerless round
+    expect(h.storyEngine.getPlan(sid)!.stories[0].verifier?.unapplied, "the blip is bounded").toBe("unverified")
+
+    verdict.stories = [{ storyId: "S1", pass: true, summary: "delivered", items: [{ itemId: "A1", met: true, note: "read it" }] }]
+    await quietIdles(h, sid, state, 5)
+
+    // THE POINT: no file moved, and the healthy verifier was still asked.
+    const stamp = h.storyEngine.getPlan(sid)!.stories[0].verifier!
+    expect(stamp.unapplied, "a recovered verifier's verdict must replace the bookkeeping stamp").toBeUndefined()
+    expect(stamp.pass).toBe(true)
+    expect(escalations(h), "a story that was verified in the end must not be reported as unverified").toHaveLength(0)
+    // ...and once it passes, the retry stops: 1 blip + 1 recovery, not 6.
+    expect(verifierSubturns(h), "a clean pass is terminal — the retry must not keep running").toBe(2)
+  })
+
+  it("re-asks about a story the verifier DEFERRED rather than escalating it after one round", async () => {
+    const h = harness({ verifierEnabled: true, maxStoryReaudits: 3 })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    h.storyEngine.createPlan(sid, [
+      { text: "Research wave", acceptanceItems: ["x.md cites sources"], scopeGlobs: [], verifiers: [], tasks: [{ text: "write it" }] },
+      { text: "Chart wave", acceptanceItems: ["chart renders"], scopeGlobs: [], verifiers: [], tasks: [{ text: "build it" }] },
+    ])
+    h.storyEngine.checkpoint(sid, "S1.T1", "complete")
+    h.storyEngine.checkpoint(sid, "S2.T1", "complete")
+    // Round 1 answers about S1 only; from round 2 the verifier answers about
+    // both. A deferral is not a refusal.
+    const s1Verdict = { storyId: "S1", pass: true, summary: "delivered", items: [{ itemId: "A1", met: true, note: "read it" }] }
+    const s2Verdict = { storyId: "S2", pass: true, summary: "renders", items: [{ itemId: "A1", met: true, note: "opened it" }] }
+    const verdict: { stories: unknown[] } = { stories: [s1Verdict] }
+    stubVerifier(h, verdict)
+
+    await quietIdles(h, sid, state, 1)
+    expect(h.storyEngine.getPlan(sid)!.stories[1].verifier?.unapplied, "round 1 leaves S2 bounded").toBe("unverified")
+
+    verdict.stories = [s1Verdict, s2Verdict]
+    await quietIdles(h, sid, state, 3)
+
+    const s2 = h.storyEngine.getPlan(sid)!.stories[1]
+    expect(s2.verifier?.unapplied, "the deferred story must get the verdict it was eventually given").toBeUndefined()
+    expect(s2.verifier?.pass).toBe(true)
+    expect(escalations(h), "a story that WAS answered about must never be escalated as unverified").toHaveLength(0)
+  })
+
+  // The other side of the same coin: the retry is bounded by the cap and by
+  // nothing else, and it costs exactly one subturn per round — no double
+  // charge from having two selection reasons (retry AND staleness) true at once.
+  it("a permanently verdictless verifier costs exactly the cap, then escalates once — with no edits", async () => {
+    const h = harness({ verifierEnabled: true, maxStoryReaudits: 3 })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid)
+    stubVerifier(h, "not a verdict at all")
+
+    await quietIdles(h, sid, state, 8)
+
+    expect(verifierSubturns(h), "a cap of 3 buys 3 rounds, not 8 and not 1").toBe(3)
+    expect(state.storyReaudits.S1, "one bump per round — never two").toBe(3)
+    expect(escalations(h), "the harness must say it, and say it once").toHaveLength(1)
+  })
+
+  it("a permanently unanswered story costs exactly the cap, then escalates once — with no edits", async () => {
+    const h = harness({ verifierEnabled: true, maxStoryReaudits: 3 })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    h.storyEngine.createPlan(sid, [
+      { text: "Research wave", acceptanceItems: ["x.md cites sources"], scopeGlobs: [], verifiers: [], tasks: [{ text: "write it" }] },
+      { text: "Chart wave", acceptanceItems: ["chart renders"], scopeGlobs: [], verifiers: [], tasks: [{ text: "build it" }] },
+    ])
+    h.storyEngine.checkpoint(sid, "S1.T1", "complete")
+    h.storyEngine.checkpoint(sid, "S2.T1", "complete")
+    stubVerifier(h, {
+      stories: [{ storyId: "S1", pass: true, summary: "delivered", items: [{ itemId: "A1", met: true, note: "read it" }] }],
+    })
+
+    await quietIdles(h, sid, state, 8)
+
+    expect(verifierSubturns(h), "the unanswered story buys 3 rounds, not one per idle").toBe(3)
+    expect(state.storyReaudits.S2).toBe(3)
+    expect(escalations(h)).toHaveLength(1)
+    expect(escalations(h)[0], "and it names the story nobody judged").toContain("S2")
+  })
+
+  // AN ANSWER IS NOT RE-ASKED. The retry keys on the answerless shape
+  // (`unverified` with NO items); a verdict that named items was an answer the
+  // harness declined, and re-running the verifier against it is the standoff.
+  it("does not re-ask about an unsubstantiated verdict that actually named items", async () => {
+    const h = harness({ verifierEnabled: true, maxStoryReaudits: 3 })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    h.storyEngine.createPlan(sid, [
+      {
+        text: "Research wave",
+        acceptanceItems: ["x.md cites sources", "x.md has a summary"],
+        scopeGlobs: [],
+        verifiers: [],
+        tasks: [{ text: "write it" }],
+      },
+    ])
+    h.storyEngine.checkpoint(sid, "S1.T1", "complete")
+    // A pass that judged only ONE of the two declared items: an answer, and an
+    // unsubstantiated one. Bounded, and NOT retried.
+    stubVerifier(h, {
+      stories: [{ storyId: "S1", pass: true, summary: "looks done", items: [{ itemId: "A1", met: true, note: "cited" }] }],
+    })
+
+    await quietIdles(h, sid, state, 4)
+
+    expect(verifierSubturns(h), "an answer is not re-asked — one audit, then the escalation").toBe(1)
+    expect(h.storyEngine.getPlan(sid)!.stories[0].verifier?.unapplied).toBe("unverified")
+    expect(escalations(h)).toHaveLength(1)
+  })
+
+  // =========================================================================
+  // THE CLOSE-OUT CLAUSE HAD NO TEST. Deleting
+  // `&& story.verifier.unapplied === undefined` from `allPassed` survived all
+  // 1843 unit tests and all 54 UAT assertions. It is the only thing standing
+  // between a bounding stamp and the harness telling the user that the
+  // verifier "independently verified every story of the plan".
+  //
+  // The exploit is two rounds: an unsubstantiated `pass:true` bound in round 1
+  // (the stamp keeps `pass: true`, because `pass` reports what the verifier
+  // SAID), then any clean sibling pass in round 2 to reach the close-out
+  // branch at all. Without the clause the plan closes as fully audited.
+  // =========================================================================
+  it("MAJ-3b: a bounded pass:true from an earlier round cannot buy the independently-verified close-out", async () => {
+    const h = harness({ verifierEnabled: true, maxStoryReaudits: 3 })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    h.storyEngine.createPlan(sid, [
+      {
+        text: "Research wave",
+        acceptanceItems: ["x.md cites sources", "x.md has a summary"],
+        scopeGlobs: [],
+        verifiers: [],
+        tasks: [{ text: "write it" }],
+      },
+      { text: "Chart wave", acceptanceItems: ["chart renders"], scopeGlobs: [], verifiers: [], tasks: [{ text: "build it" }] },
+    ])
+    // Round 1 audits S1 alone (S2 is not complete yet). `pass:true` judging
+    // one of two declared items: unsubstantiated, so it is bounded — but the
+    // stamp still carries `pass: true`.
+    h.storyEngine.checkpoint(sid, "S1.T1", "complete")
+    const verdict: { stories: unknown[] } = {
+      stories: [{ storyId: "S1", pass: true, summary: "looks done", items: [{ itemId: "A1", met: true, note: "cited" }] }],
+    }
+    stubVerifier(h, verdict)
+    await quietIdles(h, sid, state, 1)
+
+    const s1 = h.storyEngine.getPlan(sid)!.stories[0].verifier!
+    expect(s1.unapplied, "the exploit needs a BOUNDED stamp").toBe("unverified")
+    expect(s1.pass, "...that nonetheless says pass:true — otherwise this proves nothing").toBe(true)
+
+    // Round 2: S2 completes and the verifier passes it cleanly. The plan is
+    // now settled with every stamp reading `pass: true`.
+    h.storyEngine.checkpoint(sid, "S2.T1", "complete")
+    verdict.stories = [{ storyId: "S2", pass: true, summary: "renders", items: [{ itemId: "A1", met: true, note: "opened it" }] }]
+    await quietIdles(h, sid, state, 1)
+
+    const said = continuations(h.prompt).map((c) => c.text).join("\n")
+    expect(
+      said,
+      "a stamp the harness refused to act on must never be laundered into 'the verifier independently verified every story'",
+    ).not.toContain("independently verified")
+
+    // And the honest report is still made: S1 is named as unverified.
+    await quietIdles(h, sid, state, 1)
+    expect(escalations(h), "silence is not an acceptable substitute for the false close-out").toHaveLength(1)
+    expect(escalations(h)[0]).toContain("S1")
+  })
+
+  // =========================================================================
+  // ONCE MEANS ONCE. The guard keyed on `plan.revision`, which `persistPlan`
+  // bumps on EVERY plan write — including the bounding stamps the escalation
+  // is about. So any round that re-stamped the story minted a fresh key and
+  // the guard re-opened. Reproduced below as the live loop: the harness
+  // escalates, the model re-checkpoints the story it was told about, the
+  // re-audit bounds it again, and the identical escalation is repeated.
+  // =========================================================================
+  it("says it ONCE per unaudited set, even when the plan is written again", async () => {
+    const h = harness({ verifierEnabled: true, maxStoryReaudits: 1 })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid)
+    stubVerifier(h, "not a verdict at all")
+
+    await quietIdles(h, sid, state, 2) // round 1 bounds at the cap, round 2 escalates
+    expect(escalations(h), "the first escalation must happen, or the bound below is 0 <= 1").toHaveLength(1)
+
+    // (a) The operator does exactly what the harness's own health message
+    // tells them to — "resolve it or amend the story". An amendment writes the
+    // plan and resolves nothing, so the unaudited set is untouched.
+    h.storyEngine.amendStory(sid, "S1", { reason: "clarified the acceptance item" })
+    await quietIdles(h, sid, state, 2)
+    expect(escalations(h), "an amendment is a plan write, not a new situation").toHaveLength(1)
+
+    // (b) ...and the model re-opens the story for another audit. That stamps a
+    // fresh `completedAt`, so the story goes back through the verifier (past
+    // the cap — the re-claim path has no cap check), comes back answerless
+    // again, and the plan is written twice more. Same story, same reason, same
+    // sentence.
+    h.storyEngine.reopenStory(sid, "S1", { reason: "another go" })
+    await quietIdles(h, sid, state, 3)
+    expect(verifierSubturns(h), "the re-opened story really was re-audited, or (b) proves nothing").toBeGreaterThan(1)
+
+    expect(
+      escalations(h),
+      "the same sentence about the same unresolved story, repeated, is the standoff — not a report",
+    ).toHaveLength(1)
   })
 })
 

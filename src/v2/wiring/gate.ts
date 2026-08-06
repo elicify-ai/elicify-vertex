@@ -1135,9 +1135,9 @@ function boundUnappliedVerdicts(
  * a new enum member, so no persisted plan schema changes.
  *
  * NOT "retry until the cap, then stamp": a stamp is what makes the cap
- * readable at all. Retries still happen — `verdictOutdatedByEdits` re-audits a
- * bounding stamp whenever the code moves, up to the cap — so a transient
- * outage recovers, and a permanent one terminates.
+ * readable at all. The retries happen anyway — `answerlessRoundRetryable`
+ * puts this stamp straight back into the audit set on the next idle, up to
+ * the cap — so a transient outage recovers, and a permanent one terminates.
  */
 function boundAnswerlessRound(
   ctx: GateContext,
@@ -1322,6 +1322,52 @@ function verdictIsSubstantiated(v: VerifierStoryVerdict, story?: StoryV2): boole
 }
 
 /**
+ * AN ANSWERLESS BOUND IS A PAUSE, NOT A VERDICT (sign-off review, 2026-08-06).
+ *
+ * `boundAnswerlessRound` stamps a story the verifier did not answer about, so
+ * the `!story.verifier` selector stops re-picking it forever. The first cut of
+ * that made the stamp TERMINAL: the only route back into the audit set was
+ * `verdictOutdatedByEdits`, which requires a file mutation landing AFTER
+ * `verifiedAt`. At plan end nothing edits files, so ONE verifier blip froze
+ * the story `unverified` for the rest of the run. Measured on that build —
+ * verifier broken on call 1, healthy from call 2, 6 idles, no edits: 1
+ * subturn, `storyReaudits.S1 = 1` against a cap of 3, stamp frozen, the
+ * escalation fired immediately and the healthy verifier was never consulted.
+ * The same shape bound a story the verifier merely DEFERRED: a two-story audit
+ * answered about S1 in round 1 and about both from round 2 stamped and
+ * escalated S2 after a single round, never re-asking.
+ *
+ * So an answerless stamp re-enters the audit set on the next idle with no edit
+ * required, until the cap binds — and then, and only then, the escalation
+ * speaks. The cap is the terminator; the stamp is bookkeeping.
+ *
+ * WHAT COUNTS AS ANSWERLESS: `unapplied: "unverified"` with NO items. That is
+ * exactly what `boundAnswerlessRound` writes for all three answerless exits
+ * (no verdict / story not named / `insufficient-evidence`), and it is also the
+ * shape of a verdict that arrived carrying nothing at all — which is no more
+ * of an answer than silence, and which `verdictIsSubstantiated` already treats
+ * identically. Everything else stays terminal, deliberately:
+ *  - a SUBSTANTIATED verdict is an answer; answers get applied, not re-asked;
+ *  - an unsubstantiated verdict that still NAMED items is an answer the
+ *    harness refused — re-asking it is the standoff, not the cure;
+ *  - `"contradictory"` (FR-005) cannot reach this shape: its branch requires
+ *    `items.length > 0`;
+ *  - `"capped"` IS the terminal state and must never re-open.
+ */
+function answerlessRoundRetryable(ctx: GateContext, state: V2SessionState, story: StoryV2): boolean {
+  const stamp = story.verifier
+  if (!stamp || stamp.unapplied !== "unverified" || stamp.items.length > 0) return false
+  // THE CAP BINDS, exactly as it does for staleness, and it is charged by the
+  // same counter — so a retried round costs one bump and the round is never
+  // double-billed. `ctx.maxStoryReaudits > 0` FIRST: `<= 0` is the documented
+  // way to disable the CAP (GateContext doc, CR-15), not the retry — the trap
+  // MAJ-005 caught in `verdictOutdatedByEdits`, where `0` silently turned the
+  // feature off instead of its bound.
+  if (ctx.maxStoryReaudits > 0 && reaudits(state, story.id) >= ctx.maxStoryReaudits) return false
+  return true
+}
+
+/**
  * Has the code moved since this verdict was formed?
  *
  * A verdict is a SNAPSHOT. The only freshness test used to be
@@ -1394,10 +1440,24 @@ async function emitUnauditedEscalation(
   const unaudited = [...unverified, ...disputed].map((story) => story.id)
   if (unaudited.length === 0) return false
 
-  // FIX 2: speak once per unresolved SET, not once per turn. Every
-  // continuation starts a turn, so a per-turn guard let this repeat forever
-  // against a state nothing could move.
-  const signature = `${plan.revision ?? 0}:${unaudited.join(",")}`
+  // Speak once per unresolved SET, not once per turn. Every continuation
+  // starts a turn, so a per-turn guard let this repeat forever against a state
+  // nothing could move.
+  //
+  // THE SIGNATURE MUST NOT MOVE ON ITS OWN. It used to lead with
+  // `plan.revision` — and `revision` is bumped by every single plan write
+  // (`persistPlan`), which includes every bounding stamp this escalation is
+  // ABOUT. So any round that re-stamped a story minted a fresh key and the
+  // "once" guard re-opened: measured at 2 identical escalations from
+  // alternating audit-idle / quiet-idle rounds with edits between them. The
+  // key is now the unresolved set and how it is CLASSIFIED — which is exactly
+  // what the message below says — so an escalation repeats only when its own
+  // content would differ (a story moving from unverified to disputed, say),
+  // and never merely because the plan was written again.
+  //
+  // A second plan reusing the same story ids is re-armed at the audit selector
+  // (`handleVerifierAudit`), where a story with no stamp at all clears the flag.
+  const signature = `unverified=${unverified.map((s2) => s2.id).join(",")};disputed=${disputed.map((s2) => s2.id).join(",")}`
   if (state.unauditedEscalatedFor === signature) return false
   ctx.logger("verifier:unaudited-escalation", { sessionID: sid, stories: unaudited })
   const clauses: string[] = []
@@ -1440,6 +1500,9 @@ async function handleVerifierAudit(ctx: GateContext, sid: string, state: V2Sessi
       story.status === "complete" &&
       (!story.verifier ||
         (story.completedAt !== undefined && story.verifier.verifiedAt < story.completedAt) ||
+        // Nobody has answered about this story yet — ask again, no edit
+        // required, until the cap says stop.
+        answerlessRoundRetryable(ctx, state, story) ||
         // The code moved under the verdict — re-audit rather than re-litigate.
         verdictOutdatedByEdits(ctx, sid, state, story)),
   )
@@ -1447,6 +1510,16 @@ async function handleVerifierAudit(ctx: GateContext, sid: string, state: V2Sessi
   // verdict and the revert path bumps once per failing one, so counting the
   // selection too would double-charge a staleness re-audit and halve the
   // effective cap. The selector's job is to READ the cap, not to charge it.
+
+  // RE-ARM THE ESCALATION on a genuinely new situation. The once-only flag is
+  // keyed by the unresolved SET (see `emitUnauditedEscalation`), and a session
+  // can legitimately run a SECOND plan whose unaudited stories carry the same
+  // ids as the first one's — same key, so the second plan would end in the
+  // silence the escalation exists to prevent (MAJ-4). A story with no stamp at
+  // all has never been audited by anything, which is the one unambiguous
+  // marker of "this is not the state I already spoke about". It cannot collide
+  // with the escalation itself: that runs only when this list is EMPTY.
+  if (unverifiedStories.some((story) => !story.verifier)) state.unauditedEscalatedFor = null
   if (unverifiedStories.length === 0) return emitUnauditedEscalation(ctx, sid, state, plan)
 
   const [providerID, ...rest] = state.modelId.split("/")

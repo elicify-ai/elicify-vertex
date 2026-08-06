@@ -536,8 +536,24 @@ if (section("L. Answerless audit rounds")) {
   // cap 3: 8 subturns over 8 rounds, `storyReaudits` at 7-8, no stamp, and —
   // the part that matters — NOT ONE WORD to the user about work that was never
   // verified.
+  // EXACT COUNTS, NOT CEILINGS (sign-off review). Every count below used to be
+  // `<= 3`, which is also satisfied by the verifier never running at all —
+  // i.e. by the over-correction this section now guards against as well. And
+  // the "told once" assertions were vacuous: the scenarios ended with the plan
+  // untouched after the cap bound, so nothing ever ATTEMPTED a second
+  // escalation and disabling the once-guard still measured 1. Each of them now
+  // writes the plan again (via the model-facing `plan_reopen`) and keeps
+  // idling, which is what the guard is for.
   const planStories = async (s) => JSON.parse(await s.hooks.tool.elicify_vertex_plan_status.execute({}, { sessionID: s.sid })).stories
   const escalations = (s) => s.sent().filter((t) => t.includes("did not pass") && t.includes("audit"))
+  /** The bookkeeping stamp's full shape — a refusal must never read as a pass. */
+  const isAnswerlessStamp = (v) => v?.unapplied === "unverified" && v?.pass === false && Array.isArray(v?.items) && v.items.length === 0
+  /** Write the plan again without resolving anything, then idle. The guard's
+   * key used to be `plan.revision`, so any plan write re-opened it. */
+  const rewritePlanAndIdle = async (s, storyId, rounds) => {
+    await s.hooks.tool.elicify_vertex_plan_reopen.execute({ storyId, reason: "another go" }, { sessionID: s.sid })
+    for (let i = 0; i < rounds; i++) await s.idle()
+  }
 
   // L1-L3: the verifier is broken from the FIRST call, so no round ever stamps.
   let l1calls = 0
@@ -558,15 +574,24 @@ if (section("L. Answerless audit rounds")) {
     await l1.idle()
     await l1.tool("edit", { filePath: join(l1.work, `broken${i}.ts`) })
   }
-  assert("L1-verdictless-rounds-are-capped", l1calls <= 3, `${l1calls} verifier subturns over 8 edit+idle rounds`)
+  assert("L1-verdictless-rounds-are-capped", l1calls === 3, `${l1calls} verifier subturns over 8 edit+idle rounds (cap 3)`)
   assert(
     "L2-verdictless-round-stamps-the-story",
-    (await planStories(l1))?.[0]?.verifier?.unapplied === "unverified",
+    isAnswerlessStamp((await planStories(l1))?.[0]?.verifier),
     JSON.stringify((await planStories(l1))?.[0]?.verifier ?? null),
   )
   // The harness must SPEAK — once. Silence about unverified work is the worse
-  // half of this defect: the storm at least told the user something.
+  // half of this defect: the storm at least told the user something. The
+  // re-open below is the non-vacuous half: it re-audits the story, bounds it
+  // again and writes the plan twice more, which is exactly what used to mint a
+  // fresh key for the once-guard and repeat the identical sentence.
   assert("L3-user-is-told-exactly-once", escalations(l1).length === 1, `${escalations(l1).length} escalations`)
+  await rewritePlanAndIdle(l1, "S1", 3)
+  assert(
+    "L3b-a-plan-write-does-not-buy-a-second-escalation",
+    escalations(l1).length === 1,
+    `${escalations(l1).length} escalations after re-opening and re-auditing the same story`,
+  )
 
   // L4-L5: a PARTIAL answer. The verdict names S1 and never mentions S2, on
   // every round. The old code only handled the all-or-nothing case, so S2 was
@@ -596,11 +621,20 @@ if (section("L. Answerless audit rounds")) {
     await l4.idle()
     await l4.tool("edit", { filePath: join(l4.work, `partial${i}.ts`) })
   }
-  assert("L4-unanswered-story-is-capped", l4calls <= 3, `${l4calls} verifier subturns over 8 edit+idle rounds`)
+  assert("L4-unanswered-story-is-capped", l4calls === 3, `${l4calls} verifier subturns over 8 edit+idle rounds (cap 3)`)
   assert(
     "L5-unanswered-story-is-named-once",
     escalations(l4).length === 1 && escalations(l4)[0].includes("S2"),
     `${escalations(l4).length} escalations: ${escalations(l4)[0]?.slice(0, 90) ?? ""}`,
+  )
+  // The answered story keeps its real verdict; the unanswered one is stamped
+  // as never judged. Silence must not read as a pass anywhere.
+  assert(
+    "L5b-the-two-stories-are-stamped-differently",
+    (await planStories(l4))?.[0]?.verifier?.unapplied === undefined &&
+      (await planStories(l4))?.[0]?.verifier?.pass === true &&
+      isAnswerlessStamp((await planStories(l4))?.[1]?.verifier),
+    JSON.stringify((await planStories(l4))?.map((s) => s.verifier ?? null) ?? null).slice(0, 220),
   )
 
   // L6-L8: `insufficient-evidence` — B-3 (d)'s refusal, decided BEFORE any
@@ -648,13 +682,136 @@ if (section("L. Answerless audit rounds")) {
   )
   assert(
     "L7-unjudgeable-story-is-stamped",
-    (await planStories(l6))?.[0]?.verifier?.unapplied === "unverified",
+    isAnswerlessStamp((await planStories(l6))?.[0]?.verifier),
     JSON.stringify((await planStories(l6))?.[0]?.verifier ?? null),
   )
   assert(
     "L8-cannot-verify-is-not-never-speak-again",
     escalations(l6).length === 1,
     `${escalations(l6).length} escalations — 0 means the harness went silent about unverified work`,
+  )
+  await rewritePlanAndIdle(l6, "S1", 3)
+  assert(
+    "L8b-still-once-after-the-plan-is-written-again",
+    escalations(l6).length === 1,
+    `${escalations(l6).length} escalations after re-opening the same unverifiable story`,
+  )
+
+  // ==========================================================================
+  // L9-L11: THE BOUND MUST NOT BE A LIFE SENTENCE.
+  //
+  // The first cut of L1-L8 over-corrected: a bounded story's only route back
+  // into the audit set was a file edit landing after the stamp, and at plan end
+  // nothing edits files. One verifier blip therefore froze a story `unverified`
+  // for the rest of the run — measured at 1 subturn against a cap of 3, with a
+  // healthy verifier standing right there and never being asked.
+  // ==========================================================================
+  let l9calls = 0
+  const l9 = await scenario({
+    subturn: (agent) => {
+      if (agent !== "vertex-verifier") return undefined
+      l9calls++
+      // Broken on the FIRST call only. Every later call is a clean, fully
+      // substantiated pass.
+      return l9calls === 1
+        ? "not a verdict at all"
+        : '{"stories":[{"storyId":"S1","pass":true,"summary":"delivered","items":[{"itemId":"A1","met":true,"note":"read it"}]}]}'
+    },
+  })
+  await l9.say("/elicify-vertex\n\nbuild the research portal")
+  await l9.hooks.tool.elicify_vertex_plan_create.execute(
+    { stories: [{ text: "Ship", acceptanceItems: ["A1"], scopeGlobs: [], verifiers: [], tasks: [{ text: "do" }] }] },
+    { sessionID: l9.sid },
+  )
+  await l9.hooks.tool.elicify_vertex_plan_checkpoint.execute({ taskId: "S1.T1", status: "complete" }, { sessionID: l9.sid })
+  // NO EDITS ANYWHERE IN THIS LOOP. That is the whole point: the model has
+  // finished, the plan is claimed, and only the harness is still running.
+  for (let i = 0; i < 6; i++) await l9.idle()
+  assert(
+    "L9-a-recovered-verifier-is-consulted-without-an-edit",
+    (await planStories(l9))?.[0]?.verifier?.unapplied === undefined && (await planStories(l9))?.[0]?.verifier?.pass === true,
+    JSON.stringify((await planStories(l9))?.[0]?.verifier ?? null).slice(0, 200),
+  )
+  assert(
+    "L9b-the-retry-stops-at-the-verdict-and-says-nothing-false",
+    l9calls === 2 && escalations(l9).length === 0,
+    `${l9calls} subturns (1 blip + 1 recovery), ${escalations(l9).length} escalations`,
+  )
+
+  // L10: a DEFERRED story — named from round 2, not round 1 — must be re-asked
+  // rather than stamped and escalated after a single round.
+  let l10calls = 0
+  const l10 = await scenario({
+    subturn: (agent) => {
+      if (agent !== "vertex-verifier") return undefined
+      l10calls++
+      const s1 = '{"storyId":"S1","pass":true,"summary":"delivered","items":[{"itemId":"A1","met":true,"note":"read it"}]}'
+      const s2 = '{"storyId":"S2","pass":true,"summary":"renders","items":[{"itemId":"A1","met":true,"note":"opened it"}]}'
+      return l10calls === 1 ? `{"stories":[${s1}]}` : `{"stories":[${s1},${s2}]}`
+    },
+  })
+  await l10.say("/elicify-vertex\n\nbuild the research portal")
+  await l10.hooks.tool.elicify_vertex_plan_create.execute(
+    {
+      stories: [
+        { text: "Research", acceptanceItems: ["A1"], scopeGlobs: [], verifiers: [], tasks: [{ text: "do" }] },
+        { text: "Chart", acceptanceItems: ["A1"], scopeGlobs: [], verifiers: [], tasks: [{ text: "draw" }] },
+      ],
+    },
+    { sessionID: l10.sid },
+  )
+  await l10.hooks.tool.elicify_vertex_plan_checkpoint.execute({ taskId: "S1.T1", status: "complete" }, { sessionID: l10.sid })
+  await l10.hooks.tool.elicify_vertex_plan_checkpoint.execute({ taskId: "S2.T1", status: "complete" }, { sessionID: l10.sid })
+  for (let i = 0; i < 6; i++) await l10.idle()
+  assert(
+    "L10-a-deferred-story-is-re-asked-not-condemned",
+    (await planStories(l10))?.[1]?.verifier?.unapplied === undefined &&
+      (await planStories(l10))?.[1]?.verifier?.pass === true &&
+      escalations(l10).length === 0,
+    `S2=${JSON.stringify((await planStories(l10))?.[1]?.verifier ?? null).slice(0, 140)}, ${escalations(l10).length} escalations`,
+  )
+
+  // L11: the close-out's `unapplied === undefined` clause. Deleting it survived
+  // the entire unit suite AND every UAT assertion — and it is what stops a
+  // bounding stamp (which keeps `pass` as the verifier SAID it) from satisfying
+  // "the verifier independently verified every story of the plan".
+  let l11calls = 0
+  const l11 = await scenario({
+    subturn: (agent) => {
+      if (agent !== "vertex-verifier") return undefined
+      l11calls++
+      // Round 1: a `pass:true` for S1 that judged only 1 of its 2 declared
+      // acceptance items — unsubstantiated, so it is BOUNDED with pass:true.
+      // Round 2: a clean, complete pass for S2, which settles the plan.
+      return l11calls === 1
+        ? '{"stories":[{"storyId":"S1","pass":true,"summary":"looks done","items":[{"itemId":"A1","met":true,"note":"cited"}]}]}'
+        : '{"stories":[{"storyId":"S2","pass":true,"summary":"renders","items":[{"itemId":"A1","met":true,"note":"opened it"}]}]}'
+    },
+  })
+  await l11.say("/elicify-vertex\n\nbuild the research portal")
+  await l11.hooks.tool.elicify_vertex_plan_create.execute(
+    {
+      stories: [
+        { text: "Research", acceptanceItems: ["A1", "A2"], scopeGlobs: [], verifiers: [], tasks: [{ text: "do" }] },
+        { text: "Chart", acceptanceItems: ["A1"], scopeGlobs: [], verifiers: [], tasks: [{ text: "draw" }] },
+      ],
+    },
+    { sessionID: l11.sid },
+  )
+  await l11.hooks.tool.elicify_vertex_plan_checkpoint.execute({ taskId: "S1.T1", status: "complete" }, { sessionID: l11.sid })
+  await l11.idle()
+  await l11.hooks.tool.elicify_vertex_plan_checkpoint.execute({ taskId: "S2.T1", status: "complete" }, { sessionID: l11.sid })
+  await l11.idle()
+  await l11.idle()
+  assert(
+    "L11-a-bounded-pass-cannot-close-the-plan-as-audited",
+    !l11.sent().some((t) => t.includes("independently verified")),
+    `S1=${JSON.stringify((await planStories(l11))?.[0]?.verifier ?? null).slice(0, 150)}`,
+  )
+  assert(
+    "L11b-and-the-unverified-story-is-named-instead",
+    escalations(l11).length === 1 && escalations(l11)[0].includes("S1"),
+    `${escalations(l11).length} escalations: ${escalations(l11)[0]?.slice(0, 90) ?? ""}`,
   )
 }
 
