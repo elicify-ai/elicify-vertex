@@ -99,7 +99,7 @@ const CRITERIA_KEY_RE = /^\s*criteria\s*:\s*(.*)$/i
  * removes a whole class of undetectable false negatives. A `*` bullet needs
  * the trailing space, so `**bold**` still does not match.
  */
-const CRITERIA_ITEM_RE = /^\s*(?:\d{1,3}[.)]|[-*])\s+(.+?)\s*$/
+const CRITERIA_ITEM_RE = /^\s*(?:(\d{1,3})[.)]|[-*])\s+(.+?)\s*$/
 
 const MAX_CRITERIA = 10
 
@@ -132,11 +132,21 @@ export function parseCriteriaBlock(text: string): CriteriaBlock | null {
   if (startIdx === -1) return null
 
   const items: string[] = []
+  /** The number of the last item consumed (`null` for a bullet) — the only
+   *  evidence available that a list continues across a blank line. */
+  let lastNumber: number | null = null
   const tryConsume = (raw: string): boolean => {
     const m = CRITERIA_ITEM_RE.exec(raw)
     if (!m) return false
-    items.push(m[1].trim())
+    items.push(m[2].trim())
+    lastNumber = m[1] ? Number(m[1]) : null
     return true
+  }
+  /** The number of the item on `raw`, or `null` when it is not a numbered
+   *  item at all (a bullet, prose, blank). */
+  const itemNumber = (raw: string): number | null => {
+    const m = CRITERIA_ITEM_RE.exec(raw)
+    return m?.[1] ? Number(m[1]) : null
   }
 
   // Rare inline form: "CRITERIA: 1. foo" — the remainder after the colon on
@@ -154,25 +164,50 @@ export function parseCriteriaBlock(text: string): CriteriaBlock | null {
   for (let i = startIdx + 1; i < lines.length; i++) {
     const { line, fenced } = lines[i]
     if (fenced) break // a code fence ends the list — don't reach past it
-    // CONTIGUITY. A blank line ends the block, wherever it falls.
+    // CONTIGUITY, with ONE exception: a single blank line between two
+    // consecutively NUMBERED items.
     //
-    // Blank lines used to be skipped, which let the parser bridge across the
-    // paragraph break and swallow the NEXT list in the reply. Three shapes were
-    // measured pinning non-criteria: a correct block followed by a blank line
-    // and the model's plan bullets (the plan steps got pinned), a `Criteria:`
-    // prose line followed by an orientation list, and a review reply whose
-    // `Criteria:` heading picked up the review dimensions below it. Junk pins
-    // are not inert — they drive stop-blocks, reach the verifier, and a
-    // non-empty pin store permanently closes the intake-scaffold gate, so the
-    // model can never replace them by answering the scaffold properly.
+    // Blank lines used to be skipped unconditionally, which let the parser
+    // bridge a paragraph break and swallow the NEXT list in the reply. Three
+    // shapes were measured pinning non-criteria: a correct block followed by a
+    // blank line and the model's plan bullets (the plan steps got pinned), a
+    // `Criteria:` prose line followed by an orientation list, and a review
+    // reply whose `Criteria:` heading picked up the review dimensions below
+    // it. Junk pins are not inert — they drive stop-blocks, reach the
+    // verifier, and a non-empty pin store permanently closes the
+    // intake-scaffold gate, so the model can never replace them by answering
+    // the scaffold properly.
     //
-    // The cost is the reply that writes "CRITERIA:" then a blank line then a
-    // real list: it now parses as nothing. That case is LOUD (the caller logs
-    // `criteria:parse-miss` for it) where a bad pin is silent, and B-2 — which
-    // added the blank-line tolerance along with bullet support — was about
-    // making the failure visible, not about tolerating layout. Bullets, the
-    // part that was actually load-bearing, are untouched.
-    if (line.trim() === "") break
+    // Banning blank lines outright then cost the OPPOSITE failure, and it is
+    // silent where the one above is loud only for the empty case: a LOOSE
+    // markdown list ("CRITERIA:" / "1. …" / blank / "2. …" / blank / "3. …")
+    // is ordinary markdown, and it parsed as item 1 ALONE — one criterion
+    // pinned, two dropped, `parse-miss` never logged (it fires only on null),
+    // compliance recorded, and the now non-empty pin store closing the
+    // scaffold gate for the session. Losing criteria the model actually wrote
+    // is worse than not reading them at all.
+    //
+    // So the tolerance is exactly as wide as the evidence that the list
+    // CONTINUES, and no wider — the next item must be numbered `lastNumber+1`:
+    //
+    //  - "1. a" / blank / "2. b"        -> continues (this is the loose list)
+    //  - "1. a" / "2. b" / blank / "- x" -> a DIFFERENT list (the measured
+    //                                       plan-bullets pin) -> block ends
+    //  - "- a" / blank / "- b"          -> bullets carry no proof of
+    //                                       continuation -> block ends
+    //  - "1. a" / blank / blank / "2. b" -> a paragraph break, not a loose
+    //                                       list -> block ends
+    //
+    // Unchanged in both directions: the FIRST item must still be contiguous
+    // with the key line, so "CRITERIA:" + blank + unrelated prose or an
+    // unrelated list still parses as nothing and still logs `parse-miss`.
+    if (line.trim() === "") {
+      const next = lines[i + 1]
+      if (!next || next.fenced) break
+      if (lastNumber === null) break
+      if (itemNumber(next.line) !== lastNumber + 1) break
+      continue // the blank is list layout; the next iteration consumes the item
+    }
     if (!tryConsume(line)) break
   }
 

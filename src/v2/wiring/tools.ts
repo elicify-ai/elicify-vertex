@@ -227,8 +227,18 @@ export function starRepoHidden(): boolean {
  */
 export type StarConsent = "asked" | "yes" | "declined"
 
-/** Write the consent marker (mode 0600). */
-export function writeStarConsent(value: StarConsent): void {
+/**
+ * Write the consent marker (mode 0600). Returns whether it actually PERSISTED.
+ *
+ * The return value is not decoration. The write can fail for real reasons (an
+ * unwritable or non-directory config root, a read-only home, a full disk) and
+ * the failure is swallowed here so a hook never throws into the host. When the
+ * caller then reports success anyway, the harness logs `star:asked` for a
+ * record that does not exist — measured as TWO `star:asked` events (dispatch
+ * and completion) with nothing on disk. Every caller must be able to tell
+ * "recorded" from "tried and failed".
+ */
+export function writeStarConsent(value: StarConsent): boolean {
   try {
     // The config directory may not exist yet — a fresh machine, or an
     // XDG_CONFIG_HOME pointing somewhere new. Without this the write throws,
@@ -236,8 +246,10 @@ export function writeStarConsent(value: StarConsent): void {
     // would repeat forever with no record of it.
     mkdirSync(dirname(starConsentPath()), { recursive: true, mode: 0o700 })
     writeFileSync(starConsentPath(), JSON.stringify({ state: value }), { mode: 0o600 })
+    return true
   } catch {
     // Non-fatal: worst case the user is asked again next run.
+    return false
   }
 }
 
@@ -246,46 +258,128 @@ export function writeStarConsent(value: StarConsent): void {
 const STAR_REPO_NAME = STAR_REPO.split("/")[1] ?? STAR_REPO
 
 /**
+ * Every string reachable inside the host-supplied `question` args, lowercased.
+ *
+ * Walked as a STRUCTURE rather than serialised into one blob, because the
+ * matcher below needs to know which words share a string. A blob cannot tell
+ * "Would you like to star elicify-vertex?" from a question about GitHub
+ * Actions whose unrelated `filePath` argument happens to point inside this
+ * repo — in the blob both are just "star/github appears, repo name appears".
+ *
+ * Defensive by construction: the args come from the host, so the walk is
+ * cycle-safe (a `seen` set — `JSON.stringify` used to throw on a cyclic value
+ * inside a hook with no enclosing try/catch) and node-bounded.
+ */
+const MAX_ARG_NODES = 2_000
+
+function argStrings(args: unknown): string[] {
+  const out: string[] = []
+  const seen = new Set<object>()
+  const stack: unknown[] = [args]
+  let visited = 0
+  while (stack.length > 0 && visited < MAX_ARG_NODES) {
+    const node = stack.pop()
+    visited += 1
+    if (typeof node === "string") {
+      out.push(node.toLowerCase())
+      continue
+    }
+    if (node === null || typeof node !== "object") continue
+    if (seen.has(node)) continue
+    seen.add(node)
+    if (Array.isArray(node)) {
+      for (const value of node) stack.push(value)
+      continue
+    }
+    for (const value of Object.values(node as Record<string, unknown>)) stack.push(value)
+  }
+  return out
+}
+
+/**
+ * The verb "star", word-bounded, plus the emoji forms. `stars`/`starred` are
+ * deliberately NOT here: plural and past-participle forms are counts and
+ * states ("how many stars does it have", "5 stars", "your starred repos"),
+ * never the ask, which is always "star <repo>" or an emoji.
+ *
+ * The word boundary is the whole point. A substring test matched `start`,
+ * `restart` and `getting-started` — three of the commonest words in a repo's
+ * own working sessions — and one match spends a machine-wide, permanent
+ * one-shot.
+ */
+const STAR_VERB_RE = /\bstar(?:ring)?\b/g
+const STAR_EMOJI_RE = /[⭐★☆✭✩]|🌟/
+
+/**
+ * `star` used as a modifier rather than as the verb: "a star badge", "star
+ * rating", "star schema", "the star count". The ask never reads this way, and
+ * ordinary work on THIS repo does — "should I add a star badge to the
+ * elicify-vertex README?" names the repo and says star, and burned the
+ * one-shot.
+ */
+const STAR_AS_MODIFIER_RE =
+  /^[\s-]*(?:badge|badges|rating|ratings|schema|schemas|count|counts|chart|charts|graph|graphs|history|icon|icons|emoji|symbol|symbols|widget|widgets|button|buttons|field|fields|column|columns|score|scores|review|reviews|gazer|gazers|section|sections|component|components|metric|metrics|topology|network|wars|trek)\b/
+
+/** Does this ONE string ask the user to star the repo? */
+function stringIsStarAsk(text: string): boolean {
+  if (!text.includes(STAR_REPO_NAME)) return false
+  if (STAR_EMOJI_RE.test(text)) return true
+  STAR_VERB_RE.lastIndex = 0
+  for (let m = STAR_VERB_RE.exec(text); m !== null; m = STAR_VERB_RE.exec(text)) {
+    if (!STAR_AS_MODIFIER_RE.test(text.slice(m.index + m[0].length))) return true
+  }
+  return false
+}
+
+/**
  * Is this `question` tool call OUR star ask?
  *
- * The first version of this check required the full `elicify-ai/elicify-vertex`
+ * TWO failures bound this, in opposite directions, and both were measured.
+ *
+ * TOO NARROW. The first version required the full `elicify-ai/elicify-vertex`
  * slug verbatim in the serialised args, while nothing in the agent prompt asked
  * the model to write it that way. Seven plausible phrasings taken straight from
- * the prompt line were probed and FIVE recorded nothing — including "Would you
- * like to star the elicify-vertex repo on GitHub?". A miss is not a small loss:
- * `asked` is the ONLY thing that stops the agent raising the question again, so
- * a non-matching phrasing re-asks every session forever, on exactly the weaker
- * models B-6 was written for. That is strictly worse than the bounded 3-attempt
- * loop it replaced.
+ * the prompt line were probed and FIVE recorded nothing. A miss is not a small
+ * loss: `asked` is the ONLY thing that stops the agent raising the question
+ * again, so a non-matching phrasing re-asks every session forever, on exactly
+ * the weaker models B-6 was written for.
  *
- * So the match is widened to the repo NAME plus a starring/GitHub topic word,
- * and the prompt is changed to instruct the model to name the full slug (both
- * ends — neither is reliable alone: the prompt is advice, the matcher is code).
+ * TOO WIDE. The correction — repo name anywhere in the args plus the substring
+ * "star" or "github" anywhere in the args — matched ordinary work on this very
+ * repo: "should I START the elicify-vertex dev server?", "should I reSTART
+ * opencode?", "where should the getting-STARted section go?", "add a star
+ * badge to the elicify-vertex README?", "the GITHUB Actions run for
+ * elicify-vertex is failing — rerun?", a repo picker listing us, and any
+ * question at all whose args carried a path under this repo next to the word
+ * github. One of those spends the one-shot for EVERY project on the machine,
+ * permanently, and the only recovery is deleting
+ * `~/.config/opencode/.elicify-vertex-consent` by hand.
  *
- * Still NOT a bare "star" substring check. That burned the machine's one-shot
- * on "which star rating should the widget default to?" and "should I use a star
- * schema?" — the repo name is required, and those mention no repo at all. The
- * residual false positive is a question that names this repo AND says star or
- * GitHub without being the ask (e.g. while working on this codebase). It costs
- * a star we never get; the false NEGATIVE costs the user a prompt every session
- * for the rest of time, so the asymmetry decides the direction.
+ * The rule that survives both: the repo name and a genuine starring signal
+ * must appear in the SAME string, the star word is word-bounded and must not
+ * be a noun modifier, and "github" on its own is no longer a topic word at all
+ * — every phrasing of the ask says star or shows a ⭐, while GitHub chores on
+ * this repo (releases, Actions, workflow paths) say github constantly.
+ *
+ * The residual false NEGATIVE is an ask that splits the repo name and the star
+ * word across two args (e.g. repo in a `context` field). The agent prompt
+ * tells the model to name the slug in the question itself, and the prompt half
+ * of that contract is asserted in tests/agent-prompt.test.ts.
  */
 export function isStarAsk(args: unknown): boolean {
-  let blob: string
   try {
-    // Host-supplied and potentially circular — `JSON.stringify` throws on that
-    // and this runs inside a hook with no enclosing try/catch.
-    blob = JSON.stringify(args ?? {}).toLowerCase()
+    return argStrings(args).some(stringIsStarAsk)
   } catch {
     return false
   }
-  if (!blob.includes(STAR_REPO_NAME)) return false
-  return blob.includes("star") || blob.includes("github")
 }
 
 /**
  * Record `asked` when an observed `question` call is our star ask and nothing
- * is recorded yet. Returns true only when it actually wrote — the caller logs.
+ * is recorded yet. Returns true only when the record actually PERSISTED — the
+ * caller logs `star:asked` on that return, so returning true for a write that
+ * failed produces an event for a record that does not exist (and, from the two
+ * observation points, two of them).
  *
  * Lives here rather than in the hook so the matching rule is unit-testable
  * without booting the plugin, and so both observation points (dispatch and
@@ -295,8 +389,7 @@ export function isStarAsk(args: unknown): boolean {
 export function recordStarAskIfOurs(args: unknown): boolean {
   if (readStarConsent() !== null) return false
   if (!isStarAsk(args)) return false
-  writeStarConsent("asked")
-  return true
+  return writeStarConsent("asked")
 }
 
 // ---------------------------------------------------------------------------
@@ -886,7 +979,9 @@ export function buildPlanTools(deps: PlanToolsDeps) {
     description:
       "Check whether this machine has already been asked to star the elicify-vertex GitHub repo. Read-only: it " +
       'stars nothing and records nothing. Returns {consent: "none" | "asked" | "yes" | "declined"}. Only "none" ' +
-      "means you may ask the user; anything else means say nothing and never raise starring again.",
+      "means you may ask the user; anything else means say nothing and never raise starring again. The record is " +
+      "machine-wide and permanent; if the user ever asks to reset it, the marker is the file " +
+      "~/.config/opencode/.elicify-vertex-consent (XDG_CONFIG_HOME is honoured) and deleting it restores the ask.",
     args: {},
     async execute() {
       return JSON.stringify({ consent: readStarConsent() ?? "none" })
@@ -930,9 +1025,31 @@ export function buildPlanTools(deps: PlanToolsDeps) {
           note: "The user has already declined to star this repo. Nothing was starred. Do not raise starring again.",
         })
       }
-      const ok = starRepoHidden()
-      writeStarConsent("yes")
-      return JSON.stringify({ starred: ok, already: false })
+      if (starRepoHidden()) {
+        writeStarConsent("yes")
+        return JSON.stringify({ starred: true, already: false })
+      }
+      // THE STAR DID NOT HAPPEN. `yes` used to be written here anyway, which
+      // made the failure indistinguishable from success one call later: the
+      // second call read `yes` and returned `{starred:true, already:true}` —
+      // an unqualified claim of a star that was never made, in a harness whose
+      // whole thesis is that "done" means proven. `yes` is terminal and means
+      // "the repo is starred", so a failed attempt may not write it.
+      //
+      // `asked` is written instead when nothing is recorded yet. It is not a
+      // claim about the star; it records that the user was asked, which is
+      // what stops the agent raising starring again next session (the nagging
+      // loop B-6 deleted). A later call can still retry the star from `asked`
+      // and, if `gh` works that time, record the real `yes`.
+      if (prior === null) writeStarConsent("asked")
+      return JSON.stringify({
+        starred: false,
+        already: false,
+        failed: "gh-unavailable",
+        note:
+          "The star was NOT performed — the gh CLI is missing, not authenticated, or offline. Do not tell the " +
+          "user the repo was starred. Their answer is recorded, so do not raise starring again.",
+      })
     },
   })
 

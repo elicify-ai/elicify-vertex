@@ -177,35 +177,95 @@ describe("elicify_vertex_star performs the star itself, hidden", () => {
 // ---------------------------------------------------------------------------
 
 describe("elicify_vertex_star when the gh call fails", () => {
-  it("reports starred: false instead of throwing into the host", async () => {
+  function ghFails(message: string): void {
     gh.mockImplementation(() => {
-      throw new Error("gh: command not found")
+      throw new Error(message)
     })
+  }
+
+  it("reports starred: false instead of throwing into the host", async () => {
+    ghFails("gh: command not found")
 
     const result = await star()
 
-    expect(result).toEqual({ starred: false, already: false })
+    expect(result.starred).toBe(false)
+    expect(result.already).toBe(false)
   })
 
-  // Documented behaviour, asserted so it is a decision rather than an accident:
-  // consent is recorded even though the star did not land, so a transient
-  // network failure cannot turn into the user being asked again forever. The
-  // cost is a star we never get; the alternative is the nagging loop B-6
-  // deleted.
-  it("still records consent, so a transient failure cannot re-open the ask", async () => {
-    gh.mockImplementation(() => {
-      throw new Error("HTTP 401: Bad credentials")
-    })
+  // A FAILED STAR REPORTED AS A SUCCESS ON RETRY. `writeStarConsent("yes")` ran
+  // unconditionally, so with no `gh` on PATH call 1 returned `{starred:false}`
+  // and wrote `{"state":"yes"}` anyway; call 2 read that marker and returned
+  // `{"starred":true,"already":true}` — an unqualified claim of a star that
+  // never happened, from the harness whose thesis is that done means proven.
+  //
+  // MUTATION PROOF: restore the unconditional `writeStarConsent("yes")` ->
+  // the marker reads "yes" and the second call claims starred: true. Both
+  // assertions below go RED.
+  it("never writes the terminal 'yes' for a star that did not happen", async () => {
+    ghFails("gh: command not found")
 
     await star()
 
+    expect(readStarConsent(), "'yes' means the repo IS starred — it is not").toBe("asked")
+  })
+
+  it("never claims starred: true on a retry after a failure", async () => {
+    ghFails("gh: command not found")
+    await star()
+
+    const second = await star()
+
+    expect(second.starred, "the repo was never starred; no call may say it was").toBe(false)
+    expect(second.already).not.toBe(true)
+  })
+
+  it("tells the model, in words, that nothing was starred", async () => {
+    ghFails("HTTP 401: Bad credentials")
+
+    const result = await star()
+
+    expect(result.failed).toBe("gh-unavailable")
+    expect(String(result.note)).toMatch(/NOT performed/)
+  })
+
+  // The other half of the trade, unchanged: the ask must not re-open. `asked`
+  // is not a claim about the star, it records that the user was asked — which
+  // is what stops the agent raising starring again next session (the nagging
+  // loop B-6 deleted).
+  it("still records the ask, so a transient failure cannot re-open the nag", async () => {
+    ghFails("HTTP 401: Bad credentials")
+
+    await star()
+
+    expect(readStarConsent()).not.toBeNull()
+    expect(readStarConsent()).not.toBe("none")
+  })
+
+  // ...and a real retry can still succeed, which is exactly what the terminal
+  // `yes` used to make impossible.
+  it("records the real 'yes' when a later retry actually stars", async () => {
+    ghFails("offline")
+    await star()
+    gh.mockReset()
+    gh.mockReturnValue("" as never)
+
+    const result = await star()
+
+    expect(result).toEqual({ starred: true, already: false })
     expect(readStarConsent()).toBe("yes")
   })
 
+  it("leaves an existing 'asked' record exactly as it was", async () => {
+    plant(JSON.stringify({ state: "asked" }))
+    ghFails("offline")
+
+    await star()
+
+    expect(markerOnDisk()).toBe(JSON.stringify({ state: "asked" }))
+  })
+
   it("does not retry the failed call within the same invocation", async () => {
-    gh.mockImplementation(() => {
-      throw new Error("offline")
-    })
+    ghFails("offline")
 
     await star()
 
