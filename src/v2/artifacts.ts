@@ -82,10 +82,24 @@ export interface CriteriaBlock {
 }
 
 const CRITERIA_KEY_RE = /^\s*criteria\s*:\s*(.*)$/i
-/** Numbered list item: "1. text" or "1) text". Bullets (-, *) are not
- * recognized — the spec's grammar (US-4 AS-1: "CRITERIA: (numbered)") is
- * numbered lists only. */
-const CRITERIA_ITEM_RE = /^\s*(\d{1,3})[.)]\s+(.+?)\s*$/
+/**
+ * A criteria list item: "1. text", "1) text", "- text" or "* text".
+ *
+ * B-2: bullets USED to be rejected, on the letter of US-4 AS-1
+ * ("CRITERIA: (numbered)"). That made the grammar a silent trap. The pin
+ * store is both the emission gate for the intake scaffold and its only
+ * compliance signal, so a model that answered the scaffold with a bullet
+ * list pinned nothing, scored as non-compliant, and got the scaffold
+ * re-offered for the rest of the session — with no event anywhere saying
+ * why. Field measurement: 9 `intake-scaffold` directives rendered, 0
+ * complied, and no way to tell "ignored" from "parsed wrong".
+ *
+ * The numbering was never load-bearing (ids are assigned by `PinStore`, not
+ * read from the text), so accepting the two bullet forms costs nothing and
+ * removes a whole class of undetectable false negatives. A `*` bullet needs
+ * the trailing space, so `**bold**` still does not match.
+ */
+const CRITERIA_ITEM_RE = /^\s*(?:\d{1,3}[.)]|[-*])\s+(.+?)\s*$/
 
 const MAX_CRITERIA = 10
 
@@ -121,7 +135,7 @@ export function parseCriteriaBlock(text: string): CriteriaBlock | null {
   const tryConsume = (raw: string): boolean => {
     const m = CRITERIA_ITEM_RE.exec(raw)
     if (!m) return false
-    items.push(m[2].trim())
+    items.push(m[1].trim())
     return true
   }
 
@@ -141,6 +155,32 @@ export function parseCriteriaBlock(text: string): CriteriaBlock | null {
   const truncated = items.length > MAX_CRITERIA
   const criteria = items.slice(0, MAX_CRITERIA).map((item) => redactSecrets(item))
   return { criteria, truncated }
+}
+
+/**
+ * The last unfenced `CRITERIA:` key line in `text` (trimmed, redacted), or
+ * `null` when there is none — i.e. "was the model VISIBLY trying to answer
+ * the intake scaffold?", with the offending line for the event payload.
+ *
+ * B-2: `parseCriteriaBlock` returning `null` is ambiguous. It means either
+ * "the model never mentioned criteria" or "the model wrote a CRITERIA: block
+ * this grammar could not read". Those two need opposite responses, and the
+ * second is the dangerous one — the pin store is simultaneously the scaffold's
+ * emission gate and its only compliance signal, so an unreadable block makes
+ * the scaffold re-fire forever while the compliance count stays at 0. Callers
+ * use this to tell the cases apart and log `criteria:parse-miss`, so the
+ * failure stops being silent.
+ *
+ * Last-occurrence-wins, matching `parseCriteriaBlock` — the reported line is
+ * the same one the parser chose and failed on.
+ */
+export function findCriteriaKeyLine(text: string): string | null {
+  let found: string | null = null
+  for (const { line, fenced } of scanLines(text)) {
+    if (fenced) continue
+    if (CRITERIA_KEY_RE.test(line)) found = redactSecrets(line.trim())
+  }
+  return found
 }
 
 // ---------------------------------------------------------------------------

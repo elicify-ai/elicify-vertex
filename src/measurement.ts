@@ -80,6 +80,10 @@ export type V2EventType =
   | "verifier:field-dropped"
   | "criteria:re-pinned"
   | "criteria:truncated"
+  /** B-2: an unfenced `CRITERIA:` line the block grammar could not parse.
+   * Without it a parse miss is indistinguishable from the model never
+   * answering the intake scaffold, and both read as "0 complied". */
+  | "criteria:parse-miss"
   | "expect:absent"
 
 /**

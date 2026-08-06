@@ -114,6 +114,26 @@ export interface V2SessionState {
   turnExpect: ExpectArtifact | null
   expectAbsentLoggedThisTurn: boolean
 
+  /**
+   * B-2: the composer turn index the intake scaffold was last OFFERED for
+   * (`null` = never offered).
+   *
+   * Deliberately a TURN INDEX, not a boolean cleared by `resetTurnState`.
+   * The scaffold's producer runs inside `experimental.chat.system.transform`,
+   * which the host fires after EVERY tool result — one emission per agent-loop
+   * STEP. Measured: 179 `per-turn-cap:dropped` events in a single session, all
+   * `intake-scaffold`, i.e. the harness built the same finding ~180 times and
+   * the composer's cap of 1 threw away all but the first.
+   *
+   * A boolean would have re-introduced the bug from the other side, because
+   * `resetTurnState` is NOT on every turn boundary: `wiring/gate.ts`'s
+   * continuation path calls `composer.newTurn(sid)` alone. A continuation turn
+   * would then find the flag still spent and never re-offer the scaffold. The
+   * composer's index is the only value BOTH boundaries move, so comparing
+   * against it is correct on both paths and needs no reset at all.
+   */
+  intakeScaffoldOfferedForTurn: number | null
+
   // -- Phase-entry / one-shot-per-turn pending findings (re-offered every
   //    `system.transform` invocation of the turn until the composer actually
   //    renders them, then cleared; also cleared at the next `chat.message`).
@@ -185,6 +205,7 @@ export function freshSessionState(workspaceRoot: string): V2SessionState {
     multiStoryPending: false,
     turnExpect: null,
     expectAbsentLoggedThisTurn: false,
+    intakeScaffoldOfferedForTurn: null,
     precommitmentPending: false,
     scopeDriftPending: null,
     anomalyPending: null,
@@ -260,6 +281,11 @@ export function resetTurnState(state: V2SessionState): void {
   // permanently stop enforcing unevidenced criteria after only 3 blocks in
   // its entire history instead of 3 per turn — safety-critical, not cosmetic.
   state.criteriaBlocks = 0
+  // B-2: `intakeScaffoldOfferedForTurn` is deliberately NOT reset here.
+  // It holds a composer turn INDEX, and the composer advances on this path
+  // (`chat.message`) AND on the gate-continuation path, which never calls
+  // this function. Clearing it here would be harmless on this path and
+  // useless on the other; comparing indices covers both.
   // needsCriteriaReinject deliberately NOT reset here — it must survive
   // until actually rendered (FR-014), and a compaction's synthetic
   // auto-continue message is itself a chat.message-shaped event in some

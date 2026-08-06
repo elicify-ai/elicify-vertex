@@ -139,6 +139,7 @@ const KNOWN_TOOL_NAMES = [
   "elicify_vertex_plan_status",
   "elicify_vertex_plan_clear",
   "elicify_vertex_plan_reopen",
+  "elicify_vertex_scope_amend",
   "elicify_vertex_star",
 ]
 

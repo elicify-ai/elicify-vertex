@@ -49,6 +49,24 @@ export interface PlanToolsDeps {
   phaseEngine: PhaseEngine
   /** Runs when a plan is successfully created, so wiring can clear `multiStoryPending`. */
   onPlanCreated: (sessionID: string) => void
+  /**
+   * B-2: runs when the model resolves a scope-watchdog directive (fold /
+   * amend / revert), so wiring can record the FR-034 compliance.
+   *
+   * Measured motivation: `scope-watchdog` reported "3 rendered, 0 complied"
+   * — and that 0 was a STRUCTURAL artefact, not a behavioural one. There was
+   * no `recordCompliance(…, "scope-watchdog", …)` call anywhere in the
+   * codebase, so the counter would have read 0 under perfect compliance too.
+   * It was also unactionable: `StoryEngine.amendStory` existed but was
+   * reachable from no tool, so the directive's "fold / amend / revert" offer
+   * named three things the model had no mechanism to do. The tool below
+   * supplies the mechanism and this callback supplies the measurement.
+   *
+   * A callback rather than an injected composer, mirroring `onPlanCreated`:
+   * every FR-034 compliance is recorded in one place (`plugin.ts`), and this
+   * module keeps knowing nothing about the composer.
+   */
+  onScopeAmended: (sessionID: string, resolution: "fold" | "amend" | "revert") => void
 }
 
 // ---------------------------------------------------------------------------
@@ -589,6 +607,79 @@ export function buildPlanTools(deps: PlanToolsDeps) {
     },
   })
 
+  // B-2: the answer to a `scope-watchdog` directive.
+  //
+  // That directive tells the model to "fold this into the story's scope,
+  // amend the story's scopeGlobs (state why), or revert this change" — three
+  // verbs with no tool behind any of them. `StoryEngine.amendStory` had been
+  // implemented and never exposed. So the prescription could not be carried
+  // out through the harness and, separately, nothing recorded compliance:
+  // `scope-watchdog` read "0 complied" in the field because there was no
+  // `recordCompliance` call for it in the codebase at all, not because the
+  // model ignored it.
+  const scopeAmendTool = tool({
+    description:
+      "Resolve an elicify-vertex scope-watchdog directive about a file edited outside the active story's declared " +
+      "scope. Pass resolution='fold' to ADD globs covering the file to the story's existing scope, 'amend' to " +
+      "REPLACE the story's scopeGlobs wholesale (use when the declared globs are stale — e.g. after a branch " +
+      "switch or a typo that matched zero files), or 'revert' when you have undone the out-of-scope change instead. " +
+      "Always state a reason; it is appended to the story's amendment log. fold/amend require scopeGlobs.",
+    args: {
+      storyId: tool.schema.string().min(1),
+      resolution: tool.schema.enum(["fold", "amend", "revert"]),
+      reason: tool.schema.string().min(1),
+      scopeGlobs: tool.schema.array(tool.schema.string().min(1)).optional().default([]),
+    },
+    async execute(args, context) {
+      const sid = context.sessionID
+      const plan = storyEngine.getPlan(sid)
+      const story = plan?.stories.find((candidate) => candidate.id === args.storyId)
+      if (!story) throw new Error(`unknown story: ${args.storyId}`)
+
+      // An EMPTY glob list is refused for fold/amend rather than passed
+      // through: `amendStory` treats `[]` as "replace with nothing", which
+      // silently disables the watchdog for that story — the opposite of
+      // resolving a drift, and indistinguishable in the plan file afterwards.
+      if (args.resolution !== "revert" && args.scopeGlobs.length === 0) {
+        throw new Error(`resolution '${args.resolution}' requires at least one glob in scopeGlobs`)
+      }
+
+      const scopeGlobs =
+        args.resolution === "fold"
+          ? [...new Set([...story.scopeGlobs, ...args.scopeGlobs])]
+          : args.resolution === "amend"
+            ? [...args.scopeGlobs]
+            : undefined
+      storyEngine.amendStory(sid, args.storyId, { reason: `${args.resolution}: ${args.reason}`, scopeGlobs })
+
+      // FR-034 compliance — the whole point of this tool existing (see
+      // `PlanToolsDeps.onScopeAmended`). Recorded on all three arms: a
+      // revert IS one of the three prescribed responses.
+      deps.onScopeAmended(sid, args.resolution)
+
+      const writeAborted = storyEngine.consumeWriteAbort(sid)
+      const updated = storyEngine.getPlan(sid)?.stories.find((candidate) => candidate.id === args.storyId) ?? null
+      return JSON.stringify(
+        {
+          storyId: args.storyId,
+          resolution: args.resolution,
+          scopeGlobs: updated?.scopeGlobs ?? [],
+          amendments: updated?.amendments ?? [],
+          ...(writeAborted
+            ? {
+                persisted: false,
+                warning:
+                  "The amendment applied in memory but could NOT be written to disk (the state lock was held by " +
+                  "another instance). It may be lost — re-run this call.",
+              }
+            : {}),
+        },
+        null,
+        2,
+      )
+    },
+  })
+
   const statusTool = tool({
     description:
       "Read the elicify-vertex v2 plan for the current session (null if none). Includes each story's tasks and " +
@@ -655,6 +746,7 @@ export function buildPlanTools(deps: PlanToolsDeps) {
     elicify_vertex_plan_status: statusTool,
     elicify_vertex_plan_clear: clearTool,
     elicify_vertex_plan_reopen: reopenTool,
+    elicify_vertex_scope_amend: scopeAmendTool,
     elicify_vertex_star: starTool,
   }
 }

@@ -73,7 +73,11 @@ export function scopeWatchdogFinding(opts: {
     priority: "correction",
     observation: `${path} is outside the active story's declared scope.`,
     diagnosis: "Mutation falls outside the checkpointed story's scopeGlobs.",
-    prescription: `Fold this into the story's scope, amend the story's scopeGlobs (state why), or revert this change.${zeroNote} Recommended: ${offer}.`,
+    // B-2: the three verbs used to name nothing the model could actually
+    // call — `StoryEngine.amendStory` existed but was exposed by no tool, so
+    // this prescription was unactionable AND its compliance unmeasurable.
+    // Naming `elicify_vertex_scope_amend` is what makes both possible.
+    prescription: `Call elicify_vertex_scope_amend with the active story's id: resolution "fold" to add globs covering this file, "amend" to replace stale scopeGlobs, or "revert" once you have undone the change. State why.${zeroNote} Recommended: ${offer}.`,
     instanceId,
   }
 }

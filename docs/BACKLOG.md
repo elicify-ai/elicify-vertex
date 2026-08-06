@@ -50,7 +50,13 @@ contradicted. Tests referencing `frontier`/`standard` and test 36 go with it.
 
 ---
 
-## B-2 — The intake scaffold is starved by the per-turn cap and complied with zero times
+## B-2 — The intake scaffold was emitted once per agent-loop STEP, and two families' compliance counts were undecidable. **[fixed 2026-08-06]**
+
+The original entry guessed at three causes ("the cap is too low, the scaffold
+too chatty, the phase re-entry duplicates findings"). All three were wrong.
+The measured evidence stands; the diagnosis below replaces the guesswork.
+
+### The evidence
 
 `per-turn-cap:dropped` fired **179 times**, every one of them
 `family: "intake-scaffold"`, `priority: "phase-guidance"` — from turn 1 (`D-2`)
@@ -63,16 +69,64 @@ session:
 | `scope-watchdog` | 3 | **0** |
 | `verify-gap` | 9 | 14 |
 
-179 dropped against 15 complied is the harness generating guidance it then
-discards. Two of three families had no observable effect at all.
+### The actual root cause
 
-Related symptom: the phase machine never settled — 9 transitions, 7 of them
-`execute->execute`, and `intake->execute` fired **twice** (it re-entered intake
-after already executing).
+**The cap was never the bug.** `intake-scaffold` is capped at 1/turn
+(`composer.ts` `DEFAULT_FAMILY_CAPS`) and the cap was doing exactly its job.
+The PRODUCER was the bug: it pushed an `intake-scaffold` finding
+unconditionally whenever zero criteria were pinned, from inside
+`experimental.chat.system.transform` — and opencode fires that hook **after
+every tool result**, not once per turn. Findings are rebuilt on every
+invocation and the composer retains nothing across `render()` calls, so the
+harness minted ~180 identical findings in one turn and the cap threw away all
+but the first. 179 drops ≈ 179 agent-loop steps.
 
-**Unknown:** whether the cap is too low, the scaffold too chatty, or the
-re-entry is generating duplicate findings. Not yet diagnosed. Note this is
-*not* downstream of B-1 — the profile resolved to `standard` either way.
+**`scope-watchdog`'s "0 complied" was a structural artefact.** There was no
+`composer.recordCompliance(…, "scope-watchdog", …)` call anywhere in the
+codebase; the number would have read 0 under perfect compliance. Worse, the
+directive's "fold / amend / revert" offer named three actions the model had no
+mechanism to perform — `StoryEngine.amendStory` existed and was exposed by no
+tool. Only `plan-proposal`, `verify-gap` and `intake-scaffold` had compliance
+paths at all.
+
+**`intake-scaffold`'s "0 complied" was undecidable, not proof of anything.**
+Compliance was detected only via `parseCriteriaBlock`, which required an
+unfenced `CRITERIA:` line followed by a NUMBERED list; bullets were rejected
+and the scan broke at the first non-matching line. A parse miss was **silent**.
+And because the emission gate and the compliance signal were the same
+predicate (empty pin store), a parse miss made the scaffold re-fire forever
+while scoring the model non-compliant.
+
+The double `intake->execute` transition is a different story key, not
+re-entry, and is not a bug.
+
+### What was done
+
+1. **The scaffold is offered at most once per turn**, at the producer
+   (`plugin.ts`), gated on `V2SessionState.intakeScaffoldOfferedForTurn`. That
+   field holds the COMPOSER's turn index, not a boolean cleared in
+   `resetTurnState` — `wiring/gate.ts`'s continuation path calls
+   `composer.newTurn(sid)` and nothing else, so a boolean would have gone
+   permanently spent on any continuation-driven autonomous run. New accessor:
+   `InjectionComposer.currentTurn()`. Measured by test: 8 invocations in one
+   turn now produce 1 render and **0** cap drops (was 1 render and 7 drops).
+2. **`scope-watchdog` compliance is instrumented**, via a new
+   `elicify_vertex_scope_amend` tool (fold / amend / revert, backed by the
+   previously unreachable `amendStory`) and a `PlanToolsDeps.onScopeAmended`
+   callback that `plugin.ts` turns into `recordCompliance`. The directive's
+   prescription now names that tool, so the offer is actionable.
+3. **A criteria parse miss is visible and rarer.** New `criteria:parse-miss`
+   event, logged from `text.complete` when `parseCriteriaBlock` returns null
+   but `findCriteriaKeyLine` finds an unfenced `CRITERIA:` line. And
+   `CRITERIA_ITEM_RE` now accepts `-` and `*` bullets as well as numbers — a
+   model that complied with a bullet list must not score as non-compliant. The
+   numbering was never load-bearing (`PinStore` assigns the ids).
+
+**Not changed, deliberately:** the cap value (1/turn is correct), and the
+phase machine.
+
+Note this was *not* downstream of B-1 — the profile resolved to `standard`
+either way.
 
 ---
 

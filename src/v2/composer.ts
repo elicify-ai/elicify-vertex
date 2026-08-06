@@ -222,6 +222,24 @@ export class InjectionComposer {
     this.advanceTurn(this.getState(sessionID))
   }
 
+  /**
+   * The session's current turn index (0 before the first `newTurn`).
+   *
+   * Exists so a PRODUCER can be once-per-turn without duplicating the turn
+   * boundary. Measured (B-2): `system.transform` fires after every tool
+   * result, so a producer that re-derives the same finding on every
+   * invocation emitted 179 `intake-scaffold` findings in one session — all
+   * 179 dropped by the per-turn cap, because the cap is the only thing that
+   * knew where the turn boundary was. Wiring cannot key off its own
+   * `resetTurnState`: the gate-continuation path (`wiring/gate.ts`) advances
+   * the composer's turn WITHOUT resetting wiring state, so a flag reset only
+   * there would go stale and silence the producer for the rest of the run.
+   * Reading the composer's index is the one signal both boundaries move.
+   */
+  currentTurn(sessionID: string): number {
+    return this.getState(sessionID).turnIndex
+  }
+
   /** Called by wiring when FR-034 detects a compliance match. Feeds the next
    * `render()`'s decay decision for that family: a compliance recorded at
    * turn T decays rendering of that family at turn T+1 (FR-006 — "after a

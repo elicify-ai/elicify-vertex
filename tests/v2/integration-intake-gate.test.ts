@@ -221,6 +221,99 @@ describe("test 19: intake_scaffold_repeats_until_captured", () => {
 })
 
 // ===========================================================================
+// B-2: the intake scaffold is produced ONCE PER TURN, not once per
+// `system.transform` invocation.
+//
+// Field measurement that opened the backlog item: 179 `per-turn-cap:dropped`
+// events in one session, every single one `family: "intake-scaffold"`. The
+// cap (1/turn) was doing its job; the PRODUCER was re-minting the finding on
+// every invocation, and opencode fires `experimental.chat.system.transform`
+// after every tool result — so one 90-minute agent turn built ~180 identical
+// findings and threw away all but the first.
+// ===========================================================================
+
+describe("B-2: intake scaffold is once-per-turn, not once-per-system.transform", () => {
+  function scaffoldEvents(sid: string) {
+    const events = readEvents(sid)
+    const family = (e: MeasurementEvent) => (e.payload as { family?: string }).family
+    // `event_type` is widened to `string` deliberately: composer.ts's three
+    // drop-event names were never folded into `measurement.ts`'s
+    // `V2EventType` union (a known, documented drift — see wiring/logger.ts's
+    // header), so `per-turn-cap:dropped` does not typecheck against it even
+    // though it is exactly what the logger writes to disk.
+    const type = (e: MeasurementEvent): string => e.event_type
+    return {
+      capDrops: events.filter((e) => type(e) === "per-turn-cap:dropped" && family(e) === "intake-scaffold"),
+      rendered: events.filter((e) => type(e) === "directive_rendered" && family(e) === "intake-scaffold"),
+    }
+  }
+
+  it("eight system.transform invocations inside ONE turn render the scaffold once and drop it zero times", async () => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "b2-per-step-session"
+
+    await activate(hooks, sid, "implement the parser feature")
+    // Each iteration is an agent-loop STEP, exactly as the host drives it:
+    // a tool runs, then `system.transform` fires again. Same turn throughout
+    // — no user message, no gate continuation.
+    for (let step = 0; step < 8; step++) {
+      await toolAfter(hooks, sid, "read", { filePath: `src/step-${step}.ts` }, "contents")
+      await transform(hooks, sid)
+    }
+
+    const { capDrops, rendered } = scaffoldEvents(sid)
+    // Pre-fix this was 7 (one per invocation after the first). The whole
+    // point of B-2 is that a dropped directive means wasted work, so the
+    // assertion is on the DROPS, not just on the render count.
+    expect(capDrops).toHaveLength(0)
+    expect(rendered).toHaveLength(1)
+  })
+
+  it("THE TRAP: a gate continuation re-opens the offer even though it never calls resetTurnState", async () => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "b2-continuation-session"
+
+    // A DEEP ask: the zero-criteria stop-block (the continuation this test
+    // needs) is scoped to deep mode, like test 20's setup.
+    await activate(hooks, sid, "implement the production database migration")
+    await transform(hooks, sid)
+    expect(scaffoldEvents(sid).rendered).toHaveLength(1)
+
+    // A mutation with no verification, then idle: `wiring/gate.ts`'s
+    // zero-criteria fallback dispatches a continuation, and that path calls
+    // `composer.newTurn(sid)` and NOTHING ELSE — `resetTurnState` is never
+    // reached. A once-per-turn flag cleared only in `resetTurnState` would
+    // stay spent here and the scaffold would never be offered again for the
+    // rest of an autonomous run. Keying the flag on the composer's turn index
+    // is what makes this pass.
+    await toolAfter(hooks, sid, "edit", { filePath: "src/foo.ts" }, "updated")
+    await idle(hooks, sid)
+    expect(idleContinuationTexts(client, sid).length).toBeGreaterThan(0)
+
+    await transform(hooks, sid)
+    expect(scaffoldEvents(sid).rendered).toHaveLength(2)
+    expect(scaffoldEvents(sid).capDrops).toHaveLength(0)
+  })
+
+  it("a real user message re-opens the offer too (the ordinary turn boundary still works)", async () => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "b2-user-turn-session"
+
+    for (let turn = 0; turn < 3; turn++) {
+      await activate(hooks, sid, "implement the parser feature")
+      await transform(hooks, sid)
+      await transform(hooks, sid) // a second step of the same turn: no second offer
+    }
+
+    expect(scaffoldEvents(sid).rendered).toHaveLength(3)
+    expect(scaffoldEvents(sid).capDrops).toHaveLength(0)
+  })
+})
+
+// ===========================================================================
 // Test 20: criteria_idle_block_names_unmet (FR-015, FR-016)
 // ===========================================================================
 
