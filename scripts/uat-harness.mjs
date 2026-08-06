@@ -516,6 +516,34 @@ if (section("J. Staleness is bounded")) {
   }
   const after = p2.sent().filter((t) => t.includes("Report what was delivered")).length
   assert("J3-closeout-does-not-re-fire", after === 1, `${after} close-outs after 2 post-settlement edits`)
+
+  // MAJ-006. `handleVerifierAudit` has two returns that predate the cap: the
+  // verifier did not run, and it answered about the wrong stories. Neither
+  // reaches a bump, so once staleness could re-select a story every idle, an
+  // unavailable verifier bought one subturn per idle forever with the counter
+  // stuck. Measured at 6 extra subturns over 6 rounds. The cap must charge the
+  // ROUND, not the verdict.
+  let calls = 0
+  const p3 = await scenario({
+    subturn: (agent) => {
+      if (agent !== "vertex-verifier") return undefined
+      calls++
+      // First call is a real (unsubstantiated) verdict, so the story gets a
+      // stamp and stays complete. After that the verifier goes bad.
+      return calls === 1 ? '{"stories":[{"storyId":"S1","pass":false,"summary":"nope","items":[]}]}' : "not json at all"
+    },
+  })
+  await p3.say("/elicify-vertex\n\nbuild the research portal")
+  await p3.hooks.tool.elicify_vertex_plan_create.execute(
+    { stories: [{ text: "Ship", acceptanceItems: ["A1"], scopeGlobs: [], verifiers: [], tasks: [{ text: "do" }] }] },
+    { sessionID: p3.sid },
+  )
+  await p3.hooks.tool.elicify_vertex_plan_checkpoint.execute({ taskId: "S1.T1", status: "complete" }, { sessionID: p3.sid })
+  for (let i = 0; i < 6; i++) {
+    await p3.idle()
+    await p3.tool("edit", { filePath: join(p3.work, `bad${i}.ts`) })
+  }
+  assert("J4-broken-verifier-is-still-capped", calls <= 4, `${calls} verifier subturns over 6 edit+idle rounds`)
 }
 
 // --- F. No subprocess output reaches the terminal --------------------------

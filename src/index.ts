@@ -368,10 +368,14 @@ const READER_HEAD_RE = /^(?:grep|rg|man|ls|pwd|which|whereis|help|info|file|stri
  * and friends print what they WOULD do and touch nothing, but they match the
  * mutation patterns head-on — which let a read-only command satisfy the
  * evidence floor that exists to prove work actually happened.
+ *
+ * Long forms ONLY. A bare `-n` was here and meant the opposite in the commands
+ * that matter: `git commit -n` is `--no-verify` (a real commit, common in
+ * agent loops), `cp -n` / `mv -n` are `--no-clobber`. It suppressed all three.
  */
-const DRY_RUN_RE = /(?:^|\s)(?:--dry-run|--dryrun|-n(?=\s|$)|--check)(?:\s|$)/i
+const DRY_RUN_RE = /(?:^|\s)(?:--dry-run|--dryrun|--check)(?:\s|$)/i
 
-const MUTATING_BASH_RE = /^(?:sudo\s+)?(?:apply_patch\b|chmod\b|mkdir\b|mv\b|cp\b|rm\b|touch\b|install\b|ln\b|truncate\b|sed\s+-i|perl\s+-pi|git\s+(?:add|commit|checkout|switch|restore|reset|clean|apply|am|merge|rebase|cherry-pick)|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?build\b|(?:sudo\s+)?(?:npm|pnpm|yarn|bun)\s+(?:i|install|add|remove|uninstall|ci|update|upgrade)\b)/i
+const MUTATING_BASH_RE = /^(?:sudo(?:\s+-[A-Za-z]+(?:\s+\S+)?)*\s+)?(?:apply_patch\b|chmod\b|mkdir\b|mv\b|cp\b|rm\b|touch\b|install\b|ln\b|truncate\b|sed\s+-i|perl\s+-pi|git\s+(?:add|commit|checkout|switch|restore|reset|clean|apply|am|merge|rebase|cherry-pick)|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?build\b|(?:npm|pnpm|yarn|bun)\s+(?:i|install|add|remove|uninstall|ci|update|upgrade)\b)/i
 /** In-segment mutation flags (checked anywhere in the segment). Separate
  * from MUTATING_BASH_RE so segment-start anchoring does not hide
  * `--write`/`--fix` flags that mutate later in the segment. */

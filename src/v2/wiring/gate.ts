@@ -1251,7 +1251,12 @@ function verdictOutdatedByEdits(ctx: GateContext, sid: string, state: V2SessionS
   // every idle that followed any edit — measured at 5 verifier subturns over 5
   // rounds with `unapplied` stuck and the cap never firing, which is exactly
   // the unbounded audit loop `maxStoryReaudits` was added to stop.
-  if (reaudits(state, story.id) >= ctx.maxStoryReaudits) return false
+  // `ctx.maxStoryReaudits > 0` FIRST. `<= 0` is the documented way to DISABLE
+  // the cap (GateContext doc, CR-15 in plugin.ts, spec US-7 AS-4), and the
+  // revert path at the bottom of this file already spells it that way. Without
+  // it, `0` disabled staleness instead of the cap — handing an operator who
+  // turned the cap off the original live bug back, unbounded.
+  if (ctx.maxStoryReaudits > 0 && reaudits(state, story.id) >= ctx.maxStoryReaudits) return false
 
   // SCOPE LIMIT, stated rather than implied: the ledger is turn-scoped and
   // in-memory, so it is empty after a user message and after a host restart.
@@ -1385,6 +1390,14 @@ async function handleVerifierAudit(ctx: GateContext, sid: string, state: V2Sessi
       message: `the completion verifier did not run (${result.reason ?? "unknown"}) — claimed stories are unverified`,
       variant: "warning",
     })
+    // CHARGE THE ROUND. Every other exit from this function reaches a bump —
+    // `boundUnappliedVerdicts` for a bounded verdict, the revert path for a
+    // failing one. These two returns predate both, so a story that keeps being
+    // re-selected by staleness got a free verifier subturn on every idle
+    // forever. Measured: 6 extra subturns over 6 rounds with the counter stuck
+    // at 1. Charged here, and NOT at selection, so the ordinary revert path is
+    // not double-billed.
+    for (const storyId of auditIds) bumpReaudit(state, storyId)
     return false
   }
 
@@ -1398,6 +1411,10 @@ async function handleVerifierAudit(ctx: GateContext, sid: string, state: V2Sessi
       requested: [...auditIds],
       received: result.verdict.stories.map((v) => v.storyId),
     })
+    // Same reasoning as the `!result.verdict` return above: an off-target
+    // verdict is a round spent, or a verifier that never names the right story
+    // buys unlimited subturns.
+    for (const storyId of auditIds) bumpReaudit(state, storyId)
     return false
   }
 

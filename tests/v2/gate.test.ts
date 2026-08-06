@@ -13,10 +13,11 @@ import { PinStore } from "../../src/v2/pin.js"
 import { StoryEngine } from "../../src/v2/story.js"
 import { SelfCreatedSessions } from "../../src/v2/subturn.js"
 import type { OpencodeClient } from "../../src/v2/types.js"
-import { handleSessionIdle, type GateContext,
+import {
+  handleSessionIdle,
+  type GateContext,
   beginIdleTurn,
   forgetIdleTurn,
-  idleTurnCount,
   dispatchContinuation,
 } from "../../src/v2/wiring/gate.js"
 import { ManifestCache } from "../../src/v2/wiring/manifest.js"
@@ -1594,9 +1595,73 @@ describe("handleVerifierAudit — a verdict retires when the code moves", () => 
       h.evidenceLedger.recordChangedFiles(sid, `src/edit${i}.ts`)
     }
     // Without the cap check this was one audit per round, unbounded.
-    expect(audits(), "an edit must not buy an unlimited number of model calls").toBeLessThanOrEqual(
-      h.ctx.maxStoryReaudits + 1,
-    )
+    // EXACT, not `<=`: a one-sided bound is also satisfied by the feature
+    // being absent entirely, so it only ever caught the storm, never drift the
+    // other way.
+    expect(audits(), "an edit must not buy an unlimited number of model calls").toBe(2)
+  })
+
+  // MAJ-005: `<= 0` is the documented way to DISABLE the cap. The first cut of
+  // the cap check omitted the `> 0` guard the revert path has, so `0` disabled
+  // STALENESS instead — handing an operator who turned the cap off the very
+  // live bug this feature fixes, with nothing bounding it either.
+  it.each([0, -1])("treats maxStoryReaudits=%i as cap-disabled, not feature-disabled", async (cap) => {
+    const h = harness({ verifierEnabled: true, maxStoryReaudits: cap })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid)
+    stubVerifier(h, { stories: [{ storyId: "S1", pass: false, summary: "nope", items: [] }] })
+
+    const audits = (): number => h.logger.mock.calls.filter((c) => c[0] === "story:verifier-audit").length
+    await handleSessionIdle(h.ctx, sid)
+    const first = audits()
+    h.evidenceLedger.recordChangedFiles(sid, "src/fixed.ts")
+    state.idleContinuationInFlight = false
+    await handleSessionIdle(h.ctx, sid)
+
+    expect(audits(), "a disabled cap must not silently disable verdict staleness").toBeGreaterThan(first)
+  })
+
+  // MAJ-002 / SC-007: "a story disputed N+1 times produces exactly
+  // `maxStoryReaudits` reverts and 1 escalation". Charging the cap at
+  // SELECTION as well as downstream double-billed any round where the model
+  // had edited — i.e. every real one — capping after 2 reverts with a cap of
+  // 3, and inflating the operator health message that reads the same counter.
+  // The existing FR-007 cap tests all drive rounds with nothing changed, so
+  // the staleness predicate is false there and none of them can see this.
+  it("charges a revert round once when the model edited and re-checkpointed", async () => {
+    const h = harness({ verifierEnabled: true, maxStoryReaudits: 3 })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid)
+    stubVerifier(h, {
+      stories: [{ storyId: "S1", pass: false, summary: "no", items: [{ itemId: "A1", met: false, note: "missing" }] }],
+    })
+
+    const capped = (): Array<{ reverts?: number }> =>
+      h.logger.mock.calls.filter((c) => c[0] === "verifier:reaudit-capped").map((c) => c[1] as { reverts?: number })
+
+    let roundsBeforeCap = 0
+    for (let round = 0; round < 6; round++) {
+      state.idleContinuationInFlight = false
+      await handleSessionIdle(h.ctx, sid)
+      if (capped().length === 0) roundsBeforeCap = round + 1
+      // The model does what the revert asked: edits, then re-checkpoints. Both
+      // freshness predicates are true on the next round.
+      h.evidenceLedger.recordChangedFiles(sid, `src/r${round}.ts`)
+      h.storyEngine.checkpoint(sid, "S1.T1", "complete")
+    }
+
+    expect(capped().length, "the cap must eventually engage").toBeGreaterThan(0)
+    expect(roundsBeforeCap, "a cap of 3 must buy 3 revert rounds, not 2").toBe(3)
+    expect(
+      capped()[0]?.reverts,
+      "the operator-facing revert count must match the reverts that happened",
+    ).toBe(3)
   })
 
   // (The "a clean pass is terminal" net lives in `scripts/uat-harness.mjs`
@@ -2066,21 +2131,11 @@ describe("renderPlanDigest — FR-006 / MIN-002: audited stories render first", 
 // continuations, so the leak and the guard are the same object.
 // ===========================================================================
 describe("idle-turn bookkeeping", () => {
-  it("does not retain an entry once the session is gone", () => {
-    const before = idleTurnCount()
-    for (let i = 0; i < 50; i++) beginIdleTurn(`leaky-${i}`, 0)
-    expect(idleTurnCount(), "every session must be tracked while it is live").toBe(before + 50)
-    for (let i = 0; i < 50; i++) forgetIdleTurn(`leaky-${i}`)
-    expect(idleTurnCount(), "a deleted session must not be retained forever").toBe(before)
-  })
-
-  it("re-arming a session replaces its entry rather than adding one", () => {
-    const before = idleTurnCount()
-    beginIdleTurn("same", 1)
-    beginIdleTurn("same", 2)
-    expect(idleTurnCount()).toBe(before + 1)
-    forgetIdleTurn("same")
-  })
+  // (The leak net lives in `tests/v2/idleTurnLifecycle.test.ts`: it drives the
+  // plugin's own `event` hook, so it dies when the `forgetIdleTurn` wiring in
+  // plugin.ts dies. The tests that stood here called `beginIdleTurn` /
+  // `forgetIdleTurn` directly and so asserted only that `Map.delete` works —
+  // verified vacuous, they survived deleting the wiring.)
 
   // The `spoken` latch: a second dispatch inside ONE idle turn is the
   // double-message symptom — the harness talking over itself.
@@ -2096,6 +2151,38 @@ describe("idle-turn bookkeeping", () => {
     const second = await dispatchContinuation(h.ctx, sid, state, "[vertex] second line")
     expect(first, "the first continuation of a turn must be delivered").toBe(true)
     expect(second, "the harness must not talk over itself within one idle turn").toBe(false)
+    forgetIdleTurn(sid)
+  })
+})
+
+// ===========================================================================
+// MAJ-006: `beginIdleTurn` used to run BEFORE the re-entrancy guard, so an
+// idle the gate was about to abandon still reset `spoken` to false and
+// overwrote the marker of the turn actually in flight — defeating both checks
+// in `dispatchContinuation` for the turn that mattered.
+// ===========================================================================
+describe("idle-turn stamping happens after the re-entrancy guard", () => {
+  it("an abandoned idle does not reset the in-flight turn's `spoken` latch", async () => {
+    const h = harness({ verifierEnabled: true })
+    const sid = "reentrant"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid)
+
+    beginIdleTurn(sid, state.activityMarker)
+    expect(await dispatchContinuation(h.ctx, sid, state, "[vertex] first"), "first must land").toBe(true)
+
+    // A continuation is outstanding; the host fires idle again for this same
+    // session. The gate must bail at the guard and touch nothing.
+    state.idleContinuationInFlight = true
+    await handleSessionIdle(h.ctx, sid)
+
+    state.idleContinuationInFlight = false
+    expect(
+      await dispatchContinuation(h.ctx, sid, state, "[vertex] second"),
+      "the abandoned idle must not re-arm the turn and let a second line through",
+    ).toBe(false)
     forgetIdleTurn(sid)
   })
 })

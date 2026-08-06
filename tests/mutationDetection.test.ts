@@ -24,6 +24,13 @@ describe("isMutatingBashCommand", () => {
     "sudo npm install",
     "sudo rm -rf build",
     "pnpm add -D vitest",
+    // MIN-B: only the bare `sudo cmd` form was handled.
+    "sudo -u dev rm -rf build",
+    "sudo -E npm i",
+    // MIN-A: `-n` is --no-verify / --no-clobber here, not a dry run.
+    "git commit -n -m wip",
+    "cp -n a b",
+    "mv -n a b",
   ])("counts %j as a mutation", (cmd) => {
     expect(isMutatingBashCommand(cmd)).toBe(true)
   })
