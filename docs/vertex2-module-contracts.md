@@ -7,6 +7,14 @@ behavior, edge cases, exact wording of log events, and acceptance criteria, the 
 authoritative. Where this doc and the spec conflict, the spec wins and you should flag
 the conflict in your final report rather than silently picking one.
 
+> **Amended 2026-08-06 (backlog B-1, spec rev 4).** Two surfaces are **removed** from this
+> contract: the whole of **§5 `src/v2/dosing.ts`** (the `standard`/`frontier` profile table,
+> `resolveProfile`, `doseFor`, `dosingOverrides`, the `profile` event stamp and the
+> `dosing:unknown-model` event), and `runVerifier`'s **`verifierModelOverride`** parameter
+> with its fallback chain. The verifier runs on the session's model, always. Section numbers
+> and identifiers are retained rather than renumbered — see `docs/vertex2-spec.md` §*Amendment
+> — rev 4* for the measured evidence.
+
 ## Architecture decision: v1 stays untouched
 
 `src/index.ts` (today's ~90KB file: `ElicifyVertexPlugin`, `EvidenceLedger`,
@@ -26,7 +34,7 @@ src/v2/resolve.ts
 src/v2/pin.ts
 src/v2/story.ts
 src/v2/artifacts.ts
-src/v2/dosing.ts
+src/v2/dosing.ts        (REMOVED 2026-08-06 — backlog B-1; see §5)
 src/v2/verifier.ts
 src/v2/subturn.ts
 src/v2/plugin.ts        (wave 3 — wires the above into the v2 hook set)
@@ -232,28 +240,31 @@ monorepo nearest-manifest row 9 and the outside-worktree exclusion row 10).
 
 ---
 
-## 5. `src/v2/dosing.ts` — FR-028, FR-029
+## 5. ~~`src/v2/dosing.ts` — FR-028, FR-029~~ — **MODULE REMOVED (2026-08-06, backlog B-1)**
 
-```ts
-export type Profile = "standard" | "frontier"
-
-export interface DosingResolution { profile: Profile; unknown: boolean; rawModelId: string | null }
-
-/** Suffix-tolerant match (e.g. "openrouter/anthropic/claude-fable-5" still resolves via its "anthropic/claude-fable-5" suffix) over a small built-in table plus an optional caller-supplied override table. Unmapped -> {profile: "standard", unknown: true, rawModelId: <the input, verbatim>}. modelId null -> {profile: "standard", unknown: true, rawModelId: null}. */
-export function resolveProfile(modelId: string | null, overrideTable?: Record<string, Profile>): DosingResolution
-
-export type DirectiveFamily =
-  | "phase-procedure" | "verification-prescription" | "falsification"
-  | "anomaly-interrupt" | "elevate"
-  // other composer families (scope-watchdog, plan-proposal, etc.) are NOT in the FR-029 matrix — dose "full" under both profiles unconditionally; doseFor should accept any string and default to "full" for unlisted families.
-
-export type Dose = "full" | "nudge-after-compliance" | "on-relevance-gap" | "on-new-tests-only" | "rubric-and-taste-only"
-
-/** FR-029's 5x2 matrix, exact cells from the spec table. Unlisted families always return "full" regardless of profile (the floor). */
-export function doseFor(family: DirectiveFamily | string, profile: Profile): Dose
-```
-
-Own tests 16, 17 and Dataset: Dosing profiles (all 5 rows).
+> **This module no longer exists.** The section number is kept so §6…§12 do not renumber and
+> existing "see §5" references still land somewhere.
+>
+> Deleted exports — **do not reintroduce, and do not import**: `Profile`
+> (`"standard" | "frontier"`), `DosingResolution`, `resolveProfile`, `DirectiveFamily`,
+> `Dose`, `doseFor`, and `measurement.ts`'s `DosingProfile` type and the `profile` field on
+> every event record. The `dosingOverrides` plugin option is deleted with them.
+>
+> **Replacement contract, in full:** the composer renders every directive family at its full
+> form for every model. There is no model→behaviour mapping, so there is no module. See
+> `docs/vertex2-spec.md` **FR-028R** (which replaces FR-028 and FR-029).
+>
+> **Why** (spec rev 4, and `docs/BACKLOG.md` B-1): the table had exactly two rows and
+> `resolveProfile`'s match required `id === key || id.endsWith("/" + key)`. In the measured
+> session of 2026-08-06 the live model id was `minimax-coding-plan/MiniMax-M3` and the key
+> was `minimax/MiniMax-M3` — different provider segment, so the suffix match failed **138
+> times**, each one logging `dosing:unknown-model`. The unmapped fallback is
+> `{profile: "standard"}`, which is exactly what the matched row would have returned. Total
+> observable effect: 138 log lines and one wrong `unknown: true` flag. Adding a
+> `minimax-coding-plan/…` row was explicitly rejected — it keeps the machinery and buys
+> nothing.
+>
+> ~~Own tests 16, 17 and Dataset: Dosing profiles (all 5 rows).~~ All removed.
 
 ---
 
@@ -410,19 +421,25 @@ export function buildVerifierPayload(raw: { criteria: string[]; diffSummary: str
 export interface VerifierVerdict { fit: "pass" | "concern"; notes: string }
 
 /**
- * Uses subturn.ts's probeCapability + runSubturn. Model defaults to sessionModel;
- * verifierModelOverride is tried first if present, falling back to sessionModel on
- * failure (retry counts against the shared 5s budget, not an additional 5s). Returns
- * null on any failure (probe fail, timeout, malformed JSON, thrown error) — caller
- * logs verifier:unavailable/verifier:malformed/verifier:unsupported based on which; you just
- * return null and let the caller decide which reason (or return a discriminated
- * reason string alongside null — your call, document it in your final report since
- * wave 3 wiring needs to know exactly what you return).
+ * Uses subturn.ts's probeCapability + runSubturn. The model is ALWAYS sessionModel —
+ * the judge runs on the same model as the worker (FR-030a, rewritten 2026-08-06).
+ * Exactly one model is attempted; there is no override parameter and no fallback
+ * chain. Returns null on any failure (probe fail, timeout, malformed JSON, thrown
+ * error) — caller logs verifier:unavailable/verifier:malformed/verifier:unsupported
+ * based on which; you just return null and let the caller decide which reason (or
+ * return a discriminated reason string alongside null — your call, document it in
+ * your final report since wave 3 wiring needs to know exactly what you return).
+ *
+ * REMOVED 2026-08-06 (backlog B-1, review OBS-001): the `verifierModelOverride`
+ * parameter and the "tried first if present, falling back to sessionModel on failure"
+ * behaviour. The option was never set in any observed session, so the attempt list was
+ * always [sessionModel] and the second entry was unreachable. Do not reintroduce the
+ * parameter; `pauseJudge.ts` must not carry one either.
  */
 export async function runVerifier(
   client: OpencodeClient,
   deps: { selfCreated: SelfCreatedSessions; logger: EventLogger },
-  opts: { parentSessionID: string; sessionModel: { providerID: string; modelID: string }; verifierModelOverride?: { providerID: string; modelID: string }; payload: VerifierPayload }
+  opts: { parentSessionID: string; sessionModel: { providerID: string; modelID: string }; payload: VerifierPayload }
 ): Promise<VerifierVerdict | null>
 ```
 
@@ -513,17 +530,20 @@ exports (exact names your choice, but list them clearly in your final report so 
 wiring can call them):
 
 - One writer per new event type: `directive_rendered`, `directive_complied`,
-  `calibration`, `phase_transition`, `resolution:none`, `dosing:unknown-model`,
+  `calibration`, `phase_transition`, `resolution:none`,
+  ~~`dosing:unknown-model`~~ (**REMOVED** 2026-08-06 — backlog B-1),
   `gate:multi-session-advisory`, `pins:disk-fallback-memory` / `pins:disk-recovered` /
   `pins:disk-unavailable`, `intake:classify-skipped` / `-fallback` / `-capped` /
   `-unsupported`, `subturn:cleanup-failed`, `verifier:unavailable` / `verifier:malformed` /
   `verifier:unsupported` / `verifier:field-dropped`, `criteria:re-pinned` /
   `criteria:truncated`, `expect:absent`.
-- Every writer accepts `{ sessionID, model, profile, ...payload }` and stamps
-  `model` (or `"unknown"`) + the resolved dosing `profile` on every record (FR-033 —
-  this must hold even for event types that existed before v2; if a v1 event writer is
-  reused, it needs a `profile` field added too, defaulting to `"standard"` when v1's
-  engine path is active and no v2 dosing ran).
+- Every writer accepts `{ sessionID, model, ...payload }` and stamps `model` (or
+  `"unknown"`) on every record (FR-033 — this must hold even for event types that
+  existed before v2). The model id is stamped **verbatim**: no suffix normalisation, no
+  provider rewriting. **REMOVED 2026-08-06 (backlog B-1)**: the ~~`profile`~~ parameter,
+  the `DosingProfile` type and the "defaulting to `standard` when v1's engine path is
+  active" rule. Normalising the model id for a lookup is exactly what failed silently 138
+  times; recording it raw is what made the failure visible.
 - **FR-034**: `directive_complied` join — implement the verifier-equivalence check here
   (same resolver tier + same target path set, after stripping
   `IGNORED_VERIFIER_FLAGS = {--reporter=*, --reporters=*, -v, --verbose, --silent,

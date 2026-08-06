@@ -7,6 +7,24 @@
 **Supersedes**: the prior in-session self-review (rev 1) that this file previously held
 **Verdict**: **BLOCK**
 
+> **Post-review disposition update — 2026-08-06 (backlog B-1, spec rev 4).**
+> The findings below are a snapshot of the 2026-07-25 round and are **not** rewritten; only
+> per-finding **Disposition** lines are added. Two entries changed status on 2026-08-06:
+>
+> - **OBS-001** (`verifierModel` override) — was carried as *Deferred* in spec rev 3. Now
+>   **RESOLVED**: the option, `verifierModelOverride` and the fallback chain are deleted from
+>   the spec and the implementation. The verifier runs on the session model, full stop.
+> - **OBS-002** (two dosing profiles differing on one family) — rev 3 took the "restore the
+>   matrix" branch. Rev 4 goes past both of the finding's options and **deletes the profile
+>   dimension entirely** (US-8, FR-028, FR-029, `src/v2/dosing.ts`, tests 16–17).
+>
+> The evidence that settled both: in the live session of 2026-08-06 the model id
+> `minimax-coding-plan/MiniMax-M3` missed the table key `minimax/MiniMax-M3` on its provider
+> segment **138 times**, and the unmapped fallback profile (`standard`) was exactly what the
+> matched row would have assigned — so the mechanism emitted 138 log lines and one incorrect
+> `unknown: true` flag and changed no behaviour at all. See `docs/vertex2-spec.md`
+> §*Amendment — rev 4* and `docs/BACKLOG.md` B-1.
+
 ## Executive Summary
 
 Rev 2 applies the nine prior findings as text edits, but four of the nine are only
@@ -543,6 +561,11 @@ none deferred" is not accurate as a statement about the underlying defects.
   when the finding is within the plan's workspace, the diff is ≤ N lines, and the story's bound
   verifier covers the path; the license MUST require the fix to be reported in the close-out"), plus a
   BDD scenario and a test.
+- **Disposition**: **Resolved** in spec rev 3 by the first branch (qualifier removed, license declared
+  out of scope; no `FR-029a` was ever written), and **permanently moot from 2026-08-06** — model
+  profiles no longer exist at all (backlog B-1, spec rev 4), so there is no `frontier` to grant a
+  license to and the qualifier cannot be reintroduced by a later edit. The Non-Behavior now reads
+  "propose only, for every model", unconditionally.
 
 ---
 
@@ -712,6 +735,15 @@ none deferred" is not accurate as a statement about the underlying defects.
   `verifierModel` to a later version and deleting FR-030a's second sentence, US-9 AS-3 and its BDD
   scenario. Test 36 then reduces to asserting the session model is used and the child is created with
   `parentID`.
+- **Disposition**: **RESOLVED 2026-08-06** (backlog B-1, spec rev 4) — *Deferred* in rev 3 only because
+  `verifierModel` was a recorded user decision (Clarifications 2026-07-25, Ambiguity #5) and reversing it
+  without the user present was out of bounds. The operator has now reversed it explicitly: **the judge
+  runs on the same model as the worker.** Applied exactly as recommended, and one step further — the
+  option is *deleted*, not deferred: FR-030a's second sentence, US-9 AS-3 and the BDD scenario are gone,
+  test 36 is narrowed and renamed `verifier_model_selection`, and `verifierModelOverride` is removed from
+  `runVerifier`'s signature (`docs/vertex2-module-contracts.md` §8) and from `pauseJudge`. The finding's
+  diagnosis was confirmed in the field: the option was unset in every observed session, so the attempt
+  list was always `[sessionModel]` and the chain's second entry was unreachable code.
 
 #### [OBS-002] Two dosing profiles now differ on exactly one family
 
@@ -725,6 +757,16 @@ none deferred" is not accurate as a statement about the underlying defects.
   replace the profile concept with a single option `intakeScaffold: 'full' | 'nudge'` and delete the
   table, the suffix-tolerant matching, the `dosing:unknown-model` event and tests 16–17 until a second
   dimension exists.
+- **Disposition**: **Resolved** in spec rev 3 by the first branch (matrix restored into FR-029, ten cells
+  exercised by the BDD outline and test 17), then **SUPERSEDED 2026-08-06** (backlog B-1, spec rev 4) by
+  a decision past both branches: the profile dimension is **deleted**, not narrowed — no table, no
+  suffix-tolerant matching, no `dosing:unknown-model`, no `intakeScaffold` replacement option, no
+  `src/v2/dosing.ts`. Every directive family renders `full` for every model (new **FR-028R**). The
+  second branch's deletions were all correct; what field data added is that the replacement option was
+  not needed either. Note the specific way rev 3's matrix restoration failed to help: the restored
+  `frontier` column had exactly one subject (`anthropic/claude-fable-5`) which never ran under this
+  harness, while the only model that did run missed its own `standard` row 138 times and was dosed
+  `standard` anyway by the fallback.
 
 #### [OBS-003] Test 37's name and description do not match the requirement it is traced to
 
@@ -910,6 +952,17 @@ dataset and test layers, which is also where the four uncovered acceptance scena
 - [ ] MAJ-012 — add `VERTEX_V2=0` and reversible archival (FR-036/FR-022); add SC-014
 - [ ] MAJ-013 — decide the frontier proactive-fix license: delete the profile qualifier, or add FR-029a with hard bounds
 - [ ] Fix MIN-001…MIN-009 and answer the ten unasked questions, encoding each decision into the spec
+
+> **Checklist status note (2026-08-06).** Three items above are now closed by deletion rather than by the
+> action they propose, and no `FR-029a` was ever created:
+> **MAJ-013** is permanently moot — there is no `frontier` profile to license anything (spec rev 4);
+> **MAJ-011**'s "US-8 AS-1 (extend test 16)" clause is void — US-8 and test 16 are removed, and the
+> surviving invariant is US-10 AS-1 / test 42;
+> **Unasked Question 1** ("read the model id from `system.transform`… would make the
+> `dosing:unknown-model` path nearly unreachable") is answered by removal — the path does not exist, and
+> the field evidence shows the question's premise was too optimistic: the id *was* read correctly and the
+> lookup missed anyway, on the provider segment, 138 times.
+> **OBS-001** and **OBS-002** carry their own Disposition lines above.
 
 **Verdict: BLOCK**
 
