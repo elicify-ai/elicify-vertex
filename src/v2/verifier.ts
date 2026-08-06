@@ -232,7 +232,7 @@ const VERIFIER_PAYLOAD_RAW_FIELD_SAFETY_CAP = 100_000
  * Standard Shannon entropy, bits per character, over the token's own
  * observed character frequency (order-0, no positional/contextual model).
  */
-function shannonEntropyBitsPerChar(token: string): number {
+function shannonEntropyBitsPerCharViaMap(token: string): number {
   const freq = new Map<string, number>()
   for (const ch of token) {
     freq.set(ch, (freq.get(ch) ?? 0) + 1)
@@ -241,6 +241,52 @@ function shannonEntropyBitsPerChar(token: string): number {
   let bits = 0
   for (const count of freq.values()) {
     const p = count / len
+    bits -= p * Math.log2(p)
+  }
+  return bits
+}
+
+/**
+ * PERF: this is the hottest function in the scan (the span pass calls it once
+ * per candidate span, and an adversarial whitespace-free field has ~4 spans
+ * per line), and the `Map` above cost two hash lookups per character. Secret
+ * material and evidence text are overwhelmingly ASCII, so ASCII gets a
+ * reusable count table and anything else falls back to the `Map`.
+ *
+ * The scratch buffers are module-level and reused; the function is
+ * straight-line and single-threaded, so there is no reentrancy to worry about,
+ * and it always leaves them zeroed. `order` records FIRST-OCCURRENCE order so
+ * the terms are summed in exactly the order the `Map` version summed them —
+ * floating-point addition is not associative, and this keeps the returned
+ * value bit-identical rather than merely close, which matters when the value
+ * is compared against a threshold 0.05 bits below hex's theoretical maximum.
+ */
+const ENTROPY_ASCII_LIMIT = 128
+const entropyAsciiCounts = new Int32Array(ENTROPY_ASCII_LIMIT)
+const entropyAsciiOrder = new Int32Array(ENTROPY_ASCII_LIMIT)
+
+function shannonEntropyBitsPerChar(token: string): number {
+  let distinct = 0
+  let ascii = true
+  for (let i = 0; i < token.length; i++) {
+    const code = token.charCodeAt(i)
+    if (code >= ENTROPY_ASCII_LIMIT) {
+      ascii = false
+      break
+    }
+    if (entropyAsciiCounts[code] === 0) entropyAsciiOrder[distinct++] = code
+    entropyAsciiCounts[code]++
+  }
+  if (!ascii) {
+    for (let i = 0; i < distinct; i++) entropyAsciiCounts[entropyAsciiOrder[i]] = 0
+    return shannonEntropyBitsPerCharViaMap(token)
+  }
+  const len = token.length
+  let bits = 0
+  for (let i = 0; i < distinct; i++) {
+    const code = entropyAsciiOrder[i]
+    const p = entropyAsciiCounts[code] / len
+    entropyAsciiCounts[code] = 0
     bits -= p * Math.log2(p)
   }
   return bits
@@ -447,21 +493,75 @@ function unitTrips(text: string): boolean {
 // (superseded by PATHLIKE_AT_JOIN — see CRIT-001 note below)
 
 /**
- * Does a `SECRET_PATTERNS` match cross `joinIdx`?
+ * ── ONE ANALYSIS PER SPAN, NOT ONE PER JOIN ────────────────────────────────
+ *
+ * PERF fix, measured. The three straddle tests below used to each re-scan the
+ * whole joined text from scratch for EVERY join, so a 6-unit span paid six
+ * `redactSecrets` passes, six hex sweeps and six tokenisations. The span pass
+ * tries four widths at every offset, so on a whitespace-free field (where
+ * every span is a candidate) that is ~24 full scans per unit. Measured on the
+ * worst case the raw-field safety cap admits — 7600 tight units, 98,799 chars,
+ * every span tripping and then being rejected — the field took **1700 ms**,
+ * and six such fields would block a hook for ten seconds.
+ *
+ * `scanJoined` computes the match OFFSETS once per span; each join is then a
+ * few integer comparisons against them. The `SECRET_PATTERNS` window — by far
+ * the most expensive of the three, since it runs the whole pattern array over
+ * the text — is computed LAZILY and memoised, because the common case never
+ * needs it. Nothing about WHICH spans are dropped changes: the tests below are
+ * the same predicates, evaluated against precomputed offsets.
+ */
+interface JoinedScan {
+  readonly joined: string
+  /** 32+ character hex runs (the C-15 backstop), as `[start, end)` offsets. */
+  readonly hexRuns: readonly (readonly [number, number])[]
+  /** `\S+` tokens at/over the entropy floor, as `[start, end)` offsets. */
+  readonly entropyTokens: readonly (readonly [number, number])[]
+  /** Memo: `undefined` = not computed yet, `null` = no `SECRET_PATTERNS` match. */
+  patternWindow: readonly [number, number] | null | undefined
+}
+
+const HEX_RUN_GLOBAL_RE = new RegExp(HEX_RUN_RE.source, "g")
+const NON_SPACE_RUN_RE = /\S+/g
+
+function scanJoined(joined: string): JoinedScan {
+  const hexRuns: (readonly [number, number])[] = []
+  HEX_RUN_GLOBAL_RE.lastIndex = 0
+  let hex: RegExpExecArray | null
+  while ((hex = HEX_RUN_GLOBAL_RE.exec(joined)) !== null) hexRuns.push([hex.index, hex.index + hex[0].length])
+  const entropyTokens: (readonly [number, number])[] = []
+  const tokenRe = NON_SPACE_RUN_RE
+  tokenRe.lastIndex = 0
+  let token: RegExpExecArray | null
+  while ((token = tokenRe.exec(joined)) !== null) {
+    if (token[0].length < ENTROPY_MIN_TOKEN_LENGTH) continue
+    if (shannonEntropyBitsPerChar(token[0]) < ENTROPY_EFFECTIVE_THRESHOLD_BITS) continue
+    entropyTokens.push([token.index, token.index + token[0].length])
+  }
+  return { joined, hexRuns, entropyTokens, patternWindow: undefined }
+}
+
+/**
+ * Where a `SECRET_PATTERNS` match lives, as one `[start, end)` window.
  *
  * `SECRET_PATTERNS` is private to `redaction.ts` (see `tripsPatternScan`),
  * so match offsets are recovered by diffing the redacted string against the
  * original: the common prefix and common suffix bound every changed region.
  * That window is a superset of the individual matches — with matches on both
- * sides of the join but none crossing it, the window would straddle and this
- * returns true. Deliberately left as-is: that configuration is unreachable
- * from `scanUnits` (a match wholly inside one unit means that unit trips
- * alone and the pair is never considered), and erring toward redaction is
- * the safe direction if it ever becomes reachable.
+ * sides of a join but none crossing it, the window would straddle and the
+ * join reads as covered. Deliberately left as-is: that configuration is
+ * unreachable from `scanUnits` (a match wholly inside one unit means that unit
+ * trips alone and the pair/span is never considered), and erring toward
+ * redaction is the safe direction if it ever becomes reachable.
  */
-function patternMatchStraddles(joined: string, joinIdx: number): boolean {
+function patternWindowOf(scan: JoinedScan): readonly [number, number] | null {
+  if (scan.patternWindow !== undefined) return scan.patternWindow
+  const joined = scan.joined
   const redacted = redactSecrets(joined)
-  if (redacted === joined) return false
+  if (redacted === joined) {
+    scan.patternWindow = null
+    return null
+  }
   let prefix = 0
   while (prefix < joined.length && prefix < redacted.length && joined[prefix] === redacted[prefix]) prefix++
   let suffix = 0
@@ -472,17 +572,22 @@ function patternMatchStraddles(joined: string, joinIdx: number): boolean {
   ) {
     suffix++
   }
-  return prefix < joinIdx && joined.length - suffix > joinIdx
+  scan.patternWindow = [prefix, joined.length - suffix]
+  return scan.patternWindow
 }
 
-/** Does a 32+ character hex run (the C-15 backstop) cross `joinIdx`? */
-function hexRunStraddles(joined: string, joinIdx: number): boolean {
-  const re = new RegExp(HEX_RUN_RE.source, "g")
-  let match: RegExpExecArray | null
-  while ((match = re.exec(joined)) !== null) {
-    if (match.index < joinIdx && match.index + match[0].length > joinIdx) return true
-  }
-  return false
+/**
+ * Does the joined text trip any of the three scans at all? Exactly
+ * `unitTrips(joined)` (`joined` is already dewrapped), read off the precomputed
+ * offsets — and, because the pattern window is lazy, usually without running
+ * `SECRET_PATTERNS` at all.
+ */
+function joinedTrips(scan: JoinedScan): boolean {
+  return scan.hexRuns.length > 0 || scan.entropyTokens.length > 0 || patternWindowOf(scan) !== null
+}
+
+function windowStraddles(window: readonly [number, number], joinIdx: number): boolean {
+  return window[0] < joinIdx && window[1] > joinIdx
 }
 
 /**
@@ -544,21 +649,14 @@ function hexRunStraddles(joined: string, joinIdx: number): boolean {
 const LEFT_ENDS_IN_PATH = /[\w-]+\.[A-Za-z][A-Za-z0-9]{0,7}$/
 const RIGHT_STARTS_SHORT_WORD = /^[A-Za-z][\w-]{0,7}$/
 
-function entropyTokenStraddles(joined: string, joinIdx: number): boolean {
-  const re = /\S+/g
-  let match: RegExpExecArray | null
-  while ((match = re.exec(joined)) !== null) {
-    const token = match[0]
-    const start = match.index
-    const end = start + token.length
-    if (token.length < ENTROPY_MIN_TOKEN_LENGTH) continue
+function entropyTokenStraddles(scan: JoinedScan, joinIdx: number, exonerateWordJoins: boolean): boolean {
+  for (const [start, end] of scan.entropyTokens) {
     if (!(start < joinIdx && end > joinIdx)) continue
-    if (shannonEntropyBitsPerChar(token) < ENTROPY_EFFECTIVE_THRESHOLD_BITS) continue
     // The join is only exonerated when the material immediately around it is
     // structurally path-like. Everything else — including a lopsided wrap —
     // is treated as a possible secret and the pair is dropped.
-    const leftFragment = joined.slice(start, joinIdx)
-    const rightFragment = joined.slice(joinIdx, end)
+    const leftFragment = scan.joined.slice(start, joinIdx)
+    const rightFragment = scan.joined.slice(joinIdx, end)
     if (LEFT_ENDS_IN_PATH.test(leftFragment) && RIGHT_STARTS_SHORT_WORD.test(rightFragment)) continue
     // Round 4: the anchor above only exonerates a left fragment ending in a
     // FILE EXTENSION, which left the general FR-006a false positive open —
@@ -573,7 +671,13 @@ function entropyTokenStraddles(joined: string, joinIdx: number): boolean {
     // token: a 43-char base64 key can itself segment into enough pseudo-words
     // to pass (measured — testing the whole token re-opened 32 leaks), while
     // a split key always leaves at least one side that is plainly random.
-    if (looksLikeWord(leftFragment) && looksLikeWord(rightFragment)) continue
+    //
+    // `exonerateWordJoins` is FALSE for the N-way span pass — see
+    // `spanKeyCore`'s doc comment for the measured reason (the span pass has a
+    // whole-core structural test that reads far more evidence than one
+    // fragment pair can, and the fragment pair is what was leaking base32-ish
+    // keys).
+    if (exonerateWordJoins && looksLikeWord(leftFragment) && looksLikeWord(rightFragment)) continue
     return true
   }
   return false
@@ -589,65 +693,184 @@ function entropyTokenStraddles(joined: string, joinIdx: number): boolean {
  * quantifier is what keeps the FR-006a false-positive class closed as the
  * window widens: a genuine wrapped secret is continuous random material at
  * every break, whereas fused prose has at least one break where two ordinary
- * words meet — and that one exonerated join spares the whole span. Requiring
- * only SOME join to trip would have re-opened FR-006a at width 3 with
- * interest, since a wider window has more chances to manufacture one bad
- * boundary.
+ * words meet.
  *
  * Offsets are computed in DEWRAPPED space because that is the space every
  * scan matches in (`dewrap` strips `\n`/`\r` only, so
  * `dewrap(a + b) === dewrap(a) + dewrap(b)` and each join index is exactly
  * the running length of the units to its left).
+ *
+ * The three tests are a disjunction with no side effects, so they are ordered
+ * cheapest-first: two integer comparisons against precomputed hex runs, then
+ * the entropy tokens, and only then the lazily-computed `SECRET_PATTERNS`
+ * window. Which joins pass is unchanged.
  */
-function spanTripsOnEveryJoin(dewrappedUnits: readonly string[]): boolean {
-  const joined = dewrappedUnits.join("")
+function straddlesEveryJoin(scan: JoinedScan, dewrappedUnits: readonly string[], exonerateWordJoins: boolean): boolean {
+  const joined = scan.joined
   let joinIdx = 0
   for (let k = 0; k + 1 < dewrappedUnits.length; k++) {
     joinIdx += dewrappedUnits[k].length
     if (joinIdx === 0 || joinIdx === joined.length) return false
-    if (
-      !(patternMatchStraddles(joined, joinIdx) || hexRunStraddles(joined, joinIdx) || entropyTokenStraddles(joined, joinIdx))
-    ) {
-      return false
-    }
+    if (scan.hexRuns.some((run) => windowStraddles(run, joinIdx))) continue
+    if (entropyTokenStraddles(scan, joinIdx, exonerateWordJoins)) continue
+    const window = patternWindowOf(scan)
+    if (window !== null && windowStraddles(window, joinIdx)) continue
+    return false
   }
   return true
 }
 
 function pairTripsOnJoin(a: string, b: string): boolean {
-  return spanTripsOnEveryJoin([dewrap(a), dewrap(b)])
+  const units = [dewrap(a), dewrap(b)]
+  return straddlesEveryJoin(scanJoined(units.join("")), units, true)
 }
 
 /**
- * B-3b: the single `\S+` token that crosses every join of a candidate span.
- * Exactly one exists by the span pass's own construction — the interior units
- * hold no whitespace, so the last token of the first unit runs through all of
- * them and into the first token of the last unit.
+ * B-3b: the single `\S+` token that crosses every join of a candidate span,
+ * together with where the outermost joins sit inside it. Exactly one such
+ * token exists by the span pass's own construction — the interior units hold
+ * no whitespace, so the last token of the first unit runs through all of them
+ * and into the first token of the last unit.
  */
-function spanFusedToken(dewrappedSpan: readonly string[]): string {
+function spanFusedToken(dewrappedSpan: readonly string[]): { token: string; firstJoin: number; lastJoin: number } {
   const head = /\S*$/.exec(dewrappedSpan[0])?.[0] ?? ""
   const tail = /^\S*/.exec(dewrappedSpan[dewrappedSpan.length - 1])?.[0] ?? ""
-  return head + dewrappedSpan.slice(1, dewrappedSpan.length - 1).join("") + tail
+  const token = head + dewrappedSpan.slice(1, dewrappedSpan.length - 1).join("") + tail
+  return { token, firstJoin: head.length, lastJoin: token.length - tail.length }
 }
 
 /**
- * Is this fused token shaped like ONE key that got wrapped, rather than like
+ * The two character sets a wrapped key can be drawn from: standard base64
+ * (`+` and `/`, padding aside) and base64url / hex / base32 (`-` and `_`).
+ * Both are supersets of hex and base32, so two classes cover every canonical
+ * encoding. What matters is what they EXCLUDE: `.` is in neither, and no key
+ * mixes `/`+`+` with `-`/`_`.
+ */
+const KEY_ENCODING_CLASSES: readonly RegExp[] = [/^[A-Za-z0-9+/]$/, /^[A-Za-z0-9_-]$/]
+
+/**
+ * The run of single-encoding key material that crosses EVERY join of the span,
+ * or `undefined` when no such run exists.
+ *
+ * Walks outward from the join interval: everything strictly between the first
+ * and last join (i.e. the whole interior of the span) must be one class, and
+ * the run is then extended left and right through the same class into the
+ * first and last units. That is the "bounded structural prefix/suffix, clean
+ * interior" shape — `--blob="` and `"` sit outside the run and are ignored;
+ * `,` or `"` or `.` BETWEEN the joins is disqualifying.
+ *
+ * ── WHY THIS REPLACED A WHOLE-TOKEN REGEX ─────────────────────────────────
+ * The previous guard asked whether the whole fused token was one uninterrupted
+ * alphabet run with punctuation only at its edges. Two measured failures:
+ *
+ *  1. HIGH — whole-key leak. Any line-1 prefix that puts a non-alphabet
+ *     character between itself and the key gives the token TWO runs, so the
+ *     guard exonerated the span and the key was transmitted byte-identical
+ *     with an empty event list:
+ *
+ *         running deploy:
+ *         --blob="HMEr3sTxobYf
+ *         DaktWCrS
+ *         XRdwBMkQvZpNjLgUeIoA"
+ *         exit 0
+ *
+ *     Measured over 16 realistic shapes x 741 three-way split points of one
+ *     40-char key: 8 shapes leaked (`BLOB="`, `"blob":"`, `blob='`,
+ *     `--blob="`, `setBlob(`, `[x](`, `<n v="`, `id,blob,`), 662 of 11,856
+ *     probes. Only entropy-only hits were affected — hex and `SECRET_PATTERNS`
+ *     hits never reach this guard.
+ *
+ *  2. OVER-REDACTION. `.` and `/` were in the old alphabet, so a list of tight
+ *     FILE PATHS — one per line, no spaces, exactly what `criteria`,
+ *     `verifierSummaries` and `diffSummary` carry — fused into "one clean run"
+ *     and the span pass ate it. Measured over 618 innocent corpora x 2 fields:
+ *     66 fields widened, several to EMPTY (three path lines in, `undefined`
+ *     out, the verifier left judging with no changed-file evidence at all —
+ *     precisely the B-3 disease the span pass was written alongside).
+ *     Requiring a single canonical encoding fixes this without a
+ *     path-specific allowlist: real paths carry a dotted extension, or mix `/`
+ *     with `-`/`_`, and neither survives a single-class run.
+ */
+function spanKeyCore(dewrappedSpan: readonly string[]): string | undefined {
+  const { token, firstJoin, lastJoin } = spanFusedToken(dewrappedSpan)
+  if (lastJoin <= firstJoin) return undefined
+  for (const cls of KEY_ENCODING_CLASSES) {
+    let interiorIsClean = true
+    for (let i = firstJoin; i < lastJoin; i++) {
+      if (!cls.test(token[i])) {
+        interiorIsClean = false
+        break
+      }
+    }
+    if (!interiorIsClean) continue
+    let start = firstJoin
+    while (start > 0 && cls.test(token[start - 1])) start--
+    let end = lastJoin
+    while (end < token.length && cls.test(token[end])) end++
+    if (end - start >= ENTROPY_MIN_TOKEN_LENGTH) return token.slice(start, end)
+  }
+  return undefined
+}
+
+/**
+ * Structured text is SEPARATED: `_`, `-` or `/` between its parts. A DIGIT
+ * boundary is not — random key material is full of digits, and
+ * `identifierSegments` splits on them, which is how a base32 key (uppercase
+ * letters plus `2-7`, no separator anywhere) fragmented into plausible-looking
+ * "words" and exonerated itself. Base32 was the single largest share of the
+ * residual leak: 3,584 of 12,718 whole-key leaks in a 180,000-probe sweep.
+ *
+ * A core with no separator can still be structured text — camelCase carries no
+ * separator at all — which is why `coreReadsAsStructuredText` accepts one, on
+ * a strictly higher bar.
+ */
+const STRUCTURED_TEXT_SEPARATOR = /[_\-/]/
+
+/**
+ * Does the span's key-material core actually read as run-together structured
+ * text (an identifier list, a slash-joined path with no extension) rather than
+ * as one wrapped key?
+ *
+ * Applied to the WHOLE core, which is the point: a span has far more evidence
+ * than a pair. `looksLikeWord` on a 13-character fragment is a coin toss on
+ * random material — that fragment-level test is what let ~1 in 3,000
+ * bare-wrapped keys through — while the same test over the whole 32-to-64
+ * character core sees every shard the material fragments into and is not
+ * fooled. This is why the span pass turns the per-join word exoneration OFF
+ * (`straddlesEveryJoin(..., false)`) and relies on this instead.
+ */
+function coreReadsAsStructuredText(core: string): boolean {
+  const separated = STRUCTURED_TEXT_SEPARATOR.test(core)
+  const segments = identifierSegments(core)
+  if (segments.length < 2) return false
+  // A camelCase hump on its own is weak evidence — random mixed-case key
+  // material is full of humps too — so a core with NO separator has to be
+  // camelCase all the way down: EVERY segment a real word, not just the half
+  // `looksLikeWord` settles for. Measured over 180,000 probes: accepting a
+  // bare hump cost 122 newly-introduced leaks, while refusing camelCase
+  // outright emptied a field of ordinary identifiers
+  // (`createPlanRequest` / `resolveStoryPhase` / `buildVerifierPayload` ->
+  // `undefined`), which is the evidence-starvation disease again. Requiring
+  // every segment gets both — 23 introduced leaks AND the identifier list
+  // intact — because any key carrying a single digit fragments into a
+  // one-character segment that is not a word.
+  if (!separated && !segments.every(readsAsWordSegment)) return false
+  return looksLikeWord(core)
+}
+
+/**
+ * Is this span shaped like ONE key that got wrapped, rather than like
  * structured text that happens to have run together?
  *
- * Key material — hex, base64 (`+/=`), base64url (`-_`), a JWT's dotted
- * segments — is one uninterrupted run of a single alphabet. Punctuation may
- * sit at its EDGES (the quotes around a string literal, a trailing comma) but
- * never in its middle. Structured text is the opposite: its punctuation is
- * interior and load-bearing.
- *
- * Measured need, not theory. Without this the span pass dropped all three
- * lines of unindented compact JSON —
+ * Measured need, not theory. Without a guard here the span pass dropped all
+ * three lines of unindented compact JSON —
  *
  *     {"storyId":"S1",  /  "pass":true,  /  "summary":"done"}
  *
  * which fuses to a 45-char token at over 4 bits/char with no join that reads
  * as word-meets-word. That is the FR-006a class again (innocent evidence
- * deleted, field emptied), one width up.
+ * deleted, field emptied), one width up. It survives because `"` and `,` sit
+ * BETWEEN the joins, so there is no single-encoding core at all.
  *
  * Applied ONLY to an entropy-driven span hit. A `SECRET_PATTERNS` match or a
  * 32-char hex run is shape-specific — structured text cannot manufacture
@@ -655,10 +878,32 @@ function spanFusedToken(dewrappedSpan: readonly string[]): string {
  * which matters because a wrapped connection string is exactly a token whose
  * middle is full of `:/@`.
  */
-const WRAPPED_KEY_TOKEN = /^[^A-Za-z0-9+/=_.-]*[A-Za-z0-9+/=_.-]+[^A-Za-z0-9+/=_.-]*$/
-
 function spanLooksLikeOneWrappedToken(dewrappedSpan: readonly string[]): boolean {
-  return WRAPPED_KEY_TOKEN.test(spanFusedToken(dewrappedSpan))
+  if (spanIsPathTokenList(dewrappedSpan)) return false
+  const core = spanKeyCore(dewrappedSpan)
+  if (core === undefined) return false
+  return !coreReadsAsStructuredText(core)
+}
+
+/**
+ * A changed-file list, one path per line — no spaces, so every line is a span
+ * candidate, and slash-joined so an EXTENSIONLESS list (`src/v2/index`) is a
+ * clean base64-class run that `coreReadsAsStructuredText` does not always
+ * rescue. This is the exact shape `criteria`, `verifierSummaries` and
+ * `diffSummary` carry, and eating it starves the verifier of the file
+ * evidence B-3 exists to preserve.
+ *
+ * Every unit must be a well-formed path of THREE OR MORE segments. The
+ * three-segment bar is what makes this safe rather than a hole: a wrapped key
+ * chunk would have to contain two `/` characters by chance in every one of its
+ * pieces (base64 emits `/` at 1 in 64), and it must contain no `+`, `=` or
+ * quoting either. Measured over the leak sweep below, adding this changed the
+ * whole-key leak count by zero.
+ */
+const PATH_TOKEN_UNIT = /^\/?[A-Za-z0-9_.@~-]+(?:\/[A-Za-z0-9_.@~-]+){2,}$/
+
+function spanIsPathTokenList(dewrappedSpan: readonly string[]): boolean {
+  return dewrappedSpan.every((unit) => PATH_TOKEN_UNIT.test(unit))
 }
 
 /**
@@ -718,8 +963,9 @@ function spanLooksLikeOneWrappedToken(dewrappedSpan: readonly string[]): boolean
  *     a pair of array lookups per unit for every realistic field. On top of
  *     that, a candidate span is still only dropped when EVERY join in it
  *     survives the same FR-006a exoneration pass 2 uses
- *     (`spanTripsOnEveryJoin`), so a span containing one ordinary
- *     word-meets-word boundary is spared.
+ *     (`straddlesEveryJoin`) AND the material crossing those joins is shaped
+ *     like one wrapped key (`spanLooksLikeOneWrappedToken`), so a span of
+ *     ordinary structured text is spared.
  *
  * A unit already dropped individually is excluded from pairwise
  * consideration so an innocent neighbor of a standalone secret is never
@@ -761,13 +1007,24 @@ const SECRET_FRAGMENT_MIN_CHARS = 16
  * evidence the verifier needs, and the second failure is the one that has
  * actually hurt in production.
  */
+/** Three or more letters with a vowel in them — `Request`, not `Rq7`. */
+function readsAsWordSegment(segment: string): boolean {
+  return /^[A-Za-z]{3,}$/.test(segment) && /[aeiouy]/i.test(segment)
+}
+
+function identifierSegments(token: string): string[] {
+  return (
+    token
+      // `/` is in `SECRET_ALPHABET_RUN`, so without splitting on it too an
+      // all-lowercase path like `tests/fixtures/replay` was read as key
+      // material and stripped — the FR-006a class again.
+      .split(/[_\-/]|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Za-z])(?=\d)|(?<=\d)(?=[A-Za-z])/)
+      .filter((part) => part !== "")
+  )
+}
+
 function looksLikeWord(token: string): boolean {
-  const segments = token
-    // `/` is in `SECRET_ALPHABET_RUN`, so without splitting on it too an
-    // all-lowercase path like `tests/fixtures/replay` was read as key
-    // material and stripped — the FR-006a class again.
-    .split(/[_\-/]|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Za-z])(?=\d)|(?<=\d)(?=[A-Za-z])/)
-    .filter((part) => part !== "")
+  const segments = identifierSegments(token)
   if (segments.length === 0) return false
   // `+` and `=` are base64-only: no identifier or English word contains them.
   if (/[+=]/.test(token)) return false
@@ -776,7 +1033,7 @@ function looksLikeWord(token: string): boolean {
   // runs like `Nvrf`, `fdgb`, `KBCdfv`, which no English word or identifier
   // resembles. Measured: this closed the last 5 leaks in a 12000-split sweep
   // and keeps every prose token the earlier bars were protecting.
-  const wordy = segments.filter((part) => /^[A-Za-z]{3,}$/.test(part) && /[aeiouy]/i.test(part))
+  const wordy = segments.filter(readsAsWordSegment)
   // At least half the segments must be real alphabetic runs. Random material
   // fragments into one- and two-character shards; identifiers do not.
   if (wordy.length * 2 < segments.length) return false
@@ -905,15 +1162,24 @@ function scanUnits(units: string[]): { kept: string[]; anyDropped: boolean } {
         }
         if (!spanIsCandidate) continue
         const span = dewrapped.slice(i, last + 1)
-        // Cheap gate first, exactly as in the pair pass, then the FR-006a
-        // join-locality check at EVERY join in the span.
-        const fused = span.join("")
-        if (!unitTrips(fused)) continue
-        if (!spanTripsOnEveryJoin(span)) continue
-        // ...and, for an entropy-only hit, the fused token must actually be
-        // shaped like one wrapped key rather than like run-together
-        // structured text (see `spanLooksLikeOneWrappedToken`).
-        if (!tripsPatternScan(fused) && !tripsHexRunScan(fused) && !spanLooksLikeOneWrappedToken(span)) continue
+        // One analysis for the whole span (see `JoinedScan`): the cheap gate,
+        // the shape gate and the per-join check all read the same precomputed
+        // offsets, and the `SECRET_PATTERNS` pass runs at most once.
+        const scan = scanJoined(span.join(""))
+        if (!joinedTrips(scan)) continue
+        // For an entropy-only hit the span must be shaped like ONE wrapped key
+        // rather than run-together structured text (see
+        // `spanLooksLikeOneWrappedToken`). This is a conjunct of the same
+        // condition as before, hoisted ABOVE the per-join check purely for
+        // cost: it is join-independent and cheap, and on an adversarial
+        // whitespace-free field it rejects the span before any join work
+        // happens. Which spans get dropped is unchanged.
+        if (scan.hexRuns.length === 0 && !spanLooksLikeOneWrappedToken(span) && patternWindowOf(scan) === null) continue
+        // FR-006a's join-locality check at EVERY join in the span. The
+        // word-meets-word exoneration is OFF here: `spanLooksLikeOneWrappedToken`
+        // makes that judgement over the whole core instead, which is strictly
+        // more evidence than one fragment pair (see `coreReadsAsStructuredText`).
+        if (!straddlesEveryJoin(scan, span, false)) continue
         for (let k = i; k <= last; k++) toDrop.add(k)
       }
     }
