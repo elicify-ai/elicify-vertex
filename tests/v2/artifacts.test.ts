@@ -76,6 +76,114 @@ describe("artifact_parse_criteria (test 10)", () => {
   })
 
   // -------------------------------------------------------------------------
+  // B-2's OTHER half, corrected: the relaxed grammar started pinning
+  // NON-criteria. Bullets plus blank-line tolerance meant the parser could
+  // bridge a paragraph break and adopt the next list in the reply, whatever it
+  // was. Three shapes were measured doing it, and all three are here.
+  //
+  // Junk pins are not inert: an unmet pinned "criterion" drives the criteria
+  // stop-block, is replayed to the verifier as an acceptance criterion, and —
+  // because the intake scaffold's emission gate is "the pin store is empty" —
+  // a store full of junk permanently closes the gate, so the model can never
+  // replace it by answering the scaffold properly.
+  //
+  // MUTATION PROOF for the block below: turn the blank-line `break` back into
+  // `continue`, or drop the "inline remainder must parse as an item" return,
+  // and these go RED while every bullet test above stays green.
+  // -------------------------------------------------------------------------
+  it("does not bridge a blank line into the model's plan bullets", () => {
+    const text = [
+      "CRITERIA:",
+      "1. parser handles nesting",
+      "2. errors point at inner token",
+      "",
+      "Here is how I will do it:",
+      "- read the tokenizer",
+      "- add a depth counter",
+      "- run the suite",
+    ].join("\n")
+
+    const result = parseCriteriaBlock(text)
+
+    expect(result).not.toBeNull()
+    expect(result!.criteria, "the plan steps are not acceptance criteria").toEqual([
+      "parser handles nesting",
+      "errors point at inner token",
+    ])
+  })
+
+  it("stops at the blank line even when the next list is immediately below the key line's items", () => {
+    const text = ["CRITERIA:", "- one real criterion", "", "- an unrelated later bullet"].join("\n")
+
+    expect(parseCriteriaBlock(text)!.criteria).toEqual(["one real criterion"])
+  })
+
+  it("pins nothing for a prose `Criteria:` line followed by an orientation list", () => {
+    const text = [
+      "Criteria: I read the request as a refactor with no behaviour change.",
+      "",
+      "- the module is 800 lines",
+      "- there are three callers",
+      "- the tests live next door",
+    ].join("\n")
+
+    expect(parseCriteriaBlock(text), "prose after the key is a sentence, not a list").toBeNull()
+    // ...and the miss is still visible to the caller, which is what B-2 was for.
+    expect(findCriteriaKeyLine(text)).toBe("Criteria: I read the request as a refactor with no behaviour change.")
+  })
+
+  // The same shape with no blank line to stop it. Contiguity cannot help here,
+  // so this is the case the "inline remainder must itself parse as an item"
+  // rule exists for.
+  //
+  // MUTATION PROOF: restore `if (inlineRemainder) tryConsume(inlineRemainder)`
+  // (ignoring the failure and reading on) -> the two orientation bullets are
+  // pinned as acceptance criteria and this goes RED.
+  it("pins nothing when prose after the key runs straight into a list", () => {
+    const text = [
+      "Criteria: I read the request as a refactor with no behaviour change.",
+      "- the module is 800 lines",
+      "- there are three callers",
+    ].join("\n")
+
+    expect(parseCriteriaBlock(text)).toBeNull()
+  })
+
+  it("pins nothing for a review reply's `Criteria:` heading", () => {
+    const text = [
+      "I reviewed the diff against the usual dimensions.",
+      "",
+      "Criteria:",
+      "",
+      "- Correctness: the guard is in the wrong branch",
+      "- Tests: none cover the failure path",
+      "- Observability: no event on the refusal",
+    ].join("\n")
+
+    expect(parseCriteriaBlock(text), "review dimensions are not the task's acceptance criteria").toBeNull()
+  })
+
+  // The documented cost of contiguity, asserted rather than discovered: a
+  // genuine block padded with a blank line parses as nothing — but LOUDLY,
+  // because `findCriteriaKeyLine` still reports the key line and the caller
+  // logs `criteria:parse-miss`. A bad pin is silent; this is not.
+  it("treats a blank line between the key and its list as a parse miss, not a pin", () => {
+    const text = "CRITERIA:\n\n1. parser handles nesting"
+    expect(parseCriteriaBlock(text)).toBeNull()
+    expect(findCriteriaKeyLine(text)).toBe("CRITERIA:")
+  })
+
+  it("still accepts the inline first-item form", () => {
+    const result = parseCriteriaBlock("CRITERIA: 1. parser handles nesting\n2. errors point at inner token")
+    expect(result!.criteria).toEqual(["parser handles nesting", "errors point at inner token"])
+  })
+
+  it("last-block-wins still applies when the later block is an unparseable heading", () => {
+    const text = ["CRITERIA:", "1. a real earlier criterion", "", "Criteria: and now some closing prose."].join("\n")
+    expect(parseCriteriaBlock(text), "the last occurrence wins even when it is empty").toBeNull()
+  })
+
+  // -------------------------------------------------------------------------
   // B-2: a parse miss must be TELLABLE from "the model never answered".
   // -------------------------------------------------------------------------
   it("B-2: findCriteriaKeyLine reports the unparseable key line so the miss can be logged", () => {

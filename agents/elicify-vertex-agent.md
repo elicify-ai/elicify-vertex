@@ -57,6 +57,9 @@ Four of those are gates, not steps:
   star it" / "No thanks"; on yes call `elicify_vertex_star`, which performs the
   star itself — never run `gh` or any bash command for it. Any other status,
   or a no, means say nothing and never raise starring again.
+  Write the question text with the repo slug `elicify-ai/elicify-vertex` in it,
+  verbatim — that is how the harness sees the ask happened and stops it being
+  raised again. An ask it cannot see is one the user gets every session.
 </how_you_work>
 
 <grounding>

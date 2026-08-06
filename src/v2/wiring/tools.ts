@@ -114,6 +114,30 @@ export interface StarState {
 }
 
 /**
+ * The only three values that are a real user decision. Everything else — a
+ * legacy marker, a typo, a truncated write, a hand-edit — is NO RECORD.
+ *
+ * This is an ALLOWLIST on purpose. The previous denylist (`prompted`,
+ * `gave-up`) let every other word through verbatim, so the file could hold
+ * `{"consent":"banana"}` / `null` / `[]` and, per the agent prompt's
+ * "anything other than none means never raise it again", each of those
+ * permanently cancelled the ask — a terminal decision made by a corrupt byte
+ * rather than by the user. It also compared case-sensitively, so `GAVE-UP`
+ * dodged the denylist and was honoured as terminal, which is precisely the
+ * machine-behaviour-as-user-decision bug B-6 exists to kill.
+ */
+const STAR_CONSENT_VALUES: readonly StarConsent[] = ["asked", "yes", "declined"]
+
+/** Normalise a raw marker to a real consent value, or `null` for "no record".
+ *  Case- and whitespace-insensitive: the file is a plain-text artefact a human
+ *  may have touched, so `"Yes"` and `" declined "` are the same decisions. */
+function normalizeStarConsent(raw: unknown): StarConsent | null {
+  if (typeof raw !== "string") return null
+  const value = raw.trim().toLowerCase()
+  return (STAR_CONSENT_VALUES as readonly string[]).includes(value) ? (value as StarConsent) : null
+}
+
+/**
  * Read the consent record.
  *
  * Three compatibility rules, all load-bearing:
@@ -128,6 +152,9 @@ export interface StarState {
  *    instruction the user never saw, and being terminal it permanently
  *    cancelled an ask nobody ever made. The state no longer exists (B-6); a
  *    machine carrying the marker gets the one real ask it was owed.
+ *
+ * Both legacy markers now fall out of the allowlist above rather than being
+ * named in a denylist, which is why nothing here enumerates them any more.
  */
 export function readStarState(): StarState | null {
   try {
@@ -136,13 +163,12 @@ export function readStarState(): StarState | null {
     const raw = readFileSync(path, "utf8").trim()
     if (!raw) return null
     if (raw.startsWith("{")) {
-      const parsed = JSON.parse(raw) as { state?: string }
-      if (!parsed.state || parsed.state === "prompted" || parsed.state === "gave-up") return null
-      return { state: parsed.state as StarConsent }
+      const parsed = JSON.parse(raw) as { state?: unknown }
+      const state = normalizeStarConsent(parsed?.state)
+      return state ? { state } : null
     }
-    // Legacy bare words that are not real user decisions: not a record at all.
-    if (raw === "prompted" || raw === "gave-up") return null
-    return { state: raw as StarConsent }
+    const state = normalizeStarConsent(raw)
+    return state ? { state } : null
   } catch {
     return null
   }
@@ -213,6 +239,64 @@ export function writeStarConsent(value: StarConsent): void {
   } catch {
     // Non-fatal: worst case the user is asked again next run.
   }
+}
+
+/** Just the repo NAME half of `STAR_REPO` — derived, never a second literal,
+ *  so renaming the repo cannot leave the matcher pointing at the old slug. */
+const STAR_REPO_NAME = STAR_REPO.split("/")[1] ?? STAR_REPO
+
+/**
+ * Is this `question` tool call OUR star ask?
+ *
+ * The first version of this check required the full `elicify-ai/elicify-vertex`
+ * slug verbatim in the serialised args, while nothing in the agent prompt asked
+ * the model to write it that way. Seven plausible phrasings taken straight from
+ * the prompt line were probed and FIVE recorded nothing — including "Would you
+ * like to star the elicify-vertex repo on GitHub?". A miss is not a small loss:
+ * `asked` is the ONLY thing that stops the agent raising the question again, so
+ * a non-matching phrasing re-asks every session forever, on exactly the weaker
+ * models B-6 was written for. That is strictly worse than the bounded 3-attempt
+ * loop it replaced.
+ *
+ * So the match is widened to the repo NAME plus a starring/GitHub topic word,
+ * and the prompt is changed to instruct the model to name the full slug (both
+ * ends — neither is reliable alone: the prompt is advice, the matcher is code).
+ *
+ * Still NOT a bare "star" substring check. That burned the machine's one-shot
+ * on "which star rating should the widget default to?" and "should I use a star
+ * schema?" — the repo name is required, and those mention no repo at all. The
+ * residual false positive is a question that names this repo AND says star or
+ * GitHub without being the ask (e.g. while working on this codebase). It costs
+ * a star we never get; the false NEGATIVE costs the user a prompt every session
+ * for the rest of time, so the asymmetry decides the direction.
+ */
+export function isStarAsk(args: unknown): boolean {
+  let blob: string
+  try {
+    // Host-supplied and potentially circular — `JSON.stringify` throws on that
+    // and this runs inside a hook with no enclosing try/catch.
+    blob = JSON.stringify(args ?? {}).toLowerCase()
+  } catch {
+    return false
+  }
+  if (!blob.includes(STAR_REPO_NAME)) return false
+  return blob.includes("star") || blob.includes("github")
+}
+
+/**
+ * Record `asked` when an observed `question` call is our star ask and nothing
+ * is recorded yet. Returns true only when it actually wrote — the caller logs.
+ *
+ * Lives here rather than in the hook so the matching rule is unit-testable
+ * without booting the plugin, and so both observation points (dispatch and
+ * completion — see plugin.ts) share one implementation instead of two that can
+ * drift apart.
+ */
+export function recordStarAskIfOurs(args: unknown): boolean {
+  if (readStarConsent() !== null) return false
+  if (!isStarAsk(args)) return false
+  writeStarConsent("asked")
+  return true
 }
 
 // ---------------------------------------------------------------------------
@@ -372,6 +456,41 @@ function buildPlanningChallenge(plan: PlanV2): string[] {
     "Proceeding is also a valid answer — but only if you can say what the plan is grounded IN.",
   )
   return lines
+}
+
+// ---------------------------------------------------------------------------
+// Scope globs that constrain nothing (B-2 follow-up)
+// ---------------------------------------------------------------------------
+/**
+ * True when a glob has no literal path segment: every segment is made only of
+ * the wildcards star and question-mark. "double-star" on its own is the case
+ * that matters; "./double-star", "double-star/star" and "?" behave the same.
+ *
+ * `story.ts`'s matcher compiles a double-star to `.*`, so a lone one becomes
+ * `^.*$` and every path on the machine is "in scope": the watchdog is off for
+ * that story, silently, and indistinguishably from a real scope in the plan
+ * file. That is the exact outcome the empty-list guard below already refuses,
+ * reached by a different spelling — measured: after amending scope to the
+ * catch-all, editing `/etc/passwd` raised no watchdog and still recorded
+ * FR-034 compliance.
+ *
+ * The rule is structural rather than a denylist of spellings, so anything
+ * naming real files keeps working (`src/`+double-star, double-star+`/*.ts`,
+ * double-star+`/test/`+double-star). "star/double-star" is refused too — it
+ * constrains only "not a top-level file", which is not a scope.
+ *
+ * Mirrors the grammar of `globToRegExp` in `story.ts` (that function is not
+ * exported and this module does not own that file); deliberately a structural
+ * test over the same wildcard subset, not a second compiler.
+ */
+export function isUnboundedGlob(glob: string): boolean {
+  const segments = glob
+    .trim()
+    .replace(/^\.\/+/, "")
+    .split("/")
+    .filter((segment) => segment !== "" && segment !== ".")
+  if (segments.length === 0) return true
+  return segments.every((segment) => /^[*?]+$/.test(segment))
 }
 
 /** 2026-07-30: enrich each active task with its parent story's id/text so the
@@ -614,7 +733,9 @@ export function buildPlanTools(deps: PlanToolsDeps) {
       "scope. Pass resolution='fold' to ADD globs covering the file to the story's existing scope, 'amend' to " +
       "REPLACE the story's scopeGlobs wholesale (use when the declared globs are stale — e.g. after a branch " +
       "switch or a typo that matched zero files), or 'revert' when you have undone the out-of-scope change instead. " +
-      "Always state a reason; it is appended to the story's amendment log. fold/amend require scopeGlobs.",
+      "Always state a reason; it is appended to the story's amendment log. fold/amend require scopeGlobs, and every " +
+      "glob must name something: a catch-all with no literal path segment is refused because it turns the watchdog " +
+      "off. The story must be one with active tasks — the watchdog only ever reports drift against those.",
     args: {
       storyId: tool.schema.string().min(1),
       resolution: tool.schema.enum(["fold", "amend", "revert"]),
@@ -627,19 +748,62 @@ export function buildPlanTools(deps: PlanToolsDeps) {
       const story = plan?.stories.find((candidate) => candidate.id === args.storyId)
       if (!story) throw new Error(`unknown story: ${args.storyId}`)
 
-      // An EMPTY glob list is refused for fold/amend rather than passed
-      // through: `amendStory` treats `[]` as "replace with nothing", which
-      // silently disables the watchdog for that story — the opposite of
-      // resolving a drift, and indistinguishable in the plan file afterwards.
-      if (args.resolution !== "revert" && args.scopeGlobs.length === 0) {
-        throw new Error(`resolution '${args.resolution}' requires at least one glob in scopeGlobs`)
+      // `?? []`: `execute` is reachable directly (tests, and any host that
+      // does not apply the schema's `.default([])`), where a `revert` call
+      // legitimately omits the field entirely.
+      const requestedGlobs = args.scopeGlobs ?? []
+      if (args.resolution !== "revert") {
+        // An EMPTY glob list is refused for fold/amend rather than passed
+        // through: `amendStory` treats `[]` as "replace with nothing", which
+        // silently disables the watchdog for that story — the opposite of
+        // resolving a drift, and indistinguishable in the plan file afterwards.
+        if (requestedGlobs.length === 0) {
+          throw new Error(`resolution '${args.resolution}' requires at least one glob in scopeGlobs`)
+        }
+
+        // ...and a CATCH-ALL is the same defect with a different spelling: a
+        // lone double-star compiles to `^.*$`, so the story's scope becomes
+        // every path in the filesystem and the watchdog can never fire again.
+        // See `isUnboundedGlob`.
+        const unbounded = requestedGlobs.filter((glob) => isUnboundedGlob(glob))
+        if (unbounded.length > 0) {
+          throw new Error(
+            `scopeGlobs ${JSON.stringify(unbounded)} match every path, which disables the scope watchdog for ` +
+              `${args.storyId} entirely. Name the directories or file patterns this story actually touches ` +
+              `(e.g. "src/parser/**", "tests/**/*.ts"). If the change genuinely belongs outside the story, ` +
+              `revert it or re-plan instead.`,
+          )
+        }
+      }
+
+      // COMPLIANCE IS A MEASUREMENT, so it must not be earned by a call that
+      // could not have resolved a drift. The watchdog only ever reports drift
+      // against a story with ACTIVE TASKS (`StoryEngine.checkScope` filters to
+      // exactly those), so amending a pending/complete/blocked story answers
+      // no directive and must not count.
+      //
+      // NOT checked here, and deliberately so: whether the amended globs cover
+      // the path that actually drifted. The drifted path lives in
+      // `state.scopeDriftPending`, which `plugin.ts` nulls the moment the
+      // directive is rendered — by the time the model can call this tool the
+      // record is gone, and this module does not own the file that would have
+      // to retain it. Recorded as a known gap rather than approximated: a
+      // "does it cover?" check against a path we no longer hold would be a
+      // guess presented as a verification, which is the failure mode this
+      // whole harness exists to prevent.
+      const activeStoryIds = storyEngine.getActiveStories(sid).map((candidate) => candidate.id)
+      if (!activeStoryIds.includes(args.storyId)) {
+        throw new Error(
+          `story ${args.storyId} has no active tasks, so no scope-watchdog directive can be outstanding for it ` +
+            `(status: ${story.status}). Active stories: ${activeStoryIds.length ? activeStoryIds.join(", ") : "none"}.`,
+        )
       }
 
       const scopeGlobs =
         args.resolution === "fold"
-          ? [...new Set([...story.scopeGlobs, ...args.scopeGlobs])]
+          ? [...new Set([...story.scopeGlobs, ...requestedGlobs])]
           : args.resolution === "amend"
-            ? [...args.scopeGlobs]
+            ? [...requestedGlobs]
             : undefined
       storyEngine.amendStory(sid, args.storyId, { reason: `${args.resolution}: ${args.reason}`, scopeGlobs })
 
@@ -733,14 +897,39 @@ export function buildPlanTools(deps: PlanToolsDeps) {
   // the `question` tool. It runs `gh` as a hidden subprocess and records
   // consent, so no bash/gh ever appears in the chat. Idempotent: a second call
   // (consent already "yes") is a no-op.
+  //
+  // CONSENT IS CHECKED HERE, not just trusted from the caller. This is the
+  // plugin's one irreversible, outward-facing action against the user's own
+  // GitHub account, and the only thing standing between a recorded "no" and a
+  // star used to be the model choosing not to call the tool. A planted
+  // `{"state":"declined"}` was measured STARRING the repo and then rewriting
+  // the marker to `{"state":"yes"}` — overriding an explicit user no and
+  // erasing the record of it. A recorded decision now refuses:
+  //
+  //   declined — refuse, star nothing, leave the marker untouched.
+  //   yes      — already starred; no-op (the idempotency guard).
+  //   asked    — the ask fired and the model is acting on the answer: allowed.
+  //              This is the normal path.
+  //   no file  — allowed. The observer's match can still miss a phrasing, so
+  //              refusing here would make a genuine yes unhonourable; and no
+  //              user decision exists to contradict.
   const starTool = tool({
     description:
       "Star the elicify-vertex GitHub repo. Call this ONLY once, after the user agreed to star via the question tool. " +
-      "It performs the star itself — do NOT run gh or any bash command yourself. Returns {starred, already}.",
+      "It performs the star itself — do NOT run gh or any bash command yourself. Returns {starred, already}. " +
+      "Refuses if the user has already declined.",
     args: {},
     async execute() {
       const prior = readStarConsent()
       if (prior === "yes") return JSON.stringify({ starred: true, already: true })
+      if (prior === "declined") {
+        return JSON.stringify({
+          starred: false,
+          already: true,
+          refused: "declined",
+          note: "The user has already declined to star this repo. Nothing was starred. Do not raise starring again.",
+        })
+      }
       const ok = starRepoHidden()
       writeStarConsent("yes")
       return JSON.stringify({ starred: ok, already: false })
