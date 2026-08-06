@@ -627,14 +627,33 @@ wiring can call them):
   and appeared in neither this list nor the writer set, and the test that was supposed
   to catch that compared its own literal copy of the writer table against itself. The
   authority is `V2_EVENT_TYPES` in `src/measurement.ts` — a runtime `as const` array
-  that `V2EventType` is derived from — and test 42 asserts writer coverage against that
-  array in both directions. Add a type there, or it does not exist; add it there without
-  a writer, and the suite is red.
+  that `V2EventType` is derived from.
 
-  Note also that `src/v2/wiring/logger.ts` deliberately accepts event ids OUTSIDE this
-  union (`cooldown:dropped`, `per-turn-cap:dropped`, `verifier:field-truncated`,
-  `star:asked`, …) via a cast, so the on-disk ledger legitimately contains event types
-  this list has never named. See that file's header for why.
+  **UPDATED 2026-08-06.** That authority was, until this round, a claim rather than a
+  fact. `wiring/logger.ts` cast the emitted name to `V2EventType` on its way to disk, so
+  nothing consulted the array: measured over `src/v2/`, 82 distinct event names were
+  emitted and 61 were absent from it, `intake:classify-unsupported` was declared while
+  `story.ts` emitted `intake:unsupported`, and all 22 typed writers had zero callers in
+  `src/`. It is now enforced two ways:
+
+  - **Compile time.** `EventLogger` (`src/v2/types.ts`) takes `V2EventType`, not
+    `string`, and the cast in `wiring/logger.ts` is gone. `phase.ts`/`pin.ts` re-export
+    that one definition instead of re-declaring their own `string`-typed copies, and
+    `goals.ts`'s `ReceiptLogger` is typed the same way. An unregistered event name fails
+    `tsc` at the line that emits it.
+  - **Test time.** `tests/v2/measurement.test.ts` scans `src/` for emitted event
+    literals and compares them to the registry in both directions, so an entry left
+    behind after its emitter was deleted is red too — the one direction `tsc` cannot see.
+
+  Divergent spellings were REGISTERED, not renamed (`intake:unsupported` stays as
+  `story.ts` writes it, alongside the writer-backed `intake:classify-unsupported`;
+  `receipt:scope-unverifiable` and `receipts:scope-unverifiable` are both live). Renaming
+  an event breaks continuity with every record already on disk.
+
+  `V2_TYPED_WRITER_EVENTS` is the SUBSET of the registry that has a typed convenience
+  writer, and it is what test 42 checks the writer table against in both directions. The
+  registry itself is deliberately not held to one-writer-per-name: those writers have no
+  callers, so the rule would only mint 60 more functions nothing calls.
 - Every writer accepts `{ sessionID, model, ...payload }` and stamps `model` (or
   `"unknown"`) on every record (FR-033 — this must hold even for event types that
   existed before v2). The model id is stamped **verbatim**: no suffix normalisation, no

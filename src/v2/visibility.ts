@@ -40,7 +40,7 @@
 
 import { redactSecrets } from "../redaction.js"
 import type { Finding } from "./composer.js"
-import type { EventLogger, OpencodeClient } from "./types.js"
+import type { EventLogger, OpencodeClient, V2EventType } from "./types.js"
 
 // ===========================================================================
 // PUBLIC TYPES
@@ -576,7 +576,7 @@ export class VisibilityNotifier {
 
   /** Even the logger is untrusted: a sink that throws must not turn an
    * observability nicety into a harness failure. */
-  private safeLog(eventType: string, payload: Record<string, unknown>): void {
+  private safeLog(eventType: V2EventType, payload: Record<string, unknown>): void {
     try {
       this.logger(eventType, payload)
     } catch {

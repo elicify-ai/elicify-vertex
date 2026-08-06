@@ -21,8 +21,14 @@
  */
 
 /** Shared logging convention (docs/vertex2-module-contracts.md): every v2
- * module takes an injected logger rather than importing measurement.ts. */
-export type EventLogger = (eventType: string, payload: Record<string, unknown>) => void
+ * module takes an injected logger rather than importing measurement.ts.
+ *
+ * Re-exported from `types.ts` rather than re-declared. It used to be a
+ * hand-rolled copy typed `(eventType: string, …)` — precisely the drift
+ * `types.ts` says it exists to prevent — and a copy typed `string` would
+ * silently re-open the hole that `V2_EVENT_TYPES` is now enforced through. */
+export type { EventLogger } from "./types.js"
+import type { EventLogger } from "./types.js"
 
 export type Phase = "intake" | "execute" | "elevate" | "close"
 

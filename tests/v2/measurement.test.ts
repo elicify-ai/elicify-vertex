@@ -17,9 +17,9 @@
  *   - FR-035 per-family holdout-arm hashing, backward-compatible default.
  */
 
-import { mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs"
+import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { join, sep } from "node:path"
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest"
 
@@ -28,6 +28,7 @@ import {
   ROTATE_MAX_BYTES,
   ROTATE_RETENTION_DAYS,
   V2_EVENT_TYPES,
+  V2_TYPED_WRITER_EVENTS,
   appendEvent,
   eventsPath,
   holdoutArm,
@@ -229,7 +230,7 @@ describe("test 42: event_invariants_property (every FR-033 event type)", () => {
   // runtime source of truth the type itself is derived from — so a new member
   // is red until it is registered here.
   it("covers exactly the event types the source declares, in both directions", () => {
-    const declared = [...V2_EVENT_TYPES] as string[]
+    const declared = [...V2_TYPED_WRITER_EVENTS] as string[]
     const covered = WRITER_TABLE.map((w) => w.type as string)
 
     // Both directions, reported separately so the failure names the problem:
@@ -242,12 +243,18 @@ describe("test 42: event_invariants_property (every FR-033 event type)", () => {
     // per-type invariant loop silently skipped a type.
     expect(new Set(covered).size).toBe(covered.length)
     expect(new Set(declared).size).toBe(declared.length)
-    expect(WRITER_TABLE).toHaveLength(V2_EVENT_TYPES.length)
+    expect(WRITER_TABLE).toHaveLength(V2_TYPED_WRITER_EVENTS.length)
+
+    // The writer subset must really be a subset of the registry — otherwise
+    // "one writer per typed event" could stay green while the writers named
+    // events the harness has no registry entry for.
+    const registry = [...V2_EVENT_TYPES] as string[]
+    expect(declared.filter((t) => !registry.includes(t))).toEqual([])
 
     // BACKLOG B-1: `dosing:unknown-model` is not merely absent from the
     // fixture table — the writer and the event type are gone. Assert it
     // against the SOURCE list, not the fixture, or the check is vacuous.
-    expect(declared).not.toContain("dosing:unknown-model")
+    expect(registry).not.toContain("dosing:unknown-model")
   })
 
   for (const { type, call } of WRITER_TABLE) {
@@ -613,5 +620,98 @@ describe("FR-033a: rotateEventsSinkIfNeeded (small overrides — no real 32MB wr
     expect(statSync(p).isFile()).toBe(true)
     const lines = readFileSync(p, "utf8").trim().split("\n")
     expect(lines).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// V2_EVENT_TYPES is the AUTHORITATIVE registry, not a decorative list.
+//
+// It was decorative. Measured across `src/v2/`: 82 distinct event names
+// emitted, 61 of them absent from the array; `intake:classify-unsupported`
+// declared while `story.ts` emitted `intake:unsupported`; and all 22 typed
+// writers with zero callers in `src/`. Nothing consulted it — `wiring/logger.ts`
+// cast the emitted name to `V2EventType` on the way to disk — so the one thing
+// it was introduced to do (make event drift detectable) it could not do.
+//
+// Enforcement now has two independent halves, and this file holds both ends:
+//   - COMPILE TIME: `EventLogger` takes `V2EventType`. An unregistered name
+//     fails `tsc` at the emitting line. Pinned by `types.smoke.test.ts`'s
+//     `@ts-expect-error` case.
+//   - TEST TIME (below): a scan of the real source for emitted event literals,
+//     compared against the registry in BOTH directions. tsc cannot catch the
+//     reverse drift — an entry left in the registry after the code that
+//     emitted it was deleted — and a stale registry is the same defect as an
+//     incomplete one.
+// ---------------------------------------------------------------------------
+
+describe("V2_EVENT_TYPES is authoritative over the source", () => {
+  const SRC = join(__dirname, "..", "..", "src")
+
+  function tsFiles(dir: string, out: string[] = []): string[] {
+    for (const entry of readdirSync(dir)) {
+      const p = join(dir, entry)
+      if (statSync(p).isDirectory()) tsFiles(p, out)
+      else if (p.endsWith(".ts")) out.push(p)
+    }
+    return out
+  }
+
+  /** Every event-name string literal handed to a logger/log/safeLog call in
+   * `src/`, excluding `measurement.ts` itself (which is where the registry and
+   * the typed writers live, so scanning it would compare the array to itself). */
+  function emittedInSource(): Map<string, string[]> {
+    const found = new Map<string, string[]>()
+    const callRe = /(?:^|[^\w.$])((?:[\w$]+\.)?(?:logger|log|safeLog|logEvent))\(\s*"([^"]+)"/g
+    for (const file of tsFiles(SRC)) {
+      if (file.endsWith(`${sep}measurement.ts`)) continue
+      const src = readFileSync(file, "utf8")
+      for (const m of src.matchAll(callRe)) {
+        const name = m[2]
+        found.set(name, [...(found.get(name) ?? []), file.slice(SRC.length + 1)])
+      }
+    }
+    return found
+  }
+
+  it("registers every event name the source actually emits", () => {
+    const registry = new Set<string>(V2_EVENT_TYPES)
+    const unregistered = [...emittedInSource()]
+      .filter(([name]) => !registry.has(name))
+      .map(([name, files]) => `${name} (${[...new Set(files)].join(", ")})`)
+
+    // NON-VACUITY: the scan must actually find events, or this passes on an
+    // empty set the moment the regex stops matching.
+    expect(emittedInSource().size).toBeGreaterThan(60)
+    expect(unregistered, "emitted but not in V2_EVENT_TYPES").toEqual([])
+  })
+
+  /** Every double-quoted string literal anywhere in `src/` (again minus
+   * `measurement.ts`). Looser than `emittedInSource` on purpose: the reverse
+   * direction only has to prove an entry is still REACHABLE from the code, and
+   * not every emission passes its name inline — `goals.ts` picks between
+   * `receipts:disk-corrupt` and `receipts:disk-unavailable` in a ternary and
+   * logs the variable. A name that appears nowhere in the source at all is
+   * unambiguously dead. */
+  function allStringLiterals(): Set<string> {
+    const found = new Set<string>()
+    for (const file of tsFiles(SRC)) {
+      if (file.endsWith(`${sep}measurement.ts`)) continue
+      for (const m of readFileSync(file, "utf8").matchAll(/"([^"\\\n]+)"/g)) found.add(m[1])
+    }
+    return found
+  }
+
+  it("registers nothing the source no longer emits — every entry is live", () => {
+    const literals = allStringLiterals()
+    // A typed convenience writer is the other legitimate reason for an entry
+    // to exist: `intake:classify-unsupported` has one, even though `story.ts`
+    // emits the shorter `intake:unsupported`.
+    const writerBacked = new Set<string>(V2_TYPED_WRITER_EVENTS)
+    const dead = [...V2_EVENT_TYPES].filter((t) => !literals.has(t) && !writerBacked.has(t))
+    expect(dead, "registered but neither emitted nor writer-backed — delete it").toEqual([])
+  })
+
+  it("has no duplicate entries", () => {
+    expect(new Set(V2_EVENT_TYPES).size).toBe(V2_EVENT_TYPES.length)
   })
 })

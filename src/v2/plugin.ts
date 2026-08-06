@@ -574,8 +574,46 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       const activatedByTrigger = triggerRe.test(text)
       const activatedByAgent = msgInput.agent === opts.activeAgent
       const activatedByCommand = commandActivatedSessions.has(sid)
+      const activatesThisMessage = activatedByAgent || activatedByTrigger || activatedByCommand
 
-      if (activatedByAgent || activatedByTrigger || activatedByCommand) {
+      // ── THE TURN BOUNDARY ──────────────────────────────────────────────
+      // This lives OUTSIDE the activation branch on purpose. It used to sit
+      // inside it, next to `resetTurnState`, and that froze the turn index at
+      // 1 for the whole of the commonest session shape there is: a session
+      // activated by trigger text (or by `/elicify-vertex`) while running
+      // under a non-default agent. Every ordinary follow-up in such a session
+      // — the shape the C-14 comment below itself calls "the normal shape of
+      // every turn after the first", and which also covers any message with
+      // no `agent` field at all — takes neither the activation branch nor the
+      // deactivation branch, so nothing advanced the clock.
+      //
+      // Measured, one session: activation by trigger under agent "build" then
+      // three ordinary follow-ups, 16 hook invocations, identical worktree.
+      //   frozen:         turnIndex [1],     4 directives delivered
+      //   turn advancing: turnIndex [1,2,3], 12 directives delivered
+      // Every per-turn cap, every cooldown, every `claimOncePerTurn` latch and
+      // the whole FR-061 starvation verdict ride this clock, so freezing it
+      // silences the harness for the rest of the session AND silences the one
+      // detector that would have reported the silence (the verdict is reached
+      // in `advanceTurn`, which never ran).
+      //
+      // A prompt boundary is a turn regardless of how the session was
+      // activated. That is the definition `composer.ts` states and the one
+      // `wiring/gate.ts` uses for its continuations. This is emphatically NOT
+      // the reverted per-step advance (see the history note at gate.ts's own
+      // `newTurn` call): a `chat.message` on an active session is one prompt,
+      // not one agent-loop step, and the reentrant `chat.message` a harness
+      // continuation causes is consumed as an echo above and returns before
+      // it ever reaches here — so a continuation still advances the turn
+      // exactly once, at dispatch.
+      //
+      // Guarded on "active, or activating right now" so a session that never
+      // engages the harness still allocates no composer state (UAT G1).
+      if (state.active || activatesThisMessage) {
+        composer.newTurn(sid)
+      }
+
+      if (activatesThisMessage) {
         const wasClose = phaseEngine.getPhase(sid) === "close"
         state.active = true
         // C-14: record which agent (if any) activated this turn, so a LATER
@@ -600,7 +638,6 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
           activatedAgentBySession.set(sid, msgInput.agent)
         }
         phaseEngine.onUserMessage(sid)
-        composer.newTurn(sid)
         resetTurnState(state)
         // Redesign point 9: a real user message re-arms the delegation
         // tracker — a `task` whose `tool.execute.after` the host dropped (or

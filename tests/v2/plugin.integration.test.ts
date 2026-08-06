@@ -2825,3 +2825,259 @@ describe("FR-061: directive:starved reports a family a whole turn never delivere
     expect(starvedEvents(sid)).toHaveLength(0)
   })
 })
+
+// ===========================================================================
+// THE FROZEN TURN BOUNDARY.
+//
+// `composer.newTurn(sid)` used to live INSIDE `chat.message`'s activation
+// branch. A session activated by trigger text (or by `/elicify-vertex`) under
+// a non-default agent takes that branch exactly once — on the activating
+// message. Every ordinary follow-up afterwards carries the same non-default
+// agent (or no agent at all), matches neither the activation nor the
+// deactivation condition, and so advanced nothing. The turn index froze at 1
+// for the rest of the session, and with it every per-turn cap, every
+// cooldown, every `claimOncePerTurn` latch, and the FR-061 starvation verdict
+// — which is reached in `advanceTurn` and therefore could not even report the
+// silence it was measuring.
+//
+// Measured, one session, 16 hook invocations, identical worktree: activation
+// by trigger under agent "build" then three ordinary follow-ups.
+//   frozen:  turnIndex [1],     verify-gap 3, scope-watchdog 1  ->  5 rendered
+//   fixed:   turnIndex [1,2,3], verify-gap 9, scope-watchdog 3  -> 15 rendered
+// Volume stays bounded by the cap table (5 per turn: verify-gap 3 +
+// scope-watchdog 1 + intake-scaffold 1) and `per-turn-cap:dropped` stays at 0.
+// ===========================================================================
+
+describe("the turn boundary is every prompt, not only an activating one", () => {
+  /** A `chat.message` under a caller-chosen agent — `activate()` above always
+   * uses the DEFAULT agent, which is exactly why the defect survived it. */
+  async function messageAs(hooks: Hooks, sessionID: string, text: string, agent: string | undefined) {
+    await hooks["chat.message"]!(
+      { sessionID, agent } as never,
+      {
+        message: { id: `msg_${sessionID}_${Math.random().toString(36).slice(2)}` } as never,
+        parts: [{ type: "text", text } as never],
+      },
+    )
+  }
+
+  function renderedTurnIndexes(sid: string): number[] {
+    return [
+      ...new Set(
+        readEvents()
+          .filter((e) => e.event_type === "directive_rendered" && e.session_id === sid)
+          .map((e) => Number(e.payload.turnIndex)),
+      ),
+    ]
+  }
+
+  function renderCount(sid: string, family: string): number {
+    return readEvents().filter(
+      (e) => e.event_type === "directive_rendered" && e.session_id === sid && e.payload.family === family,
+    ).length
+  }
+
+  function withTestScript() {
+    writeFileSync(
+      join(workDir, "package.json"),
+      JSON.stringify({ name: "fixture", private: true, scripts: { test: "vitest run" } }),
+    )
+  }
+
+  /** Trigger-activated under "build", then three ordinary follow-ups whose
+   * agent is chosen by the caller. Each turn makes one out-of-scope,
+   * unverified mutation and renders three times — the busy shape. */
+  async function triggerActivatedSession(
+    hooks: Hooks,
+    sid: string,
+    followUpAgent: string | undefined,
+  ): Promise<void> {
+    // A package script so `resolveVerifier` can name a command — the
+    // verify-gap producer stays silent when it cannot (redesign point 7).
+    withTestScript()
+    await messageAs(hooks, sid, "/elicify-vertex refactor the auth database migration end to end", "build")
+    await hooks.tool!.elicify_vertex_plan_create!.execute!(
+      {
+        stories: [
+          {
+            text: "parser work",
+            acceptanceItems: ["A1"],
+            scopeGlobs: ["src/parser/**"],
+            verifiers: [],
+            tasks: [{ text: "do the parser work" }],
+          },
+        ],
+      } as never,
+      { sessionID: sid } as never,
+    )
+    for (let turn = 1; turn <= 3; turn++) {
+      await toolAfter(hooks, sid, "edit", { filePath: `src/cli-${turn}.ts` }, "updated")
+      await transform(hooks, sid)
+      await transform(hooks, sid)
+      await transform(hooks, sid)
+      await messageAs(hooks, sid, `follow-up ${turn}`, followUpAgent)
+    }
+  }
+
+  it("an ordinary follow-up under the SAME non-default agent advances the turn", async () => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = `turnfreeze-build-${Math.random().toString(36).slice(2)}`
+
+    await triggerActivatedSession(hooks, sid, "build")
+
+    // Pre-fix this was [1] — the whole session on one turn index.
+    expect(renderedTurnIndexes(sid), "the turn index must advance on every prompt").toEqual([1, 2, 3])
+    // ...and the delivery that freezing cost. Pre-fix: 3 and 1.
+    expect(renderCount(sid, "verify-gap"), "cap 3 per turn, three turns").toBe(9)
+    expect(renderCount(sid, "scope-watchdog"), "cap 1 per turn, three turns").toBe(3)
+
+    // BOUNDED, not merely larger: every family stays inside its cap table
+    // entry, so nothing here is a directive flood.
+    const capDrops = readEvents().filter((e) => e.event_type === "per-turn-cap:dropped" && e.session_id === sid)
+    expect(capDrops, "producers still ask blockedBeforeBudget first").toHaveLength(0)
+    const perTurn = new Map<string, number>()
+    for (const e of readEvents().filter((x) => x.event_type === "directive_rendered" && x.session_id === sid)) {
+      const key = `${e.payload.turnIndex}/${e.payload.family}`
+      perTurn.set(key, (perTurn.get(key) ?? 0) + 1)
+    }
+    expect(perTurn.get("1/scope-watchdog")).toBe(1)
+    expect(perTurn.get("2/scope-watchdog")).toBe(1)
+    expect(perTurn.get("1/verify-gap")).toBe(3)
+    expect(perTurn.get("2/verify-gap")).toBe(3)
+  })
+
+  it("a follow-up carrying NO agent field advances the turn", async () => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = `turnfreeze-noagent-${Math.random().toString(36).slice(2)}`
+
+    await triggerActivatedSession(hooks, sid, undefined)
+
+    expect(renderedTurnIndexes(sid)).toEqual([1, 2, 3])
+    expect(renderCount(sid, "verify-gap")).toBe(9)
+  })
+
+  it("the harness's own continuation echo does NOT advance the turn", async () => {
+    // The echo is consumed and returns above the boundary. If the advance
+    // were placed before that consume, the gate's own `newTurn` at dispatch
+    // plus the echo would count ONE reply cycle as two turns — halving every
+    // per-turn cap in exactly the unattended loop the caps exist to pace.
+    const client = makeStubClient()
+    client.session.prompt.mockImplementation(
+      (args: { body?: { agent?: string } }) =>
+        args?.body?.agent === undefined
+          ? new Promise(() => {}) // the gate continuation hangs, as on a real host
+          : Promise.resolve({
+              data: { info: {}, parts: [{ type: "text", text: '{"multiStory":false}' }] },
+              error: undefined,
+            }),
+    )
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = `turnfreeze-echo-${Math.random().toString(36).slice(2)}`
+
+    withTestScript()
+    await messageAs(hooks, sid, "/elicify-vertex refactor the auth database migration end to end", "build")
+    await toolAfter(hooks, sid, "edit", { filePath: "src/report.ts" }, "updated")
+    await transform(hooks, sid)
+    expect(renderedTurnIndexes(sid), "turn 1").toEqual([1])
+
+    vi.useFakeTimers()
+    const idling = idle(hooks, sid)
+    await vi.advanceTimersByTimeAsync(31_000)
+    await idling
+    vi.useRealTimers()
+
+    const dispatched = idleContinuationTexts(client, sid)
+    expect(dispatched.length, "the idle gate never dispatched a continuation").toBeGreaterThan(0)
+
+    // The gate already advanced the turn at dispatch (1 -> 2). The reentrant
+    // `chat.message` it causes must add nothing.
+    await messageAs(hooks, sid, dispatched[dispatched.length - 1], "build")
+    expect(
+      readEvents().filter((e) => e.event_type === "gate:continuation-echo-consumed" && e.session_id === sid),
+      "the echo must be recognised as one",
+    ).toHaveLength(1)
+
+    await toolAfter(hooks, sid, "edit", { filePath: "src/report2.ts" }, "updated")
+    await transform(hooks, sid)
+    // Exactly ONE advance for the whole continuation cycle: 2, never 3.
+    expect(renderedTurnIndexes(sid), "dispatch advanced once; the echo added nothing").toEqual([1, 2])
+  })
+
+  it("a message on a session the harness is not active in advances nothing", async () => {
+    // The `state.active || activatesThisMessage` guard. Without it a session
+    // that switched away to an unrelated agent keeps burning turn indexes on
+    // messages the harness has no part in, and every never-activated session
+    // in the host allocates composer state.
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = `turnfreeze-inactive-${Math.random().toString(36).slice(2)}`
+
+    withTestScript()
+    await messageAs(hooks, sid, "/elicify-vertex refactor the auth database migration end to end", "build")
+    await toolAfter(hooks, sid, "edit", { filePath: "src/a.ts" }, "updated")
+    await transform(hooks, sid)
+    expect(renderedTurnIndexes(sid)).toEqual([1])
+
+    // Switch away to an unrelated agent: this message IS a boundary for the
+    // session that was still active when it arrived (turn 1 -> 2), and it
+    // deactivates.
+    await messageAs(hooks, sid, "unrelated work now", "plan")
+    // Three messages the harness is not part of. None of them is a turn.
+    await messageAs(hooks, sid, "still unrelated", "plan")
+    await messageAs(hooks, sid, "and more", "plan")
+    await messageAs(hooks, sid, "and more again", "plan")
+
+    // Back to the harness: the next turn is 3, not 6.
+    await activate(hooks, sid, "carry on with the migration")
+    await toolAfter(hooks, sid, "edit", { filePath: "src/b.ts" }, "updated")
+    await transform(hooks, sid)
+    expect(renderedTurnIndexes(sid), "inactive messages must not burn turn indexes").toEqual([1, 3])
+  })
+
+  it("FR-061's starvation verdict is reached at a non-default-agent boundary too", async () => {
+    // The compounding half of the defect: the detector runs in `advanceTurn`,
+    // so a frozen turn silenced the one signal that would have reported the
+    // freeze. Same pressure as the FR-061 suite above, closed by the follow-up
+    // shape that used to advance nothing.
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = `turnfreeze-fr061-${Math.random().toString(36).slice(2)}`
+
+    await messageAs(hooks, sid, "/elicify-vertex implement the production database migration", "build")
+    await hooks.tool!.elicify_vertex_plan_create!.execute!(
+      {
+        stories: [
+          {
+            text: "narrow story",
+            acceptanceItems: ["A1"],
+            scopeGlobs: ["src/in-scope/**"],
+            verifiers: ["npx vitest run"],
+            tasks: [{ text: "do the work" }],
+          },
+        ],
+      } as never,
+      { sessionID: sid } as never,
+    )
+    await hooks.event!({ event: { type: "session.compacted", properties: { sessionID: sid } } as never })
+    for (let step = 0; step < 3; step++) {
+      await toolAfter(hooks, sid, "edit", { filePath: `src/elsewhere/step-${step}.ts` }, "updated")
+      if (step === 2) {
+        await toolAfter(hooks, sid, "bash", { command: "npx vitest run" }, "AssertionError: boom", { exit: 1 })
+        await toolAfter(hooks, sid, "bash", { command: "npx vitest run" }, "AssertionError: boom", { exit: 1 })
+      }
+      await transform(hooks, sid)
+    }
+
+    const starved = () => readEvents().filter((e) => e.event_type === "directive:starved" && e.session_id === sid)
+    expect(starved(), "still open mid-turn").toHaveLength(0)
+
+    // An ORDINARY follow-up under the same non-default agent. Pre-fix this
+    // reported nothing, ever.
+    await messageAs(hooks, sid, "carry on then", "build")
+    expect(starved()).toHaveLength(1)
+    expect(starved()[0].payload.family).toBe("pinned-criteria-reinject")
+    expect(starved()[0].payload.turnIndex).toBe(1)
+  })
+})

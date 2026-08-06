@@ -6,28 +6,23 @@
  * This is the one place a v2 event-type string becomes a real
  * `measurement.ts` JSONL record via `makeV2Event`/`appendEvent`.
  *
- * Cross-module inconsistency (flagged, not silently patched — see this
- * wave's final report): `measurement.ts`'s `V2EventType` union is a closed
- * set of event-name literals, but the wave-1/2 modules that emit events do
- * not all agree with it or with each other:
- *   - `story.ts` logs `"intake:unsupported"`; `measurement.ts`'s union spells
- *     the same concept `"intake:classify-unsupported"`.
- *   - `composer.ts` logs `"budget:dropped"`, `"per-turn-cap:dropped"`,
- *     `"cooldown:dropped"` — none of which are in `V2EventType` at all (the
- *     module contract left composer's drop-event names as "yours to define
- *     consistently", so composer.ts picked reasonable names but they were
- *     never folded back into measurement.ts's union).
- *   - `story.ts` also logs `"story:v1-archived"`, its own addition for
- *     FR-022 observability, again absent from `V2EventType`.
- * Rather than hand-maintain a translation table that could silently drift
- * (or drop events that don't match), this logger passes `eventType` straight
- * through to `makeV2Event` with a type-level cast: every event still reaches
- * disk under the name its emitting module actually used, and `session_id` /
- * `model` are still stamped consistently (FR-033). `V2EventType` remains
- * useful as authoring-time documentation for measurement.ts's own typed
- * writer functions; it is not enforced as a runtime allowlist here.
+ * HISTORY, because the shape of the fix depends on it. This function used to
+ * cast: `makeV2Event(eventType as V2EventType, …)`. The comment here said
+ * `V2EventType` was "authoring-time documentation … not enforced as a runtime
+ * allowlist", and listed three known divergences (`intake:unsupported` vs
+ * `intake:classify-unsupported`, composer's three drop events,
+ * `story:v1-archived`) as flagged-not-patched. Left alone, that list grew:
+ * measured across `src/v2/`, 82 distinct event names were emitted and 61 were
+ * absent from the registry. An event-name registry nothing consults cannot
+ * detect drift, which was the only reason to have one.
+ *
+ * `EventLogger` now takes `V2EventType` and the cast is gone, so the registry
+ * is enforced at the emitting line. Divergent spellings were REGISTERED
+ * rather than renamed — `intake:unsupported` stays as `story.ts` emits it —
+ * because renaming an event breaks continuity with every record already on
+ * disk, which is the thing measurement exists to preserve.
  */
-import { appendEvent, makeV2Event, type V2EventType } from "../../measurement.js"
+import { appendEvent, makeV2Event } from "../../measurement.js"
 import type { EventLogger } from "../types.js"
 
 export interface SessionLogContext {
@@ -51,7 +46,10 @@ export function createSharedV2Logger(getContext: (sessionID: string | undefined)
   return (eventType, payload) => {
     const sessionID = typeof payload.sessionID === "string" ? payload.sessionID : undefined
     const ctx = getContext(sessionID)
-    const ev = makeV2Event(eventType as V2EventType, {
+    // No cast. `EventLogger` now takes `V2EventType`, so an unregistered
+    // event name is a compile error at the emitting line rather than
+    // something this function launders on its way to disk.
+    const ev = makeV2Event(eventType, {
       ...payload,
       sessionID,
       model: ctx.model,

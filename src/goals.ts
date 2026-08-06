@@ -21,7 +21,7 @@ import {
 import { homedir } from "node:os"
 import { basename, dirname, join, resolve } from "node:path"
 
-import { dataRoot } from "./measurement.js"
+import { dataRoot, type V2EventType } from "./measurement.js"
 import { redactForDisk, redactSecrets } from "./redaction.js"
 
 /** True when path is filesystem root (`/` or `C:\`) — never a project worktree. */
@@ -627,7 +627,11 @@ function isPersistedReceipt(value: unknown): value is VerificationReceipt {
   return isPersistedScope(value.scope)
 }
 
-export type ReceiptLogger = (event: string, payload: Record<string, unknown>) => void
+/** `event` is `V2EventType`, not `string`: the plugin passes its shared v2
+ * logger straight in here, so an unregistered name emitted from the receipt
+ * store would bypass `V2_EVENT_TYPES` exactly as `wiring/logger.ts`'s old
+ * cast did. */
+export type ReceiptLogger = (event: V2EventType, payload: Record<string, unknown>) => void
 
 export interface VerificationReceiptStoreOptions {
   /** Overrides the state directory otherwise derived from each receipt's own

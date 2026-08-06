@@ -48,8 +48,11 @@ export const fsIO = {
 }
 
 /** Shared logging convention (docs/vertex2-module-contracts.md) — every v2
- * module takes an injected logger instead of importing measurement.ts directly. */
-export type EventLogger = (eventType: string, payload: Record<string, unknown>) => void
+ * module takes an injected logger instead of importing measurement.ts
+ * directly. Re-exported from `types.ts`, not re-declared: see the note on
+ * `phase.ts`'s copy of this line. */
+export type { EventLogger } from "./types.js"
+import type { EventLogger } from "./types.js"
 
 export interface Criterion {
   id: string // "C1", "C2", ... stable per session (positional within the current pin set)

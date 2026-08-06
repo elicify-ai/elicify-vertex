@@ -55,19 +55,17 @@ export type EventType =
   | "recovery_repeat"
 
 /**
- * Vertex 2 event types (FR-033). Additive to `EventType` — the v1 union above
- * is untouched; `MeasurementEvent.event_type` below accepts either.
+ * The subset of v2 event types that has a typed convenience writer in the
+ * "typed v2 convenience writers" section below.
  *
- * Declared as a runtime `as const` array rather than a bare type union
- * ON PURPOSE. A union is erased at compile time, so the test that is supposed
- * to prove "every v2 event type has a writer" (test 42) could only ever
- * compare a literal list against another literal list — which it did, and
- * which is why `criteria:parse-miss` sat in the union for a whole round with
- * no writer and no failing test. The array is the single source of truth for
- * BOTH the type and the coverage assertion: adding a member here without
- * registering a writer turns test 42 red.
+ * This is the list test 42 checks the writer table against, in both
+ * directions. It is deliberately NOT the whole registry: every one of these
+ * writers has zero callers in `src/` (the wiring emits through the injected
+ * `EventLogger` instead), so they are authoring-time payload documentation,
+ * and a rule of "one writer per registered event name" would mean minting 60
+ * more functions nothing calls.
  */
-export const V2_EVENT_TYPES = [
+export const V2_TYPED_WRITER_EVENTS = [
   "directive_rendered",
   "directive_complied",
   "calibration",
@@ -93,6 +91,146 @@ export const V2_EVENT_TYPES = [
    * answering the intake scaffold, and both read as "0 complied". */
   "criteria:parse-miss",
   "expect:absent",
+] as const
+
+/**
+ * Vertex 2 event types (FR-033) — the AUTHORITATIVE registry of every event
+ * name this harness may write to `.vertex-events.jsonl`. Additive to
+ * `EventType`; the v1 union above is untouched and
+ * `MeasurementEvent.event_type` accepts either.
+ *
+ * Declared as a runtime `as const` array rather than a bare type union
+ * ON PURPOSE. A union is erased at compile time, so the test that is supposed
+ * to prove "every v2 event type has a writer" (test 42) could only ever
+ * compare a literal list against another literal list — which it did, and
+ * which is why `criteria:parse-miss` sat in the union for a whole round with
+ * no writer and no failing test.
+ *
+ * It was, until this change, decorative in exactly the same way one level up.
+ * Measured over `src/v2/`: 82 distinct event names were emitted and 61 of them
+ * were absent from this array; `intake:classify-unsupported` was declared
+ * while `story.ts` actually emitted `intake:unsupported`; and every one of the
+ * 22 typed writers had zero callers. The array could not detect drift because
+ * nothing consulted it — `wiring/logger.ts` cast the emitted name straight to
+ * `V2EventType` on its way to disk.
+ *
+ * It is now enforced twice over:
+ *   - COMPILE TIME. `EventLogger` (src/v2/types.ts) takes `V2EventType`, not
+ *     `string`, and `wiring/logger.ts`'s cast is gone. Emitting a name that is
+ *     not registered here fails `tsc` at the emitting line.
+ *   - TEST TIME. `tests/v2/measurement.test.ts` scans `src/` for emitted event
+ *     literals and asserts the registry covers them exactly — both directions,
+ *     so an unemitted, unwritten entry is also red. That catches the case tsc
+ *     cannot: a name deleted from the code but left in the registry.
+ *
+ * Adding an event therefore means adding it here. That is the whole point.
+ */
+export const V2_EVENT_TYPES = [
+  ...V2_TYPED_WRITER_EVENTS,
+
+  // -- composer.ts: directive budgeting (FR-004/FR-005/FR-061) --------------
+  "budget:dropped",
+  "per-turn-cap:dropped",
+  "cooldown:dropped",
+  "directive:starved",
+
+  // -- wiring/gate.ts: the idle completion gate ----------------------------
+  "gate:continuation-dispatched",
+  "gate:continuation-echo-consumed",
+  "gate:continuation-failed",
+  "gate:continuation-guard-released",
+  "gate:continuation-slow",
+  "gate:delegation-defer",
+  "gate:delegation-stale",
+  "gate:dispatch-suppressed",
+  "gate:no-progress",
+  "gate:plan-incomplete",
+  "gate:plan-incomplete-capped",
+  "gate:stall-paused",
+
+  // -- pauseJudge.ts -------------------------------------------------------
+  "pause:armed",
+  "pause:cancelled",
+  "pause:judge-malformed",
+  "pause:judge-unavailable",
+  "pause:not-armed",
+  "pause:verdict",
+
+  // -- pin.ts --------------------------------------------------------------
+  "pins:disk-corrupt",
+  "pins:gc-deferred",
+  "pins:gc-failed",
+
+  // -- story.ts: the plan store and its persistence ------------------------
+  /** NOT `intake:classify-unsupported`: `story.ts` has always emitted this
+   * spelling. Both are registered — the writer-backed one above, and the one
+   * the code actually emits, here — rather than renaming an event mid-flight
+   * and breaking continuity with every record already on disk. */
+  "intake:unsupported",
+  "checkpoint:idempotent-noop",
+  "plan:archive-failed",
+  "plan:concurrent-merge",
+  "plan:foreign-entry-preserved",
+  "plan:lock-contended",
+  "plan:replaced",
+  "plan:unpersisted-change-lost",
+  "plan:write-aborted",
+  "story:disk-corrupt",
+  "story:plan-cleared",
+  "story:reopened",
+  "story:v1-archive-deferred",
+  "story:v1-archive-failed",
+  "story:v1-archived",
+  "story:verifier-audit",
+
+  // -- verifier.ts ---------------------------------------------------------
+  "verifier:contradicted",
+  "verifier:crosscheck-inconclusive",
+  "verifier:field-oversized",
+  "verifier:field-partial-drop",
+  "verifier:field-truncated",
+  "verifier:insufficient-evidence",
+  "verifier:off-target",
+  "verifier:reaudit-capped",
+  "verifier:unaudited-escalation",
+  "verifier:unverified",
+  "verifier:verdict-contradictory",
+  "verifier:verdict-not-enforced",
+
+  // -- coverage.ts / artifacts.ts: verification relevance ------------------
+  "verify:ambiguous-exit",
+  "verify:non-executing",
+  "verify:relevance-gap",
+  "receipt:scope-unverifiable",
+
+  // -- goals.ts: the verification receipt store (`ReceiptLogger`) ----------
+  // Note the plural prefix: these are `receipts:*`, distinct from plugin.ts's
+  // singular `receipt:scope-unverifiable` above. Both spellings are live and
+  // both are registered rather than unified, for the same
+  // continuity-of-records reason as `intake:unsupported`.
+  "receipts:archive-failed",
+  "receipts:disk-corrupt",
+  "receipts:disk-unavailable",
+  "receipts:evicted",
+  "receipts:schema-archived",
+  "receipts:scope-unverifiable",
+  "receipts:signature-invalid",
+  "receipts:stale-dropped",
+  "receipts:unsigned",
+
+  // -- visibility.ts: FR-060..FR-064 toast plumbing ------------------------
+  "visibility:cap-reached",
+  "visibility:deduped",
+  "visibility:mode-changed",
+  "visibility:notify-failed",
+  "visibility:suppressed-summary",
+  "visibility:toast-failed",
+  "visibility:unavailable",
+
+  // -- plugin.ts and the remaining wiring ----------------------------------
+  "star:asked",
+  "subagent:injection-skipped",
+  "workspace:unwritable-fallback",
 ] as const
 
 export type V2EventType = (typeof V2_EVENT_TYPES)[number]
@@ -506,9 +644,12 @@ export function logV2Event(eventType: V2EventType, input: V2EventInput, path?: s
 
 // ---------- typed v2 convenience writers --------------------------------------
 //
-// One wrapper per member of `V2_EVENT_TYPES` — no more, no fewer; test 42
-// asserts that correspondence against the array itself, so a new event type
-// without a writer here is a failing test, not a silent gap. (The module
+// One wrapper per member of `V2_TYPED_WRITER_EVENTS` — no more, no fewer;
+// test 42 asserts that correspondence against the array itself, so a new
+// member there without a writer here is a failing test, not a silent gap.
+// (The full event registry is `V2_EVENT_TYPES`, which this is a subset of;
+// see its doc comment for why one-writer-per-registered-name is not the
+// rule.) (The module
 // contracts doc listed 22; `dosing:unknown-model` is gone — BACKLOG B-1
 // deleted model-conditioned dosing outright, so there is no profile to
 // resolve and no unknown model to report — and B-2's `criteria:parse-miss`

@@ -4,8 +4,21 @@ import type { EventLogger, OpencodeClient } from "../../src/v2/types.js"
 describe("v2/types.ts smoke", () => {
   it("EventLogger types a vi.fn() logger and it is callable", () => {
     const logger: EventLogger = vi.fn()
+    // A REGISTERED name. This used to read `logger("some:event", …)`, which
+    // is the whole reason the event registry was decorative: `EventLogger`
+    // took `string`, so an unregistered name compiled everywhere — in the
+    // harness as much as here. It takes `V2EventType` now.
+    logger("directive_rendered", { sessionID: "s1" })
+    expect(logger).toHaveBeenCalledWith("directive_rendered", { sessionID: "s1" })
+  })
+
+  it("rejects an event name absent from V2_EVENT_TYPES", () => {
+    const logger: EventLogger = vi.fn()
+    // @ts-expect-error — an unregistered event name must not compile. If this
+    // line ever stops erroring, the registry is decorative again and the
+    // `@ts-expect-error` itself turns the suite red.
     logger("some:event", { sessionID: "s1" })
-    expect(logger).toHaveBeenCalledWith("some:event", { sessionID: "s1" })
+    expect(logger).toHaveBeenCalled()
   })
 
   it("OpencodeClient type-checks a minimal stub with the contract-cited methods", () => {
