@@ -310,11 +310,25 @@ export function incompletePlanFinding(opts: {
 
   const stalledOnBlocked = incomplete.filter((story) => story.status === "blocked" || story.status === "failed")
 
+  // FIX 4 — SIZE. One full prescription PER active story produced a 7,837
+  // character continuation in a live session, delivered into the user's chat
+  // as an apparent user message, twice per loop iteration. A nudge that long
+  // is a dump: the model acts on the first actionable instruction, and the
+  // user reads a wall of text they did not write.
+  //
+  // Prescribe for the story that is actually next, and name the rest.
   const prescription =
     activeStories.length > 0
-      ? activeStories
-          .slice(0, MAX_LISTED_STORIES)
-          .map((story) => activeStoryPrescription(story))
+      ? [
+          activeStoryPrescription(activeStories[0]),
+          activeStories.length > 1
+            ? `Also open, in order: ${listWithOverflow(
+                activeStories.slice(1).map((story) => story.id),
+                MAX_LISTED_STORIES,
+              )}. Take them one at a time.`
+            : "",
+        ]
+          .filter(Boolean)
           .join(" ")
       : `No story is active, so nothing can be checkpointed and the plan has stalled with ${incomplete
           .map((story) => story.id)

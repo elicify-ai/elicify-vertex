@@ -1038,7 +1038,21 @@ describe("handleVerifierAudit — verdict reconciliation", () => {
     expect(h.storyEngine.getPlan(sid)!.stories[0].status).toBe("active") // reverted, correctly
   })
 
-  it("FR-014: a verdict produced with ZERO tool calls is not applied", async () => {
+  // THE VERIFIER JUDGES; IT DOES NOT JUST RUN COMMANDS.
+  //
+  // This used to require a tool call before any failing verdict was applied.
+  // That test was wrong: the verifier is handed the plan digest, the
+  // acceptance criteria, the diff summary and the session transcript — the
+  // transcript being its LEADING evidence — and reasoning over that is the
+  // work. Measured cost of the old rule in a live session: the verifier
+  // judged five stories unmet and wrote per-item reasons; the verdict was
+  // discarded for want of an `ls`, every story froze at
+  // `complete / unapplied:"unverified"`, and two branches argued about that
+  // frozen state until the session was killed.
+  //
+  // The test is now substantiation, which is what actually separates
+  // judgement from fabrication.
+  it("applies a SUBSTANTIATED failing verdict even with zero tool calls", async () => {
     const h = harness({ verifierEnabled: true })
     const sid = "s1"
     const state = quietSession(h, sid)
@@ -1047,14 +1061,33 @@ describe("handleVerifierAudit — verdict reconciliation", () => {
     claimedStory(h, sid)
     stubVerifier(
       h,
+      // SUBSTANTIATED: names the item and says why. No tool call, and that is
+      // fine — the reason is the evidence.
       { stories: [{ storyId: "S1", pass: false, summary: "nope", items: [{ itemId: "A1", met: false, note: "not delivered" }] }] },
-      [{ type: "text" }], // the verifier answered without observing anything
+      [{ type: "text" }],
     )
 
     await handleSessionIdle(h.ctx, sid)
 
+    expect(loggedEventTypes(h.logger)).not.toContain("verifier:unverified")
+    expect(h.storyEngine.getPlan(sid)!.stories[0].status, "a reasoned failure must revert the claim").toBe("active")
+  })
+
+  it("bounds a failing verdict whose unmet items carry NO reason", async () => {
+    const h = harness({ verifierEnabled: true })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid)
+    stubVerifier(h, {
+      stories: [{ storyId: "S1", pass: false, summary: "nope", items: [{ itemId: "A1", met: false, note: "" }] }],
+    })
+
+    await handleSessionIdle(h.ctx, sid)
+
     expect(loggedEventTypes(h.logger)).toContain("verifier:unverified")
-    expect(h.storyEngine.getPlan(sid)!.stories[0].status).toBe("complete") // claim stands
+    expect(h.storyEngine.getPlan(sid)!.stories[0].status, "an unexplained failure must not revert work").toBe("complete")
   })
 
   it("FR-005: pass:false with every item met is dropped per story, leaving the story untouched", async () => {
@@ -1094,8 +1127,9 @@ describe("handleVerifierAudit — verdict reconciliation", () => {
     claimedStory(h, sid)
     stubVerifier(
       h,
-      { stories: [{ storyId: "S1", pass: false, summary: "nope", items: [{ itemId: "A1", met: false, note: "not delivered" }] }] },
-      [{ type: "text" }], // no tool call -> FR-014 refuses the verdict
+      // Unsubstantiated: a failure with no reason. THIS is what gets bounded now —
+      // not a reasoned verdict that happened to skip the shell.
+      { stories: [{ storyId: "S1", pass: false, summary: "nope", items: [] }] },
     )
 
     await handleSessionIdle(h.ctx, sid)
@@ -1145,7 +1179,7 @@ describe("handleVerifierAudit — verdict reconciliation", () => {
     state.workspaceRoot = h.stateDir
     claimedStory(h, sid)
 
-    stubVerifier(h, { stories: [{ storyId: "S1", pass: true, summary: "looks fine to me", items: [] }] }, [{ type: "text" }])
+    stubVerifier(h, { stories: [{ storyId: "S1", pass: true, summary: "looks fine to me", items: [] }] })
     await handleSessionIdle(h.ctx, sid)
 
     const stamp = h.storyEngine.getPlan(sid)!.stories[0].verifier!
@@ -1181,11 +1215,12 @@ describe("handleVerifierAudit — verdict reconciliation", () => {
       h,
       {
         stories: [
-          { storyId: "S1", pass: false, summary: "no sources", items: [{ itemId: "A1", met: false, note: "no sources cited" }] },
+          // S1 unsubstantiated (no items) so it is bounded; a REASONED failure
+          // would now simply be applied, which is the point of the new rule.
+          { storyId: "S1", pass: false, summary: "no sources", items: [] },
           { storyId: "S2", pass: true, summary: "chart is there", items: [{ itemId: "A1", met: true, note: "verified" }] },
         ],
       },
-      [{ type: "text" }],
     )
     await handleSessionIdle(h.ctx, sid)
 
@@ -1256,8 +1291,8 @@ describe("handleVerifierAudit — verdict reconciliation", () => {
     claimedStory(h, sid)
     stubVerifier(
       h,
-      { stories: [{ storyId: "S1", pass: false, summary: "nope", items: [{ itemId: "A1", met: false, note: "not delivered" }] }] },
-      [{ type: "text" }],
+      // Unsubstantiated (no items) — the bounded path under the new rule.
+      { stories: [{ storyId: "S1", pass: false, summary: "nope", items: [] }] },
     )
     await handleSessionIdle(h.ctx, sid)
 
@@ -1290,7 +1325,9 @@ describe("handleVerifierAudit — verdict reconciliation", () => {
     const unauditedRound = async (): Promise<void> => {
       stubVerifier(
         h,
-        { stories: [{ storyId: "S1", pass: false, summary: "nope", items: [{ itemId: "A1", met: false, note: "not delivered" }] }] },
+        // Unsubstantiated, so it is BOUNDED and leaves the story unaudited — a
+        // reasoned failure is applied now and would never reach escalation.
+        { stories: [{ storyId: "S1", pass: false, summary: "nope", items: [] }] },
         [{ type: "text" }], // verifier observed nothing -> bounding stamp
       )
       await handleSessionIdle(h.ctx, sid)
@@ -1324,8 +1361,8 @@ describe("handleVerifierAudit — verdict reconciliation", () => {
     claimedStory(h, sid)
     stubVerifier(
       h,
-      { stories: [{ storyId: "S1", pass: false, summary: "nope", items: [{ itemId: "A1", met: false, note: "not delivered" }] }] },
-      [{ type: "text" }],
+      // Unsubstantiated (no items) — the bounded path under the new rule.
+      { stories: [{ storyId: "S1", pass: false, summary: "nope", items: [] }] },
     )
     await handleSessionIdle(h.ctx, sid) // bounding stamp written
 

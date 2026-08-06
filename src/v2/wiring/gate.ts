@@ -1145,13 +1145,32 @@ function applyPathVeto(
  * genuinely all-passed plan still returns false here and gets its close-out
  * from the audit that settled it.
  */
+/**
+ * Is this verdict backed by something, or invented?
+ *
+ * A failing verdict must name the acceptance items it failed and say why. That
+ * is what distinguishes judgement from fabrication — not whether a shell
+ * command ran. A passing verdict with every item met costs nothing to apply.
+ */
+function verdictIsSubstantiated(v: VerifierStoryVerdict): boolean {
+  // ORDER MATTERS. `[].every()` is vacuously TRUE, so testing `pass` first
+  // made a `pass:true` with no items read as substantiated — the same
+  // vacuous-truth trap that let an empty `items` array bypass the old floor.
+  // Nothing behind the verdict means unsubstantiated, whichever way it points.
+  if (v.items.length === 0) return false
+  if (v.pass && v.items.every((i) => i.met)) return true
+  // Every failed item must carry a reason. An empty note is an assertion, not
+  // a finding.
+  return v.items.filter((i) => !i.met).every((i) => (i.note ?? "").trim().length > 0)
+}
+
 async function emitUnauditedEscalation(
   ctx: GateContext,
   sid: string,
   state: V2SessionState,
   plan: PlanV2,
 ): Promise<boolean> {
-  if (state.unauditedEscalated) return false
+  // (guard moved below, once the unresolved set is known)
   if (!plan.stories.every((story) => story.status === "complete" && story.verifier !== undefined)) return false
   // A capped story WAS audited — the verifier failed it and the harness stopped
   // reverting. Reporting it as "never verified" would be false, so the two
@@ -1160,6 +1179,12 @@ async function emitUnauditedEscalation(
   const disputed = plan.stories.filter((s2) => s2.verifier?.unapplied === "capped")
   const unaudited = [...unverified, ...disputed].map((story) => story.id)
   if (unaudited.length === 0) return false
+
+  // FIX 2: speak once per unresolved SET, not once per turn. Every
+  // continuation starts a turn, so a per-turn guard let this repeat forever
+  // against a state nothing could move.
+  const signature = `${plan.revision ?? 0}:${unaudited.join(",")}`
+  if (state.unauditedEscalatedFor === signature) return false
   ctx.logger("verifier:unaudited-escalation", { sessionID: sid, stories: unaudited })
   const clauses: string[] = []
   if (unverified.length > 0) {
@@ -1186,7 +1211,7 @@ async function emitUnauditedEscalation(
   // actually happened. Setting it beforehand meant a stall-paused or refused
   // dispatch burned the single escalation and the run ended in silence — the
   // very outcome this branch exists to prevent.
-  if (dispatched) state.unauditedEscalated = true
+  if (dispatched) state.unauditedEscalatedFor = signature
   return dispatched
 }
 
@@ -1283,8 +1308,27 @@ async function handleVerifierAudit(ctx: GateContext, sid: string, state: V2Sessi
   // `items.length > 0`, and `applyPathVeto` maps an empty array, so nothing
   // downstream caught it either. Any unobserved verdict that would COST
   // something — a failing story, or one with nothing backing it — is bounded.
-  const wouldRevert = onTarget.some((v) => !v.pass || v.items.length === 0 || v.items.some((i) => !i.met))
-  if (observed === false && wouldRevert) {
+  // FIX 1 — THE VERIFIER JUDGES; IT DOES NOT JUST RUN COMMANDS.
+  //
+  // This floor used to discard any failing verdict produced without a tool
+  // call. That is the wrong test. The verifier is handed the plan digest,
+  // the acceptance criteria, the diff summary, the verifier output and the
+  // session transcript — reading that evidence IS the work, and the
+  // transcript is the LEADING evidence, not the shell.
+  //
+  // Measured cost of the old rule (live session, 09:14:58): the verifier read
+  // the payload, judged all five stories unmet, and wrote per-item notes
+  // saying why. The verdict was thrown away for want of an `ls`, every story
+  // froze at `complete / pass=false / unapplied=unverified`, and two branches
+  // argued about that state for the rest of the session.
+  //
+  // The real risk — a verdict invented about work nobody looked at — is
+  // caught by SUBSTANTIATION, and by `applyPathVeto`, which independently
+  // checks the worktree whenever the verifier claims a path is missing. That
+  // is the defence that actually works; a tool call proves nothing about
+  // whether the verdict was reasoned.
+  const unsubstantiated = onTarget.some((v) => !verdictIsSubstantiated(v))
+  if (unsubstantiated) {
     ctx.logger("verifier:unverified", { sessionID: sid, stories: onTarget.map((v) => v.storyId) })
     void ctx.visibility?.notify("health", {
       sessionID: sid,

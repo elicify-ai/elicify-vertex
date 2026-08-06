@@ -611,7 +611,10 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       // per-plan state whose boundary is a real user message, which is
       // exactly what this is.
       if (state.active) {
-        state.unauditedEscalated = false
+        // NOT `unauditedEscalatedFor`: that is keyed by the unresolved story
+        // set, and a user message does not resolve anything. Clearing it here
+        // is what let the escalation repeat every turn against a state nothing
+        // could move (fix 2). It clears itself when the set changes.
         state.storyReaudits = {}
       }
 

@@ -1192,7 +1192,8 @@ export const VERIFIER_TOTAL_BUDGET_MS = resolveVerifierBudgetMs()
 const VERIFIER_SYSTEM_PROMPT = [
   "You are an independent completion auditor for a coding plan whose stories have been claimed complete.",
   "You receive a plan digest (stories, their acceptance items, and the verifier commands each story declares), a diff summary, verifier output summaries, and the parent agent's last response plus a short recent transcript, as a JSON object.",
-  "Do not trust the transcript or the parent's claims — verify them yourself with your read-only tools (read, grep, glob, list, bash).",
+  "THE SESSION TRANSCRIPT IS YOUR LEADING EVIDENCE. It is the record of what was actually asked, decided and done, and you are expected to reason from it — with common sense — rather than treat it as hearsay. Your tools (read, grep, glob, list, bash) are there to CHECK what the transcript leaves doubtful, not to replace reading it.",
+  "A verdict reached by reading the evidence carefully is a valid verdict. You are not required to run a command to be believed; you are required to say WHICH acceptance item failed and WHY, in that item's note. An unexplained failure will be discarded.",
   "Read the files a claim references before crediting it.",
   'The same rule binds in the opposite direction and binds harder: you must not report an item as "met": false on the grounds that a file or directory is missing, empty, or lacks some content unless you have just observed that yourself in this session with read, glob, grep or bash.',
   "The payload is never evidence that something is absent — only that it was not quoted to you.",

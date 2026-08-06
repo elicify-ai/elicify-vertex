@@ -77,7 +77,21 @@ export interface V2SessionState {
    * the flag already spent and ended in total silence. The doc here used to
    * claim a new plan reset it; nothing did.
    */
-  unauditedEscalated: boolean
+  /**
+   * Which unresolved story set has already been escalated, as a stable
+   * signature.
+   *
+   * FIX 2 — THE DEAD END. This was a boolean cleared by `resetTurnState`, and
+   * every continuation begins a turn, so the escalation re-fired forever
+   * against a state nothing could move: a story stamped
+   * `complete / unapplied:"unverified"` cannot become verified (its verdict was
+   * already discarded) and cannot be closed. Measured live: four escalations
+   * for the same five stories, alternating with plan-incomplete.
+   *
+   * Keyed by the set now, and deliberately NOT reset per turn — only a change
+   * in that set (a re-audit, a new plan) is grounds to speak again.
+   */
+  unauditedEscalatedFor: string | null
   /** True between `experimental.session.compacting` and the matching `session.compacted`. */
   compacting: boolean
 
@@ -161,7 +175,7 @@ export function freshSessionState(workspaceRoot: string): V2SessionState {
     statedIntentNudges: 0,
     idleContinuationInFlight: false,
     lastContinuationText: null,
-    unauditedEscalated: false,
+    unauditedEscalatedFor: null,
     compacting: false,
     workspaceRoot,
     modelId: null,
@@ -235,7 +249,6 @@ export function resetTurnState(state: V2SessionState): void {
   // second unaudited plan in the same session found it already spent and the
   // run ended in silence. A real user message is the right boundary: it is
   // what precedes a new plan.
-  state.unauditedEscalated = false
   state.markerAtLastContinuation = -1
   state.consecutiveNoProgress = 0
   state.stallPaused = false
