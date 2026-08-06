@@ -2,9 +2,48 @@
 
 **Created**: 2026-07-25
 **Revised**: 2026-07-25 (**rev 3** — applies the independent adversarial review round)
-**Status**: Final — revised
+**Amended**: 2026-08-06 (**rev 4** — backlog B-1: model-conditioned dosing and the verifier-model override are removed)
+**Status**: Final — revised, amended
 **Input**: Greenfield design `docs/vertex2-greenfield.html` + session design review (guide-over-gate, three-tier composer, story contracts). Full Vertex 2 scope in one spec; priorities P0–P2 map to the migration order.
 **Review**: `docs/vertex2-spec-review.md` — independent round against rev 2, verdict **BLOCK**: 3 critical, 14 major, 9 minor, 4 observation. Rev 3 resolves every CRITICAL and MAJOR finding and every mechanical MINOR/OBSERVATION finding; deferrals are listed with reasons in *Review Findings Applied (rev 3)*.
+
+---
+
+## Amendment — rev 4 (2026-08-06, backlog B-1)
+
+> **The rule, stated once: the judge runs on the same model as the worker.** No table,
+> no profile, no override.
+
+Two mechanisms are **removed** from the specification and from the implementation in the
+same change:
+
+1. **Model-conditioned dosing** — the model→profile table (`standard` | `frontier`),
+   suffix-tolerant matching, the `dosingOverrides` escape hatch, the `dosing:unknown-model`
+   event and the `profile` stamp on every event. This retires **US-8**, **FR-028**,
+   **FR-029**, the *Feature: Dosing* BDD block, *Dataset: Dosing profiles*, tests 16–17 and
+   `src/v2/dosing.ts`.
+2. **The `verifierModel` override and its fallback chain** — the `verifierModel` plugin
+   option, `verifierModelOverride`, and the two-entry `[override, sessionModel]` attempt
+   list. This rewrites **FR-030a** (it is not deleted: the verifier still has a model
+   requirement, just a one-line one), retires **US-9 AS-3** and its BDD scenario, and
+   narrows test 36.
+
+**Why — the measured evidence.** In the live session of 2026-08-06 the model reported
+itself as `minimax-coding-plan/MiniMax-M3`. The dosing table's key is
+`minimax/MiniMax-M3`, and the match requires `id === key` or `id.endsWith("/" + key)`, so
+the differing **provider** segment missed the row **138 times in one session** — logging
+`dosing:unknown-model` on every turn. The unmapped fallback profile is `standard`, which is
+*exactly what the matched row would have assigned*. The entire mechanism therefore produced
+138 log lines and one incorrect `unknown: true` flag and **changed no behaviour at all**.
+Adding a `minimax-coding-plan/…` row would have kept the machinery and bought nothing.
+`docs/vertex2-spec-review.md` **OBS-001** had reached the same conclusion about the
+`verifierModel` override independently — "configurability without a driver" — and was
+carried as *Deferred*; rev 4 resolves it.
+
+**Convention used below.** Retired requirements, stories, scenarios, tests and datasets keep
+their identifiers so existing cross-references still resolve. Their original text is struck
+through and followed by a bold status word and a one-line reason with the date, matching the
+convention already used in `docs/vertex2-waves-spec.md` (FR-051 `~~…~~ **WITHDRAWN.**`).
 
 ---
 
@@ -53,7 +92,7 @@ No `docs/reference/` directory exists in this project. The v1 implementation its
 | `contextForMode`/`contextForStopMode`/`contextForReview` | **replaced** | Content moves into the pattern library rendered by the composer |
 | `parseVerification`, `isMutatingBashCommand`, `changedPathsFromTool` | kept (behavior frozen) | Regression surface |
 | `MultiStoryGoalEngine`, `VerificationReceiptStore` (src/goals.ts) | **replaced by `StoryEngine` (schemaVersion 2)** | Receipts store kept; plan schema breaks |
-| `measurement.ts` log functions | extended | `model` + profile on every event; new event types; size/age rotation (FR-033a) |
+| `measurement.ts` log functions | extended | `model` on every event; new event types; size/age rotation (FR-033a). *Rev 4 (2026-08-06): the `profile` stamp is removed with dosing.* |
 | `formatDirectives`, `formatGateContinuationText` | kept | Envelope + redaction unchanged |
 | `EvidenceLedger.shouldBlockStop` | **kept as the zero-criteria fallback** | Rev 3: v1's unverified-changes trigger is preserved inside the v2 gate, not replaced (FR-015) |
 | `gateContinuationSessions` (src/index.ts) | **generalised → `selfCreatedSessions`** | Rev 3: v1 already excludes its own continuation sessions from `chat.message`; v2 adds two more `session.prompt` call sites, so the exclusion becomes a first-class rule across five hooks (FR-036) |
@@ -83,7 +122,7 @@ No `docs/reference/` directory exists in this project. The v1 implementation its
 
 ### Cluster Placement
 
-Single-package plugin. New modules: `src/phase.ts`, `src/composer.ts`, `src/resolve.ts`, `src/pin.ts`, `src/story.ts`, `src/artifacts.ts`, `src/dosing.ts`, `src/verifier.ts`, `src/subturn.ts` (shared session create/prompt/delete + `selfCreatedSessions` + the FR-030b capability probe). `src/index.ts` shrinks to wiring, plus the `VERTEX_V2=0` branch that returns the v1 hook set untouched.
+Single-package plugin. New modules: `src/phase.ts`, `src/composer.ts`, `src/resolve.ts`, `src/pin.ts`, `src/story.ts`, `src/artifacts.ts`, ~~`src/dosing.ts`~~ (**REMOVED** rev 4, 2026-08-06 — US-8), `src/verifier.ts`, `src/subturn.ts` (shared session create/prompt/delete + `selfCreatedSessions` + the FR-030b capability probe). `src/index.ts` shrinks to wiring, plus the `VERTEX_V2=0` branch that returns the v1 hook set untouched.
 
 ---
 
@@ -223,37 +262,55 @@ When the bound verifier goes green on a deep task, the harness injects the eleva
 
 ---
 
-### User Story 8 — Model-conditioned dosing (Priority: P2)
+### User Story 8 — Model-conditioned dosing (Priority: P2) — **REMOVED (rev 4, 2026-08-06)**
 
-Directive families are dosed per model class. The plugin reads the model id from `experimental.chat.system.transform` (where `model: Model` is **required**), falling back to `chat.message` (where it is optional), maps it through a config-supplied profile table, and the composer consults the dose before rendering. **Two profiles only** (review F-08: `small` and `mid` had identical doses — three classes were speculative): `standard` (full scaffolds + prescriptions; the default) and `frontier` (one-line phase nudges, but anomaly interrupts and falsification demands stay on). The two profiles differ across **five directive families** (FR-029 dose matrix, restored from `docs/vertex2-greenfield.html` §05), not one. Every event logs the model id so doses can be tuned from outcomes, and unmapped models are logged with their raw id so the table can be populated from telemetry.
+> **REMOVED — backlog B-1, 2026-08-06.** The model→profile mechanism never changed a
+> rendered directive in the field: the only two table rows were `anthropic/claude-fable-5`
+> and `minimax/MiniMax-M3`, and in the measured session the live model id
+> (`minimax-coding-plan/MiniMax-M3`) missed its own row on the provider segment 138 times
+> while the unmapped fallback (`standard`) assigned exactly the dose the row would have. One
+> dimension of variation that no model ever actually took is not a feature; every directive
+> family is now dosed `full`, unconditionally, for every model. The story id is kept so the
+> `Traces to: User Story 8` references elsewhere in this document still resolve.
+>
+> Removed with it: **FR-028**, **FR-029**, the *Feature: Dosing* BDD block, *Dataset: Dosing
+> profiles*, tests 16–17, the `dosing:unknown-model` event, the `profile` event stamp, the
+> `dosingOverrides` plugin option and `src/v2/dosing.ts`.
+>
+> **Replacement requirement**: none is needed — "the composer renders every family at its
+> full form" is the behaviour that already shipped, and it is now the only behaviour. The
+> model id is still recorded on every event (FR-033), which was the one part of this story
+> with measured value.
 
-**Why this priority**: Multiplies the value of all prior stories but is safe to ship after them; wrong dosing degrades gracefully to the default profile.
+~~Directive families are dosed per model class. The plugin reads the model id from `experimental.chat.system.transform` (where `model: Model` is **required**), falling back to `chat.message` (where it is optional), maps it through a config-supplied profile table, and the composer consults the dose before rendering. **Two profiles only** (review F-08: `small` and `mid` had identical doses — three classes were speculative): `standard` (full scaffolds + prescriptions; the default) and `frontier` (one-line phase nudges, but anomaly interrupts and falsification demands stay on). The two profiles differ across **five directive families** (FR-029 dose matrix, restored from `docs/vertex2-greenfield.html` §05), not one. Every event logs the model id so doses can be tuned from outcomes, and unmapped models are logged with their raw id so the table can be populated from telemetry.~~
 
-**Independent Test**: Same synthetic finding stream rendered under `profile:standard` vs `profile:frontier` produces the documented different directive sets.
+~~**Why this priority**: Multiplies the value of all prior stories but is safe to ship after them; wrong dosing degrades gracefully to the default profile.~~
 
-**Acceptance Scenarios**:
+~~**Independent Test**: Same synthetic finding stream rendered under `profile:standard` vs `profile:frontier` produces the documented different directive sets.~~
 
-1. **Given** a model id is available (from `system.transform`, else `chat.message`), **When** the session initializes, **Then** the resolved profile is recorded on the session **and stamped on every subsequent event emitted for that session** — asserted over the whole event stream, not just the init event.
-2. **Given** profile `frontier`, **When** an intake finding renders after one observed compliance, **Then** the scaffold is suppressed to a one-line nudge; **Given** profile `standard`, **Then** the full scaffold renders every task. The same profile pair produces the documented different form for each of the five families in the FR-029 dose matrix.
-3. **Given** no model id or an unknown model, **When** the session initializes, **Then** the default profile (`standard`) applies and a `dosing:unknown-model` event is logged **including the raw `providerID/modelID` string** so unmapped models are discoverable from telemetry.
+**Acceptance Scenarios** — all three **REMOVED** (rev 4, 2026-08-06):
+
+1. ~~**Given** a model id is available (from `system.transform`, else `chat.message`), **When** the session initializes, **Then** the resolved profile is recorded on the session **and stamped on every subsequent event emitted for that session** — asserted over the whole event stream, not just the init event.~~ **REMOVED** — no profile exists to stamp; the `model`/`session_id` half of this assertion survives as US-10 AS-1 (test 42).
+2. ~~**Given** profile `frontier`, **When** an intake finding renders after one observed compliance, **Then** the scaffold is suppressed to a one-line nudge; **Given** profile `standard`, **Then** the full scaffold renders every task. The same profile pair produces the documented different form for each of the five families in the FR-029 dose matrix.~~ **REMOVED** — every family renders at `full` for every model.
+3. ~~**Given** no model id or an unknown model, **When** the session initializes, **Then** the default profile (`standard`) applies and a `dosing:unknown-model` event is logged **including the raw `providerID/modelID` string** so unmapped models are discoverable from telemetry.~~ **REMOVED** — this is the path that fired 138 times to no effect; the event type is deleted.
 
 ---
 
 ### User Story 9 — Tier-3 verifier as an in-loop subturn (Priority: P2)
 
-At the final checkpoint of a deep story plan, the harness runs a verifier **subturn inside the same agent loop**: it creates a child session (`session.create({parentID})` — the same mechanism OpenCode uses for subagents), prompts it via `session.prompt` **as the plugin-registered zero-tool `vertex-verifier` agent** with a verifier system prompt and an evidence-only payload. **By default the subturn runs on the session's own model** — the one already serving the agent, guaranteed configured — so the verifier always works with zero extra setup. An optional plugin option `verifierModel: "providerID/modelID"` selects a different host-configured model; any failure of the override falls back to the session model, and any failure of the subturn fails open. The verdict `{fit: pass|concern, notes}` is appended to the close-out report and never gates the checkpoint. The child session is **inert to the harness's own hooks** (FR-036) and is **deleted on every exit path** (FR-038).
+At the final checkpoint of a deep story plan, the harness runs a verifier **subturn inside the same agent loop**: it creates a child session (`session.create({parentID})` — the same mechanism OpenCode uses for subagents), prompts it via `session.prompt` **as the plugin-registered zero-tool `vertex-verifier` agent** with a verifier system prompt and an evidence-only payload. **The subturn runs on the session's own model** — the one already serving the agent, guaranteed configured — so the verifier always works with zero extra setup, and the judge is always the same model as the worker. Any failure of the subturn fails open. *Rev 4 (2026-08-06, backlog B-1): the optional `verifierModel` plugin option and its override → session-model fallback chain are removed; there is one model and no chain.* The verdict `{fit: pass|concern, notes}` is appended to the close-out report and never gates the checkpoint. The child session is **inert to the harness's own hooks** (FR-036) and is **deleted on every exit path** (FR-038).
 
 > **Rev 3 (review CRIT-001, CRIT-002)**: rev 2 said "tool-calling disabled" and cited `SessionPromptData.body.tools` as verification. That field is a per-tool-**name** boolean map (`{[key: string]: boolean}`) — it expresses a deny *list*, not a deny-*all*, so the claimed capability was not established by the cited type. Rev 3 replaces the prose with a constructed mechanism (FR-030b: a registered zero-tool agent + a deny map enumerated from `client.tool.ids()` + `"*": false`) behind a **capability probe** that refuses to send the subturn at all when zero-tool execution cannot be confirmed. Separately, rev 2 never excluded the plugin's own child sessions from its own hooks — v1's `gateContinuationSessions` set in `src/index.ts` exists precisely because `session.prompt` re-enters `chat.message` — so the verifier would have received the harness's activation cue and directive block on top of its "evidence-only" payload. FR-036 closes that.
 
 **Why this priority**: Escalation tier for the one judgment that cannot be pinned (intent); explicitly non-blocking and degradable.
 
-**Independent Test**: Stub client: `session.create` + `session.prompt` + `session.delete` recorded → close-out contains verdict notes; payload schema-checked (no chat narrative); prompt body asserts `model` = session model by default (override when configured), `agent: "vertex-verifier"`, and the exact `tools` deny map; stub throwing/hanging → checkpoint completes, `verifier:unavailable` logged, child session still deleted. **Plus an integration test (not stub-only)** that drives the real hook set over a simulated harness-created child session and asserts `output.system` and `output.parts` are untouched.
+**Independent Test**: Stub client: `session.create` + `session.prompt` + `session.delete` recorded → close-out contains verdict notes; payload schema-checked (no chat narrative); prompt body asserts `model` = the session model (rev 4: no override exists), `agent: "vertex-verifier"`, and the exact `tools` deny map; stub throwing/hanging → checkpoint completes, `verifier:unavailable` logged, child session still deleted. **Plus an integration test (not stub-only)** that drives the real hook set over a simulated harness-created child session and asserts `output.system` and `output.parts` are untouched.
 
 **Acceptance Scenarios**:
 
 1. **Given** a final verification story checkpointing complete, **When** the verifier subturn succeeds, **Then** the close-out report appends the verdict, and the checkpoint result does not depend on it.
-2. **Given** no `verifierModel` configured, **When** the subturn is built, **Then** its prompt uses the current session's `{providerID, modelID}` (read from `experimental.chat.system.transform`, falling back to `chat.message`).
-3. **Given** `verifierModel` is configured but its prompt fails, **When** the subturn retries, **Then** it falls back to the session model before failing open.
+2. **Given** any deep session, **When** the subturn is built, **Then** its prompt uses the current session's `{providerID, modelID}` (read from `experimental.chat.system.transform`, falling back to `chat.message`) — always, with no configurable alternative (rev 4, 2026-08-06).
+3. ~~**Given** `verifierModel` is configured but its prompt fails, **When** the subturn retries, **Then** it falls back to the session model before failing open.~~ **REMOVED (rev 4, 2026-08-06, backlog B-1)** — there is no override to fall back from. A failing subturn fails open directly (AS-4). Resolves review OBS-001.
 4. **Given** the subturn fails or exceeds the 5 s cap, **When** checkpointing, **Then** the checkpoint completes normally and `verifier:unavailable` is logged.
 5. **Given** a verifier request is built, **Then** its payload contains criteria, diff summary, and verifier output summaries only — asserted by schema — and **every one of the three fields** is passed through `redactSecrets` and then the strict scan (FR-031).
 6. **Given** the harness has created a child session for a subturn, **When** any harness hook (`chat.message`, `experimental.chat.system.transform`, `experimental.text.complete`, `tool.execute.after`, `event(session.idle)`) fires for that session id, **Then** the harness returns early: no activation cue is pushed into `output.parts`, no directive block is appended to `output.system`, no ledger entry is allocated, and no gate runs — asserted over the **delivered** payload, not the built payload.
@@ -328,7 +385,7 @@ Boundary conditions:
 ## Edge Cases
 
 - Two sessions active concurrently → all state (phase, criteria, artifacts, doses) is per-session; `file.edited` attribution only when exactly one session is active (v1 rule preserved). **Because attribution is suppressed, evidence cannot accrue, so the criteria gate MUST NOT block in this state** — it renders the replay as advisory and logs `gate:multi-session-advisory` (review MIN-007).
-- Harness-created child session (verifier or intake subturn) → the harness is inert for that session: no activation cue, no directives, no gate, no ledger/dosing/review map entry, no recursion into `attemptGateContinuation` (FR-036).
+- Harness-created child session (verifier or intake subturn) → the harness is inert for that session: no activation cue, no directives, no gate, no ledger/review map entry, no recursion into `attemptGateContinuation` (FR-036).
 - Harness-created child session outlives its subturn → deleted in a `finally` block on every path; failure logs `subturn:cleanup-failed` (FR-038).
 - Deep session idles with changed files and **zero** pinned criteria → v1 unverified-changes gate applies (FR-015 fallback); block text states no criteria were captured.
 - Model writes multiple `CRITERIA:` blocks in one reply → last block wins; earlier ones ignored; event `criteria:re-pinned`.
@@ -339,7 +396,7 @@ Boundary conditions:
 - Compaction mid-turn → pinned criteria survive (**always disk-backed** in `pins.json`, memory only as a write-failure fallback — review MIN-009), re-injection occurs once on the next transform.
 - Story scope globs stop matching after a branch switch → the scope watchdog's per-turn cap (FR-004 table, 1/turn) bounds the noise; the directive text offers `amend` first when the plan's globs match **zero** files in the worktree (review: unasked question 7).
 - Verifier returns malformed JSON → treated as unavailable; logged `verifier:malformed`.
-- Unknown model string variants (e.g., provider prefixes) → normalized by suffix match before profile lookup; unmatched → default profile.
+- ~~Unknown model string variants (e.g., provider prefixes) → normalized by suffix match before profile lookup; unmatched → default profile.~~ **REMOVED (rev 4, 2026-08-06)** — nothing is looked up by model id any more. An unrecognised model id is simply recorded verbatim on the event (FR-033); it selects nothing, so there is no longer an edge case here. This normalisation is precisely what failed 138 times in the measured session.
 - Prescription command contains user path with secrets → passed through `redactSecrets` before injection (as all directive text already is).
 
 ---
@@ -348,7 +405,7 @@ Boundary conditions:
 
 - The system must not block quick- or normal-mode sessions at idle, because advisory-only modes are a v1 contract that prevents harness-paradox friction.
 - The system must not auto-create a story plan without user confirmation, because plans redirect the whole session and a wrong plan is worse than none.
-- The system must not instruct silent fixing of out-of-scope findings **under any model profile** (propose only), because ungoverned proactivity is the v1 sprawl failure inverted. A `frontier` proactive-fix license is **out of scope for v2.0** — see Assumptions (review MAJ-013: rev 2's `standard`-only qualifier implied an unbounded fix license for `frontier` that no requirement granted and that contradicted FR-021).
+- The system must not instruct silent fixing of out-of-scope findings — **propose only, for every model** — because ungoverned proactivity is the v1 sprawl failure inverted. *Historical note: review MAJ-013 objected that rev 2 qualified this with "under the `standard` model profile", which by exclusion granted `frontier` an unbounded fix license no requirement defined; rev 3 removed the qualifier and declared the license out of scope. Rev 4 (2026-08-06) removed model profiles entirely, so the qualifier can no longer be reintroduced by accident.*
 - The system must not send chat narrative, file contents beyond diff summaries, or unredacted text to the verifier, because the verifier must not inherit coherence bias and must not leak secrets.
 - The system must not let the verifier verdict gate or block a checkpoint, because tier 3 is advisory by design.
 - The system must not inject more than 2 directives per `system.transform` invocation, exceed any family's per-turn cap, or re-inject a family within `cooldownTurns`, because attention is the scarce resource being managed.
@@ -379,7 +436,7 @@ Boundary conditions:
 - **Cleanup**: `session.delete` in a `finally` block on every path (FR-038).
 - **Pre-filter (intake classification only)**: a **cost** gate, not a scope gate — the subturn is issued at most once per task and never for asks matching `TRIVIAL_ASK_RE`; skipped asks log `intake:classify-skipped` (review MAJ-006 replaced rev 2's character-length gate, which provably missed short multi-story asks such as "refactor auth end-to-end").
 - **Payload hygiene**: **all three** payload fields — pinned criteria, diff summary, verifier output summaries — pass `redactSecrets` and then the strict scan (FR-031), applied to the reassembled field rather than per chunk; a field that trips the scan has the offending hunk/line removed, and an emptied field is omitted with `verifier:field-dropped` logged (review MAJ-009).
-- **Model selection**: default = the current session's `{providerID, modelID}` (from `system.transform`, else `chat.message`) — always configured because it is already serving the agent. Optional plugin option `verifierModel: "providerID/modelID"`; on override failure, fall back to session model, then fail open.
+- **Model selection**: the current session's `{providerID, modelID}` (from `system.transform`, else `chat.message`) — always configured because it is already serving the agent, and the judge is deliberately the same model as the worker. There is **one** attempt on **one** model; on failure the subturn fails open (FR-030a). *Rev 4 (2026-08-06, backlog B-1): the `verifierModel` option and the override → session-model fallback chain are removed — see review OBS-001.*
 - **Data out**: JSON verdict `{fit, notes}` (verifier) / `{multiStory: boolean, outcomes: string[]}` (intake classification).
 - **Contract**: one prompt per subturn, `Promise.race` **5 s total including the retry** (v1 gate-continuation pattern reused), JSON-parse with schema check. Verifier fires only at final-story checkpoint of a deep plan; intake classification fires only from `chat.message`, ≤1 per task and ≤ `VERTEX_INTAKE_SUBTURN_MAX` (3) per session.
 - **On failure**: verifier → `verifier:unavailable`, close-out proceeds deterministically; intake classification → heuristic fallback (`SEQUENCING_WORDS` / `IMPERATIVE_VERBS`, FR-018), logged `intake:classify-fallback`, no second attempt after the 5 s budget expires.
@@ -731,45 +788,29 @@ Rev 3 records the spec's own threat posture so the claims are auditable. `risk` 
 - **And** a story-completion directive naming story 2 renders instead
 - **But** when the **final** story's verifier passes, the elevate directive is injected exactly once
 
-### Feature: Dosing (US-8)
+### Feature: Dosing (US-8) — **REMOVED (rev 4, 2026-08-06)**
 
-#### Scenario Outline: Same finding, different profile, different dose
-**Traces to**: User Story 8, Acceptance Scenario 2
-**Category**: Happy Path
-- **Given** profile `<profile>` with one prior compliance for the family
-- **When** a `<family>` finding renders
-- **Then** the directive form is `<form>`
-
-**Examples**:
-
-| family | profile | form |
-|---|---|---|
-| phase procedure (intake/plan scaffold) | standard | full scaffold, every task |
-| phase procedure (intake/plan scaffold) | frontier | one-line nudge; suppressed after first compliance |
-| verification prescription | standard | always, with the exact resolved command |
-| verification prescription | frontier | only on a relevance gap |
-| falsification / pre-commitment | standard | on new tests |
-| falsification / pre-commitment | frontier | every execute-entry turn (primary lever) |
-| anomaly interrupt | standard | full |
-| anomaly interrupt | frontier | full (FR-029 floor) |
-| elevate | standard | full checklist |
-| elevate | frontier | rubric + taste pass only |
-
-#### Scenario: Resolved profile is stamped on session init and on every subsequent event
-**Traces to**: User Story 8, Acceptance Scenario 1
-**Category**: Happy Path
-- **Given** a session whose first `system.transform` carries `model: {providerID: "anthropic", modelID: "claude-fable-5"}`
-- **When** the session runs a full turn emitting directive, calibration and gate events
-- **Then** the resolved profile `frontier` is recorded on the session
-- **And** **every** event in the emitted stream carries that profile value — asserted over the stream, not the init event alone
-
-#### Scenario: Unknown model falls back to default profile with raw id logged
-**Traces to**: User Story 8, Acceptance Scenario 3
-**Category**: Error Path
-- **Given** `chat.message` with model id `someprovider/new-model-x`
-- **When** the session initializes
-- **Then** profile `standard` applies
-- **And** `dosing:unknown-model` is logged containing the raw string `someprovider/new-model-x`
+> **REMOVED — backlog B-1, 2026-08-06.** All three scenarios in this feature are retired
+> with US-8, FR-028 and FR-029. The heading is kept so the `Traces to` and test-plan
+> references resolve; the scenario titles are kept so that citations of them by name
+> (traceability matrix, test 16/17 rows, review OBS-002) land somewhere rather than
+> dangling. Their bodies described a dose difference that no model in the field ever
+> selected.
+>
+> - ~~Scenario Outline: Same finding, different profile, different dose~~ — **REMOVED.**
+>   Ten cells (5 directive families × 2 profiles). Every family now renders `full` for
+>   every model, which was the `standard` column verbatim. The `frontier` column had no
+>   live subject: the only mapped `frontier` model was `anthropic/claude-fable-5`.
+> - ~~Scenario: Resolved profile is stamped on session init and on every subsequent
+>   event~~ — **REMOVED.** No profile exists. The surviving invariant — every event
+>   carries `model` and `session_id` — is *Feature: Measurement*'s
+>   "Every emitted event carries model and session id" (US-10 AS-1, FR-033, test 42).
+> - ~~Scenario: Unknown model falls back to default profile with raw id logged~~ —
+>   **REMOVED.** This is the exact path that fired 138 times in the measured session
+>   (`minimax-coding-plan/MiniMax-M3` missing the key `minimax/MiniMax-M3` on the provider
+>   segment) while the fallback assigned the same profile the table row would have. The
+>   `dosing:unknown-model` event type is deleted; the raw model id it existed to surface is
+>   already on every event via FR-033.
 
 ### Feature: Verifier (US-9)
 
@@ -781,21 +822,28 @@ Rev 3 records the spec's own threat posture so the claims are auditable. `risk` 
 - **Then** the checkpoint succeeds
 - **And** the close-out report contains the verifier notes
 
-#### Scenario: Verifier subturn uses the session model by default
+#### Scenario: Verifier subturn uses the session model
 **Traces to**: User Story 9, Acceptance Scenario 2
 **Category**: Happy Path
-- **Given** no `verifierModel` option and a session served by `minimax/MiniMax-M3`
+> Renamed from "Verifier subturn uses the session model **by default**" (rev 4,
+> 2026-08-06) — there is no other case to be the default of.
+- **Given** a session served by `minimax-coding-plan/MiniMax-M3`
 - **When** the verifier subturn prompt is built
-- **Then** the prompt body's model is `{providerID: "minimax", modelID: "MiniMax-M3"}`
+- **Then** the prompt body's model is `{providerID: "minimax-coding-plan", modelID: "MiniMax-M3"}` — the worker's model verbatim, unmapped and unnormalised
 - **And** the prompt targets a child session created with the current session as parent
+- **And** exactly one model is attempted
 
-#### Scenario: Configured verifierModel failure falls back to the session model
-**Traces to**: User Story 9, Acceptance Scenario 3
+#### Scenario: Configured verifierModel failure falls back to the session model — **REMOVED (rev 4, 2026-08-06)**
+**Traces to**: ~~User Story 9, Acceptance Scenario 3~~ (also removed)
 **Category**: Error Path
-- **Given** `verifierModel: "provider-x/model-y"` whose prompt rejects
-- **When** the subturn retries
-- **Then** the retry prompt uses the session model
-- **And** on success the verdict is appended to the close-out report
+> **REMOVED — backlog B-1, 2026-08-06.** Resolves review OBS-001. The scenario's
+> precondition (`verifierModel: "provider-x/model-y"`) is no longer expressible: the option
+> does not exist and the attempt list is `[sessionModel]`, length one. The heading is kept
+> because the traceability matrix and test 36 cite this scenario by name.
+- ~~**Given** `verifierModel: "provider-x/model-y"` whose prompt rejects~~
+- ~~**When** the subturn retries~~
+- ~~**Then** the retry prompt uses the session model~~
+- ~~**And** on success the verdict is appended to the close-out report~~
 
 #### Scenario: Verifier timeout fails open
 **Traces to**: User Story 9, Acceptance Scenario 4
@@ -895,7 +943,7 @@ Rev 3 records the spec's own threat posture so the claims are auditable. `risk` 
 
 | Level | Scope | Purpose |
 |---|---|---|
-| Unit | phase machine, composer, resolver, artifact parser, story engine, dosing table, verifier payload builder | Logic in isolation, fixture-driven |
+| Unit | phase machine, composer, resolver, artifact parser, story engine, verifier payload builder | Logic in isolation, fixture-driven. *Rev 4 (2026-08-06): the dosing table is removed.* |
 | Integration | plugin hooks wired together (v1 harness pattern: synthetic hook calls) | Components cooperate across a turn lifecycle |
 | E2E | UAT harness scenarios + scripted live `opencode run` | Full behavior under the real/simulated host |
 
@@ -918,8 +966,8 @@ Rev 3 records the spec's own threat posture so the claims are auditable. `risk` 
 | 13 | `story_v1_archival` | Unit | v1 plan archived on first contact | archive + message |
 | 14 | `story_scope_watchdog_globs` | Unit | Out-of-scope mutation guides | glob match incl. empty-match hint |
 | 15 | `story_final_receipt_gate` | Unit | Final story completion requires observed receipt | receipt binding (v1 semantics) |
-| 16 | `dosing_profile_resolution` | Unit | Unknown model falls back; **Resolved profile is stamped on session init and on every subsequent event** | suffix normalization + default + event-stream assertion that every emitted event carries the profile |
-| 17 | `dosing_render_matrix` | Unit | Scenario Outline: Same finding, different profile | 5-family × 2-profile form matrix (FR-029) |
+| 16 | ~~`dosing_profile_resolution`~~ | — | ~~Unknown model falls back; Resolved profile is stamped on every event~~ | **REMOVED (rev 4, 2026-08-06, backlog B-1)** — FR-028 is retired. The event-stream half of this test survives as test 42 (`event_invariants_property`), which already asserts `model` and `session_id` on every event type. Number retained; do not reuse |
+| 17 | ~~`dosing_render_matrix`~~ | — | ~~Scenario Outline: Same finding, different profile~~ | **REMOVED (rev 4, 2026-08-06, backlog B-1)** — FR-029's 5×2 matrix is retired; every family renders `full`. Number retained; do not reuse |
 | 18 | `verifier_payload_evidence_only` | Unit | Verifier payload carries evidence only | schema + canary + redaction across all three fields |
 | 19 | `intake_scaffold_repeats_until_captured` | Integration | Intake scaffold repeats until criteria are captured | injects on each of three consecutive turns with no `CRITERIA:` block, then suppresses permanently once one is captured (rev 3: the rev-2 name `intake_scaffold_once` contradicted FR-011's "every turn until captured") |
 | 20 | `criteria_idle_block_names_unmet` | Integration | Idle block quotes the unmet criterion; **Multi-session activity renders the criteria replay as advisory** | teachable gate + cap + two-active-session advisory row |
@@ -938,7 +986,7 @@ Rev 3 records the spec's own threat posture so the claims are auditable. `risk` 
 | 33 | `uat_v2_story_lifecycle` | E2E | plan propose → checkpoints → final gate | UAT harness |
 | 34 | `uat_v2_anomaly_and_elevate` | E2E | EXPECT interrupt + elevate | UAT harness |
 | 35 | `live_scripted_session` | E2E | Behavioral Contract (all primary flows) | **Maintainer-run locally; skipped in headless CI unless `OPENCODE_LIVE_TEST=1`** (review F-07 — CI lacks provider keys) |
-| 36 | `verifier_model_selection_and_fallback` | Integration | Verifier subturn uses the session model by default; Configured verifierModel failure falls back | default model, override, fallback chain, child-session parentID, `session.delete` called exactly once per attempt path |
+| 36 | `verifier_model_selection` | Integration | Verifier subturn uses the session model | **Narrowed (rev 4, 2026-08-06, backlog B-1)**, and renamed from `verifier_model_selection_and_fallback` — the implementation in `tests/v2/integration-verifier.test.ts` still carries the old `describe` name and should follow. Asserts: the session model is used verbatim, exactly one model is attempted, child-session `parentID` is set, and `session.delete` is called exactly once. The override and fallback-chain assertions are removed with FR-030a's second sentence |
 | 37 | `story_lock_file_stale_recovery` | Unit | (coverage gap — state-directory write concurrency) | concurrent `plan.json`/`pins.json` write under the shared directory lock: second writer sees lock and throws; lock older than 30 s is reclaimed; no partial file left |
 | 38 | `intake_prefilter_and_heuristics` | Unit | Trivial ask skips the classification subturn; Short multi-story ask still reaches the classifier | `TRIVIAL_ASK_RE` matrix, `SEQUENCING_WORDS` / `IMPERATIVE_VERBS` matrix (incl. Korean, code-fence, attachment rows); asserts no client call on skip and a call on every non-trivial row |
 | 39 | `verifier_payload_secret_scan` | Unit | Verifier payload carries evidence only | strict scan over **all three** fields on the reassembled field; unlabelled 40-hex token, entropy rule, line-wrapped token, base64 in criteria; `verifier:field-dropped` when a field empties |
@@ -1064,15 +1112,16 @@ Rev 3 records the spec's own threat posture so the claims are auditable. `risk` 
 | 5 | A1,A2 | none | blocked | accepted (evidence not required for blocked) | Story contracts | terminal non-complete |
 | 6 | A1 | waiver written by the model into the tool arguments | complete | **rejected** — a waiver is only valid when recorded from a user message, never self-issued | Checkpoint rejected | the model may not author its own evidence (v1 receipt rule extended to waivers) |
 
-#### Dataset: Dosing profiles
+#### Dataset: Dosing profiles — **REMOVED (rev 4, 2026-08-06)**
 
-| # | Model id input | Normalized class | Intake form (post-compliance) | Traces to | Notes |
-|---|---|---|---|---|---|
-| 1 | `anthropic/claude-fable-5` | frontier | one-line nudge | Dosing outline | |
-| 2 | `openrouter/anthropic/claude-fable-5` | frontier | one-line nudge | Dosing outline | prefix-tolerant |
-| 3 | `minimax/MiniMax-M3` | standard | full scaffold | Dosing outline | mapped, non-frontier |
-| 4 | `x/tiny-7b` | unknown → standard | full scaffold | Unknown model falls back | default + event with raw id |
-| 5 | absent | unknown → standard | full scaffold | Unknown model falls back | `"unknown"` on events |
+> **REMOVED — backlog B-1, 2026-08-06.** All five rows are retired with US-8/FR-028/FR-029
+> and tests 16–17. Every model id now produces the same directive forms, so the dataset has
+> no boundary left to exercise. Recorded here because the rows are themselves the evidence
+> for the removal: row 3's key (`minimax/MiniMax-M3`) is the one the live model id
+> `minimax-coding-plan/MiniMax-M3` missed 138 times on the provider segment, and rows 4–5
+> show the unmapped fallback assigning `standard` — the same profile row 3 would have
+> assigned. Two of five rows tested a `frontier` model (`anthropic/claude-fable-5`) that
+> never ran under this harness.
 
 #### Dataset: Verifier payload hygiene (US-9 / FR-031)
 
@@ -1198,23 +1247,20 @@ Explicitly **replaced** (tests updated/retired with the change): directive id/te
 **Elevate (US-7)**
 - **FR-027**: System MUST inject the elevate directive exactly once per turn when a relevant verifier passes on a deep session with mutations **and the passing verifier covers the final story of the active plan, or no plan is active**, containing criteria replay, the graduated sweep protocol, and the taste pass; never for quick or docs-only sessions, and never on an intermediate story's green (review MAJ-004 — declaring the finishing ritual at every intermediate green teaches the model to close early, the inverse of US-5's purpose).
 
-**Dosing (US-8)**
-- **FR-028**: System MUST resolve a model profile from the set `{standard, frontier}` (review F-08 — `small`/`mid` collapsed; their doses were identical) from the model id via suffix-tolerant matching over a config table, defaulting to `standard`; the profile MUST be recorded on the session and stamped on **every** event emitted for that session. The model id MUST be read from `experimental.chat.system.transform` (where `model: Model` is **required**) in preference to `chat.message` (where `model?` is optional), so the `dosing:unknown-model` path is reachable only for genuinely unmapped models (review: unasked question 1). `dosing:unknown-model` events MUST include the raw `providerID/modelID` string so the profile table can be populated from telemetry (review F-06).
-- **FR-029**: The composer MUST consult the profile's dose per directive family before rendering, per this matrix (restored from `docs/vertex2-greenfield.html` §05, minus the proactive-fix license which is out of scope for v2.0 — see FR-021 and the Non-Behaviors; review OBS-002/MAJ-013):
+**Dosing (US-8) — REMOVED (rev 4, 2026-08-06, backlog B-1)**
 
-  | Directive family | `standard` | `frontier` |
-  |---|---|---|
-  | Phase procedure (intake / plan scaffold) | full scaffold, every task | one-line nudge; suppressed after the first observed compliance |
-  | Verification prescription | always, with the exact resolved command | only on a relevance gap |
-  | Falsification / pre-commitment (FR-023a) | on turns introducing new tests | every execute-entry turn (primary lever) |
-  | Anomaly interrupt (FR-024) | full | full |
-  | Elevate (FR-027) | full checklist | rubric + taste pass only |
+> Both requirements below are retired. Their identifiers are kept so cross-references
+> resolve; nothing renumbers. **The replacement rule is one sentence and is stated as
+> FR-028R below** — this is an absence being filled, not left.
 
-  The `frontier` profile MUST NOT reduce the anomaly-interrupt or falsification families below `full` (floor). Unlisted families are dosed `full` under both profiles.
+- **FR-028**: ~~System MUST resolve a model profile from the set `{standard, frontier}` (review F-08 — `small`/`mid` collapsed; their doses were identical) from the model id via suffix-tolerant matching over a config table, defaulting to `standard`; the profile MUST be recorded on the session and stamped on **every** event emitted for that session. The model id MUST be read from `experimental.chat.system.transform` (where `model: Model` is **required**) in preference to `chat.message` (where `model?` is optional), so the `dosing:unknown-model` path is reachable only for genuinely unmapped models (review: unasked question 1). `dosing:unknown-model` events MUST include the raw `providerID/modelID` string so the profile table can be populated from telemetry (review F-06).~~ **REMOVED (2026-08-06, backlog B-1)** — the two-row table missed the live model id on its provider segment 138 times in one session and its unmapped fallback assigned the same profile the row would have; the mechanism produced log lines and one wrong `unknown: true` flag and changed no behaviour. The `dosing:unknown-model` event type, the `profile` session field, the `profile` event stamp and the `dosingOverrides` option go with it. **Reading the model id from `system.transform` in preference to `chat.message` survives** — it is still how `model` reaches every event under FR-033.
+- **FR-028R** (**replaces FR-028**, 2026-08-06): The composer MUST render every directive family at its full form for every model. There is no model→behaviour mapping of any kind: no profile, no table, no per-model suppression, no override. The model id is recorded (FR-033) and never branched on.
+- **FR-029**: ~~The composer MUST consult the profile's dose per directive family before rendering, per this matrix (restored from `docs/vertex2-greenfield.html` §05, minus the proactive-fix license which is out of scope for v2.0 — see FR-021 and the Non-Behaviors; review OBS-002/MAJ-013): a 5-family × 2-profile matrix over phase procedure, verification prescription, falsification/pre-commitment (FR-023a), anomaly interrupt (FR-024) and elevate (FR-027), with `frontier` floored at `full` for anomaly interrupt and falsification, and unlisted families dosed `full` under both profiles.~~ **REMOVED (2026-08-06, backlog B-1)** — superseded by FR-028R. The matrix's `standard` column *is* FR-028R; the `frontier` column had no live subject (the only `frontier` row was `anthropic/claude-fable-5`) and was therefore never exercised in the field. The original matrix survives in `docs/vertex2-greenfield.html` §05 (also annotated as superseded) and in this file's git history at commit `4cb0b02`.
 
 **Verifier (US-9)**
 - **FR-030**: The verifier MUST run as an in-loop subturn: child session via `session.create({parentID})`, one `session.prompt` with the verifier system prompt and the tool-disabling mechanism of FR-030b, `Promise.race` **5 s total including the retry**; fired only at final-story checkpoint of deep plans when enabled; its verdict MUST NOT gate the checkpoint.
-- **FR-030a**: The subturn's model MUST default to the current session's `{providerID, modelID}`; a `verifierModel: "providerID/modelID"` plugin option MAY override it, with fallback to the session model on override failure.
+- **FR-030a** (**rewritten** 2026-08-06, backlog B-1 — the requirement survives, its second sentence does not): The subturn's model MUST be the current session's `{providerID, modelID}`, verbatim and unnormalised. Exactly **one** model MUST be attempted; there MUST be no override option, no fallback chain and no model→model mapping. The judge runs on the same model as the worker, by construction rather than by default. On failure the subturn fails open (FR-032).
+  - ~~The subturn's model MUST default to the current session's `{providerID, modelID}`; a `verifierModel: "providerID/modelID"` plugin option MAY override it, with fallback to the session model on override failure.~~ **Superseded 2026-08-06** — resolves review OBS-001 ("the `verifierModel` override and its fallback chain are configurability without a driver"). The option was never set in any observed session, so the attempt list was always `[sessionModel]` and the second entry was unreachable code.
 - **FR-030b** (review CRIT-002): "Tool-calling disabled" MUST be **constructed**, not asserted. `SessionPromptData.body.tools` is `{ [toolName: string]: boolean }` — a per-tool-name allow/deny map with no documented deny-all flag — so the capability the spec needs is **not** established by the existence of that field. The system MUST therefore:
   1. Register a zero-tool subagent through the `config` hook: `config.agent["vertex-verifier"] = { mode: "subagent", description, prompt: <rubric>, tools: <deny map>, permission: { edit: "deny", bash: "deny", webfetch: "deny" }, maxSteps: 1 }`, and likewise `config.agent["vertex-intake"]` when the intake subturn is enabled. Grounded in `Config.agent[name]: AgentConfig` (`types.gen.d.ts:1112`, `:835`).
   2. Build the **deny map** at plugin init by enumerating the host's tool ids via `client.tool.ids()` (`GET /experimental/tool/ids` → `Array<string>`, `:1705`), setting every id to `false`, and additionally setting the key `"*": false` for hosts that honour a wildcard. Enumeration is at runtime, so installation-specific and MCP-contributed tools are covered.
@@ -1226,7 +1272,7 @@ Explicitly **replaced** (tests updated/retired with the change): directive id/te
 - **FR-032**: Verifier unavailability or malformed responses MUST fail open with `verifier:unavailable`/`verifier:malformed` events.
 
 **Measurement (US-10)**
-- **FR-033**: Every event MUST carry `model` (or `"unknown"`), session id and resolved dosing profile; new event types: `directive_rendered`, `directive_complied`, `calibration`, `phase_transition`, `resolution:none`, `dosing:unknown-model`, `gate:multi-session-advisory`, `pins:disk-*`, `intake:classify-*`, `subturn:cleanup-failed`, `verifier:*` statuses. These invariants MUST be enforced by a property test over every event type (test 42), not only by scenario tests.
+- **FR-033** (**amended** 2026-08-06, backlog B-1): Every event MUST carry `model` (or `"unknown"`) and session id; new event types: `directive_rendered`, `directive_complied`, `calibration`, `phase_transition`, `resolution:none`, `gate:multi-session-advisory`, `pins:disk-*`, `intake:classify-*`, `subturn:cleanup-failed`, `verifier:*` statuses. These invariants MUST be enforced by a property test over every event type (test 42), not only by scenario tests. *Amendment: the ~~resolved dosing profile~~ field and the ~~`dosing:unknown-model`~~ event type are removed with FR-028. `model` stays — it is the part of US-8 with measured value, and it is recorded verbatim (no suffix normalisation), because normalising it is what silently failed 138 times.*
 - **FR-033a**: The `events.jsonl` sink MUST be size- and age-bounded: rotate at **32 MB** to `events.<timestamp>.jsonl` and delete rotated files older than **30 days**. v2 widens what lands on disk (directive text, changed-path sets, raw model ids); `redactForDisk` remains the only content control in v2.0 and no per-field classification scheme is specified (accepted risk, see the STRIDE table).
 - **FR-034**: System MUST assign instance ids to rendered prescriptions and log `directive_complied` when the prescribed **or equivalently-resolved** verifier is observed in the same turn. **Two commands are equivalent when the FR-008 resolver returns the same tier and the same target path set for both, after stripping the flags enumerated in `IGNORED_VERIFIER_FLAGS` = `{--reporter=*, --reporters=*, -v, --verbose, --silent, --no-color, --color, --bail, --run, --watch=false}`** (review MIN-008 — compliance rate drives directive ROI and therefore which prescriptions get deleted, so the equivalence relation cannot be left to the implementer). A broader suite (different tier or a superset target path set) is **not** equivalent.
 - **FR-035**: Holdout arms MUST extend to directive families (suppress rendering, log `holdout_suppress` with family), preserving v1 gate holdout behavior.
@@ -1295,10 +1341,11 @@ Explicitly **replaced** (tests updated/retired with the change): directive id/te
 | FR-025 | US-6 | absent/malformed fails open | 11, 24 |
 | FR-026 | US-6 | calibration logged | 25 |
 | FR-027 | US-7 | elevate once; docs-only never; intermediate story green does not elevate | 26, 49 |
-| FR-028 | US-8 | unknown model falls back with raw id logged; resolved profile stamped on every event | 16 |
-| FR-029 | US-8 | dosing outline (5 families × 2 profiles) | 17 |
+| ~~FR-028~~ | ~~US-8~~ | — | **REMOVED** rev 4, 2026-08-06 (backlog B-1); test 16 removed |
+| **FR-028R** | — | every family renders `full` for every model; no model→behaviour mapping exists | 4, 5, 6, 7 (the composer render/budget/decay/cooldown tests, which now exercise the only form there is). This is a negative requirement: its stronger guarantee is structural — no dosing module and no model-keyed branch exists to test |
+| ~~FR-029~~ | ~~US-8~~ | — | **REMOVED** rev 4, 2026-08-06 (backlog B-1); superseded by FR-028R; test 17 removed |
 | FR-030 | US-9 | verdict appended, non-gating; timeout fails open | 29, 51 |
-| FR-030a | US-9 | subturn uses session model; verifierModel fallback | 36 |
+| FR-030a | US-9 | subturn uses the session model, exactly one attempt (**rewritten** rev 4, 2026-08-06 — the `verifierModel` fallback clause is gone) | 36 |
 | FR-030b | US-9 | verifier subturn is refused when tools cannot be disabled | 44 |
 | FR-031 | US-9 | payload evidence-only (three fields, strict scan) | 18, 39 |
 | FR-032 | US-9 | timeout fails open | 29 |
@@ -1310,21 +1357,21 @@ Explicitly **replaced** (tests updated/retired with the change): directive id/te
 | FR-037 | US-11 | kill switch restores v1 behaviour for the whole process | 52 |
 | FR-038 | US-9 | subturn child session is deleted on every path | 47, 29, 36 |
 
-**Completeness check (counted, rev 3)**:
+**Completeness check (counted, rev 3; re-counted rev 4)**:
 
-| Artefact | Count | Breakdown |
-|---|---|---|
-| User stories | **11** | US-1…US-11 (US-11 added in rev 3) |
-| Acceptance scenarios | **54** | US-1: 5, US-2: 5, US-3: 4, US-4: 8, US-5: 7, US-6: 4, US-7: 4, US-8: 3, US-9: 8, US-10: 3, US-11: 3 |
-| BDD scenarios | **51** | 49 scenarios + 2 Scenario Outlines; fewer than 54 because three scenarios each cover a group of acceptance scenarios (US-3 AS-1–3, US-7 AS-1–2, US-11 AS-1 & 3) |
-| Tests in the TDD plan | **53** | 1–53; 26 Unit, 21 Integration, 5 E2E, 1 Unit (property) |
-| Functional requirements | **45** | FR-001…FR-038 plus FR-013a, FR-018a, FR-018b, FR-023a, FR-030a, FR-030b, FR-033a |
-| Success criteria | **18** | SC-001…SC-017 plus SC-004a (manual) |
-| Test datasets | **9** | resolution, artifact parsing, composer budget/cooldown/decay, intake pre-filter, idle gate matrix, pins persistence, checkpoint evidence, dosing profiles, verifier payload hygiene |
+| Artefact | rev 3 | **rev 4 (live)** | Breakdown after the 2026-08-06 amendment |
+|---|---|---|---|
+| User stories | 11 | **10** | US-1…US-11 minus **US-8** (removed; id retained) |
+| Acceptance scenarios | 54 | **50** | US-1: 5, US-2: 5, US-3: 4, US-4: 8, US-5: 7, US-6: 4, US-7: 4, ~~US-8: 3~~ **0**, US-9: **7** (AS-3 removed), US-10: 3, US-11: 3 |
+| BDD scenarios | 51 | **47** | 46 scenarios + **1** Scenario Outline; the *Feature: Dosing* outline and its 2 scenarios, plus "Configured verifierModel failure falls back", are removed |
+| Tests in the TDD plan | 53 | **51** | 1–53 minus tests **16** and **17** (numbers retained, not reused); 24 Unit, 21 Integration, 5 E2E, 1 Unit (property) |
+| Functional requirements | 45 | **44** | FR-001…FR-038 plus FR-013a, FR-018a, FR-018b, FR-023a, FR-030a, FR-030b, FR-033a; minus **FR-028** and **FR-029**, plus **FR-028R** |
+| Success criteria | 18 | **18** | SC-001…SC-017 plus SC-004a (manual) — unchanged; no SC referenced dosing or `verifierModel` |
+| Test datasets | 9 | **8** | resolution, artifact parsing, composer budget/cooldown/decay, intake pre-filter, idle gate matrix, pins persistence, checkpoint evidence, ~~dosing profiles~~, verifier payload hygiene |
 
-Every FR appears in the matrix above. **All 54 acceptance scenarios are covered** — verified by resolving every BDD `Traces to:` line against the acceptance lists, with zero uncovered. Every BDD scenario has ≥1 named test in the TDD plan.
+Every FR appears in the matrix above. **All 50 live acceptance scenarios are covered** — verified by resolving every BDD `Traces to:` line against the acceptance lists, with zero uncovered. Every live BDD scenario has ≥1 named test in the TDD plan. Retired identifiers (US-8, US-9 AS-3, FR-028, FR-029, tests 16–17, *Dataset: Dosing profiles*) are struck through in place rather than deleted, so every pre-existing cross-reference still lands on a row that explains itself.
 
-Rev 2's check asserted completeness without counting: the independent review found 41 acceptance scenarios against 34 BDD scenarios, with US-1 AS-3, US-6 AS-1, US-8 AS-1 and US-10 AS-1 uncovered and the verifier happy path untested (review MAJ-011). All five gaps are closed by tests 45, 46, 16 (extended), 42 and 51; the E2E tests 32–35 remain cross-story coverage on top of, not instead of, the per-scenario rows.
+Rev 2's check asserted completeness without counting: the independent review found 41 acceptance scenarios against 34 BDD scenarios, with US-1 AS-3, US-6 AS-1, US-8 AS-1 and US-10 AS-1 uncovered and the verifier happy path untested (review MAJ-011). All five gaps were closed by tests 45, 46, 16 (extended), 42 and 51; the E2E tests 32–35 remain cross-story coverage on top of, not instead of, the per-scenario rows. *Rev 4 note: US-8 AS-1 and test 16 are now removed, so MAJ-011's fifth gap closes differently — the surviving half of that assertion ("every event carries `model` and `session_id`") is US-10 AS-1, covered by test 42.*
 
 ---
 
@@ -1336,9 +1383,9 @@ Resolved 2026-07-25 (user review); one item pending:
 |---|---|---|---|
 | 1 | Criteria source when the model never produces a `CRITERIA:` block | **Keep demanding** — scaffold repeats every turn until captured (FR-011) | Resolved |
 | 2 | Multi-story detection for auto-propose | **LLM-classified intake subturn** (session model), heuristic fallback on failure (FR-018). Rev 3 restores this resolution: the pre-filter is a *cost* gate (`TRIVIAL_ASK_RE`, FR-018a), not a scope gate, so the LLM still decides for every non-trivial ask | Resolved |
-| 3 | Dosing profile table source | Plugin options in `opencode.json` + built-in defaults (FR-028); the tunables are `verifierModel`, `engine`, `VERTEX_INTAKE_SUBTURN_MAX` and the per-family `cooldownTurns`/cap overrides — all in the options surface, none hardcoded | Resolved |
+| 3 | Dosing profile table source | ~~Plugin options in `opencode.json` + built-in defaults (FR-028); the tunables are `verifierModel`, `dosingOverrides`, `engine`, `VERTEX_INTAKE_SUBTURN_MAX` and the per-family `cooldownTurns`/cap overrides~~ | **MOOT (rev 4, 2026-08-06)** — there is no profile table to source. `dosingOverrides` and `verifierModel` are deleted; the surviving tunables are `engine`, `VERTEX_INTAKE_SUBTURN_MAX` and the per-family `cooldownTurns`/cap overrides |
 | 4 | "Turn" boundary | User message → next user message (v1 ledger semantics). A turn contains **many** `system.transform` invocations; the injection budget is per invocation and the caps/cooldowns are per turn (FR-004, FR-005) | Resolved |
-| 5 | Verifier model selection | **In-loop subturn on the session's own model by default** (always works, no extra config); optional `verifierModel` plugin option over host-configured providers; grounded in SDK 1.18.4 `session.create({parentID})` + `session.prompt({model, agent, system, tools, parts})` (FR-030/030a). **Rev 3 correction**: the presence of the `tools` field does **not** establish "tool-calling disabled" — see FR-030b and Open Question 1 | Resolved (with a correction) |
+| 5 | Verifier model selection | **In-loop subturn on the session's own model** (always works, no extra config); grounded in SDK 1.18.4 `session.create({parentID})` + `session.prompt({model, agent, system, tools, parts})` (FR-030/030a). **Rev 3 correction**: the presence of the `tools` field does **not** establish "tool-calling disabled" — see FR-030b and Open Question 1. **Rev 4 amendment (2026-08-06, backlog B-1)**: the ~~optional `verifierModel` plugin option over host-configured providers~~ is removed — the judge runs on the worker's model, full stop (review OBS-001) | Resolved (amended rev 4) |
 | 6 | v2 tool/slash naming | `elicify_vertex_plan_*` tools, `/elicify-vertex-plan-*` slash; `goal` names removed | Resolved |
 | 7 | Elevate trigger without a story | Any successful verifier while unverified changes existed; relevance preferred, not required (FR-027) | Resolved |
 | 8 | Automated one-shot-rate labeling in v2.0 | **No in-plugin labeling, ever** — corrective-turn labeling is semantic judgment (tier 3), unreliable deterministically. v2.0 records raw events only (FR-033/034); one-shot rate is computed offline by a future verifier script over recorded sessions, out of v2.0 scope | Resolved |
@@ -1378,9 +1425,9 @@ Added in rev 3 (decided by the revision pass, not by the user — flagged as suc
 | MAJ-008 | Major | **Resolved** | New **FR-013a** (session-keyed `pins.json`, shared directory lock, 7-day expiry, delete-when-empty); Integration Boundaries → Filesystem state; new Dataset: Pins persistence (8 rows); test 40; SC-013 retargeted at test 40; test 37 removed from the FR-013 row (OBS-003) |
 | MAJ-009 | Major | **Resolved** | **FR-031** extends the strict scan to all three payload fields on the reassembled field and defines it (`SECRET_PATTERNS` + Shannon entropy ≥4.0 bits/char over ≥32-char tokens), with `verifier:field-dropped`; hygiene dataset rows 5–9 (incl. a false-positive row); SC-012 |
 | MAJ-010 | Major | **Resolved** | New **FR-023a** (pre-commitment as a phase-entry injection); US-6 AS-1 rewritten; BDD "Pre-commitment prompt renders on execute entry"; test 46; `tool.execute.before` explicitly **not** added to the hook surface |
-| MAJ-011 | Major | **Resolved** | BDD scenarios + tests added for US-1 AS-3 (45), US-6 AS-1 (46), US-8 AS-1 (16 extended), US-10 AS-1 (42) and the verifier happy path (51); the Completeness check now states counted numbers |
+| MAJ-011 | Major | **Resolved** | BDD scenarios + tests added for US-1 AS-3 (45), US-6 AS-1 (46), ~~US-8 AS-1 (16 extended)~~, US-10 AS-1 (42) and the verifier happy path (51); the Completeness check now states counted numbers. *Rev 4 (2026-08-06): US-8 AS-1 and test 16 are removed with US-8; the surviving invariant is covered by US-10 AS-1 / test 42* |
 | MAJ-012 | Major | **Resolved** | New **US-11** (P0), **FR-037** (`VERTEX_V2=0` / `engine: "v1"`, read before any state access), **FR-022** reversible archival; BDD ×2; tests 52–53; SC-014; regression row for the whole v1 suite under the flag |
-| MAJ-013 | Major | **Resolved** (license declared out of scope) | Non-Behavior's `standard`-only qualifier removed — propose-only under **all** profiles; the frontier proactive-fix license added to the Assumptions' out-of-scope list; FR-029's dose matrix omits it explicitly |
+| MAJ-013 | Major | **Resolved** (license declared out of scope), then **MOOT** rev 4 | Non-Behavior's `standard`-only qualifier removed — propose-only under **all** profiles; the frontier proactive-fix license added to the Assumptions' out-of-scope list; FR-029's dose matrix omitted it explicitly. *Rev 4 (2026-08-06): profiles no longer exist, so the qualifier cannot be reintroduced and the finding is permanently closed rather than merely resolved* |
 | MAJ-014 | Major | **Resolved** | New **FR-038** (`session.delete` in `finally` on every path, `subturn:cleanup-failed`); US-9 AS-8; BDD; test 47; assertions added to tests 29 and 36; SC-016 |
 | MIN-001 | Minor | **Resolved** | SC-002 restated as every row (10/10) after the resolution dataset grew to 10 rows |
 | MIN-002 | Minor | **Resolved** | SC-004 restated over `uat_v2_core_loop` (test 32, CI); SC-004a keeps the live session as an explicitly manual criterion |
@@ -1391,12 +1438,12 @@ Added in rev 3 (decided by the revision pass, not by the user — flagged as suc
 | MIN-007 | Minor | **Resolved** | FR-015 multi-session advisory clause; US-4 AS-7; BDD; Edge Cases; test 20 extended; gate dataset row 7 |
 | MIN-008 | Minor | **Resolved** | FR-034 defines verifier equivalence (same tier + same target path set, modulo `IGNORED_VERIFIER_FLAGS`); Composer dataset rows 10–11 |
 | MIN-009 | Minor | **Resolved** | FR-013 always persists pins; the plan-conditional dual mode deleted; BDD and Edge Cases updated |
-| OBS-001 | Observation | **Deferred** — `verifierModel` is a recorded user decision (Clarifications 2026-07-25, Ambiguity #5); removing it would reverse a resolved question without the user present. Cost is one option, one AS, one BDD scenario and part of test 36 | No change; recorded here as an accepted carry |
-| OBS-002 | Observation | **Resolved** | FR-029 now carries the five-family × two-profile dose matrix restored from `docs/vertex2-greenfield.html` §05 (minus the fix license, per MAJ-013); the BDD outline and test 17 exercise all ten cells |
+| OBS-001 | Observation | **RESOLVED 2026-08-06 (rev 4, backlog B-1)** — was *Deferred* in rev 3 on the ground that `verifierModel` was a recorded user decision (Clarifications 2026-07-25, Ambiguity #5) that should not be reversed without the user present. The operator has now reversed it explicitly: the judge runs on the worker's model, no override | The `verifierModel` option, `verifierModelOverride` and the two-entry fallback chain are deleted from spec and code. FR-030a rewritten to a single-model rule; US-9 AS-3 and the BDD "Configured verifierModel failure falls back" retired; test 36 narrowed and renamed `verifier_model_selection`; Ambiguity #5 amended. The finding's own diagnosis held: in every observed session the option was unset, so the second attempt-list entry was unreachable |
+| OBS-002 | Observation | **Resolved** rev 3, then **SUPERSEDED** rev 4 (2026-08-06) | FR-029 carried the five-family × two-profile dose matrix restored from `docs/vertex2-greenfield.html` §05 (minus the fix license, per MAJ-013); the BDD outline and test 17 exercised all ten cells. *Rev 4 took OBS-002's **other** branch, and further: the finding offered "restore the matrix" or "replace the profile concept with a single option and delete the table, the suffix-tolerant matching, the `dosing:unknown-model` event and tests 16–17". Field evidence (138 missed lookups, zero behaviour change) showed no second option was needed either — the whole dimension is deleted, not narrowed. See FR-028R* |
 | OBS-003 | Observation | **Resolved** | Test 37 removed from the FR-013 traceability row and re-described as state-directory write concurrency; the pins fault-injection test (40) takes its place |
 | OBS-004 | Observation | **Resolved** | The rev-2 self-review independence caveat is retired and replaced by the provenance note below |
 
-**Deferred, with reasons** (3): OBS-001 (reverses a recorded user decision — see above); **token/spend budgeting beyond call counts** (review Unasked Question 3 — v2.0 bounds the *number* of paid calls but sets no cost ceiling; a spend budget needs pricing data the plugin does not have); **per-field data classification for `events.jsonl`** (STRIDE Information-Disclosure row — v2.0 ships `redactForDisk` plus FR-033a's size/age bound and defers a classification scheme to v2.1).
+**Deferred, with reasons** (rev 3: 3; **rev 4: 2** — OBS-001 was resolved on 2026-08-06 and is no longer carried): ~~OBS-001 (reverses a recorded user decision — see above)~~; **token/spend budgeting beyond call counts** (review Unasked Question 3 — v2.0 bounds the *number* of paid calls but sets no cost ceiling; a spend budget needs pricing data the plugin does not have); **per-field data classification for `events.jsonl`** (STRIDE Information-Disclosure row — v2.0 ships `redactForDisk` plus FR-033a's size/age bound and defers a classification scheme to v2.1).
 
 **Partially resolved** (1): CRIT-002 — see the row above and Open Question 1.
 
@@ -1419,9 +1466,9 @@ Rev 2 applied nine findings (F-01…F-09) as text edits. The independent round f
 | F-03 | FR-018a pre-filter | Replaced — cost gate, not length gate (MAJ-006); heuristic terms enumerated (MAJ-005) |
 | F-04 | FR-031 reassembled-hunk scan | Extended — all three fields, scan defined (MAJ-009) |
 | F-05 | FR-004 budget channel-scoped | Kept, and re-scoped per invocation with a cap table (MAJ-001) |
-| F-06 | FR-028 raw model id | Kept unchanged; model id now sourced from `system.transform` first |
+| F-06 | FR-028 raw model id | Kept unchanged; model id now sourced from `system.transform` first. *Rev 4 (2026-08-06): FR-028 is removed, and with it the `dosing:unknown-model` event F-06 was about. The raw model id survives on every event under FR-033 — verbatim, never normalised* |
 | F-07 | Test 35 CI-skipped | Kept; SC-004 moved off it to test 32 (MIN-002) |
-| F-08 | Profiles collapsed to 2 | Kept; the two profiles now differ across five families, not one (OBS-002) |
+| F-08 | Profiles collapsed to 2 | Kept; the two profiles differed across five families, not one (OBS-002). *Rev 4 (2026-08-06): collapsed to **0** — profiles are removed entirely (FR-028R). F-08's own argument, that a distinction with identical doses is not a distinction, applied one level up and nobody noticed* |
 | F-09 | Inline `EXPECT [conf]:` | Kept unchanged |
 
 ---
@@ -1488,9 +1535,9 @@ Rev 2 applied nine findings (F-01…F-09) as text edits. The independent round f
 - The host honours plugin-registered agents written into `config.agent` from the `config` hook, and `client.app.agents()` reflects the resolved result. **If it does not, FR-030b's probe fails closed and both subturns are disabled — the spec degrades rather than breaks.**
 - Single OpenCode process per project; cross-process plan safety relies on the existing lock-file mechanism only.
 - vitest remains the project's test framework for v2's own tests; fixture-driven unit tests require no network and no subprocess.
-- The v1 measurement environment variables (`VERTEX_DATA`, `VERTEX_HOLDOUT`, `VERTEX_DEBUG`) carry over; new: `VERTEX_VERIFIER` (verifier subturn on/off) and **`VERTEX_V2`** (`0` = kill switch, FR-037). New plugin options: `verifierModel`, `engine`, `VERTEX_INTAKE_SUBTURN_MAX`, per-family `cooldownTurns` and per-turn cap overrides.
+- The v1 measurement environment variables (`VERTEX_DATA`, `VERTEX_HOLDOUT`, `VERTEX_DEBUG`) carry over; new: `VERTEX_VERIFIER` (verifier subturn on/off) and **`VERTEX_V2`** (`0` = kill switch, FR-037). New plugin options: `engine`, `VERTEX_INTAKE_SUBTURN_MAX`, per-family `cooldownTurns` and per-turn cap overrides. *Rev 4 (2026-08-06, backlog B-1): ~~`verifierModel`~~ and ~~`dosingOverrides`~~ are removed from the options surface. No user-facing document ever published them — `docs/CONFIGURATION.md` lists the v1 factory options only — so their removal is not a documented-API break.*
 - Breaking-change communication (README migration note, major version bump) happens at release; the *technical* rollback path is in scope and specified (US-11, FR-037).
-- Out of scope for v2.0: cross-session/user-level memory, automated one-shot-rate labeling, multi-agent evidence trust-weighting, prompt-technique A/B content variants beyond family holdouts, **a `frontier` proactive-fix license** (review MAJ-013 — propose-only holds under every profile in v2.0), **token/spend budgeting beyond the call-count bounds in FR-018b and FR-030**, and **per-field data classification for the event sink** (FR-033a bounds size and age only).
+- Out of scope for v2.0: cross-session/user-level memory, automated one-shot-rate labeling, multi-agent evidence trust-weighting, prompt-technique A/B content variants beyond family holdouts, ~~**a `frontier` proactive-fix license** (review MAJ-013 — propose-only holds under every profile in v2.0)~~ *(rev 4, 2026-08-06: moot — no profiles exist; propose-only is unconditional)*, **any model-conditioned behaviour at all** (rev 4 — FR-028R), **a verifier model distinct from the worker's** (rev 4 — FR-030a), **token/spend budgeting beyond the call-count bounds in FR-018b and FR-030**, and **per-field data classification for the event sink** (FR-033a bounds size and age only).
 - `.elicify-vertex/` state lives in the worktree root and is **not** branch-aware: switching branches leaves `plan.json` in place. Projects wanting branch-scoped plans should add `.elicify-vertex/` to `.gitignore` and re-create plans per branch (review: unasked question 1). v2.0 ships no branch detection.
 
 ## Clarifications
@@ -1508,9 +1555,9 @@ Rev 2 applied nine findings (F-01…F-09) as text edits. The independent round f
 
 - Q: Model never produces CRITERIA? → A: Keep demanding every turn until captured.
 - Q: Multi-story detection? → A: LLM-classified intake subturn; heuristic only as failure fallback.
-- Q: Dosing config? → A: Plugin options + built-in defaults.
+- Q: Dosing config? → A: ~~Plugin options + built-in defaults.~~ *Superseded 2026-08-06 (rev 4): there is no dosing to configure — see FR-028R.*
 - Q: Turn boundary? → A: User message → user message.
-- Q: Verifier model? → A: Must always work; run as a subturn of the agent loop on the session's own model; optional `verifierModel` plugin option for a different host-configured model. Grounded against SDK 1.18.4 (`session.create` supports `parentID`; `session.prompt` supports per-call `model`, `agent`, `system`, `tools`). *Superseded in part by rev 3: the `tools` field is a per-tool-name map, not a disable flag — see FR-030b.*
+- Q: Verifier model? → A: Must always work; run as a subturn of the agent loop on the session's own model; ~~optional `verifierModel` plugin option for a different host-configured model~~. Grounded against SDK 1.18.4 (`session.create` supports `parentID`; `session.prompt` supports per-call `model`, `agent`, `system`, `tools`). *Superseded in part by rev 3: the `tools` field is a per-tool-name map, not a disable flag — see FR-030b.* *Superseded in part by rev 4 (2026-08-06): the `verifierModel` option is removed; the session model is the only model — see FR-030a and the rev-4 clarification below.*
 - Q: Naming? → A: `plan_*`.
 - Q: Elevate trigger without story? → A: Any green verifier.
 - Q: One-shot labeling in v2.0? → A: None in the plugin — labeling is semantic and only reliable via an LLM verifier, therefore offline tier-3 tooling out of v2.0 scope; the plugin records raw events only.
@@ -1522,9 +1569,9 @@ Rev 2 applied nine findings (F-01…F-09) as text edits. The independent round f
 - Q: Does the classification subturn run on trivial asks? → A: No — pre-filter at 120 chars or a sequencing word; skip and log (F-03).
 - Q: Could a split credential reach the verifier? → A: Scan the reassembled hunk and drop it; not per-chunk (F-04).
 - Q: Do idle continuations consume the injection budget? → A: No — budget is `system.transform`-scoped (F-05).
-- Q: How are unmapped models discovered? → A: raw id in `dosing:unknown-model` (F-06).
+- Q: How are unmapped models discovered? → A: ~~raw id in `dosing:unknown-model` (F-06).~~ *Superseded 2026-08-06 (rev 4): nothing is "mapped", so nothing can be unmapped. The raw id is on every event (FR-033). Note the irony recorded in backlog B-1 — this discovery mechanism worked perfectly, firing 138 times with the correct raw id, and the table it existed to populate was never updated.*
 - Q: Can the live E2E run in CI? → A: Maintainer-run; skipped unless `OPENCODE_LIVE_TEST=1` (F-07).
-- Q: Three dosing profiles? → A: Two — `standard`, `frontier`; the third was speculative (F-08).
+- Q: Three dosing profiles? → A: ~~Two — `standard`, `frontier`; the third was speculative (F-08).~~ *Superseded 2026-08-06 (rev 4): none. All three were speculative.*
 - Q: Separate `CONFIDENCE:` line? → A: Retired; inline `EXPECT [conf]:` (F-09).
 
 ### 2026-07-25 — rev 3 (independent adversarial review revision)
@@ -1545,7 +1592,20 @@ Rev 2 applied nine findings (F-01…F-09) as text edits. The independent round f
 - Q: Which verifier payload fields are scanned? → A: All three, on the reassembled field, with `SECRET_PATTERNS` + an entropy rule (FR-031, MAJ-009).
 - Q: How does the pre-commitment prompt arrive before the verifier? → A: As a phase-entry injection on the first `system.transform` after entering `execute`; `tool.execute.before` stays out of the hook surface (FR-023a, MAJ-010).
 - Q: What is the rollback path? → A: `VERTEX_V2=0`, read before any state access, plus byte-identical reversible archival (US-11, FR-037/FR-022, MAJ-012).
-- Q: Does `frontier` get a silent-fix license? → A: No — propose-only under every profile in v2.0; out of scope (MAJ-013).
+- Q: Does `frontier` get a silent-fix license? → A: No — propose-only under every profile in v2.0; out of scope (MAJ-013). *Rev 4 (2026-08-06): permanently unaskable — there is no `frontier`.*
 - Q: Are subturn child sessions deleted? → A: Yes, in `finally`, on every path (FR-038, MAJ-014).
 - Q: Who may issue an evidence waiver? → A: Only a user message; a model-authored waiver in tool arguments is rejected (FR-019).
 - Q: What makes two verifier commands "equivalent" for compliance? → A: Same resolver tier and same target path set, ignoring `IGNORED_VERIFIER_FLAGS` (FR-034, MIN-008).
+
+### 2026-08-06 — rev 4 (backlog B-1 amendment)
+
+> **Operator decision, not a revision-pass inference.** The rule is: *the judge runs on the
+> same model as the worker.* Both removals below follow from it, and both are supported by
+> measurement from the live session of 2026-08-06 (450 events, MiniMax-M3).
+
+- Q: Which model does the verifier run on? → A: The session's own model, always. No override option, no fallback chain, no table. This reverses the rev-3 deferral of review OBS-001, which had been held open only because nobody with authority to reverse the original decision was present.
+- Q: Should the dosing table gain a `minimax-coding-plan/…` row to fix the 138 misses? → A: **No.** That keeps the machinery and buys nothing. The mechanism is deleted instead.
+- Q: What replaces per-model dosing? → A: Nothing needs to. Every family renders `full` for every model (FR-028R) — which is what the `standard` column already said, and `standard` is what every real session resolved to, whether it hit the table or missed it.
+- Q: What was the actual cost of keeping it? → A: 138 `dosing:unknown-model` log lines in one session and one incorrect `unknown: true` flag, plus a module, a config option, two tests, a dataset, two FRs and a user story to maintain — for zero behavioural difference.
+- Q: Does the model id stop being recorded? → A: No. `model` stays on every event (FR-033) and is recorded **verbatim**. Suffix normalisation is what silently failed; the raw string is what proved it.
+- Q: Is any published configuration key broken by this? → A: No. Neither `verifierModel` nor `dosingOverrides` appears in `docs/CONFIGURATION.md`, `docs/USAGE.md` or `README.md` — verified by grep on 2026-08-06. They existed only in `src/v2/plugin.ts`'s option type and in this specification.

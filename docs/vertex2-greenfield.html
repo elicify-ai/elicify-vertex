@@ -126,6 +126,20 @@
   }
   .callout p { margin: 0; font-size: 15px; }
 
+  /* ---------- superseded (retired design element, kept for the record) ---------- */
+  .superseded {
+    border-left: 3px solid var(--bad); background: var(--bad-soft);
+    padding: 16px 20px; border-radius: 0 10px 10px 0; margin: 24px 0; max-width: 76ch;
+  }
+  .superseded p { margin: 0 0 10px; font-size: 15px; }
+  .superseded p:last-child { margin-bottom: 0; }
+  .superseded .stamp {
+    display: inline-block; font-size: 12px; letter-spacing: .08em; text-transform: uppercase;
+    font-weight: 700; color: var(--bad);
+  }
+  section.retired > h2, section.retired > .sec-sub,
+  section.retired > table { opacity: .55; }
+
   footer { margin-top: 80px; padding-top: 24px; border-top: 1px solid var(--line);
     font-size: 13px; color: var(--ink-faint); }
 
@@ -505,9 +519,27 @@ receipt type — it's actually widened upstream."</div>
 </section>
 
 <!-- ============================================================ -->
-<section>
+<section class="retired">
   <div class="sec-num">05</div>
   <h2>Model-conditioned dosing</h2>
+  <div class="superseded">
+    <p><span class="stamp">Superseded — 2026-08-06</span></p>
+    <p><strong>This section is a historical design input. The mechanism it describes was built and
+    then removed</strong> (backlog B-1; <code>docs/vertex2-spec.md</code> rev 4 retires US-8, FR-028
+    and FR-029, and <code>src/v2/dosing.ts</code> is deleted). The shipped profile table held exactly
+    two rows — <code>anthropic/claude-fable-5</code> → <code>frontier</code> and
+    <code>minimax/MiniMax-M3</code> → <code>standard</code>. In the measured session of 2026-08-06 the
+    live model reported itself as <code>minimax-coding-plan/MiniMax-M3</code>, which missed its own
+    key on the <em>provider</em> segment <strong>138 times</strong>; the unmapped fallback assigned
+    <code>standard</code> — precisely what the matched row would have assigned. Net effect of the
+    whole mechanism: 138 log lines, one incorrect <code>unknown: true</code> flag, and no behavioural
+    difference whatsoever.</p>
+    <p><strong>What replaced it:</strong> every directive family renders at its full form for every
+    model (spec FR-028R) — i.e. the <code>standard</code> column below, unconditionally. The
+    <code>frontier</code> column never had a live subject. The one part of this section that survives
+    is the sentence after the heading: the model id is still logged on every event, verbatim.</p>
+    <p>The table is kept as written for the record; do not implement from it.</p>
+  </div>
   <p class="sec-sub">One failure profile per model class, one dose per profile. Every event logs the model id;
   the holdout arm learns which directives earn their tokens <em>per model</em>.</p>
   <table>
@@ -569,7 +601,9 @@ receipt type — it's actually widened upstream."</div>
   <strong>3.</strong> Story contracts (scope, verifiers, receipt-bound checkpoints) →
   <strong>4.</strong> Anomaly interrupt via pre-commitment →
   <strong>5.</strong> Elevate phase →
-  <strong>6.</strong> Model-conditioned dosing + directive ROI measurement.</p>
+  <strong>6.</strong> <s>Model-conditioned dosing</s> + directive ROI measurement.
+  <em>(Step 6's dosing half was built and removed on 2026-08-06 — see §05. Directive ROI measurement
+  stands.)</em></p>
 
   <div class="callout"><p><strong>The honest ceiling, stated up front:</strong> this system closes the
   <em>discipline</em> gap — front-loading, persistence, root-cause, evidence. It narrows but cannot close
@@ -614,8 +648,9 @@ receipt type — it's actually widened upstream."</div>
       classifying failures the taxonomy misses, scoring taste passes <em>for measurement</em>.
       Constraints: runs as an <strong>in-loop subturn</strong> — a child session
       (<code>session.create({parentID})</code>) prompted with tool-calling disabled, on the
-      <strong>session's own model by default</strong> (always configured; optional
-      <code>verifierModel</code> override), 5&nbsp;s cap, never in the hot path, deterministic
+      <strong>session's own model</strong> — always configured, and deliberately the same model as the
+      worker (<em>2026-08-06: the optional <s><code>verifierModel</code> override</s> and its fallback
+      chain were removed — backlog B-1, spec FR-030a</em>), 5&nbsp;s cap, never in the hot path, deterministic
       fallback, and an <strong>evidence-only diet</strong> — diff + criteria + verifier output,
       never the chat narrative, or the verifier inherits the coherence bias it exists to catch.</p>
     </div>
