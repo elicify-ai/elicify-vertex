@@ -17,7 +17,6 @@
  * FR-036 (self-created-session inertness) is enforced at the top of EVERY
  * hook via `selfCreated.isSelfCreated(sessionID, selfCreatedGuard.resolveParent)`.
  */
-import { execFileSync } from "node:child_process"
 import { resolve as resolvePath } from "node:path"
 import { randomUUID } from "node:crypto"
 
@@ -35,6 +34,7 @@ import { PLUGIN_STATE_DIR, VerificationReceiptStore, isProtectedStatePath, resol
 import { holdoutSuppresses, logHoldoutSuppress } from "../measurement.js"
 
 import { compareExpectation, findCriteriaKeyLine, parseCriteriaBlock, parseExpectArtifact } from "./artifacts.js"
+import { computeBoundedDiffStat, formatChangedPathsSummary, NON_PATH_MUTATION_MARKERS } from "./diffstat.js"
 import { isNonExecutingCommand, isTestRunnerCommand, observedCoversPrescribed, verifyGapComplied } from "./coverage.js"
 import { VisibilityNotifier, resolveVisibilityMode, summarizeFinding } from "./visibility.js"
 import { InjectionComposer, type Finding } from "./composer.js"
@@ -112,7 +112,6 @@ const WRITE_TOOL_NAMES = new Set(["write", "edit", "patch", "multiedit", "notebo
  * checked only three of these. */
 const WRITE_TOOL_PATH_KEYS = ["filePath", "file_path", "path", "file", "notebookPath", "destination"]
 
-const NON_PATH_MUTATION_MARKERS = new Set(["edit-mutation", "patch-mutation", "bash-mutation"])
 const TEST_PATH_RE = /\.(?:test|spec)\.[^./]+$/
 const TEST_DIR_RE = /(^|\/)tests?\//
 
@@ -153,22 +152,6 @@ function resolveStoryIdForPhase(storyEngine: StoryEngine, sessionID: string): st
 }
 
 /**
- * FIX #7 (verifier payload richness): a bounded `git diff --stat` for the
- * currently changed paths, invoked at verifier-invocation time only
- * (`session.idle`, which FR-009 does NOT list among the prohibited hot
- * paths — only `tool.execute.after`/`system.transform` are). Never throws:
- * a missing `git` binary, a non-repo `cwd`, or a timeout all degrade to the
- * empty string so the caller can fall back to the old changed-paths label.
- *
- * This is a `--stat` summary, not full hunks — a size-capped full `git diff`
- * for the changed paths is a reasonable follow-up if the verifier needs more
- * than file-level shape, but is not implemented here (documented in the
- * final report, not silently claimed as solved).
- */
-const DIFF_STAT_TIMEOUT_MS = 2000
-const DIFF_STAT_MAX_CHARS = 4000
-
-/**
  * CR-15: pick the first DEFINED value, not the first truthy one. `0` is a
  * meaningful setting for several of these knobs (it disables the FR-007
  * re-audit cap), and a `||` chain silently replaced it with the default.
@@ -178,33 +161,6 @@ function firstDefinedNumber(...values: Array<number | undefined>): number {
     if (typeof value === "number" && Number.isFinite(value)) return value
   }
   return 0
-}
-
-function computeBoundedDiffStat(cwd: string, changedPaths: readonly string[]): string {
-  const realPaths = changedPaths.filter((p) => !NON_PATH_MUTATION_MARKERS.has(p))
-  try {
-    const args = realPaths.length > 0 ? ["diff", "--stat", "--", ...realPaths] : ["diff", "--stat"]
-    const out = execFileSync("git", args, {
-      cwd,
-      encoding: "utf8",
-      timeout: DIFF_STAT_TIMEOUT_MS,
-      maxBuffer: 1024 * 1024,
-      // Node inherits the child's stderr by default for execFileSync, so it
-      // is written STRAIGHT to the terminal running opencode — past the TUI's
-      // renderer, which then has no idea the screen changed and draws over a
-      // corrupted frame. Outside a git repo `git diff` prints a warning plus
-      // its entire usage page (measured: 7,393 bytes) to stderr, so pointing
-      // the harness at a non-repo folder wrecked the display on every idle.
-      // The `catch` below swallowed the exception but never the output, which
-      // is why the event log looked perfectly healthy throughout.
-      stdio: ["ignore", "pipe", "pipe"],
-    })
-    const trimmed = out.trim()
-    if (trimmed.length === 0) return ""
-    return trimmed.length > DIFF_STAT_MAX_CHARS ? `${trimmed.slice(0, DIFF_STAT_MAX_CHARS)}\n… (truncated)` : trimmed
-  } catch {
-    return ""
-  }
 }
 
 /**
@@ -428,24 +384,27 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       return l ? [l] : []
     },
     // FIX #7: a bounded `git diff --stat` for the changed paths, falling
-    // back to the old comma-joined path list when git is unavailable, the
-    // worktree isn't a repo, or the diff is empty.
+    // back to the recorded path list when git is unavailable, the worktree
+    // isn't a repo, or the diff is empty.
+    //
+    // B-3: the fallback now carries the REASON the diff is missing
+    // (`unavailableReason`) instead of being indistinguishable from a real
+    // diff, and the list itself is workspace-relative and one-path-per-line
+    // so the payload's own secret scan stops eating it — see
+    // `diffstat.ts`'s header for the measured failure both properties fix.
     diffSummary: (sessionID) => {
       const state = states.get(sessionID)
       const cwd = state?.workspaceRoot ?? workspaceRoot
       const changedPaths = evidenceLedger.getChangedPaths(sessionID)
       const stat = computeBoundedDiffStat(cwd, changedPaths)
-      return stat || formatChangedPathsSummary(changedPaths)
+      if (stat.text.length > 0) return stat
+      return { text: formatChangedPathsSummary(changedPaths, cwd), unavailableReason: stat.unavailableReason }
     },
     composer,
     visibility,
     delegation: delegationTracker,
     maxNoProgressTurns: opts.maxNoProgressTurns,
     maxStoryReaudits: opts.maxStoryReaudits,
-  }
-
-  function formatChangedPathsSummary(paths: readonly string[]): string {
-    return paths.length === 0 ? "no changed paths recorded" : paths.join(", ")
   }
 
   const planTools = buildPlanTools({

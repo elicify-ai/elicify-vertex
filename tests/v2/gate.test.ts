@@ -91,7 +91,14 @@ function harness(opts: {
     verifierEnabled: opts.verifierEnabled ?? false,
     isValidReceipt: () => false,
     recentVerifierSummaries,
-    diffSummary: () => "",
+    // B-3: was `() => ""`, which the real provider in `plugin.ts` cannot
+    // produce — when git gives it nothing it falls back to
+    // `formatChangedPathsSummary`, whose own floor is the literal string
+    // below. An empty `text` here is not a faithful stub, and after B-3 (d)
+    // it means "no file evidence AND no transcript", which makes
+    // `runVerifier` return `insufficient-evidence` without prompting anyone
+    // — see the dedicated test for that path in `verifier.test.ts`.
+    diffSummary: () => ({ text: "no changed paths recorded" }),
     composer,
     // Redesign point 9: a real DelegationTracker (never records a `task`
     // call in these pure gate tests, so it never defers), and a HIGH

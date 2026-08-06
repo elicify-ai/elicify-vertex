@@ -867,3 +867,70 @@ describe("a secret in a real (mocked) transcript is redacted through the full fe
     expect(payload.recentTranscript).not.toContain(secret)
   })
 })
+
+// ===========================================================================
+// BACKLOG B-3, end to end through the REAL wiring.
+//
+// `workDir` here is a bare `mkdtempSync` directory — NOT a git repository,
+// which is exactly the condition the audited field session ran under. Before
+// B-3 this session produced `verifier:field-dropped {field:"diffSummary"}`
+// and the judge was handed no file evidence and no reason. These two tests
+// drive the whole path (`plugin.ts`'s `diffSummary` provider -> `diffstat.ts`
+// -> `gate.ts` -> `buildVerifierPayload` -> the subturn prompt) and read back
+// the JSON that actually reached the verifier.
+// ===========================================================================
+
+function b3PayloadFromCall(call: PromptArgs | undefined): { diffSummary?: string; diffSummaryUnavailable?: string } {
+  const text = call?.body?.parts?.[0]?.text
+  if (typeof text !== "string") throw new Error("no vertex-verifier prompt call captured")
+  return JSON.parse(text) as { diffSummary?: string; diffSummaryUnavailable?: string }
+}
+
+describe("B-3: outside a git repository the verifier is TOLD there is no diff, and still gets the file list", () => {
+  it("the payload carries workspace-relative changed paths plus the stated reason", async () => {
+    const client = makeStubClient({ promptImpl: passingVerifierPromptImpl })
+    const recordSpy = vi.spyOn(VerificationReceiptStore.prototype, "record")
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "verifier-b3-nonrepo-session"
+
+    const { taskId } = await setUpFinalStoryVerified(hooks, sid, { providerID: "minimax", id: "MiniMax-M3" }, recordSpy)
+    // ABSOLUTE paths, the way opencode's own edit/write tools report them —
+    // and the exact shape whose 42-44 char tokens cleared the entropy rule
+    // and emptied this field in the field session.
+    await toolAfter(hooks, sid, "edit", { filePath: join(workDir, "src/games/breakout.js") }, "updated")
+    await toolAfter(hooks, sid, "edit", { filePath: join(workDir, "src/games/index.html") }, "updated")
+    await callTool(hooks, "elicify_vertex_plan_checkpoint", { taskId, status: "complete" }, sid)
+    await idle(hooks, sid)
+
+    const payload = b3PayloadFromCall(verifierPromptCalls(client)[0])
+
+    // The field the audited run lost entirely.
+    expect(payload.diffSummary).toBeDefined()
+    expect(payload.diffSummary).toContain("src/games/breakout.js")
+    expect(payload.diffSummary).toContain("src/games/index.html")
+    // Relative, not absolute: the tokens are now under the scan's 32-char
+    // floor, which is what stops them being scored at all.
+    expect(payload.diffSummary).not.toContain(workDir)
+    // And the hole is stated rather than silent.
+    expect(payload.diffSummaryUnavailable).toContain("not a git repository")
+  })
+
+  it("no `verifier:field-dropped {diffSummary}` is logged for that session — the regression, watched at the event log", async () => {
+    const client = makeStubClient({ promptImpl: passingVerifierPromptImpl })
+    const recordSpy = vi.spyOn(VerificationReceiptStore.prototype, "record")
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "verifier-b3-nonrepo-events-session"
+
+    const { taskId } = await setUpFinalStoryVerified(hooks, sid, { providerID: "minimax", id: "MiniMax-M3" }, recordSpy)
+    await toolAfter(hooks, sid, "edit", { filePath: join(workDir, "src/games/memory.js") }, "updated")
+    await toolAfter(hooks, sid, "edit", { filePath: join(workDir, "src/games/index.html") }, "updated")
+    await toolAfter(hooks, sid, "edit", { filePath: join(workDir, "src/games/breakout.js") }, "updated")
+    await callTool(hooks, "elicify_vertex_plan_checkpoint", { taskId, status: "complete" }, sid)
+    await idle(hooks, sid)
+
+    const dropped = readEvents().filter(
+      (e) => e.event_type === "verifier:field-dropped" && (e.payload as { field?: string } | undefined)?.field === "diffSummary",
+    )
+    expect(dropped).toEqual([])
+  })
+})

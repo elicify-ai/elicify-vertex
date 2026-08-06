@@ -147,6 +147,76 @@ the worker/verifier standoffs already fixed this round. Find out why
 `diffSummary` was dropped (empty? redacted? `git diff` failed?), and make the
 verifier say so rather than judging around the hole.
 
+### ROOT CAUSE — found, reproduced, measured (2026-08-06)
+
+**The harness's own secret-redaction ate its own file list.** Not git, not the
+model, not the recent `stdio` change (that one is innocent — it only stopped
+stderr being inherited). The chain, end to end:
+
+1. **The project under test was not a git repository.**
+   `computeBoundedDiffStat` ran `git diff --stat -- <absolute paths>`; outside
+   a repo git exits non-zero, `execFileSync` throws, and the `catch` returned
+   `""` — with no record anywhere of why.
+2. **The fallback hid it.** `plugin.ts` fell back to
+   `formatChangedPathsSummary(changedPaths)`: a **comma-joined list of
+   ABSOLUTE paths**. So the raw field was never empty and nothing looked
+   wrong.
+3. **The scan then ate the fallback.** `scanDiffSummaryField` splits a field
+   into removal units on `@@` hunk headers; a path list has none, so
+   `splitDiffIntoHunks` returned **the entire blob as ONE unit**.
+   `tripsEntropyScan` (>= 3.95 bits/char over whitespace tokens of >= 32
+   chars) fired on the long absolute paths — measured on the session's real
+   strings:
+
+   | token | chars | bits/char |
+   |---|---|---|
+   | `/workspace/vertextest4/src/games/memory.js,` | 43 | 3.979 |
+   | `/workspace/vertextest4/src/games/index.html,` | 44 | 4.190 |
+   | `/workspace/vertextest4/src/games/breakout.js` | 44 | 3.971 |
+
+   One trip emptied the single unit, `kept.length === 0`, and the whole field
+   was dropped. A real `git diff --stat` never trips: its `++++`/`----` runs
+   measure 0.732 bits/char.
+
+### FIXED (2026-08-06)
+
+Four changes, each with a test that fails when the change is reverted
+(mutation-verified, all nine mutations red):
+
+- **(a)** `formatChangedPathsSummary` (now `src/v2/diffstat.ts`) emits
+  **workspace-relative** paths, **one per indented line**, not one
+  comma-joined absolute line. `src/games/breakout.js` is 21 chars — under the
+  entropy rule's 32-char token floor, so it is never even scored. The indent
+  also stops the adjacent-unit boundary check fusing two paths into one long
+  token.
+- **(b)** `computeBoundedDiffStat` probes `git rev-parse
+  --is-inside-work-tree` and returns an explicit reason
+  (`DIFF_UNAVAILABLE_NOT_A_REPO` / `_GIT_FAILED` / `_NO_CHANGES`) instead of a
+  silent `""`. It also lists **untracked new files** via `git ls-files
+  --others --exclude-standard` — `git diff --stat` shows nothing for them, so
+  the same blind verdict would have recurred inside a real repository for any
+  session that only creates files.
+- **(c)** `scanDiffSummaryField` scans a hunk-less field **per LINE**. This
+  changes the removal UNIT only — never the threshold, the patterns, or what
+  counts as suspicious. One suspicious token now costs one line instead of the
+  whole field. Proven not to weaken FR-031: dedicated tests isolate each of
+  the three detectors (pattern scan, entropy rule, hex-run) plus the
+  adjacent-pair boundary check, and each goes red when that detector is
+  disabled.
+- **(d)** The hole is stated, not silent: `diffSummaryUnavailable` is a
+  payload field of its own, and `VERIFIER_SYSTEM_PROMPT` tells the judge to
+  treat the file evidence as incomplete and cite the reason rather than infer
+  that nothing changed. `runVerifier` additionally returns
+  `reason: "insufficient-evidence"` when the payload has **neither** a diff
+  summary **nor** a transcript — deliberately narrow, because a missing diff
+  alone must never disable the verifier outside a repository.
+
+Code: `src/v2/diffstat.ts` (new), `src/v2/verifier.ts`, `src/v2/plugin.ts`,
+`src/v2/wiring/gate.ts`. Tests: `tests/v2/diffstat.test.ts` (new, drives real
+git against real temp repos), `tests/v2/verifier.test.ts`,
+`tests/v2/integration-verifier.test.ts` (the non-repo session end to end
+through the real wiring).
+
 ---
 
 ## B-3a — The transcript is truncated from the WRONG END

@@ -91,6 +91,8 @@ import type { EventLogger, OpencodeClient } from "./types.js"
 export interface VerifierPayload {
   criteria?: string[]
   diffSummary?: string
+  /** BACKLOG B-3: why `diffSummary` is not a real diff, when it isn't. */
+  diffSummaryUnavailable?: string
   verifierSummaries?: string[]
   lastResponse?: string
   recentTranscript?: string
@@ -100,6 +102,20 @@ export interface VerifierPayload {
 interface RawVerifierPayload {
   criteria: string[]
   diffSummary: string
+  /**
+   * BACKLOG B-3 (d): the STATED reason `diffSummary` carries no real `git
+   * diff` — the workspace is not a repository, git failed, or git reports
+   * nothing changed (see `diffstat.ts`'s `DIFF_UNAVAILABLE_*`). Absent when
+   * `diffSummary` IS a real diff.
+   *
+   * Why a field and not silence: in the audited session the diff was missing
+   * AND the field was then dropped outright by the secret scan, so the
+   * verifier formed a verdict with zero file evidence and no way to know it
+   * was missing any. A hard refusal to run is the wrong remedy — outside a
+   * repository it would disable the verifier permanently — so the hole is
+   * made explicit instead, and the prompt tells the judge to cite it.
+   */
+  diffSummaryUnavailable?: string
   verifierSummaries: string[]
   /** Parent's final assistant message, verbatim, before this session went
    * idle. Empty string when unavailable (no messages, fetch failure, or no
@@ -772,7 +788,14 @@ function scanUnits(units: string[]): { kept: string[]; anyDropped: boolean } {
   return { kept, anyDropped: toDrop.size > 0 }
 }
 
-type VerifierFieldName = "criteria" | "verifierSummaries" | "diffSummary" | "lastResponse" | "recentTranscript" | "plan"
+type VerifierFieldName =
+  | "criteria"
+  | "verifierSummaries"
+  | "diffSummary"
+  | "diffSummaryUnavailable"
+  | "lastResponse"
+  | "recentTranscript"
+  | "plan"
 
 /**
  * C-9 fix (docs/CODE-ISSUES-FROM-PROMPT-AUDIT.md — "boundary-truncation
@@ -860,11 +883,26 @@ function truncateField(
  * Splits a diff summary into hunks. A hunk starts at a line matching `/^@@/`
  * (unified-diff hunk header) and runs to the next such line or end of text.
  * Any content before the first hunk header (e.g. a `diff --git`/file-header
- * preamble) is kept as its own leading unit. If no `@@` header is present at
- * all, the whole text is treated as a single hunk (a diff summary need not
- * be literal unified-diff syntax — this module cannot assume it is, so
- * "can't find a hunk boundary" degrades to "the whole field is one unit"
- * rather than silently scanning nothing).
+ * preamble) is kept as its own leading unit.
+ *
+ * BACKLOG B-3 (c): if no `@@` header is present at all, the units are the
+ * LINES, not the whole blob. The old behaviour ("can't find a hunk boundary"
+ * degrades to "the whole field is one unit") is what turned a single
+ * suspicious token into a total loss of the field: in the audited session
+ * `diffSummary` was a comma-joined list of absolute paths, one of which
+ * (`/workspace/vertextest4/src/games/index.html,`, 44 chars, measured 4.190
+ * bits/char) cleared the 3.95 bits/char entropy rule, and because the ONE
+ * unit was the whole field, `kept.length === 0` and the verifier judged with
+ * no file evidence at all. Two thirds of the harness's own file list was
+ * innocent and went with it.
+ *
+ * This changes the removal UNIT, never the threshold, the patterns, or what
+ * counts as suspicious — a secret is still found and still removed, and a
+ * secret split across two adjacent lines is still caught by `scanUnits`'
+ * adjacent-pair pass (which reassembles neighbours with their newlines
+ * stripped). What changes is the blast radius of one hit: one line instead
+ * of the entire field. `git diff --stat` output has no `@@` headers either,
+ * so this is the path a REAL diff summary takes as well.
  */
 function splitDiffIntoHunks(diffSummary: string): string[] {
   if (diffSummary.length === 0) return []
@@ -873,7 +911,7 @@ function splitDiffIntoHunks(diffSummary: string): string[] {
   lines.forEach((line, idx) => {
     if (/^@@/.test(line)) hunkStarts.push(idx)
   })
-  if (hunkStarts.length === 0) return [diffSummary]
+  if (hunkStarts.length === 0) return lines
 
   const hunks: string[] = []
   if (hunkStarts[0] > 0) {
@@ -985,7 +1023,7 @@ function scanDiffSummaryField(rawDiff: string, logger: EventLogger): string | un
  */
 export function scanProseField(
   text: string,
-  field: "lastResponse" | "recentTranscript" | "plan",
+  field: "lastResponse" | "recentTranscript" | "plan" | "diffSummaryUnavailable",
   logger: EventLogger,
   cap: number,
 ): string | undefined {
@@ -1038,6 +1076,17 @@ export function buildVerifierPayload(raw: RawVerifierPayload, logger: EventLogge
 
   const diffSummary = scanDiffSummaryField(raw.diffSummary, logger)
   if (diffSummary !== undefined) payload.diffSummary = diffSummary
+
+  // B-3 (d). Scanned like everything else that reaches the model — the rule
+  // in this module is that NOTHING model-visible skips the scan, and an
+  // exemption "because the harness wrote this string" is exactly the kind of
+  // carve-out that later grows a hole. In practice it always survives: the
+  // `DIFF_UNAVAILABLE_*` constants are fixed English prose with no
+  // interpolated host paths, so there is no long high-entropy token in them.
+  if (raw.diffSummaryUnavailable !== undefined && raw.diffSummaryUnavailable.length > 0) {
+    const reason = scanProseField(raw.diffSummaryUnavailable, "diffSummaryUnavailable", logger, VERIFIER_PAYLOAD_FIELD_CHAR_CAP)
+    if (reason !== undefined) payload.diffSummaryUnavailable = reason
+  }
 
   const lastResponse = scanProseField(raw.lastResponse, "lastResponse", logger, VERIFIER_PAYLOAD_FIELD_CHAR_CAP)
   if (lastResponse !== undefined) payload.lastResponse = lastResponse
@@ -1138,7 +1187,19 @@ type ModelRef = { providerID: string; modelID: string }
  */
 export type VerifierRunResult =
   | { verdict: VerifierVerdict; childSessionID?: string; observedToolCall?: boolean }
-  | { verdict: null; reason: "unsupported" | "unavailable" | "malformed"; childSessionID?: string; observedToolCall?: boolean }
+  | {
+      verdict: null
+      /** BACKLOG B-3 (d): `"insufficient-evidence"` is the one reason decided
+       * BEFORE any model is asked — the payload carries neither a diff
+       * summary nor a transcript, so there is nothing for a judge to judge
+       * from and a verdict would be invention. Deliberately narrow: a
+       * missing diff ALONE never trips it (outside a git repository that
+       * would disable the verifier permanently, which is the opposite of
+       * what B-3 asks for); the transcript must be gone too. */
+      reason: "unsupported" | "unavailable" | "malformed" | "insufficient-evidence"
+      childSessionID?: string
+      observedToolCall?: boolean
+    }
 
 const VERIFIER_AGENT_NAME = "vertex-verifier"
 
@@ -1262,6 +1323,11 @@ const VERIFIER_SYSTEM_PROMPT = [
   "Read the files a claim references before crediting it.",
   'The same rule binds in the opposite direction and binds harder: you must not report an item as "met": false on the grounds that a file or directory is missing, empty, or lacks some content unless you have just observed that yourself in this session with read, glob, grep or bash.',
   "The payload is never evidence that something is absent — only that it was not quoted to you.",
+  // BACKLOG B-3 (d): the audited run judged a completed plan with NO diff at
+  // all and never said so. The field below states WHY the diff is missing;
+  // this sentence makes the judge carry that fact into its notes instead of
+  // quietly treating "no diff shown" as "nothing was changed".
+  'If a "diffSummaryUnavailable" field is present, there is no real git diff in this payload and that field says why. Treat the file-level evidence as INCOMPLETE, not as evidence that nothing changed: inspect the workspace yourself with read, glob, grep or bash, and if an item turns on file evidence you could not obtain, say so in its note and quote the stated reason.',
   'If you cannot make that observation, say exactly that in the item\'s note (for example "could not verify: no observation of research/x.json") instead of claiming the file or its content does not exist.',
   'Where a story declares verifiers, re-run them with bash when that is feasible within your budget: run each verifier as a standalone command, never chained with ";" and never piped, so its exit code is reliable — then read the output and judge what it actually tells you about the acceptance items. The result informs your verdict; it does not decide it.',
   "You must not modify anything: you have no write or edit capability, and bash is for running verifiers and read-only inspection only.",
@@ -1472,6 +1538,17 @@ export async function runVerifier(
 ): Promise<VerifierRunResult> {
   const { selfCreated, logger } = deps
   const { parentSessionID, sessionModel, verifierModelOverride, payload } = opts
+
+  // BACKLOG B-3 (d). Cheapest possible check, and it runs before the probe
+  // so a hopeless audit costs nothing: with no diff summary AND no
+  // transcript, every remaining field is the harness quoting its own plan
+  // back at itself, and the audited session showed what a judge does with
+  // that — it produces a confident verdict anyway. Not a general refusal:
+  // either field alone is enough to proceed (see the type's comment).
+  if (payload.diffSummary === undefined && payload.recentTranscript === undefined) {
+    logger("verifier:insufficient-evidence", { fields: Object.keys(payload) })
+    return { verdict: null, reason: "insufficient-evidence" }
+  }
 
   const observed: { childSessionID?: string } = {}
   const recordingSelfCreated = observeChildSessionID(selfCreated, observed)
