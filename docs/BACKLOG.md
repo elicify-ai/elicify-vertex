@@ -712,3 +712,26 @@ next round re-derives it the hard way.
 `gate:dispatch-suppressed — "turn resumed since idle"` fired once. That is the
 guard added in `401e354` working: a continuation was correctly withheld because
 the worker resumed after idle fired.
+
+---
+
+## R-4 — Open: `relevanceGap` is folded into `success` (reported by the B-4 fix agent, not fixed)
+
+`src/v2/plugin.ts:1043` folds `relevanceGap` into `success`, so ANY uncovered
+prescription both suppresses the receipt and records a passing command as
+`"failed"`. The coverage-equivalence work removed the common spelling-driven
+cause, but the asymmetry itself remains a plugin-level design choice:
+
+- no prescription at all → the run mints a receipt;
+- an imperfect prescription → the same run is recorded as a failure.
+
+That is backwards: the harness is most punitive exactly when its own
+resolution was weakest. Not fixed — it sits in a file another workstream owned
+this round, and changing receipt semantics deserves its own change with its own
+evidence.
+
+## R-5 — Open: one residual 3-way span leak
+
+The general span-pass fix measured whole-key leaks over 400 probes per
+encoding: base64-44 92 -> 0, hex-40 193 -> 0, but **base64-40 151 -> 1**. One
+case in that class still transmits. Recorded rather than rounded to zero.
