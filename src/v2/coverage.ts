@@ -237,11 +237,21 @@ function workspaceSelectorDirs(narrowing: readonly string[] | undefined): string
 
 const RUNNER_NON_NARROWING_FLAGS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   ["cargo test", new Set(["--workspace", "--all"])],
-  // `-w` is npm/pnpm's workspace SELECTOR (narrowing, in the global set) but
+  // `-w` is npm's workspace SELECTOR (narrowing, in the global set) but
   // jest/vitest's `--maxWorkers` -- parallelism, not selection. A full
   // `npx jest -w 4` was scored as narrowed and minted nothing.
   ["jest", new Set(["-w"])],
   ["vitest", new Set(["-w"])],
+  // FIX 6: `-w` is npm's PACKAGE SELECTOR but pnpm's BOOLEAN "run at the
+  // workspace root" flag (`--workspace-root`), and yarn/bun have no selector
+  // spelled that way at all. Reading pnpm's boolean as a selector invented a
+  // workspace directory out of the next token: `pnpm -w run check` recorded the
+  // narrowing `-w=run` and `pnpm -w check` recorded `-w=check` -- a "workspace"
+  // named after the script, which could never equal any real prescription's, so
+  // the most ordinary pnpm-monorepo verifier there is matched nothing at all.
+  ["pnpm", new Set(["-w", "--workspace-root"])],
+  ["yarn", new Set(["-w", "--workspace-root"])],
+  ["bun", new Set(["-w", "--workspace-root"])],
   // `-o` is jest's `--onlyChanged` (narrowing) but go's OUTPUT BINARY PATH and
   // pytest's `--override-ini`; neither restricts what runs.
   ["go test", new Set(["-o"])],
@@ -330,6 +340,11 @@ const RUNNER_NON_EXECUTING_FLAGS: ReadonlyMap<string, ReadonlySet<string>> = new
  */
 const WHOLE_SUITE_WHEN_BARE: ReadonlySet<string> = new Set([
   "npm test",
+  // `npm t` is npm's own documented alias for `npm test`. It was in the alias
+  // CLASS but not in this set, so it was interchangeable with `npm test` and yet
+  // not credited for a narrower prescription — one spelling of one command,
+  // scored two ways.
+  "npm t",
   "npm run test",
   "yarn test",
   "pnpm test",
@@ -484,6 +499,95 @@ const PACKAGE_MANAGER_SUBCOMMANDS: ReadonlySet<string> = new Set([
 ])
 
 /**
+ * Words that are a YARN CLASSIC builtin and therefore not the script of that
+ * name. `yarn check` is Yarn 1's node_modules INTEGRITY check -- it does not
+ * read `scripts.check` at all -- so canonicalising it to `npm run check` had a
+ * dependency-tree audit minting a receipt for the project's own gate. Yarn Berry
+ * dropped the builtin and would run the script, but the two are
+ * indistinguishable from the command string, and this module resolves ambiguity
+ * toward "not covered" (see the header): `yarn run check` still canonicalises,
+ * so an agent has an unambiguous spelling available.
+ */
+const YARN_CLASSIC_SUBCOMMANDS: ReadonlySet<string> = new Set([
+  "check",
+  "autoclean",
+  "policies",
+  "upgrade-interactive",
+  "generate-lock-entry",
+  "versions",
+  "licenses",
+])
+
+/**
+ * FIX 6 -- package-manager flags that appear BEFORE the script name, and whether
+ * they consume the next token.
+ *
+ * `pnpm -w run check` is the ordinary way to run a pnpm monorepo's root gate, and
+ * it parsed to runner `"pnpm"` (the runner scan stops at the first flag) with the
+ * narrowing `-w=run`. That is not a near miss -- the runner is no longer a script
+ * invocation at all, so nothing the resolver can ever prescribe covers it.
+ *
+ * The two halves are per-manager because the SAME SPELLING means opposite things:
+ * `-w <pkg>` selects one package for npm, while `-w` is a bare boolean for pnpm
+ * ("run in the workspace root"). Getting that backwards is what invented the
+ * bogus `-w=check` workspace.
+ *
+ * An UNRECOGNISED leading flag stops the hoist, leaving the command to parse
+ * exactly as it did before -- new spellings degrade to the old behaviour rather
+ * than to a guess.
+ */
+const PM_VALUE_FLAGS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ["npm", new Set(["-w", "--workspace"])],
+  ["pnpm", new Set(["--filter", "-F", "--workspace-concurrency"])],
+  ["bun", new Set(["--filter"])],
+  ["yarn", new Set(["--cwd"])],
+])
+
+const PM_BOOLEAN_FLAGS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ["npm", new Set(["--if-present"])],
+  ["pnpm", new Set(["-w", "--workspace-root", "-r", "--recursive", "--if-present", "--no-bail"])],
+  ["yarn", new Set(["-w", "--workspace-root"])],
+  ["bun", new Set(["-w", "--workspace-root"])],
+])
+
+/**
+ * Move a package manager's own leading flags AFTER the script name, so the runner
+ * scan reaches `<pm> run <script>` instead of stopping at the flag. Nothing is
+ * dropped: the flags still reach `extractNarrowing`, where the per-manager tables
+ * decide whether they select anything.
+ */
+function hoistPackageManagerFlags(tokens: readonly string[]): readonly string[] {
+  if (tokens.length < 2) return tokens
+  const manager = tokens[0].toLowerCase()
+  if (!PACKAGE_MANAGERS.has(manager)) return tokens
+  const booleans = PM_BOOLEAN_FLAGS.get(manager)
+  const values = PM_VALUE_FLAGS.get(manager)
+  const hoisted: string[] = []
+  let index = 1
+  while (index < tokens.length && isFlagToken(tokens[index])) {
+    const token = tokens[index]
+    const name = token.split("=")[0]
+    if (booleans?.has(name)) {
+      hoisted.push(token)
+      index += 1
+      continue
+    }
+    if (values?.has(name)) {
+      hoisted.push(token)
+      index += 1
+      if (!token.includes("=") && index < tokens.length && !isFlagToken(tokens[index])) {
+        hoisted.push(tokens[index])
+        index += 1
+      }
+      continue
+    }
+    break
+  }
+  if (hoisted.length === 0) return tokens
+  return [tokens[0], ...tokens.slice(index), ...hoisted]
+}
+
+/**
  * FIX 1 (evidence starvation, measured): reduce `<pm> [run] <script>` to ONE
  * identity, `npm run <script>`.
  *
@@ -514,6 +618,7 @@ function canonicalScriptRunner(runner: string): string {
   // run` is a BINARY with an argument). Refuse to guess.
   if (script === undefined || script.length === 0 || rest.length > 0) return runner
   if (!explicit && PACKAGE_MANAGER_SUBCOMMANDS.has(script)) return runner
+  if (!explicit && tokens[0] === "yarn" && YARN_CLASSIC_SUBCOMMANDS.has(script)) return runner
   return `npm run ${script}`
 }
 
@@ -635,9 +740,32 @@ function cleanTokens(tokens: readonly string[]): string[] {
   return cleaned
 }
 
-/** Lowercase + collapse internal whitespace, so `"GO  TEST"` == `"go test"`. */
+/**
+ * Lowercase + collapse internal whitespace, so `"GO  TEST"` == `"go test"` --
+ * EXCEPT for a package-manager script name, which keeps its spelling.
+ *
+ * npm script names are case-SENSITIVE: `scripts.check` and `scripts.Check` are
+ * two different entries and `npm run Check` fails outright in a repo that
+ * declares only `check`. Folding case here made a command that cannot run cover
+ * the prescription of one that can -- a receipt minted for a `npm ERR! Missing
+ * script` exit. Program words (`npm`, `run`, `go test`) are genuinely
+ * case-insensitive and stay folded.
+ */
 function normalizeRunner(runner: string): string {
-  return runner.trim().replace(/\s+/g, " ").toLowerCase()
+  const collapsed = runner.trim().replace(/\s+/g, " ")
+  const tokens = collapsed.split(" ")
+  if (tokens.length >= 2 && PACKAGE_MANAGERS.has(tokens[0].toLowerCase())) {
+    const lowered = tokens[1].toLowerCase()
+    const scriptIndex = lowered === "run" || lowered === "run-script" ? 2 : 1
+    if (tokens.length > scriptIndex) {
+      return [
+        ...tokens.slice(0, scriptIndex).map((token) => token.toLowerCase()),
+        tokens[scriptIndex],
+        ...tokens.slice(scriptIndex + 1).map((token) => token.toLowerCase()),
+      ].join(" ")
+    }
+  }
+  return collapsed.toLowerCase()
 }
 
 // ===========================================================================
@@ -912,7 +1040,7 @@ export function parseSubcommands(command: string, workspaceRoot?: string): SubCo
     // FR-036a: a pipeline's meaningful command is its head; the rest is
     // formatting. Exit-status semantics of the pipe stay with parseVerification.
     const head = rawPart.split("|")[0]
-    const tokens = cleanTokens(head.trim().split(/\s+/).filter(Boolean))
+    const tokens = hoistPackageManagerFlags(cleanTokens(head.trim().split(/\s+/).filter(Boolean)))
     if (tokens.length === 0) continue
 
     const parsed = toSubCommand(tokens)
@@ -1317,10 +1445,32 @@ export function subCommandCovers(observed: SubCommand, prescribed: SubCommand): 
   // that very workspace directory (`cd packages/api && npm run check`). That is
   // the same work the selector names, spelled the way an agent types it, and
   // refusing it starved the most ordinary monorepo verifier there is.
-  const prescribedWorkspaces = (prescribed.narrowing ?? []).filter((n) => WORKSPACE_SELECTOR_RE.test(n))
+  // ...and it is EVERY named workspace, not one of them. `npm run check -w
+  // packages/api -w packages/web` runs the script twice, in two packages, and a
+  // command that entered only `packages/api` is evidence about half of it.
+  // Measured regression: the selector VALUES stopped being path targets (they
+  // name a package, not a file), which silently retired the "all workspaces"
+  // requirement that `targetsCover` had been carrying by accident -- after which
+  // both `cd packages/api && npm run check` and `npm run check -w packages/api`
+  // covered the two-workspace prescription, and `narrowingAllows` waved the
+  // second through because a SUBSET of the prescribed selectors is, in every
+  // other case, the broader run.
+  const prescribedWorkspaces = workspaceSelectorDirs(prescribed.narrowing)
+  const observedWorkspaces = workspaceSelectorDirs(observed.narrowing)
   if (prescribedWorkspaces.length > 0) {
-    const observedWorkspaces = (observed.narrowing ?? []).filter((n) => WORKSPACE_SELECTOR_RE.test(n))
-    if (observedWorkspaces.length === 0 && observedCwd !== prescribedCwd) return false
+    const observedSet = new Set(observedWorkspaces)
+    const observedDirectory = observed.cwd ?? ""
+    const ranWorkspace = (workspace: string): boolean =>
+      observedSet.has(workspace) || observedDirectory === workspace
+    if (!prescribedWorkspaces.every(ranWorkspace)) return false
+  } else if (observedWorkspaces.length > 0) {
+    // The mirror: the prescription named NO workspace (a root run), so a run
+    // confined to one is narrower and evidences less. `narrowingAllows` used to
+    // carry this by string comparison, which also refused the SUPERSET case --
+    // observed `-w api -w web` against prescribed `-w api` ran strictly more and
+    // was scored a gap. Selectors are compared here, as directories, in both
+    // directions; `narrowingAllows` keeps the TEST selectors it is actually about.
+    return false
   }
 
   if (observed.targets.length === 0 && !WHOLE_SUITE_WHEN_BARE_CANONICAL.has(canonicalScriptRunner(observed.runner))) {
@@ -1349,9 +1499,14 @@ function narrowingAllows(
   observed: readonly string[] | undefined,
   prescribed: readonly string[] | undefined,
 ): boolean {
-  if (!observed || observed.length === 0) return true
-  const allowed = new Set(prescribed ?? [])
-  return observed.every((selector) => allowed.has(selector))
+  // WORKSPACE selectors are excluded: they name a DIRECTORY to run in, not a
+  // subset of tests, and they are compared as directories in `subCommandCovers`
+  // (both directions, including the superset case a string comparison refused).
+  const isTestSelector = (selector: string): boolean => !WORKSPACE_SELECTOR_RE.test(selector)
+  const filtered = (observed ?? []).filter(isTestSelector)
+  if (filtered.length === 0) return true
+  const allowed = new Set((prescribed ?? []).filter(isTestSelector))
+  return filtered.every((selector) => allowed.has(selector))
 }
 
 /**

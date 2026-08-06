@@ -560,69 +560,453 @@ function scriptQuality(name: string): number {
 // The detector is a closed blocklist of shapes that actually occur, not a
 // sandbox, and it errs toward REFUSING to prescribe — a false positive here loses
 // one prescription, a false negative rewrites files.
+//
+// ---------------------------------------------------------------------------
+// FIX 1 (this wave) — ONE level of indirection walked straight past all of it
+// ---------------------------------------------------------------------------
+//
+// The detector above only ever saw the NAMED script's own body, and the commonest
+// aggregate-script shape in the wild puts the dangerous half one hop away:
+//
+//     { "check": "npm run lint:fix && vitest run", "lint:fix": "eslint --fix ." }
+//
+// `check`'s body carries no marker at all, so the harness prescribed
+// `npm run check` — i.e. it told the agent to run `eslint --fix .` over the
+// user's tree, which is the exact instruction FIX 3 exists to never give.
+// `npm-run-all lint:fix`, `run-s lint:fix`, `bash scripts/fix-all.sh` and
+// `./scripts/ci.sh` all had the same free pass. So:
+//
+//   - script references are RESOLVED and the referenced body inspected, through
+//     `<pm> [run] <name>` and through `npm-run-all` / `run-s` / `run-p`
+//     (including their `lint:*` globs);
+//   - a reference that cannot be resolved to a body in the SAME manifest is
+//     UNKNOWN, and unknown is unsafe — the whole point of the rule is that an
+//     uninspected body is exactly what let `eslint --fix .` through;
+//   - a command that hands control to an opaque FILE (`bash scripts/fix-all.sh`,
+//     `./scripts/ci.sh`) is unknown for the same reason. The line is drawn at
+//     SHELL entry points, not at every program that takes a filename: a shell
+//     script's entire job is to run other commands — it is the idiomatic home of
+//     "fix everything and commit" glue — whereas refusing every
+//     `node scripts/ci.mjs` / `python -m tool` would refuse this very repo's
+//     `node scripts/uat-harness.mjs` and re-open the `resolution:none`
+//     starvation that widening tier 3 was for.
+//
+// DEPTH: 8, plus a total visit budget so a wide fan-out cannot blow up (see
+// `MAX_SCRIPT_REFERENCE_DEPTH`). Real aggregate chains bottom out at two or three
+// hops (`check` -> `lint` -> `lint:js`), so 8 is generous headroom for the
+// deepest shape anyone actually writes while keeping the walk bounded on a
+// per-turn hot path. Past the bound the map is pathological, and pathological is
+// unknown, which is unsafe. That single bound is also what handles a CYCLE
+// (`{a: "npm run b", b: "npm run a"}`): a cycle cannot bottom out in an
+// inspectable body, so it hits the bound and is refused, for the same reason it
+// would never terminate if run.
+//
+// ---------------------------------------------------------------------------
+// FIX 2 / FIX 5 (this wave) — the checks are TOKEN-based, not substring-based
+// ---------------------------------------------------------------------------
+//
+// The regexes this replaces matched anywhere in the body, in both directions:
+//
+//   - too loose: `\b(?:deploy|publish|release|upload)\b` fired on ARGUMENTS, so
+//     `vitest run src/publish.test.ts`, `vitest run --project release`,
+//     `jest --testPathPattern 'deploy'`, `python -m pytest -k 'not release'` and
+//     `node scripts/verify-release.mjs` were all refused — over-refusal is how
+//     `resolution:none` starvation comes back.
+//   - too tight, and dangerously so: `-l` was listed as a read-only format flag
+//     (prettier's `--list-different`), but `-l` is LINE LENGTH for black, isort
+//     and rustfmt, so `black -l 100 .` and `isort -l 100 .` scored SAFE and
+//     rewrote every file they touched. The shorthand is dropped rather than
+//     patched: prettier is not a default-writing formatter, so `-l` never had a
+//     read-only meaning for any tool this table applies to.
+//
+// Everything below therefore splits the body into shell segments, reads each
+// segment's COMMAND WORDS (the leading run of program words, stopping at the
+// first flag or path operand) and matches flags as whole tokens.
 
-/** `--fix` (eslint, stylelint, ruff), `--write` (prettier), `sed -i`. */
-const WRITE_BACK_FLAG_RE = /(?:^|\s)(?:--fix|--write|--in-place)(?:[=\s]|$)|\bsed\s+-[A-Za-z]*i\b/
+/** Split a script body into the commands a shell would run separately. */
+function bodySegments(body: string): string[][] {
+  return body
+    .split(/\s*(?:&&|\|\||[;|&])\s*/)
+    .map((segment) => segment.trim().split(/\s+/).filter((token) => token.length > 0))
+    .filter((segment) => segment.length > 0)
+}
+
+function stripQuotes(token: string): string {
+  return token.replace(/^(['"])(.*)\1$/, "$2")
+}
+
+const ENV_ASSIGNMENT_TOKEN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/
+
+/** Names a file or directory rather than a program word. */
+function isPathLikeToken(token: string): boolean {
+  return token.includes("/") || token.includes("\\") || /\.[A-Za-z0-9_-]+$/.test(token)
+}
+
+/**
+ * The PROGRAM WORDS at the head of a segment: `npx prettier --write .` ->
+ * `["npx","prettier"]`, `vitest run src/publish.test.ts` -> `["vitest","run"]`.
+ *
+ * Stopping at the first flag or path operand is the whole of FIX 5: everything
+ * after that point is an ARGUMENT, and an argument that happens to contain the
+ * word "release" says nothing about what the command does. `-m <module>` is the
+ * one flag whose value is a program word, so it is followed (`python -m pytest`).
+ */
+function commandWords(tokens: readonly string[]): string[] {
+  const words: string[] = []
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index]
+    if (ENV_ASSIGNMENT_TOKEN_RE.test(token)) continue
+    if (token === "-m" || token === "--module") {
+      const value = tokens[index + 1]
+      if (value === undefined || value.startsWith("-") || isPathLikeToken(value)) break
+      words.push(stripQuotes(value))
+      index += 1
+      continue
+    }
+    if (token.startsWith("-")) break
+    if (isPathLikeToken(token)) break
+    words.push(stripQuotes(token))
+  }
+  return words
+}
+
+/** Do these command words contain the given phrase, in order and adjacent? */
+function hasCommandPhrase(words: readonly string[], phrase: readonly string[]): boolean {
+  for (let start = 0; start + phrase.length <= words.length; start++) {
+    if (phrase.every((word, offset) => words[start + offset] === word)) return true
+  }
+  return false
+}
+
+/** Whole-token flags that mean "and write the result back", whatever the tool. */
+const WRITE_BACK_FLAGS: ReadonlySet<string> = new Set([
+  "--fix",
+  "--write",
+  "--in-place",
+  // biome's rewrite switches, the ones that made `biome check --apply` score safe.
+  "--apply",
+  "--apply-unsafe",
+  "--unsafe-apply",
+  // snapshot rewriting: `jest --updateSnapshot` REWRITES the assertions it is
+  // being asked to verify, which is the purest form of this defect.
+  "--updateSnapshot",
+  "--update-snapshot",
+  "--updateSnapshots",
+  "--update-snapshots",
+  "--snapshot-update",
+])
+
+/**
+ * Write-back flags that are only write-back FOR A SPECIFIC TOOL, because the
+ * same letter means something harmless elsewhere: `-w` is prettier's `--write`
+ * but jest/vitest's worker count and npm's workspace selector; `-u`/`--update`
+ * rewrites snapshots for jest/vitest/ava but is nothing in particular elsewhere.
+ */
+const TOOL_WRITE_BACK_FLAGS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ["prettier", new Set(["-w"])],
+  ["jest", new Set(["-u"])],
+  ["vitest", new Set(["-u", "--update"])],
+  ["ava", new Set(["-u"])],
+  ["insta", new Set(["--accept"])],
+])
 
 /** Formatters that rewrite files unless explicitly asked not to. */
-const DEFAULT_WRITING_FORMATTER_RE = /\b(?:black|isort|rustfmt|ruff\s+format|dprint\s+fmt|cargo\s+fmt|go\s+fmt)\b/
+const DEFAULT_WRITING_FORMATTERS: readonly (readonly string[])[] = [
+  ["black"],
+  ["isort"],
+  ["rustfmt"],
+  ["autopep8"],
+  ["yapf"],
+  ["gofmt"],
+  ["ruff", "format"],
+  ["dprint", "fmt"],
+  ["cargo", "fmt"],
+  ["go", "fmt"],
+]
 
-/** Flags that turn a default-writing formatter into a reporter. */
-const READ_ONLY_FORMAT_FLAG_RE = /(?:^|\s)(?:--check|--check-only|--diff|--dry-run|-l|--list-different)(?:[=\s]|$)/
+/**
+ * Flags that turn a default-writing formatter into a reporter.
+ *
+ * `-l` is NOT here (see the FIX 2 note above): for every tool this table applies
+ * to, `-l` sets the LINE LENGTH.
+ */
+const READ_ONLY_FORMAT_FLAGS: ReadonlySet<string> = new Set([
+  "--check",
+  "--check-only",
+  "--diff",
+  "--dry-run",
+  "--list-different",
+])
 
-/** Commands with effects outside the working tree (or on git history). */
-const EFFECTFUL_COMMAND_RE =
-  /\b(?:deploy|publish|release|upload)\b|(?:^|\s)push\b|\bgit\s+(?:commit|push|add|checkout|switch|reset|clean|rebase|merge|tag|stash)\b/
+/** Command words with effects outside the working tree. */
+const EFFECTFUL_COMMAND_WORDS: ReadonlySet<string> = new Set([
+  "deploy",
+  "publish",
+  "release",
+  "upload",
+  "push",
+  "semantic-release",
+])
 
-/** Scripts that never exit: a verification step that blocks forever is not one. */
-const NEVER_EXITING_RE =
-  /(?:^|\s)(?:--watch|--watchAll|--watch-all|--hot)(?:[=\s]|$)|\b(?:nodemon|watchexec|http-server|live-server)\b|\b(?:vite|webpack|snowpack)\s+(?:dev|serve)\b|\b(?:next|nuxt|astro|remix|gatsby)\s+dev\b|(?:^|\s)serve(?:\s|$)/
+/** `git <sub>` forms that rewrite the tree or the history. */
+const GIT_MUTATING_SUBCOMMANDS: ReadonlySet<string> = new Set([
+  "commit",
+  "push",
+  "add",
+  "checkout",
+  "switch",
+  "reset",
+  "clean",
+  "rebase",
+  "merge",
+  "tag",
+  "stash",
+])
+
+/** Flags that mean "and keep running": a verification step that blocks forever is not one. */
+const NEVER_EXITING_FLAGS: ReadonlySet<string> = new Set(["--watch", "--watchAll", "--watch-all", "--hot"])
+
+/** Command shapes that start a long-running process. */
+const NEVER_EXITING_COMMANDS: readonly (readonly string[])[] = [
+  ["nodemon"],
+  ["watchexec"],
+  ["http-server"],
+  ["live-server"],
+  ["serve"],
+  ["vite", "dev"],
+  ["vite", "serve"],
+  ["webpack", "dev"],
+  ["webpack", "serve"],
+  ["snowpack", "dev"],
+  ["snowpack", "serve"],
+  ["next", "dev"],
+  ["nuxt", "dev"],
+  ["astro", "dev"],
+  ["remix", "dev"],
+  ["gatsby", "dev"],
+]
 
 /** Generated locations a build may legitimately delete and regenerate. */
 const BUILD_OUTPUT_PATH_RE =
-  /^(?:\.\/)?(?:dist|build|out|output|lib|libs|es|esm|cjs|coverage|target|tmp|temp|node_modules|\.next|\.nuxt|\.turbo|\.cache|\.svelte-kit|\.parcel-cache|\.vite|\.output)(?:[/\\].*)?$|\.tsbuildinfo$/
+  /^(?:\.\/)?(?:dist|build|out|output|es|esm|cjs|coverage|target|tmp|temp|node_modules|\.next|\.nuxt|\.turbo|\.cache|\.svelte-kit|\.parcel-cache|\.vite|\.output)(?:[/\\].*)?$|\.tsbuildinfo$/
 
-const SHELL_OPERATOR_RE = /^(?:&&|\|\||;|\||&)$/
+/** Shells whose argument is a SCRIPT FILE this module cannot read. */
+const SHELL_INTERPRETERS: ReadonlySet<string> = new Set(["bash", "sh", "zsh", "dash", "ksh", "fish"])
+
+/** Tools whose every non-flag argument is another script NAME. */
+const SCRIPT_RUNNER_TOOLS: ReadonlySet<string> = new Set([
+  "npm-run-all",
+  "npm-run-all2",
+  "run-s",
+  "run-p",
+  "run-series",
+  "run-parallel",
+])
+
+/** Package managers whose `<pm> [run] <name>` form invokes a package.json script. */
+const SCRIPT_INVOKING_MANAGERS: ReadonlySet<string> = new Set(["npm", "pnpm", "yarn", "bun"])
+
+/**
+ * Words that are the package manager's OWN subcommand in the bare `<pm> <word>`
+ * form, so they are not a script reference to chase. They are not thereby judged
+ * SAFE — `npm publish` is still caught by the effectful-command rule; this list
+ * only stops them being looked up as scripts and refused as "unknown".
+ */
+const MANAGER_SUBCOMMAND_WORDS: ReadonlySet<string> = new Set([
+  "install", "i", "ci", "add", "remove", "rm", "uninstall", "link", "unlink", "update", "up",
+  "upgrade", "outdated", "audit", "dedupe", "prune", "rebuild", "pack", "exec", "dlx", "x",
+  "create", "init", "import", "patch", "config", "set", "get", "cache", "store", "env",
+  "explain", "why", "ls", "list", "view", "info", "search", "docs", "repo", "bugs", "fund",
+  "doctor", "ping", "login", "logout", "whoami", "token", "root", "bin", "prefix", "help",
+  "completion", "workspace", "workspaces", "global",
+])
 
 /**
  * `rm -rf dist` is part of building; `rm -rf src` is not. Any `rm` operand that
  * is not a recognised generated location makes the script unsafe.
+ *
+ * `lib`/`libs` were removed from the generated-location list this wave: for a
+ * large share of npm packages `lib/` IS the source directory, and "the harness
+ * told me to run a script that deleted my source" is not a trade this module can
+ * make to save one prescription.
  */
-function removesOutsideBuildOutput(body: string): boolean {
-  const tokens = body.split(/\s+/).filter((token) => token.length > 0)
-  for (let index = 0; index < tokens.length; index++) {
-    if (!/^(?:rm|rmdir|shx?)$/.test(tokens[index]) && tokens[index] !== "rimraf") continue
-    for (let arg = index + 1; arg < tokens.length; arg++) {
-      const token = tokens[arg]
-      if (SHELL_OPERATOR_RE.test(token)) break
+function removesOutsideBuildOutput(segment: readonly string[]): boolean {
+  // `shx` and the `token === "rm"` skip that used to be here were dead: for
+  // `shx rm -rf dist` the inner `rm` matches the head test one token later and
+  // reaches the same operands, so neither alternative could change an answer —
+  // and an unreachable alternative in a SAFETY blocklist reads as protection it
+  // does not provide. `npx rimraf dist` matches on `rimraf` the same way.
+  for (let index = 0; index < segment.length; index++) {
+    if (!/^(?:rm|rmdir|rimraf)$/.test(segment[index])) continue
+    for (let arg = index + 1; arg < segment.length; arg++) {
+      const token = segment[arg]
       if (token.startsWith("-")) continue
-      if (token === "rm" || token === "rimraf") continue // `shx rm`, `npx rimraf`
-      if (!BUILD_OUTPUT_PATH_RE.test(token)) return true
+      if (!BUILD_OUTPUT_PATH_RE.test(stripQuotes(token))) return true
     }
   }
   return false
 }
 
-/** Does running this script body change the user's workspace (or never return)? */
-export function isUnsafeScriptBody(body: string): boolean {
+/** Does this segment hand control to a file whose contents are invisible here? */
+function runsOpaqueFile(segment: readonly string[]): boolean {
+  const head = segment[0]
+  if (head === undefined) return false
+  if (SHELL_INTERPRETERS.has(head)) {
+    // `bash -c "<inline command>"` is fully visible and is analysed as tokens;
+    // `bash scripts/fix-all.sh` is not.
+    return !segment.slice(1).some((token) => /^-[a-z]*c$/.test(token))
+  }
+  // `./node_modules/.bin/vitest run` is a spelled-out binary, not a project script.
+  if (/^(?:\.\/)?node_modules\/\.bin\//.test(head)) return false
+  if (/^(?:\.{1,2})?\//.test(head)) return true
+  return /\.(?:sh|bash|zsh|ksh|fish)$/.test(head)
+}
+
+function segmentWritesBack(segment: readonly string[], words: readonly string[]): boolean {
+  const scoped = new Set<string>()
+  for (const word of words) for (const flag of TOOL_WRITE_BACK_FLAGS.get(word) ?? []) scoped.add(flag)
+  for (const token of segment) {
+    const name = token.split("=")[0]
+    if (WRITE_BACK_FLAGS.has(name) || scoped.has(name)) return true
+  }
+  // `sed -i` / `perl -pi -e` edit in place; every other `-x` spelling does not.
+  if (words[0] === "sed" || words[0] === "perl") {
+    if (segment.some((token) => /^-[A-Za-z]*i/.test(token))) return true
+  }
+  return false
+}
+
+function segmentIsDefaultWritingFormatter(segment: readonly string[], words: readonly string[]): boolean {
+  if (!DEFAULT_WRITING_FORMATTERS.some((phrase) => hasCommandPhrase(words, phrase))) return false
+  return !segment.some((token) => READ_ONLY_FORMAT_FLAGS.has(token.split("=")[0]))
+}
+
+function segmentIsEffectful(words: readonly string[]): boolean {
+  if (words.some((word) => EFFECTFUL_COMMAND_WORDS.has(word))) return true
+  const git = words.indexOf("git")
+  const subcommand = git === -1 ? undefined : words[git + 1]
+  return subcommand !== undefined && GIT_MUTATING_SUBCOMMANDS.has(subcommand)
+}
+
+function segmentNeverExits(segment: readonly string[], words: readonly string[]): boolean {
+  for (const token of segment) {
+    const [name, value] = token.split("=")
+    // `vitest --watch=false` is the CI spelling and exits like anything else.
+    if (NEVER_EXITING_FLAGS.has(name) && value !== "false" && value !== "0") return true
+  }
+  return NEVER_EXITING_COMMANDS.some((phrase) => hasCommandPhrase(words, phrase))
+}
+
+/**
+ * The script names this segment invokes: `npm run lint:fix` -> `["lint:fix"]`,
+ * `run-s clean build` -> `["clean","build"]`, `npm-run-all lint:*` -> every
+ * matching key. Unresolvable references come back as `null`, which the caller
+ * reads as "unknown" and therefore unsafe.
+ */
+function referencedScripts(
+  segment: readonly string[],
+  scripts: Record<string, string>,
+): { names: string[]; unresolved: boolean } {
+  const head = segment[0]
+  const raw: string[] = []
+
+  if (head !== undefined && SCRIPT_RUNNER_TOOLS.has(head)) {
+    for (const token of segment.slice(1)) {
+      if (token.startsWith("-")) continue
+      raw.push(stripQuotes(token))
+    }
+  } else if (head !== undefined && SCRIPT_INVOKING_MANAGERS.has(head)) {
+    let index = 1
+    while (index < segment.length && segment[index].startsWith("-")) index += 1
+    let name: string | undefined = segment[index]
+    if (name === "run" || name === "run-script") name = segment[index + 1]
+    else if (name !== undefined && MANAGER_SUBCOMMAND_WORDS.has(name)) name = undefined
+    // A path-shaped operand is a leftover flag value (`npm -w packages/api ...`),
+    // never a script name.
+    if (name !== undefined && !name.startsWith("-") && !isPathLikeToken(name)) raw.push(stripQuotes(name))
+  }
+
+  const names: string[] = []
+  let unresolved = false
+  for (const reference of raw) {
+    if (reference.includes("*")) {
+      const pattern = new RegExp(`^${reference.split("*").map(escapeForGlob).join("[^\\s]*")}$`)
+      const matches = Object.keys(scripts).filter((key) => pattern.test(key))
+      if (matches.length === 0) unresolved = true
+      names.push(...matches)
+      continue
+    }
+    if (typeof scripts[reference] !== "string") unresolved = true
+    else names.push(reference)
+  }
+  return { names, unresolved }
+}
+
+function escapeForGlob(literal: string): string {
+  return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+/** See the FIX 1 note above for why the bound is 8 and what exceeding it means. */
+const MAX_SCRIPT_REFERENCE_DEPTH = 8
+const MAX_SCRIPT_REFERENCE_VISITS = 64
+
+interface ScriptWalk {
+  scripts: Record<string, string>
+  visits: { count: number }
+}
+
+function bodyIsUnsafe(body: string, depth: number, walk: ScriptWalk): boolean {
   const text = body.trim()
   if (text.length === 0) return true
-  if (WRITE_BACK_FLAG_RE.test(text)) return true
-  if (DEFAULT_WRITING_FORMATTER_RE.test(text) && !READ_ONLY_FORMAT_FLAG_RE.test(text)) return true
-  if (EFFECTFUL_COMMAND_RE.test(text)) return true
-  if (NEVER_EXITING_RE.test(text)) return true
-  if (removesOutsideBuildOutput(text)) return true
+  // Cycles are caught HERE and not by a separate visited-set: a cycle cannot
+  // terminate before the bound, so the two guards give the same answer for the
+  // same reason (the chain never bottoms out in an inspectable body), and a
+  // second guard that can never change an answer is protection this file does
+  // not actually have.
+  if (depth > MAX_SCRIPT_REFERENCE_DEPTH) return true
+
+  for (const segment of bodySegments(text)) {
+    const words = commandWords(segment)
+    if (runsOpaqueFile(segment)) return true
+    if (segmentWritesBack(segment, words)) return true
+    if (segmentIsDefaultWritingFormatter(segment, words)) return true
+    if (segmentIsEffectful(words)) return true
+    if (segmentNeverExits(segment, words)) return true
+    if (removesOutsideBuildOutput(segment)) return true
+
+    const { names, unresolved } = referencedScripts(segment, walk.scripts)
+    if (unresolved) return true
+    for (const name of names) {
+      walk.visits.count += 1
+      if (walk.visits.count > MAX_SCRIPT_REFERENCE_VISITS) return true
+      if (bodyIsUnsafe(walk.scripts[name], depth + 1, walk)) return true
+    }
+  }
   return false
 }
 
 /**
+ * Does running this script body change the user's workspace (or never return)?
+ *
+ * `scripts` is the SAME manifest the body came from, so `npm run lint:fix` can be
+ * followed to its own definition (FIX 1). Omitting it means every script
+ * reference is unresolvable, i.e. unknown, i.e. unsafe — the fail-closed reading,
+ * and the only honest one when the referenced body is genuinely unavailable.
+ */
+export function isUnsafeScriptBody(body: string, scripts: Record<string, string> = {}): boolean {
+  return bodyIsUnsafe(body, 0, { scripts, visits: { count: 0 } })
+}
+
+/**
  * The highest-preference usable script name in `scripts`, or null when it has
- * none. "Usable" is name-listed AND non-blank AND non-mutating (FIX 3).
+ * none. "Usable" is name-listed AND non-blank AND non-mutating, TRANSITIVELY
+ * (FIX 1): the body's own text is only the first hop.
  */
 function preferredScript(scripts: Record<string, string>): string | null {
   for (const name of PACKAGE_SCRIPT_PREFERENCE) {
     const body = scripts[name]
-    if (typeof body === "string" && !isUnsafeScriptBody(body)) return name
+    if (typeof body !== "string") continue
+    if (!bodyIsUnsafe(body, 0, { scripts, visits: { count: 0 } })) return name
   }
   return null
 }
@@ -884,10 +1268,6 @@ export function resolveVerifier(ctx: ResolveContext, deps: ResolveDeps): Resolut
     .filter((path) => isInsideAnyRoot(path, roots))
     .map((path) => relativiseToAnyRoot(path, roots))
 
-  if (paths.length === 0) {
-    return { command: null, rationale: "none", matchedPaths: [] }
-  }
-
   // Tier 1: active-story verifiers. Story precedence is absolute — a story that
   // declares its own verifiers overrides every ecosystem inference below.
   // M7 (grill round 2): `verifiers` is LLM-authored and reaches the plan
@@ -898,8 +1278,23 @@ export function resolveVerifier(ctx: ResolveContext, deps: ResolveDeps): Resolut
   const storyVerifiers = (ctx.storyVerifiers ?? []).filter(
     (verifier) => typeof verifier === "string" && verifier.trim().length > 0,
   )
+  // BEFORE the path filter, and that ordering is the fix, not an accident.
+  // The worktree bound exists to stop an outside path being INFERRED into a
+  // command ("this file changed, so run that suite"); a story verifier is
+  // inferred from nothing — the user declared it — so there is no inference to
+  // suppress. Filtering first meant a turn whose every changed path arrived
+  // absolute-and-outside (a symlinked root the aliases missed, an edit in a
+  // sibling checkout) silently threw away the plan's OWN `verifiers` and
+  // degraded to `resolution:none`, replacing the strongest prescription this
+  // module has with the weakest. `matchedPaths` still reports only the paths
+  // inside the worktree, so the bound keeps its effect on what is DISPLAYED and
+  // compared.
   if (storyVerifiers.length > 0) {
     return { command: storyVerifiers.join(" && "), rationale: "story", matchedPaths: [...paths] }
+  }
+
+  if (paths.length === 0) {
+    return { command: null, rationale: "none", matchedPaths: [] }
   }
 
   const resolutions: GroupResolution[] = []
