@@ -752,8 +752,11 @@ export interface ResolveVerifierContext {
   storyVerifiers: readonly string[] | null
 }
 export interface ResolveVerifierDeps {
+  // B-4 (b): the mirrored `fallbackProbe?` is gone with the tier it described.
+  // `resolve.ts:resolveNodeGroup` documents why that tier was deleted rather than
+  // wired; a mirror of a field that no longer exists is just a second copy of the
+  // same dead safety net.
   readManifest(): ResolveVerifierManifest | null
-  fallbackProbe?: (globs: string[]) => string[]
 }
 export interface ResolveVerifierResult {
   command: string | null

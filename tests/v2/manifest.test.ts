@@ -81,3 +81,53 @@ describe("buildManifest populates projectRoots", () => {
     expect(buildManifest(root).projectRoots ?? []).not.toContainEqual({ ecosystem: "go", root: "" })
   })
 })
+
+// ===========================================================================
+// B-4 — `resolution:none` × 65, on turns with real file edits.
+//
+// Reproduced here through the REAL reader and the REAL resolver, because the
+// defect needed all three of the measured conditions at once and each component
+// looked fine on its own: a project with no test file anywhere (tier 2 empty),
+// a package.json declaring only `check` and `dev` (tier 3's `scripts.test`
+// filter missed), and absolute changed paths straight off opencode's `edit`
+// tool. The FR-009 probe that was supposed to be the last resort was never
+// supplied by any call site, so the whole thing fell through to `none`.
+// ===========================================================================
+describe("B-4: the measured `resolution:none` project resolves to a command", () => {
+  it("package.json with ONLY `check` and `dev`, no test files, absolute changed paths", () => {
+    write("package.json", '{"name":"neon-arcade","scripts":{"check":"tsc --noEmit","dev":"vite"}}')
+    write("index.html", "<!doctype html>")
+    write("src/games/memory.js", "export const memory = 1\n")
+    write("src/games/breakout.js", "export const breakout = 1\n")
+
+    const manifest = buildManifest(root)
+    // Preconditions of the measured case, asserted so this test cannot pass for
+    // the wrong reason if the fixture drifts.
+    expect(manifest.testFiles).toEqual([])
+    expect(manifest.scripts.test).toBeUndefined()
+
+    const result = resolveVerifier(
+      {
+        // Exactly what `changedPathsFromTool` hands over: absolute paths.
+        changedPaths: [join(root, "src/games/memory.js"), join(root, "index.html")],
+        storyVerifiers: null,
+      },
+      { readManifest: () => manifest },
+    )
+
+    expect(result.command).toBe("npm run check")
+    expect(result.rationale).toBe("fallback:package-script")
+    expect(result.matchedPaths).toEqual(["src/games/memory.js", "index.html"])
+  })
+
+  it("...and a repo with neither test files nor any verifier script still degrades honestly", () => {
+    write("package.json", '{"name":"x","scripts":{"dev":"vite"}}')
+    write("src/app.js", "export const a = 1\n")
+
+    const result = resolveVerifier(
+      { changedPaths: [join(root, "src/app.js")], storyVerifiers: null },
+      { readManifest: () => buildManifest(root) },
+    )
+    expect(result).toEqual({ command: null, rationale: "none", matchedPaths: [] })
+  })
+})

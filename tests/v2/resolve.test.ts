@@ -1,11 +1,11 @@
-import { describe, expect, it, vi } from "vitest"
+import { describe, expect, it } from "vitest"
 import { observedCoversPrescribed } from "../../src/v2/coverage.js"
 import type { Manifest, ResolveContext, ResolveDeps } from "../../src/v2/resolve.js"
 import { classifyPathEcosystem, resolveVerifier } from "../../src/v2/resolve.js"
 
-/** Helper: build ResolveDeps from a fixed manifest (or null), with an optional fallbackProbe. */
-function deps(manifest: Manifest | null, fallbackProbe?: (globs: string[]) => string[]): ResolveDeps {
-  return { readManifest: () => manifest, fallbackProbe }
+/** Helper: build ResolveDeps from a fixed manifest (or null). */
+function deps(manifest: Manifest | null): ResolveDeps {
+  return { readManifest: () => manifest }
 }
 
 function ctx(changedPaths: string[], storyVerifiers: readonly string[] | null = null): ResolveContext {
@@ -194,41 +194,40 @@ describe("Dataset: Narrowest-verifier resolution (fixture layout, all 10 rows)",
   })
 })
 
-describe("FR-009: bounded fallback probe (caller-injected, never invoked unbounded by this module)", () => {
-  it("is not called at all when an earlier tier already resolves", () => {
-    const fallbackProbe = vi.fn(() => ["tests/never.test.ts"])
-    const result = resolveVerifier(
-      ctx(["src/lexer.ts"]),
-      deps({ scripts: {}, testFiles: ["tests/lexer.test.ts"] }, fallbackProbe),
-    )
-    expect(result.rationale).toBe("basename")
-    expect(fallbackProbe).not.toHaveBeenCalled()
+describe("FR-009: the bounded fallback probe tier is GONE (B-4 (b))", () => {
+  // `ResolveDeps.fallbackProbe` was never supplied by either production call site
+  // (`plugin.ts`'s verify-gap branch, `gate.ts:narrowestPrescription`), so the tier
+  // had never executed outside its own unit tests. It was deleted rather than
+  // wired: `wiring/manifest.ts:scanRepo` already collects every `*.test.*` /
+  // `*.spec.*` in the worktree into `manifest.testFiles` under the same bounds, so
+  // a probe honouring those bounds can only return a subset of what tier 2 already
+  // saw. FR-009 permitted the probe; it never required it, and it explicitly
+  // requires the degraded path to be correct without it.
+
+  it("ResolveDeps carries no probe hook at all — the type is readManifest and nothing else", () => {
+    // A compile-time assertion, not a shape count: `keyof ResolveDeps` widening
+    // back to include a probe fails this line and the tsc projects together.
+    const keys: Array<keyof ResolveDeps> = ["readManifest"]
+    const probeless: "readManifest" = keys[0]
+    expect(probeless).toBe("readManifest")
+    expect(Object.keys(deps({ scripts: {} }))).toEqual(["readManifest"])
   })
 
-  it("is used as the last resort when static tiers are exhausted, and its matches resolve as basename", () => {
-    const fallbackProbe = vi.fn((globs: string[]) => {
-      expect(globs).toContain("**/x.test.*")
-      expect(globs).toContain("**/x.spec.*")
-      return ["live/x.test.ts"]
-    })
-    const result = resolveVerifier(ctx(["src/x.ts"]), deps({ scripts: {} }, fallbackProbe))
-    expect(result).toEqual({
-      command: "npx vitest run live/x.test.ts",
-      rationale: "basename",
-      matchedPaths: ["src/x.ts"],
-    })
-    expect(fallbackProbe).toHaveBeenCalledTimes(1)
-  })
-
-  it("degrades to none when fallbackProbe is provided but finds nothing", () => {
-    const fallbackProbe = vi.fn(() => [] as string[])
-    const result = resolveVerifier(ctx(["src/x.ts"]), deps({ scripts: {} }, fallbackProbe))
+  it("the degraded path is still correct with no probe (FR-009: correctness never depended on it)", () => {
+    const result = resolveVerifier(ctx(["src/x.ts"]), deps({ scripts: {} }))
     expect(result).toEqual({ command: null, rationale: "none", matchedPaths: [] })
   })
 
-  it("the degraded path remains correct without a fallbackProbe (FR-009: correctness never depends on it)", () => {
-    const result = resolveVerifier(ctx(["src/x.ts"]), deps({ scripts: {} } /* no fallbackProbe */))
-    expect(result).toEqual({ command: null, rationale: "none", matchedPaths: [] })
+  it("an unrecognised extra dep is inert — nothing in the resolver reaches for a probe", () => {
+    // The tier's whole observable signature was "a probe's test files appear in
+    // the command". Passing one in the old shape must now change nothing.
+    const withStrayProbe = {
+      readManifest: () => ({ scripts: {} }) as Manifest,
+      fallbackProbe: () => ["live/x.test.ts"],
+    }
+    const result = resolveVerifier(ctx(["src/x.ts"]), withStrayProbe)
+    expect(result.command).toBeNull()
+    expect(result.rationale).toBe("none")
   })
 })
 
@@ -372,12 +371,6 @@ describe("language awareness: a change never resolves to another ecosystem's run
     })
   })
 
-  it("the FR-009 probe is a JS/TS convention and is never invoked for a pure-Go change", () => {
-    const fallbackProbe = vi.fn(() => ["should/never/be/used.test.ts"])
-    const result = resolveVerifier(ctx(["main.go"]), deps({ scripts: {} }, fallbackProbe))
-    expect(result.command).toBe("go test ./...")
-    expect(fallbackProbe).not.toHaveBeenCalled()
-  })
 })
 
 describe("language awareness: nearest ancestor project root scopes the command", () => {
@@ -622,6 +615,202 @@ describe("language awareness: resolve <-> coverage pairing (requirement 4)", () 
     expect(prescribed).toBe("npx vitest run tests/lexer.test.ts && go test ./...")
     expect(observedCoversPrescribed(prescribed, "npm test && go test ./...")).toBe(true)
     expect(observedCoversPrescribed(prescribed, "npm test")).toBe(false)
+  })
+})
+
+// ===========================================================================
+// B-4 — `resolution:none` fired 65 times in one measured session, including on
+// turns carrying real changed paths (`src/games/memory.js`, `index.html`,
+// `src/games/breakout.js`).
+//
+// Tier-by-tier miss: no story verifiers (tier 1); `manifest.testFiles` empty,
+// the project genuinely had no test file (tier 2); tier 3 hard-filtered on
+// `scripts.test` while the project's package.json declared only `check` and
+// `dev`; the FR-009 probe was never supplied by either call site, so it was
+// dead code. The harness spent the session reciting a category list.
+// ===========================================================================
+
+describe("B-4 (a): tier 3 prescribes an ORDERED preference of scripts, not `test` alone", () => {
+  it("THE MEASURED CASE — package.json with only `check` and `dev` resolves to a command, not none", () => {
+    const result = resolveVerifier(
+      ctx(["src/games/memory.js", "index.html"]),
+      deps({ scripts: { check: "tsc --noEmit && eslint .", dev: "vite" } }),
+    )
+    expect(result.command).toBe("npm run check")
+    expect(result.rationale).toBe("fallback:package-script")
+    expect(result.matchedPaths).toEqual(["src/games/memory.js", "index.html"])
+  })
+
+  it.each([
+    ["check", { check: "c", verify: "v", lint: "l", typecheck: "t", build: "b" }],
+    ["verify", { verify: "v", lint: "l", typecheck: "t", build: "b" }],
+    ["lint", { lint: "l", typecheck: "t", build: "b" }],
+    ["typecheck", { typecheck: "t", build: "b" }],
+    ["build", { build: "b" }],
+  ])("prefers `%s` when it is the best script present", (expected, scripts) => {
+    const result = resolveVerifier(ctx(["src/misc.ts"]), deps({ scripts }))
+    expect(result.command).toBe(`npm run ${expected}`)
+  })
+
+  it("`test` outranks every widened name AND keeps the bare `npm test` spelling", () => {
+    // The spelling is load-bearing: only `npm test` sits in
+    // `coverage.ts:WHOLE_SUITE_ALIASES`, so `npm run test` would narrow what
+    // counts as covering evidence for the single most common verifier there is.
+    const result = resolveVerifier(
+      ctx(["src/misc.ts"]),
+      deps({ scripts: { build: "b", check: "c", test: "vitest run", lint: "l" } }),
+    )
+    expect(result.command).toBe("npm test")
+    expect(observedCoversPrescribed(result.command!, "npx vitest run")).toBe(true)
+  })
+
+  it("the preference list is CLOSED — a package.json of only non-verifier scripts still degrades to none", () => {
+    // `npm run dev` starts a server that never exits; `start`/`deploy`/`clean`
+    // are worse. Prescribing an arbitrary script is worse than prescribing none.
+    const result = resolveVerifier(
+      ctx(["src/misc.ts"]),
+      deps({ scripts: { dev: "vite", start: "node .", deploy: "fly deploy", clean: "rm -rf dist" } }),
+    )
+    expect(result).toEqual({ command: null, rationale: "none", matchedPaths: [] })
+  })
+
+  it("a blank script body does not count as a declared verifier", () => {
+    const result = resolveVerifier(ctx(["src/misc.ts"]), deps({ scripts: { check: "   " } }))
+    expect(result.command).toBeNull()
+  })
+
+  it("the widened prescription pairs with coverage.ts: the same command covers it, a different script does not", () => {
+    const prescribed = resolveVerifier(ctx(["src/misc.ts"]), deps({ scripts: { check: "c", build: "b" } })).command!
+    expect(prescribed).toBe("npm run check")
+    expect(observedCoversPrescribed(prescribed, "npm run check")).toBe(true)
+    expect(observedCoversPrescribed(prescribed, "npm run check 2>&1 | tail -20")).toBe(true)
+    // Fail closed: running a DIFFERENT script is not evidence for this one.
+    expect(observedCoversPrescribed(prescribed, "npm run build")).toBe(false)
+    expect(observedCoversPrescribed(prescribed, "npm test")).toBe(false)
+  })
+
+  it("PRECEDENCE UNCHANGED — nearest manifest still wins: a nested `check` beats the root's `test`", () => {
+    // Widening the script set must not quietly promote the root manifest over
+    // the package the change actually lives in (dataset row 9's rule).
+    const result = resolveVerifier(
+      ctx(["packages/api/src/h.ts"]),
+      deps({
+        scripts: { test: "vitest run" },
+        workspaces: [{ root: "packages/api", scripts: { check: "tsc --noEmit" } }],
+      }),
+    )
+    expect(result.command).toBe("npm run check -w packages/api")
+    expect(result.rationale).toBe("fallback:package-script")
+  })
+
+  it("a workspace-scoped widened script carries npm's `-w` selector, so a bare root run cannot cover it", () => {
+    const prescribed = resolveVerifier(
+      ctx(["packages/api/src/h.ts"]),
+      deps({ scripts: {}, workspaces: [{ root: "packages/api", scripts: { check: "tsc --noEmit" } }] }),
+    ).command!
+    expect(prescribed).toBe("npm run check -w packages/api")
+    expect(observedCoversPrescribed(prescribed, "npm run check -w packages/api")).toBe(true)
+    expect(observedCoversPrescribed(prescribed, "npm run check")).toBe(false)
+  })
+
+  it("tier 2 still outranks tier 3 — a basename match beats a widened script", () => {
+    const result = resolveVerifier(
+      ctx(["src/lexer.ts"]),
+      deps({ scripts: { check: "tsc --noEmit" }, testFiles: ["tests/lexer.test.ts"] }),
+    )
+    expect(result.command).toBe("npx vitest run tests/lexer.test.ts")
+    expect(result.rationale).toBe("basename")
+  })
+
+  it("tier 1 still outranks tier 3 — a story verifier beats a widened script", () => {
+    const result = resolveVerifier(
+      ctx(["src/misc.ts"], ["npm run check"]),
+      deps({ scripts: { check: "tsc --noEmit" } }),
+    )
+    expect(result.rationale).toBe("story")
+  })
+
+  it("a widened script never crosses ecosystems — a .go change still resolves to go", () => {
+    const result = resolveVerifier(ctx(["main.go"]), deps({ scripts: { check: "tsc --noEmit" } }))
+    expect(result.command).toBe("go test ./...")
+  })
+})
+
+describe("B-4 (c): ABSOLUTE changed paths are relativised against manifest.workspaceRoot", () => {
+  // opencode's `edit`/`write` tools declare `filePath` as an absolute path and
+  // `changedPathsFromTool` passes it through verbatim, so in production nearly
+  // every changed path arrives absolute — while `workspaces[].root` and
+  // `projectRoots[].root` are bare and repo-relative.
+
+  it("KILLER — a root-level file is not scoped into a workspace whose NAME appears in the absolute prefix", () => {
+    // Repo at /work/app, workspace literally named `app`. The old root-unaware
+    // heuristic hunted for `/app/` anywhere in the string, found the repo's own
+    // directory, and prescribed `npm test -w app` for a file that lives at the
+    // root — a workspace selector naming a package the change is not in.
+    const result = resolveVerifier(
+      ctx(["/work/app/src/x.ts"]),
+      deps({
+        scripts: { test: "vitest run" },
+        workspaceRoot: "/work/app",
+        workspaces: [{ root: "app", scripts: { test: "vitest run" } }],
+      }),
+    )
+    expect(result.command).toBe("npm test")
+    expect(result.matchedPaths).toEqual(["src/x.ts"])
+  })
+
+  it("KILLER — a repo-root Go file is not scoped into a project root whose name appears in the prefix", () => {
+    const result = resolveVerifier(
+      ctx(["/work/services/main.go"]),
+      deps({
+        scripts: {},
+        workspaceRoot: "/work/services",
+        projectRoots: [{ ecosystem: "go", root: "services" }],
+      }),
+    )
+    expect(result.command).toBe("go test ./...")
+  })
+
+  it("a genuinely nested absolute path still resolves to its own workspace", () => {
+    const result = resolveVerifier(
+      ctx(["/work/app/packages/api/src/h.ts"]),
+      deps({
+        scripts: { test: "vitest run" },
+        workspaceRoot: "/work/app",
+        workspaces: [{ root: "packages/api", scripts: { test: "vitest run" } }],
+      }),
+    )
+    expect(result.command).toBe("npm test -w packages/api")
+    expect(result.matchedPaths).toEqual(["packages/api/src/h.ts"])
+  })
+
+  it("the story tier reports relativised matchedPaths too — one coordinate system for every tier", () => {
+    const result = resolveVerifier(
+      ctx(["/work/app/src/x.ts"], ["npm run check"]),
+      deps({ scripts: {}, workspaceRoot: "/work/app" }),
+    )
+    expect(result.matchedPaths).toEqual(["src/x.ts"])
+  })
+
+  it("a path OUTSIDE the workspace root is left absolute — never silently rebased into the repo", () => {
+    const result = resolveVerifier(
+      ctx(["/tmp/elsewhere/x.ts"]),
+      deps({ scripts: { test: "vitest run" }, workspaceRoot: "/work/app" }),
+    )
+    expect(result.matchedPaths).toEqual(["/tmp/elsewhere/x.ts"])
+  })
+
+  it("the workspace root itself is never reduced to an empty path", () => {
+    const result = resolveVerifier(
+      ctx(["/work/app"]),
+      deps({ scripts: { test: "vitest run" }, workspaceRoot: "/work/app" }),
+    )
+    expect(result.matchedPaths).toEqual(["/work/app"])
+  })
+
+  it("a manifest with no workspaceRoot is unchanged (unit-test and null-manifest callers)", () => {
+    const result = resolveVerifier(ctx(["src/misc.ts"]), deps({ scripts: { test: "vitest run" } }))
+    expect(result.matchedPaths).toEqual(["src/misc.ts"])
   })
 })
 

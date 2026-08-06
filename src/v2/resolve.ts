@@ -4,8 +4,7 @@
  * Pure, injectable resolver: given the paths a mutation touched and (optionally) the
  * active story's bound verifiers, returns the narrowest runnable command that verifies
  * those changes. No real fs or subprocess access happens inside `resolveVerifier`
- * itself — the caller supplies a `readManifest()` snapshot (cached per-turn) and may
- * inject a bounded `fallbackProbe` for the ambiguous case (FR-009).
+ * itself — the caller supplies a `readManifest()` snapshot (cached per-turn).
  *
  * Tier order (FR-008):
  *   1. active-story verifiers
@@ -13,6 +12,30 @@
  *   3. package-manifest scripts (nearest manifest wins in a monorepo)
  *   4. generic category list — rationale "none", command null. The caller renders the
  *      generic list text and logs `resolution:none` (FR-010); this module never logs.
+ *
+ * ## B-4: `resolution:none` × 65 in one measured session
+ *
+ * A field session logged `resolution:none` **65 times**, including on turns that
+ * carried genuine changed paths (`src/games/memory.js`, `index.html`,
+ * `src/games/breakout.js`). Resolution is the step that turns "these paths changed"
+ * into "run THIS command", so 65 misses means the verify-gap nudge and the idle
+ * stop-block spent the whole session saying "run something relevant" instead of
+ * naming a command. Every tier missed, for a different reason:
+ *
+ *   - tier 1: the session declared no story verifiers.
+ *   - tier 2: `manifest.testFiles` was empty — the project genuinely had no
+ *     `*.test.*` / `*.spec.*` file anywhere the bounded scan looks.
+ *   - tier 3: `resolvePackageScript` HARD-FILTERED on `scripts.test`, and the
+ *     project's `package.json` declared only `check` and `dev`. A repo with a
+ *     perfectly good `npm run check` was treated as having no verifier at all.
+ *   - the FR-009 probe: never supplied by either production call site, so the
+ *     branch was dead code (see `resolveNodeGroup` for why it is now gone).
+ *
+ * Two of those are fixed here: tier 3 now prefers an ORDERED list of script names
+ * (`PACKAGE_SCRIPT_PREFERENCE`) rather than demanding `test`, and absolute changed
+ * paths are relativised against `manifest.workspaceRoot` before any path matching
+ * runs (`relativiseToWorkspaceRoot`) so workspace/project-root scoping compares
+ * like with like. Tier 2's miss was not a defect — the repo had no test files.
  *
  * ## Language awareness (why tiers 2/3 are per-ecosystem)
  *
@@ -145,18 +168,6 @@ export interface ResolveContext {
 export interface ResolveDeps {
   /** Cached per-turn by the caller — may be called more than once per resolveVerifier call; the caller owns the cache, not this module. */
   readManifest(): Manifest | null
-  /**
-   * Optional bounded (<=250ms) fallback the caller may inject for the ambiguous case.
-   * Omitted in unit tests (fixture-driven, no real fs/subprocess). This module never
-   * calls it without a caller-supplied cap — i.e. it is only ever invoked when the
-   * caller has chosen to provide it, and only as the very last resort before the
-   * generic degrade, never speculatively or more than once per resolveVerifier call.
-   *
-   * Scoped to the JS/TS group: the globs it is handed are the `*.test.*` / `*.spec.*`
-   * basename convention, which is a Node convention. Go/Python/Rust never reach it,
-   * so the "at most once per call" guarantee is unchanged by language awareness.
-   */
-  fallbackProbe?: (globs: string[]) => string[]
 }
 
 const TEST_SUFFIX_RE = /^(.*)\.(?:test|spec)\.[^./]+$/
@@ -279,22 +290,46 @@ function normalizeRoot(root: string): string {
 }
 
 /**
- * Normalise a changed path to the bare repo-relative form the manifest's roots
- * use.
+ * B-4 (c): re-express an ABSOLUTE changed path as the bare repo-relative form the
+ * manifest's roots use, by SUBTRACTING the known workspace root.
  *
- * Roots come from `manifest.ts` as `relative(repoRoot, dir)` -- bare and
- * repo-relative ("services/api"). Changed paths do NOT arrive that way:
- * opencode's `edit`/`write` tools declare `filePath` as an ABSOLUTE path and
- * `changedPathsFromTool` passes it through verbatim, and a `./`-prefixed form
- * is equally common. Comparing those against a bare root silently matched
- * nothing, so every nested project root fell back to the repo root -- the
- * scoping feature was inert in production while its unit tests, which feed only
- * bare-relative paths, stayed green. The npm case was worse than inert: it
- * degraded `npm test -w packages/api` to bare `npm test`, re-opening the
- * fabrication the workspace-selector rule exists to close.
+ * opencode's `edit`/`write` tools declare `filePath` as an absolute path and
+ * `changedPathsFromTool` (src/index.ts:558) passes it through verbatim, so in
+ * production nearly every changed path arrives absolute — while `workspaces[].root`
+ * and `projectRoots[].root` are `relative(repoRoot, dir)`, i.e. bare. Every
+ * path-based comparison in this module was therefore comparing two different
+ * coordinate systems.
  *
- * `workspaceRoot` is unknown here (this module is pure), so an absolute path is
- * reduced by finding the root segment within it rather than by subtraction.
+ * `normalizeChangedPath` below is the older, root-unaware workaround: it hunts for
+ * `/<root>/` ANYWHERE inside the absolute path. That guesses right often enough to
+ * look fine, and wrong in a way that produces a WRONGER prescription than none: for
+ * a repo at `/work/app` with a workspace literally named `app`, the root-level file
+ * `/work/app/src/x.ts` contains `/app/` and was scoped to `npm test -w app` — a
+ * workspace it does not live in. Subtracting the real root removes the guess.
+ *
+ * Fail-open by design: a path that is not absolute, or that lies outside the root,
+ * or a manifest with no `workspaceRoot`, is returned unchanged and falls through to
+ * the older marker heuristic. Narrowing this to "under the root" matters — a
+ * `/tmp/x.ts` must not be silently rebased into the repo.
+ */
+export function relativiseToWorkspaceRoot(path: string, workspaceRoot: string | undefined): string {
+  if (!path.startsWith("/")) return path
+  if (workspaceRoot === undefined) return path
+  const base = workspaceRoot.replace(/\/+$/, "")
+  if (base === "" || !base.startsWith("/")) return path
+  if (!path.startsWith(`${base}/`)) return path
+  const rest = path.slice(base.length + 1).replace(/^\/+/, "")
+  return rest === "" ? path : rest
+}
+
+/**
+ * Residual normalisation for a path that `relativiseToWorkspaceRoot` could not
+ * reduce — no `workspaceRoot` in the manifest (unit tests, `readManifest()` ->
+ * null), or a path outside the root. Strips a `./` prefix, and for a still-absolute
+ * path falls back to locating the root segment inside it.
+ *
+ * Kept because dropping it would regress the pre-B-4 behaviour for root-less
+ * callers, but it is now the SECOND line of defence, not the first.
  */
 function normalizeChangedPath(path: string, root: string): string {
   const cleaned = path.replace(/^\.\/+/, "")
@@ -321,26 +356,81 @@ function collectWorkspaces(manifest: Manifest): WorkspaceCandidate[] {
 }
 
 /**
+ * B-4 (a): the ordered set of `package.json` script names tier 3 will prescribe,
+ * best first. First match wins.
+ *
+ * Tier 3 used to demand `scripts.test` and nothing else. In the measured session
+ * (65 × `resolution:none`, see this file's header) the project's `package.json`
+ * declared exactly `check` and `dev`, so a repo whose author had provided a
+ * one-command verifier was classified as unverifiable and the harness fell back to
+ * reciting a category list for the entire session.
+ *
+ * Why THIS list and this order:
+ *   - `test` first, and it keeps its canonical `npm test` spelling, because that is
+ *     the only entry `coverage.ts:WHOLE_SUITE_ALIASES` treats as interchangeable
+ *     with `npx vitest run` / `npx jest` / `yarn test`. Reaching it through
+ *     `npm run test` instead would narrow what counts as covering evidence.
+ *   - `check` / `verify` next: by convention these are the project's own aggregate
+ *     gate (this repo's own `check`, for instance), so they are stronger evidence
+ *     than any single one of their parts.
+ *   - `lint` / `typecheck` / `build` last, in ascending order of how little they say
+ *     about behaviour. They are still worth prescribing: a build that fails is a
+ *     real refutation, and `findings.ts`'s own generic category list already names
+ *     lint, typecheck and build as acceptable verifiers.
+ *
+ * Closed on purpose. Prescribing an arbitrary script would be worse than
+ * prescribing nothing — `npm run dev` starts a server that never exits, and `start`,
+ * `deploy`, `release`, `clean` and `postinstall` are outright dangerous to suggest
+ * as a verification step. A script not on this list is not a verifier.
+ */
+const PACKAGE_SCRIPT_PREFERENCE: readonly string[] = ["test", "check", "verify", "lint", "typecheck", "build"]
+
+/** The highest-preference usable script name in `scripts`, or null when it has none. */
+function preferredScript(scripts: Record<string, string>): string | null {
+  for (const name of PACKAGE_SCRIPT_PREFERENCE) {
+    const body = scripts[name]
+    if (typeof body === "string" && body.trim().length > 0) return name
+  }
+  return null
+}
+
+/**
+ * `test` keeps the bare `npm test` spelling (alias-class membership, above); every
+ * other script is reached through `npm run <name>`. A nested workspace appends npm's
+ * own `-w <root>` selector, which `coverage.ts` reads as a workspace narrowing and
+ * therefore refuses to credit to a bare root-level run.
+ */
+function packageScriptCommand(script: string, root: string): string {
+  const base = script === "test" ? "npm test" : `npm run ${script}`
+  return root === "" ? base : `${base} -w ${root}`
+}
+
+/**
  * Tier 3: package-manifest scripts, nearest manifest wins (dataset row 9). Judgment
  * call (undocumented by the spec beyond the single-path row 9 case): when multiple
  * changed paths span different workspaces, the FIRST changed path's nearest workspace
  * decides the command for the whole batch, since `ResolutionResult` carries only one
  * command. "Nearest" walks from the most specific (longest) matching root down to the
- * repo root (`""`), picking the first workspace whose `scripts.test` is usable.
+ * repo root (`""`), picking the first workspace that declares any usable script.
+ *
+ * PRECEDENCE, unchanged by B-4 (a): the WORKSPACE decision comes first and the script
+ * preference is applied inside the winner. A nested package's own `check` therefore
+ * still beats the repo root's `test`, exactly as "nearest manifest wins" has always
+ * meant — widening the script set must not quietly promote the root manifest.
  */
 function resolvePackageScript(paths: readonly string[], manifest: Manifest): { command: string } | null {
   if (paths.length === 0) return null
 
   const workspaces = collectWorkspaces(manifest)
-    .filter((workspace) => typeof workspace.scripts.test === "string" && workspace.scripts.test.trim().length > 0)
+    .map((workspace) => ({ root: workspace.root, script: preferredScript(workspace.scripts) }))
+    .filter((workspace): workspace is { root: string; script: string } => workspace.script !== null)
     .sort((a, b) => b.root.length - a.root.length)
 
   const primaryPath = paths[0]
   const nearest = workspaces.find((workspace) => isWithinWorkspace(primaryPath, workspace.root))
   if (!nearest) return null
 
-  const command = nearest.root === "" ? "npm test" : `npm test -w ${nearest.root}`
-  return { command }
+  return { command: packageScriptCommand(nearest.script, nearest.root) }
 }
 
 /**
@@ -469,12 +559,36 @@ interface GroupResolution {
   matchedPaths: string[]
 }
 
-/** Tiers 2/3 (+ FR-009 probe) for the JS/TS group — unchanged from the npm-only resolver. */
-function resolveNodeGroup(
-  paths: readonly string[],
-  manifest: Manifest | null,
-  deps: ResolveDeps,
-): GroupResolution | null {
+/**
+ * Tiers 2/3 for the JS/TS group.
+ *
+ * ## B-4 (b): the FR-009 "bounded fallback probe" tier was DELETED, not wired
+ *
+ * `ResolveDeps` used to accept an optional `fallbackProbe(globs)` that ran after
+ * tier 3 and re-searched the tree for `**\/<base>.test.*` / `**\/<base>.spec.*`.
+ * Neither production call site (`plugin.ts`'s verify-gap branch,
+ * `gate.ts:narrowestPrescription`) ever supplied one, so the branch had never
+ * executed outside its own unit tests, while reading — in a module about
+ * evidence — like a safety net that was catching something.
+ *
+ * It was deleted rather than wired because it is REDUNDANT BY CONSTRUCTION. The
+ * only manifest reader in this codebase, `wiring/manifest.ts:scanRepo`, already
+ * walks the whole worktree once per turn and collects EVERY file matching
+ * `/\.(?:test|spec)\.[^./]+$/` into `manifest.testFiles` — the same convention,
+ * the same tree, the same skip list. Any probe honouring those bounds can only
+ * return a subset of what tier 2 was already handed, and the probe is reached
+ * only when tier 2 found no match in that set. To find anything new it would have
+ * to walk MORE of the tree than the cached scan, uncached, inside
+ * `tool.execute.after` / `chat.system.transform` — precisely the subprocess/latency
+ * spend FR-009 and SC-003 exist to bound, for a case whose defining property is
+ * that a full-repo scan already found zero test files.
+ *
+ * FR-009 permits this fallback ("an optional resolution fallback bounded at 250 ms";
+ * "the degraded path MUST remain correct without it") — it never required it. The
+ * right place to spend effort on tier-2 recall is `scanRepo`'s bounds, not a second
+ * walk behind an interface nobody implements.
+ */
+function resolveNodeGroup(paths: readonly string[], manifest: Manifest | null): GroupResolution | null {
   if (paths.length === 0) return null
 
   // Tier 2: basename convention, matched via the cached manifest.
@@ -497,28 +611,6 @@ function resolveNodeGroup(
     }
   }
 
-  // FR-009: bounded fallback, last resort before the generic degrade. Only invoked
-  // when the caller supplied one — never called speculatively, never called more than
-  // once, and this module never applies its own timeout: bounding it is the caller's
-  // job (the <=250ms cap lives in the caller's `fallbackProbe` implementation).
-  if (deps.fallbackProbe) {
-    const globs = paths.flatMap((path) => {
-      const base = baseNameNoExt(path)
-      return [`**/${base}.test.*`, `**/${base}.spec.*`]
-    })
-    const found = deps.fallbackProbe(globs)
-    if (found.length > 0) {
-      const matched = matchBasenameConvention(paths, found)
-      if (matched.testFiles.length > 0) {
-        return {
-          command: `npx vitest run ${matched.testFiles.join(" ")}`,
-          rationale: "basename",
-          matchedPaths: matched.matchedPaths,
-        }
-      }
-    }
-  }
-
   return null
 }
 
@@ -528,11 +620,18 @@ function resolveNodeGroup(
  * supplies everything this function reads.
  */
 export function resolveVerifier(ctx: ResolveContext, deps: ResolveDeps): ResolutionResult {
-  const paths = ctx.changedPaths.filter((path) => path.trim().length > 0)
+  const rawPaths = ctx.changedPaths.filter((path) => path.trim().length > 0)
 
-  if (paths.length === 0) {
+  if (rawPaths.length === 0) {
     return { command: null, rationale: "none", matchedPaths: [] }
   }
+
+  // Read the manifest BEFORE tier 1 (the contract allows it: "may be called more
+  // than once per resolveVerifier call", and in production it is a cache hit),
+  // because B-4 (c)'s relativisation needs `workspaceRoot` and every tier —
+  // including the story tier's `matchedPaths` — must speak one coordinate system.
+  const manifest = deps.readManifest()
+  const paths = rawPaths.map((path) => relativiseToWorkspaceRoot(path, manifest?.workspaceRoot))
 
   // Tier 1: active-story verifiers. Story precedence is absolute — a story that
   // declares its own verifiers overrides every ecosystem inference below.
@@ -548,13 +647,11 @@ export function resolveVerifier(ctx: ResolveContext, deps: ResolveDeps): Resolut
     return { command: storyVerifiers.join(" && "), rationale: "story", matchedPaths: [...paths] }
   }
 
-  const manifest = deps.readManifest()
-
   const resolutions: GroupResolution[] = []
   for (const group of partitionByEcosystem(paths, manifest)) {
     const resolved =
       group.ecosystem === "node"
-        ? resolveNodeGroup(group.paths, manifest, deps)
+        ? resolveNodeGroup(group.paths, manifest)
         : {
             command: foreignCommand(group.ecosystem, group.root),
             // A `go.mod` / `pyproject.toml` / `Cargo.toml` IS the project manifest, so
