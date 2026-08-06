@@ -1464,32 +1464,233 @@ describe("BACKLOG B-1: the model id does not change what the harness renders", (
   it("composes with B-2: rendering FULL for every model does not re-open the per-step flood", async () => {
     // B-1 raises directive volume (every session now gets the full form that
     // only the 'frontier' row used to get). B-2 bounds emission to once per
-    // TURN. Measured across 6/12/24/48/96 agent-loop steps in one turn, both
-    // before and after B-1: rendered count is FLAT and no directive is ever
-    // built only to be thrown away by the cap. This pins that composition at
-    // a step count far past the point the pre-B-2 bug would have shown (the
-    // field session logged 179 `per-turn-cap:dropped`, all intake-scaffold).
+    // TURN. This pins that composition at a step count far past the point the
+    // pre-B-2 bug would have shown (the field session logged 179
+    // `per-turn-cap:dropped`, all intake-scaffold).
+    //
+    // REWRITTEN (B-2 follow-up). The assertion below was
+    // `expect(capDrops).toHaveLength(0)` over EVERY family, in a session with
+    // no plan and no scope globs — so `scope-watchdog` (needs an active
+    // story's scopeGlobs) and `verify-gap` (needs a resolvable verifier)
+    // could not be produced at all, and the guard passed vacuously for
+    // exactly the two families that were still flooding: measured on this
+    // file's own harness, 119 + 117 cap drops in one 120-step turn. The
+    // scenario now declares a plan WITH scopeGlobs and verifiers and edits
+    // outside that scope without verifying, so every family named below is
+    // genuinely producible, and each is asserted BY NAME with a rendered
+    // count to prove the family was live.
     const client = makeStubClient()
     const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
     const sid = `b1-bounded-${Math.random().toString(36).slice(2)}`
     const model = { providerID: "anthropic", id: "claude-fable-5" }
 
     await activate(hooks, sid, "implement the production database migration", model)
+    await hooks.tool!.elicify_vertex_plan_create!.execute!(
+      {
+        stories: [
+          {
+            text: "narrow story",
+            acceptanceItems: ["A1"],
+            scopeGlobs: ["src/in-scope/**"],
+            verifiers: ["npx vitest run"],
+            tasks: [{ text: "do the work" }],
+          },
+        ],
+      } as never,
+      { sessionID: sid } as never,
+    )
+
     let injectedBlocks = 0
     for (let step = 0; step < 40; step++) {
-      await toolAfter(hooks, sid, "edit", { filePath: `src/step-${step}.ts` }, "updated")
+      await toolAfter(hooks, sid, "edit", { filePath: `src/elsewhere/step-${step}.ts` }, "updated")
       injectedBlocks += (await transformWith(hooks, sid, model)).system.length
     }
 
     const mine = readEvents().filter((e) => e.session_id === sid)
     const family = (e: LoggedEvent) => String((e.payload as { family?: string }).family)
-    const scaffoldRenders = mine.filter((e) => e.event_type === "directive_rendered" && family(e) === "intake-scaffold")
-    const capDrops = mine.filter((e) => e.event_type === "per-turn-cap:dropped")
+    const count = (type: string, fam: string) => mine.filter((e) => e.event_type === type && family(e) === fam).length
+    const rendered = (fam: string) => count("directive_rendered", fam)
+    const capDrops = (fam: string) => count("per-turn-cap:dropped", fam)
 
-    // 40 steps, ONE turn: one scaffold, one injected block, zero waste.
-    expect(scaffoldRenders).toHaveLength(1)
-    expect(injectedBlocks).toBe(1)
-    expect(capDrops).toHaveLength(0)
+    // NON-VACUITY FIRST: every family the drop assertions cover really did
+    // reach the model in this scenario. Pre-rewrite, all three of these read
+    // 0 (no plan -> no scope drift, no resolvable verifier) or 0 for the
+    // scaffold (B-2's flag was spent by the budget-dropped offer on step 1).
+    expect(rendered("verify-gap"), "verify-gap must be producible here").toBe(3) // its cap
+    expect(rendered("scope-watchdog"), "scope-watchdog must be producible here").toBe(1)
+    expect(rendered("intake-scaffold"), "the scaffold must still land in this turn").toBe(1)
+
+    // 40 steps, ONE turn, and not one finding built for the composer to bin.
+    // Measured before the fix, per family: verify-gap 37, scope-watchdog 39.
+    expect(capDrops("verify-gap")).toBe(0)
+    expect(capDrops("scope-watchdog")).toBe(0)
+    expect(capDrops("intake-scaffold")).toBe(0)
+    expect(capDrops("pre-commitment")).toBe(0)
+    expect(capDrops("elevate")).toBe(0)
+    // ...and globally, which is what the old assertion MEANT to say.
+    expect(mine.filter((e) => e.event_type === "per-turn-cap:dropped")).toHaveLength(0)
+    // Rendered volume is flat in the step count: 5 directives in 3 blocks,
+    // whether the turn runs 6 steps or 120.
+    expect(injectedBlocks).toBe(3)
+  })
+})
+
+// ===========================================================================
+// B-2 FOLLOW-UP — the producers, not the composer.
+//
+// B-2 fixed ONE family (`intake-scaffold`) and fixed it in the wrong place:
+// the once-per-turn flag was spent when the finding was OFFERED, so the first
+// invocation whose 2-slot budget went to corrections spent the flag on a
+// directive that never reached the model, and no later step re-offered it.
+// Measured on the harness below, before this change:
+//
+//   family           rendered   per-turn-cap:dropped   (one 120-step turn)
+//   intake-scaffold      0          0  (1 budget:dropped, then silence)
+//   verify-gap           3        117
+//   scope-watchdog       1        119
+//   pre-commitment       1         95  (96 edit/verify cycles)
+//   elevate              1        284  (same run)
+//
+// Every one of those drops is a finding that was built — `resolveVerifier`
+// re-run, an instance id burned, an event written — after the composer had
+// already spent that family's cap for the turn. `InjectionComposer.
+// blockedBeforeBudget` lets the producer ask before building; because it
+// models only the two PRE-BUDGET filters, a budget drop still re-offers, which
+// is what the composer's contract requires and what B-2 broke.
+// ===========================================================================
+
+describe("B-2 follow-up: producers stop re-minting, and stop suppressing", () => {
+  const NARROW_STORY = {
+    stories: [
+      {
+        text: "narrow story",
+        acceptanceItems: ["A1"],
+        scopeGlobs: ["src/in-scope/**"],
+        verifiers: ["npx vitest run"],
+        tasks: [{ text: "do the work" }],
+      },
+    ],
+  }
+
+  function tally(sid: string) {
+    const mine = readEvents().filter((e) => e.session_id === sid)
+    const family = (e: LoggedEvent) => String((e.payload as { family?: string }).family)
+    const count = (type: string, fam: string) => mine.filter((e) => e.event_type === type && family(e) === fam).length
+    return {
+      rendered: (fam: string) => count("directive_rendered", fam),
+      capDrops: (fam: string) => count("per-turn-cap:dropped", fam),
+      budgetDrops: (fam: string) => count("budget:dropped", fam),
+    }
+  }
+
+  it("FIX 1: a scaffold that loses the 2-slot budget on step 1 is re-offered and lands on step 2", async () => {
+    // The reviewer's repro, exactly: a deep ask, a plan with scopeGlobs, and
+    // one unverified out-of-scope edit per step. Step 1 produces verify-gap +
+    // scope-watchdog (both `correction`) and the scaffold (`phase-guidance`),
+    // so the scaffold is budget-dropped. Pre-fix its once-per-turn flag was
+    // ALREADY spent at that point and the scaffold never appeared again:
+    // `rendered=0, budgetDrops=1` for the whole turn — B-2 suppressing the
+    // very directive it was written to preserve.
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = `b2f-scaffold-${Math.random().toString(36).slice(2)}`
+
+    await activate(hooks, sid, "implement the production database migration")
+    await hooks.tool!.elicify_vertex_plan_create!.execute!(NARROW_STORY as never, { sessionID: sid } as never)
+
+    const sawScaffold: boolean[] = []
+    for (let step = 0; step < 6; step++) {
+      await toolAfter(hooks, sid, "edit", { filePath: `src/elsewhere/step-${step}.ts` }, "updated")
+      sawScaffold.push((await transform(hooks, sid)).system.join("\n").includes("OUTCOME:"))
+    }
+
+    // Pre-fix: [false, false, false, false, false, false].
+    expect(sawScaffold[0], "step 1 legitimately loses the budget to two corrections").toBe(false)
+    expect(sawScaffold[1], "step 2 must re-offer — this is the whole fix").toBe(true)
+    const t = tally(sid)
+    expect(t.rendered("intake-scaffold")).toBe(1)
+    expect(t.budgetDrops("intake-scaffold")).toBe(1) // step 1 only: after a render the offer stops
+    expect(t.capDrops("intake-scaffold")).toBe(0)
+  })
+
+  it("FIX 2: verify-gap still renders on exactly the steps it always did — only the doomed re-mints go", async () => {
+    // The caution: verify-gap is the one family with measured real-world
+    // compliance (9 rendered, 14 complied), so the gate must not move WHEN it
+    // reaches the model. It cannot: `blockedBeforeBudget` closes only once the
+    // composer has spent the family's cap of 3, at which point every further
+    // finding was already guaranteed `per-turn-cap:dropped`. Asserted as
+    // "steps 1-3 carry the prescription, exactly as before".
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = `b2f-verifygap-${Math.random().toString(36).slice(2)}`
+
+    await activate(hooks, sid, "implement the production database migration")
+    await hooks.tool!.elicify_vertex_plan_create!.execute!(NARROW_STORY as never, { sessionID: sid } as never)
+
+    const carried: boolean[] = []
+    for (let step = 0; step < 30; step++) {
+      await toolAfter(hooks, sid, "edit", { filePath: `src/elsewhere/step-${step}.ts` }, "updated")
+      carried.push((await transform(hooks, sid)).system.join("\n").includes("Run npx vitest run"))
+    }
+
+    expect(carried.slice(0, 3), "the three renders the cap allows, on their original steps").toEqual([true, true, true])
+    expect(carried.slice(3).some(Boolean), "steps 4+ were already silent — the cap saw to that").toBe(false)
+    const t = tally(sid)
+    expect(t.rendered("verify-gap")).toBe(3)
+    expect(t.capDrops("verify-gap")).toBe(0) // measured pre-fix over 30 steps: 27
+  })
+
+  it("FIX 2: scope-watchdog renders once, and the drift it is still holding renders again next turn", async () => {
+    // The second half of "do not weaken delivery": the gate skips the MINT,
+    // it does not clear `scopeDriftPending`. A gate continuation advances the
+    // composer's turn without touching wiring state, the cap refills, and the
+    // watchdog speaks again — the same behaviour a per-step re-mint produced,
+    // minus the 119 discarded findings.
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = `b2f-scope-${Math.random().toString(36).slice(2)}`
+
+    await activate(hooks, sid, "implement the production database migration")
+    await hooks.tool!.elicify_vertex_plan_create!.execute!(NARROW_STORY as never, { sessionID: sid } as never)
+
+    for (let step = 0; step < 20; step++) {
+      await toolAfter(hooks, sid, "edit", { filePath: `src/elsewhere/step-${step}.ts` }, "updated")
+      await transform(hooks, sid)
+    }
+    expect(tally(sid).rendered("scope-watchdog")).toBe(1)
+    expect(tally(sid).capDrops("scope-watchdog")).toBe(0) // measured pre-fix over 20 steps: 19
+
+    await idle(hooks, sid)
+    expect(idleContinuationTexts(client, sid).length, "the idle gate must have opened a new turn").toBeGreaterThan(0)
+    await transform(hooks, sid)
+    expect(tally(sid).rendered("scope-watchdog"), "the held drift is delivered, not dropped").toBe(2)
+  })
+
+  it("FIX 3: pre-commitment survives 20 re-entries into execute without minting 19 doomed findings", async () => {
+    // `precommitmentPending` is re-armed by T6 (elevate -> execute), i.e. by
+    // every mutation that follows a passing verifier, so an edit/verify cycle
+    // re-mints it per cycle against a cap of 1. Measured pre-fix over 96
+    // cycles: 1 rendered, 95 dropped.
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = `b2f-precommit-${Math.random().toString(36).slice(2)}`
+
+    await activate(hooks, sid, "implement the production database migration")
+    for (let cycle = 0; cycle < 20; cycle++) {
+      await toolAfter(hooks, sid, "edit", { filePath: `src/step-${cycle}.ts` }, "updated")
+      await transform(hooks, sid)
+      await toolAfter(hooks, sid, "bash", { command: "npx vitest run" }, "20 passed", { exit: 0 })
+      await transform(hooks, sid)
+    }
+
+    const t = tally(sid)
+    expect(t.rendered("pre-commitment"), "the one offer FR-023a promises still lands").toBe(1)
+    expect(t.capDrops("pre-commitment")).toBe(0) // measured pre-fix over 20 cycles: 19
+    // Same shape, same run, worst numbers of the five — found by this
+    // harness rather than reported: `elevatePending` is re-armed by every
+    // passing verifier (T4). Measured pre-fix over 96 cycles: 284 drops.
+    expect(t.rendered("elevate")).toBe(1)
+    expect(t.capDrops("elevate")).toBe(0)
   })
 })
 
@@ -2305,6 +2506,31 @@ describe("B-2: an unreadable CRITERIA block is logged instead of vanishing", () 
     const misses = parseMisses(sid)
     expect(misses).toHaveLength(1)
     expect(misses[0].payload.keyLine).toBe("CRITERIA: it should all just work")
+  })
+
+  it("logs it ONCE per turn, not once per text part — and re-opens on the next turn", async () => {
+    // B-2 follow-up (FIX 5). `text.complete` fires per assistant TEXT PART,
+    // and a model that writes an unreadable `CRITERIA:` line repeats it in
+    // every part of the same reply: measured, 12 parts -> 12 identical
+    // events. Its sibling `expect:absent` has had a per-turn guard since it
+    // was written (`state.expectAbsentLoggedThisTurn`); this one did not.
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "b2f-parse-miss-flood-session"
+
+    await activate(hooks, sid, "implement the parser feature")
+    for (let part = 0; part < 12; part++) {
+      await completeText(hooks, sid, `CRITERIA: part ${part} should all just work`)
+    }
+    expect(parseMisses(sid), "pre-fix: 12").toHaveLength(1)
+
+    // A real user message is a new turn, and the next turn's miss is a new
+    // fact about the model's behaviour — the guard must not silence it for
+    // the rest of the session (that is the failure mode B-2's own event was
+    // introduced to end).
+    await activate(hooks, sid, "try again please")
+    await completeText(hooks, sid, "CRITERIA: still not a list")
+    expect(parseMisses(sid)).toHaveLength(2)
   })
 
   it("stays silent when the model simply never mentioned criteria", async () => {

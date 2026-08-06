@@ -581,3 +581,94 @@ describe("turn boundaries: a turn is a prompt, not an agent-loop step", () => {
     ])
   })
 })
+
+// ===========================================================================
+// B-2 follow-up — `blockedBeforeBudget`: the predicate producers use to
+// decide whether building a finding is worth anything.
+//
+// It replaces B-2's `currentTurn()`, which producers used as a stand-in for
+// "has this family rendered yet this turn". A turn index does not answer that
+// question — it moves at the turn boundary, not at a render — and the
+// producer that trusted it went silent for the rest of the turn the first
+// time its finding lost the 2-slot budget.
+// ===========================================================================
+
+describe("blockedBeforeBudget", () => {
+  const f = (family: string, priority: Finding["priority"] = "correction") => makeFinding({ family, priority })
+
+  it("is false before anything renders, and true only once the family's cap is spent", () => {
+    const composer = new InjectionComposer({ logger: vi.fn() })
+    composer.newTurn("s1")
+
+    expect(composer.blockedBeforeBudget("s1", "verify-gap")).toBe(false)
+    composer.render("s1", [f("verify-gap")], never)
+    expect(composer.blockedBeforeBudget("s1", "verify-gap"), "cap 3: two left").toBe(false)
+    composer.render("s1", [f("verify-gap")], never)
+    composer.render("s1", [f("verify-gap")], never)
+    expect(composer.blockedBeforeBudget("s1", "verify-gap"), "cap 3 spent").toBe(true)
+
+    // Exactly the ruling the composer itself would make on the next finding.
+    const r = composer.render("s1", [f("verify-gap")], never)
+    expect(r.dropped).toEqual([{ family: "verify-gap", reason: "per-turn-cap" }])
+  })
+
+  it("a BUDGET drop does NOT block — that is the case the caller must re-offer", () => {
+    // THE B-2 BUG, in one assertion. `intake-scaffold` is phase-guidance and
+    // loses the 2-slot budget to two corrections; it has rendered nothing, so
+    // its cap is untouched and the producer must be told to try again.
+    const composer = new InjectionComposer({ logger: vi.fn() })
+    composer.newTurn("s1")
+
+    const r = composer.render(
+      "s1",
+      [f("anomaly-interrupt"), f("scope-watchdog"), f("intake-scaffold", "phase-guidance")],
+      never,
+    )
+    expect(r.dropped).toEqual([{ family: "intake-scaffold", reason: "budget" }])
+    expect(composer.blockedBeforeBudget("s1", "intake-scaffold")).toBe(false)
+
+    // ...and the re-offer lands, in the same turn.
+    expect(composer.render("s1", [f("intake-scaffold", "phase-guidance")], never).renderedFamilies).toEqual([
+      "intake-scaffold",
+    ])
+  })
+
+  it("clears at the next turn boundary, on both paths that advance it", () => {
+    const composer = new InjectionComposer({ logger: vi.fn() })
+    composer.newTurn("s1")
+    composer.render("s1", [f("scope-watchdog")], never)
+    expect(composer.blockedBeforeBudget("s1", "scope-watchdog")).toBe(true)
+
+    composer.newTurn("s1") // a user message, or a gate continuation: same call
+    expect(composer.blockedBeforeBudget("s1", "scope-watchdog")).toBe(false)
+  })
+
+  it("also reports a cooldown block, so a configured cooldown cannot re-open the flood", () => {
+    const composer = new InjectionComposer({ logger: vi.fn(), cooldowns: { "scope-watchdog": 3 } })
+    composer.newTurn("s1")
+    composer.render("s1", [f("scope-watchdog")], never)
+
+    composer.newTurn("s1")
+    expect(composer.blockedBeforeBudget("s1", "scope-watchdog"), "cap refilled, cooldown has not").toBe(true)
+    expect(composer.render("s1", [f("scope-watchdog")], never).dropped).toEqual([
+      { family: "scope-watchdog", reason: "cooldown" },
+    ])
+
+    composer.newTurn("s1")
+    composer.newTurn("s1")
+    expect(composer.blockedBeforeBudget("s1", "scope-watchdog")).toBe(false)
+  })
+
+  it("is per session and per family", () => {
+    const composer = new InjectionComposer({ logger: vi.fn() })
+    composer.newTurn("a")
+    composer.newTurn("b")
+    composer.render("a", [f("scope-watchdog")], never)
+
+    expect(composer.blockedBeforeBudget("a", "scope-watchdog")).toBe(true)
+    expect(composer.blockedBeforeBudget("b", "scope-watchdog")).toBe(false)
+    expect(composer.blockedBeforeBudget("a", "verify-gap")).toBe(false)
+    // A family with no cap-table entry is never blocked by the cap.
+    expect(composer.blockedBeforeBudget("a", "story-completion")).toBe(false)
+  })
+})

@@ -176,6 +176,7 @@ re-entry, and is not a bug.
    permanently spent on any continuation-driven autonomous run. New accessor:
    `InjectionComposer.currentTurn()`. Measured by test: 8 invocations in one
    turn now produce 1 render and **0** cap drops (was 1 render and 7 drops).
+   **Superseded — see the follow-up below.**
 2. **`scope-watchdog` compliance is instrumented**, via a new
    `elicify_vertex_scope_amend` tool (fold / amend / revert, backed by the
    previously unreachable `amendStory`) and a `PlanToolsDeps.onScopeAmended`
@@ -199,6 +200,49 @@ per-step flood for ONE family, not in general.
 
 Note this was *not* downstream of B-1 — the profile resolved to `standard`
 either way.
+
+### Follow-up (review of the above): right diagnosis, wrong flag, one family of four
+
+Item 1 spent its once-per-turn flag when the finding was **offered**, not when
+it **rendered**. `intake-scaffold` is `phase-guidance` and loses the 2-slot
+invocation budget to any two `correction`s, so the first invocation that
+dropped it for budget reasons also spent the flag — and nothing re-offered it
+for the rest of the turn. Measured (deep ask → plan with `scopeGlobs` → one
+unverified out-of-scope edit per step): `rendered=0, budgetDrops=1` across a
+six-step turn, where removing the gate entirely renders it at step 2. B-2 could
+**suppress** the directive it was written to protect. It also contradicted
+`composer.ts`'s stated contract ("the caller must re-detect and re-pass them on
+a later invocation if still true") and diverged from the sibling one-shots,
+which clear only on `renderResult.renderedFamilies`.
+
+And the per-step flood was never `intake-scaffold`-only. Same measurement, one
+turn each:
+
+| family | rendered | `per-turn-cap:dropped` before | after |
+|---|---|---|---|
+| `verify-gap` | 3 | 117 | **0** |
+| `scope-watchdog` | 1 | 119 | **0** |
+| `pre-commitment` | 1 | 95 | **0** |
+| `elevate` | 1 | 284 | **0** |
+| `intake-scaffold` | 0 → **1** | 0 (suppressed instead) | **0** |
+
+`InjectionComposer.currentTurn()` is **replaced** by
+`InjectionComposer.blockedBeforeBudget(sessionID, family)`, and
+`intakeScaffoldOfferedForTurn` is gone. The new predicate answers the question
+the producers were actually asking — *would the composer bin this if I built
+it?* — from the composer's own per-turn spend and cooldown state, which move on
+a **render** and on nothing else. It deliberately does not model the budget
+trim, so a budget drop still re-offers next invocation. Every rendered
+directive still renders, at the same invocation: only findings whose
+`per-turn-cap:dropped` was already a foregone conclusion are skipped, along
+with the `resolveVerifier` call and instance id each one burned.
+`verify-gap` — the one family with real measured compliance (9/14) — renders on
+exactly the same three steps as before; that is asserted by test, not assumed.
+
+`criteria:parse-miss` (item 3) also lacked the per-turn guard its sibling
+`expect:absent` has: `text.complete` fires per assistant text part, so 12 parts
+carrying the same unreadable `CRITERIA:` line produced 12 events. Now 1 per
+turn, re-opening on the next turn.
 
 ---
 

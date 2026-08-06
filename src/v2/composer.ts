@@ -223,21 +223,41 @@ export class InjectionComposer {
   }
 
   /**
-   * The session's current turn index (0 before the first `newTurn`).
+   * Would a finding of `family` be thrown away by one of the two PRE-BUDGET
+   * filters (per-turn cap, cooldown) if it were passed to `render()` right
+   * now? Producers call this to skip BUILDING a finding the composer is
+   * already committed to discarding.
    *
-   * Exists so a PRODUCER can be once-per-turn without duplicating the turn
-   * boundary. Measured (B-2): `system.transform` fires after every tool
-   * result, so a producer that re-derives the same finding on every
-   * invocation emitted 179 `intake-scaffold` findings in one session — all
-   * 179 dropped by the per-turn cap, because the cap is the only thing that
-   * knew where the turn boundary was. Wiring cannot key off its own
-   * `resetTurnState`: the gate-continuation path (`wiring/gate.ts`) advances
-   * the composer's turn WITHOUT resetting wiring state, so a flag reset only
-   * there would go stale and silence the producer for the rest of the run.
-   * Reading the composer's index is the one signal both boundaries move.
+   * Deliberately does NOT model the budget trim — that depends on the whole
+   * findings array of the invocation, and a budget drop is exactly the case
+   * where the producer MUST re-offer next invocation (see the module doc:
+   * "the caller must re-detect and re-pass them on a later invocation if
+   * still true"). Cap and cooldown are the two rulings that cannot change
+   * before the next turn boundary, so acting on them is behaviour-preserving:
+   * every directive that reached the model still reaches it, at the same
+   * invocation.
+   *
+   * Supersedes B-2's `currentTurn()`, which producers used as a stand-in for
+   * "has this rendered yet this turn". It was not one: a turn index moves at
+   * the turn boundary, and a producer that spent it at OFFER time went silent
+   * for the rest of the turn the first time its finding lost the 2-slot
+   * budget to a correction — measured, `intake-scaffold` rendered 0 times in a
+   * turn that offered it once and dropped it. Cap spend moves on RENDER and
+   * on nothing else, so it answers the question producers were actually
+   * asking.
+   *
+   * Measured (B-2 follow-up, one 120-step turn with a plan + scopeGlobs):
+   * 119 `per-turn-cap:dropped`/`scope-watchdog` + 117 /`verify-gap` + 95
+   * /`pre-commitment` + 284 /`elevate` — every one a finding built, resolved
+   * and instance-id'd after its family's cap for the turn was already gone.
    */
-  currentTurn(sessionID: string): number {
-    return this.getState(sessionID).turnIndex
+  blockedBeforeBudget(sessionID: string, family: string): boolean {
+    const state = this.getState(sessionID)
+    if ((state.turnSpend.get(family) ?? 0) >= this.capFor(family)) return true
+    const lastTurn = state.lastRenderedTurn.get(family)
+    if (lastTurn === undefined) return false
+    const cooldown = this.cooldownFor(family)
+    return state.turnIndex > lastTurn && state.turnIndex < lastTurn + cooldown
   }
 
   /** Called by wiring when FR-034 detects a compliance match. Feeds the next

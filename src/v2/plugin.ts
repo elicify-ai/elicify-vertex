@@ -1305,14 +1305,33 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       // times and the composer's cap of 1 discarded all but the first. The
       // cap was never the bug; this producer was.
       //
-      // The emission gate is keyed on the COMPOSER's turn index rather than a
-      // boolean cleared in `resetTurnState`, because `wiring/gate.ts`'s
-      // continuation path advances the turn without touching wiring state — a
-      // boolean would have gone permanently spent on any continuation-driven
-      // run. See `V2SessionState.intakeScaffoldOfferedForTurn`.
-      const scaffoldTurn = composer.currentTurn(sid)
-      if (pinStore.get(sid).length === 0 && state.intakeScaffoldOfferedForTurn !== scaffoldTurn) {
-        state.intakeScaffoldOfferedForTurn = scaffoldTurn
+      // B-2 FOLLOW-UP: the gate is spent on RENDER, not on OFFER.
+      //
+      // B-2 stamped `intakeScaffoldOfferedForTurn` at the moment the finding
+      // was BUILT, which is not the moment it reaches the model. The scaffold
+      // is `phase-guidance` and therefore ranks below every `correction` in
+      // the 2-slot invocation budget. Measured (deep ask -> plan with
+      // scopeGlobs -> one out-of-scope unverified edit): step 1 mints
+      // verify-gap + scope-watchdog + the scaffold, the scaffold is
+      // `budget:dropped` — and the flag was already spent, so steps 2..N never
+      // re-offered it. `rendered=0, budgetDrops=1` for the WHOLE turn, six
+      // steps running, where the same run renders it at step 2 with the gate
+      // removed. B-2 could suppress the scaffold entirely.
+      //
+      // That inverted the composer's own contract ("the caller must re-detect
+      // and re-pass them on a later invocation if still true") and diverged
+      // from the two sibling one-shots ~130 lines below, which clear only on
+      // `renderResult.renderedFamilies`.
+      //
+      // `blockedBeforeBudget` IS the sibling rule, read off the composer's own
+      // per-render bookkeeping instead of a wiring copy of it: for a cap-1
+      // family it is true exactly when the family already RENDERED this turn.
+      // Preferring it to a wiring flag also keeps B-2's real find — a flag
+      // cleared in `resetTurnState` goes stale on `wiring/gate.ts`'s
+      // continuation path, which advances the composer's turn and touches no
+      // wiring state — without re-introducing the failure mode B-2 shipped,
+      // because cap spend cannot move on anything but a render.
+      if (pinStore.get(sid).length === 0 && !composer.blockedBeforeBudget(sid, "intake-scaffold")) {
         findings.push(intakeScaffoldFinding(nextInstanceId(state)))
       }
 
@@ -1332,7 +1351,21 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
         findings.push(planProposalFinding(nextInstanceId(state)))
       }
 
-      if (state.precommitmentPending && evidenceLedger.hasChangedFiles(sid) && !state.turnExpect) {
+      // `precommitmentPending` is re-armed by every RE-ENTRY into execute
+      // (T6: elevate -> execute on the next mutation), so a turn that cycles
+      // edit -> green verifier -> edit re-mints this finding per cycle while
+      // its cap of 1 has been gone since the first render. Measured, 96
+      // edit/bash cycles in one turn: 1 rendered, 95 `per-turn-cap:dropped`.
+      // The pending flag is still cleared unconditionally below, exactly as
+      // before — the skipped mints are the ones the composer was already
+      // committed to discarding, so FR-023a's "offered at most once per phase
+      // entry" is untouched.
+      if (
+        state.precommitmentPending &&
+        evidenceLedger.hasChangedFiles(sid) &&
+        !state.turnExpect &&
+        !composer.blockedBeforeBudget(sid, "pre-commitment")
+      ) {
         findings.push(precommitmentFinding(nextInstanceId(state)))
       }
       state.precommitmentPending = false // FR-023a: offered at most once per phase entry
@@ -1350,7 +1383,22 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       // idle stop-block (gate.ts's zero-criteria fallback) still catches
       // genuinely unverified work at turn end. The composer cap table's
       // per-turn ceiling is the "capped" half of the redesign point.
-      if (evidenceLedger.hasChangedFiles(sid) && !hasVerification) {
+      //
+      // ...and `blockedBeforeBudget` is what stops this producer re-deriving
+      // the nudge once that ceiling is reached. Unverified changes stay
+      // unverified across the whole turn, so the condition above is true on
+      // EVERY step: measured, one 120-step turn resolved a verifier and minted
+      // this finding 120 times for 3 renders (its cap) and 117
+      // `per-turn-cap:dropped` — 117 `resolveVerifier` calls and instance ids
+      // burned on findings that could not reach the model.
+      //
+      // This does NOT change when the nudge reaches the model, which matters
+      // more here than anywhere else: verify-gap is the one family with
+      // measured real-world compliance (9 rendered, 14 complied). The first
+      // three renders of a turn are unaffected — the gate only closes once the
+      // composer has already spent the family's cap, i.e. only over mints
+      // whose `per-turn-cap:dropped` was a foregone conclusion.
+      if (evidenceLedger.hasChangedFiles(sid) && !hasVerification && !composer.blockedBeforeBudget(sid, "verify-gap")) {
         const realPaths = changedPaths.filter((p) => !NON_PATH_MUTATION_MARKERS.has(p))
         const manifest = manifests.get(state.workspaceRoot)
         const activeStory = storyEngine.getActiveStory(sid)
@@ -1377,7 +1425,15 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
         }
       }
 
-      if (state.scopeDriftPending) {
+      // Same treatment, same reason: `scopeDriftPending` is re-armed by every
+      // out-of-scope mutation, and a turn that keeps editing outside the
+      // active story's scope re-mints this on every step against a cap of 1.
+      // Measured, same 120-step turn: 1 rendered, 119 `per-turn-cap:dropped`.
+      // The pending drift is deliberately NOT cleared when the gate closes —
+      // it is cleared only by a render, so the LATEST drift still carries into
+      // the next turn and renders there, exactly as it did when each step
+      // minted a finding for the composer to throw away.
+      if (state.scopeDriftPending && !composer.blockedBeforeBudget(sid, "scope-watchdog")) {
         const drift = state.scopeDriftPending
         findings.push(
           scopeWatchdogFinding({
@@ -1400,7 +1456,15 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
         )
       }
 
-      if (state.elevatePending) {
+      // FOUND BY THE SAME MEASUREMENT, not in the reported set: `elevate` has
+      // the identical shape and the WORST numbers of the five. `elevatePending`
+      // is re-armed by every execute -> elevate transition (T4), i.e. by every
+      // passing verifier, and `pinStore.get(sid)` is re-read to build the
+      // criteria replay each time. Measured over 96 edit/pass/fail cycles in
+      // one turn: 1 rendered, 284 `per-turn-cap:dropped`. Same gate, same
+      // guarantee — `elevatePending` is cleared by a render and by nothing
+      // else, so a still-pending elevate still renders at the next turn.
+      if (state.elevatePending && !composer.blockedBeforeBudget(sid, "elevate")) {
         findings.push(elevateFinding({ instanceId: nextInstanceId(state), criteria: pinStore.get(sid) }))
       }
 
@@ -1509,8 +1573,19 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
         // intake-scaffold directives rendered, 0 complied) could not be read
         // as "the model ignored us" precisely because this case was silent.
         // Now it is an event, so the next session's numbers are decidable.
+        //
+        // ONCE PER TURN, like its sibling `expect:absent` above. `text.complete`
+        // fires per assistant TEXT PART, and a model that writes an unreadable
+        // `CRITERIA:` line tends to repeat it in every part of the same reply:
+        // measured, 12 text parts in one turn -> 12 identical events. The event
+        // exists to make "did the model answer the scaffold?" decidable, and
+        // one record per turn answers that; twelve only inflate the
+        // denominator of every rate computed from this log.
         const keyLine = findCriteriaKeyLine(textOutput.text)
-        if (keyLine !== null) logger("criteria:parse-miss", { sessionID: sid, keyLine: keyLine.slice(0, 200) })
+        if (keyLine !== null && !state.criteriaParseMissLoggedThisTurn) {
+          state.criteriaParseMissLoggedThisTurn = true
+          logger("criteria:parse-miss", { sessionID: sid, keyLine: keyLine.slice(0, 200) })
+        }
       }
 
       const expect = parseExpectArtifact(textOutput.text)

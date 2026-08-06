@@ -111,26 +111,27 @@ export interface V2SessionState {
   // -- EXPECT artifact (FR-023) — expires at turn end.
   turnExpect: ExpectArtifact | null
   expectAbsentLoggedThisTurn: boolean
-
   /**
-   * B-2: the composer turn index the intake scaffold was last OFFERED for
-   * (`null` = never offered).
+   * B-2 follow-up: `criteria:parse-miss` has already been logged this turn.
    *
-   * Deliberately a TURN INDEX, not a boolean cleared by `resetTurnState`.
-   * The scaffold's producer runs inside `experimental.chat.system.transform`,
-   * which the host fires after EVERY tool result — one emission per agent-loop
-   * STEP. Measured: 179 `per-turn-cap:dropped` events in a single session, all
-   * `intake-scaffold`, i.e. the harness built the same finding ~180 times and
-   * the composer's cap of 1 threw away all but the first.
-   *
-   * A boolean would have re-introduced the bug from the other side, because
-   * `resetTurnState` is NOT on every turn boundary: `wiring/gate.ts`'s
-   * continuation path calls `composer.newTurn(sid)` alone. A continuation turn
-   * would then find the flag still spent and never re-offer the scaffold. The
-   * composer's index is the only value BOTH boundaries move, so comparing
-   * against it is correct on both paths and needs no reset at all.
+   * Exactly `expectAbsentLoggedThisTurn`'s job, for exactly its reason —
+   * `text.complete` fires once per assistant TEXT PART, and the unreadable
+   * `CRITERIA:` line that produces the event is typically repeated in every
+   * part of the same reply (measured: 12 parts -> 12 events). The sibling had
+   * this guard from the start; this one was written without it.
    */
-  intakeScaffoldOfferedForTurn: number | null
+  criteriaParseMissLoggedThisTurn: boolean
+
+  // NO `intakeScaffoldOfferedForTurn`. B-2 added it (a composer turn index
+  // stamped when the scaffold was OFFERED) and it could suppress the scaffold
+  // for a whole turn: the finding is `phase-guidance`, so an invocation whose
+  // 2-slot budget went to corrections dropped it AFTER the flag was spent, and
+  // no later step re-offered it. Wiring has no business tracking "did this
+  // render" at all — `InjectionComposer.blockedBeforeBudget` reads the
+  // composer's own per-turn spend, which moves on a render and on nothing
+  // else, and is correct on the `wiring/gate.ts` continuation path (which
+  // advances the composer's turn and never touches this struct) for the same
+  // reason B-2's turn index was.
 
   // -- Phase-entry / one-shot-per-turn pending findings (re-offered every
   //    `system.transform` invocation of the turn until the composer actually
@@ -204,7 +205,7 @@ export function freshSessionState(workspaceRoot: string): V2SessionState {
     multiStoryPending: false,
     turnExpect: null,
     expectAbsentLoggedThisTurn: false,
-    intakeScaffoldOfferedForTurn: null,
+    criteriaParseMissLoggedThisTurn: false,
     precommitmentPending: false,
     scopeDriftPending: null,
     anomalyPending: null,
@@ -230,6 +231,7 @@ export function freshSessionState(workspaceRoot: string): V2SessionState {
 export function resetTurnState(state: V2SessionState): void {
   state.turnExpect = null
   state.expectAbsentLoggedThisTurn = false
+  state.criteriaParseMissLoggedThisTurn = false
   state.precommitmentPending = false
   state.scopeDriftPending = null
   state.anomalyPending = null
@@ -275,11 +277,6 @@ export function resetTurnState(state: V2SessionState): void {
   // permanently stop enforcing unevidenced criteria after only 3 blocks in
   // its entire history instead of 3 per turn — safety-critical, not cosmetic.
   state.criteriaBlocks = 0
-  // B-2: `intakeScaffoldOfferedForTurn` is deliberately NOT reset here.
-  // It holds a composer turn INDEX, and the composer advances on this path
-  // (`chat.message`) AND on the gate-continuation path, which never calls
-  // this function. Clearing it here would be harmless on this path and
-  // useless on the other; comparing indices covers both.
   // needsCriteriaReinject deliberately NOT reset here — it must survive
   // until actually rendered (FR-014), and a compaction's synthetic
   // auto-continue message is itself a chat.message-shaped event in some
