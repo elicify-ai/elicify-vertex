@@ -67,6 +67,25 @@ else
   say "  ⚠ Agent file not found at $SOURCE_AGENT"
 fi
 
+# --- evict any previously resolved copy -----------------------------------
+# opencode does NOT load the package npm just installed. It resolves plugins
+# into its own cache and pins them, so a stale build keeps loading after an
+# upgrade — and it keeps TWO entries (`<pkg>` and `<pkg>@latest`), so an old
+# and a new copy can both be live at once.
+#
+# Measured: a user upgraded mid-session and ended up with two plugin instances
+# running against one session, each with its own plan and its own directive
+# counter, dispatching contradictory nudges seconds apart. Neither this script
+# nor the uninstaller touched that cache, so every upgrade risked it.
+#
+# Evicting here makes the next start re-resolve exactly what was installed.
+CACHE_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/opencode/packages"
+if [[ -d "$CACHE_ROOT/@elicify-ai" ]]; then
+  rm -rf "$CACHE_ROOT/@elicify-ai"
+  say ""
+  say "  ✓ evicted the previously resolved copy from opencode's plugin cache"
+fi
+
 # --- register plugin in opencode.json -------------------------------------
 say ""
 say "  Registering plugin in opencode.json..."

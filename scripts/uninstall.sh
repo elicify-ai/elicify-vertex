@@ -37,6 +37,16 @@ for file in \
   fi
 done
 
+# --- evict opencode's resolved copy ----------------------------------------
+# Removing the npm package is not enough: opencode loads from its own plugin
+# cache, so an uninstall that skips this leaves a fully working copy behind.
+CACHE_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/opencode/packages"
+if [[ -d "$CACHE_ROOT/@elicify-ai" ]]; then
+  rm -rf "$CACHE_ROOT/@elicify-ai"
+  echo "  ✓ evicted opencode's cached copy"
+  REMOVED=1
+fi
+
 # --- unregister plugin + commands from opencode.json -----------------------
 if [[ -f "$OPENCODE_JSON" ]]; then
   node -e "
