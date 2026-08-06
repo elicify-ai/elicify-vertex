@@ -735,3 +735,53 @@ evidence.
 The general span-pass fix measured whole-key leaks over 400 probes per
 encoding: base64-44 92 -> 0, hex-40 193 -> 0, but **base64-40 151 -> 1**. One
 case in that class still transmits. Recorded rather than rounded to zero.
+
+---
+
+# Round closed — 2026-08-06
+
+Two adversarial review gates ran over this round (7 reviewers, then 7 more on
+the fixes). Both found real defects in the previous pass's work. That is the
+headline result, and it is worth stating plainly: **every fix in the first wave
+over-corrected**, and the second wave introduced fewer but still-real problems
+of its own.
+
+## Closed
+
+| Item | Outcome (measured) |
+|---|---|
+| B-1 dosing removal | verifier takes the session model; spec retired, not deleted |
+| B-2 directive floods | verify-gap 117->0, scope-watchdog 119->0, pre-commitment 95->0, elevate 284->0 cap-drops |
+| B-3 diff evidence | non-repo probe, relative paths, per-line scan unit |
+| B-3a truncation | tail-keeping for chronological fields, cap 4000->16000 |
+| B-3b judge criteria | goal/stories/holds-up; exit codes are evidence, never criteria |
+| B-4 resolution | tier 3 widened + coverage equivalence + script-body safety |
+| B-6 star | nag loop deleted, read-only status tool, `gave-up` gone |
+| Audit loop | 8 subturns -> 3; `insufficient-evidence` no longer means permanent silence; transient outage recovers |
+| Redaction span | wrapped-key leaks 662/11856 -> 0; over-redaction 66 widened -> 0; worst case 1782ms -> 218ms |
+| Turn boundary | 5 -> 15 directives per 16 invocations (was frozen at turn 1 in the common case) |
+| Event registry | `V2_EVENT_TYPES` authoritative; 61 of 82 emitted names had been unregistered |
+
+## The recurring failure mode
+
+Seven vacuous tests were found and repaired across the two gates. Two were
+load-bearing: a cap test comparing `0 === 0` for its entire life because its
+helper read a mock the stub bypassed, and an integration test that PINNED a bug
+by using it as its staggering mechanism. A third — the anti-laundering clause at
+`gate.ts` — could be deleted with all 1843 tests and 54 UAT assertions still
+green.
+
+The lesson for the next round: a test that asserts a length, a count, or an
+absence is the shape most likely to be vacuous. Mutate it before trusting it.
+
+## Still open
+
+- **R-4** `relevanceGap` folded into `success` (plugin.ts): an imperfect
+  prescription is more punitive than no prescription at all. Needs its own
+  change with its own evidence.
+- **R-5** residual wrapped-key leaks: 12,532 -> 42 over 180,000 probes. 181 of
+  the surviving 223 also leak with the key on ONE line, i.e. the entropy floor,
+  not the span pass. Recorded rather than rounded to zero.
+- **FR-033** (`docs/vertex2-spec.md`) carries an abbreviated event list that
+  names no `criteria:*` type. Explicitly partial, not false; fold into a rev-4
+  amendment if the list is ever meant to be exhaustive.
