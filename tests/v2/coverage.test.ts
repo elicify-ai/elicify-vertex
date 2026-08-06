@@ -1006,13 +1006,14 @@ describe("FIX 1: one script, every package manager (the covering half)", () => {
     ["npm run check", "pnpm run check"],
     ["npm run check", "pnpm check"],
     ["npm run check", "yarn run check"],
-    ["npm run check", "yarn check"],
+    // `yarn run check` and NOT bare `yarn check` — see the YARN_CLASSIC block below.
+    ["npm run check", "yarn run check"],
     ["npm run check", "bun run check"],
     ["npm run check", "npm run-script check"],
     ["npm run check", "npm run check --silent"],
     ["npm run check", "npm --silent run check"],
     ["npm run check", "CI=1 pnpm run check 2>&1 | tail -5"],
-    ["npm run check", "cd . && yarn check"],
+    ["npm run check", "cd . && yarn run check"],
     ["npm run build", "yarn build"],
     ["npm run build", "pnpm build"],
     ["npm run typecheck", "bun run typecheck"],
@@ -1107,5 +1108,223 @@ describe("FIX 1: a workspace selector is one run spelled several ways", () => {
     expect(parseSubcommands(PRESCRIBED)).toEqual([
       { runner: "npm run check", targets: [], narrowing: ["-w=packages/api"], nonExecuting: false },
     ])
+  })
+})
+
+// ===========================================================================
+// FIX 3 (this wave) — REGRESSION. Moving the workspace selector's VALUE out of
+// `targets` (it names a package, not a file) silently retired the "all named
+// workspaces" requirement that `targetsCover` had been carrying by accident.
+// After it, `npm run check -w packages/api -w packages/web` — a command that
+// runs the script TWICE, in two packages — was covered by a run that entered
+// only one of them, in either spelling. Both were correctly false at base.
+// ===========================================================================
+
+describe("FIX 3: a multi-workspace prescription needs EVERY workspace to have run", () => {
+  const TWO = "npm run check -w packages/api -w packages/web"
+
+  it("KILLER — the `cd` spelling of ONE workspace is half the prescription", () => {
+    expect(observedCoversPrescribed(TWO, "cd packages/api && npm run check")).toBe(false)
+    expect(observedCoversPrescribed(TWO, "cd packages/web && pnpm check")).toBe(false)
+  })
+
+  it("KILLER — the selector spelling of ONE workspace is half the prescription", () => {
+    expect(observedCoversPrescribed(TWO, "npm run check -w packages/api")).toBe(false)
+    expect(observedCoversPrescribed(TWO, "npm run check --workspace packages/web")).toBe(false)
+  })
+
+  it("running BOTH covers it, in either spelling", () => {
+    expect(observedCoversPrescribed(TWO, "npm run check -w packages/api -w packages/web")).toBe(true)
+    expect(observedCoversPrescribed(TWO, "pnpm run check --workspace packages/web --workspace packages/api")).toBe(true)
+  })
+
+  it("three named, two run — still a gap", () => {
+    const THREE = "npm run check -w packages/api -w packages/web -w packages/cli"
+    expect(observedCoversPrescribed(THREE, "npm run check -w packages/api -w packages/web")).toBe(false)
+    expect(observedCoversPrescribed(THREE, "npm run check -w packages/api -w packages/web -w packages/cli")).toBe(true)
+  })
+
+  it("a SUPERSET of the named workspaces still covers (the starvation direction stays closed)", () => {
+    // Two workspaces asked for, three run: strictly more work, so it counts.
+    // Comparing the selector LISTS as strings refused this.
+    expect(observedCoversPrescribed(TWO, "npm run check -w packages/api -w packages/web -w packages/cli")).toBe(true)
+  })
+
+  it("...but a workspace-scoped run never covers an UNSCOPED prescription", () => {
+    expect(observedCoversPrescribed("npm run check", "npm run check -w packages/api")).toBe(false)
+    expect(observedCoversPrescribed("npm run check", "npm run check -w packages/api -w packages/web")).toBe(false)
+  })
+})
+
+// ===========================================================================
+// FIX 7 — the workspace guard was VACUOUS: deleting it left the whole suite
+// green while it is the only thing standing between a bare root script and a
+// receipt saying a workspace it never entered was verified.
+// ===========================================================================
+
+describe("FIX 7: the fail-closed workspace guard is load-bearing and now pinned", () => {
+  it("KILLER — a bare root run does not cover a workspace-scoped prescription THAT NAMES TARGETS", () => {
+    // The uncovered hole: with targets present both `cwd` guards fall through,
+    // `npm test` IS whole-suite-when-bare, and `targetsCover([], …)` says an
+    // empty observed target set covers everything. Only the workspace guard
+    // refuses. An npm workspace root's `test` script frequently does not
+    // recurse, so this receipt would assert `packages/api` was verified by a
+    // command that never entered it.
+    expect(observedCoversPrescribed("npm test -w packages/api src/a.test.ts", "npm test")).toBe(false)
+    expect(observedCoversPrescribed("npm run check -w packages/api src/a.ts", "pnpm check")).toBe(false)
+  })
+
+  it("...and the honest spellings of that same run still count", () => {
+    expect(observedCoversPrescribed("npm test -w packages/api src/a.test.ts", "npm test -w packages/api")).toBe(true)
+    expect(observedCoversPrescribed("npm test -w packages/api src/a.test.ts", "cd packages/api && npm test")).toBe(true)
+  })
+})
+
+// ===========================================================================
+// FIX 6 — `-w` is npm's package SELECTOR but pnpm's BOOLEAN workspace-root flag.
+// ===========================================================================
+
+describe("FIX 6: per-package-manager selector semantics", () => {
+  it("KILLER — `pnpm -w run check` is the root `check` script, not a workspace named `run`", () => {
+    expect(parseSubcommands("pnpm -w run check")).toEqual([
+      { runner: "pnpm run check", targets: [], narrowing: [], nonExecuting: false },
+    ])
+    expect(observedCoversPrescribed("npm run check", "pnpm -w run check")).toBe(true)
+  })
+
+  it("KILLER — `pnpm -w check` is the `check` script, not a workspace named `check`", () => {
+    expect(parseSubcommands("pnpm -w check")).toEqual([
+      { runner: "pnpm check", targets: [], narrowing: [], nonExecuting: false },
+    ])
+    expect(observedCoversPrescribed("npm run check", "pnpm -w check")).toBe(true)
+  })
+
+  it("`--workspace-root` and `-r` are the same kind of flag", () => {
+    expect(observedCoversPrescribed("npm run check", "pnpm --workspace-root run check")).toBe(true)
+    expect(observedCoversPrescribed("npm test", "pnpm -r run test")).toBe(true)
+  })
+
+  it("npm's `-w` is STILL a selector, wherever it appears in the command", () => {
+    expect(parseSubcommands("npm -w packages/api run check")).toEqual([
+      { runner: "npm run check", targets: [], narrowing: ["-w=packages/api"], nonExecuting: false },
+    ])
+    expect(observedCoversPrescribed("npm run check -w packages/api", "npm -w packages/api run check")).toBe(true)
+    expect(observedCoversPrescribed("npm run check", "npm -w packages/api run check")).toBe(false)
+  })
+
+  it("pnpm's boolean `-w` does not fabricate a workspace it never entered", () => {
+    expect(observedCoversPrescribed("npm run check -w packages/api", "pnpm -w run check")).toBe(false)
+  })
+
+  it("an UNRECOGNISED leading flag leaves the command parsing exactly as before", () => {
+    // New spellings degrade to the old behaviour, not to a guess.
+    expect(observedCoversPrescribed("npm run check", "pnpm --frobnicate run check")).toBe(false)
+  })
+})
+
+// ===========================================================================
+// Minor judgment calls flagged at sign-off
+// ===========================================================================
+
+describe("npm script names are CASE-SENSITIVE", () => {
+  it("KILLER — `npm run Check` is a different script from `npm run check`", () => {
+    // In a repo declaring only `check`, `npm run Check` exits with
+    // `npm ERR! Missing script`. Crediting it minted a receipt for a command
+    // that cannot run.
+    expect(observedCoversPrescribed("npm run check", "npm run Check")).toBe(false)
+    expect(observedCoversPrescribed("npm run Check", "npm run check")).toBe(false)
+    expect(observedCoversPrescribed("npm run check", "pnpm CHECK")).toBe(false)
+  })
+
+  it("...while PROGRAM words stay case-insensitive, which is what they are", () => {
+    expect(observedCoversPrescribed("go test ./...", "GO  TEST ./...")).toBe(true)
+    expect(observedCoversPrescribed("npm run check", "NPM RUN check")).toBe(true)
+  })
+})
+
+describe("`yarn check` is Yarn 1's integrity check, not the `check` script", () => {
+  it("KILLER — a node_modules audit is not the project's gate", () => {
+    expect(observedCoversPrescribed("npm run check", "yarn check")).toBe(false)
+    expect(observedCoversPrescribed("npm run check", "yarn autoclean")).toBe(false)
+  })
+
+  it("the unambiguous spelling still counts, and other yarn scripts are untouched", () => {
+    expect(observedCoversPrescribed("npm run check", "yarn run check")).toBe(true)
+    expect(observedCoversPrescribed("npm run build", "yarn build")).toBe(true)
+    expect(observedCoversPrescribed("npm run verify", "yarn verify")).toBe(true)
+  })
+})
+
+describe("constants that change real behaviour, previously unpinned (sign-off EXTRA B)", () => {
+  it("the alias table is keyed by SCRIPT IDENTITY, so `npm t` is `npm test`", () => {
+    // `ALIAS_GROUP_BY_RUNNER` canonicalises each alias as it is indexed. Without
+    // that, `npm t` normalises to `npm run t` at lookup time and finds nothing.
+    expect(observedCoversPrescribed("npm test", "npm t")).toBe(true)
+    expect(observedCoversPrescribed("npx vitest run tests/a.test.ts", "npm t")).toBe(true)
+    // ...and it is still only the whole-suite class, not any script.
+    expect(observedCoversPrescribed("npm run check", "npm t")).toBe(false)
+  })
+
+  it("regression fence — the discriminations sign-off confirmed, pinned so a widening cannot quietly take them", () => {
+    // Every widening in this module (script identity, selector spellings, pm
+    // flags, case handling) is one edit away from making two DIFFERENT runs one
+    // identity. These are the pairs that must stay separate, in both
+    // directions, and they were verified by hand at sign-off rather than by the
+    // suite — which is how a widening gets to break one without failing a test.
+    const SEPARATE: Array<[string, string]> = [
+      // Different scripts, including the `<name>` / `<name>:<variant>` shapes.
+      ["npm test", "npm run check"],
+      ["npm run build", "npm run build:prod"],
+      ["npm run test:unit", "npm test"],
+      ["npm test", "pnpm test:unit"],
+      ["npm run check", "npx vitest run"],
+      // Cross-ecosystem, and compiling is not testing.
+      ["npm test", "pytest"],
+      ["go test ./...", "npm test"],
+      ["cargo test", "npm test"],
+      ["go test ./...", "go build ./..."],
+      // A script NAME appearing as an argument is not that script running.
+      ["npm run vitest", "npx vitest"],
+      ["npm run vitest", "pnpm dlx vitest"],
+      ["npm run vitest", "yarn vitest run"],
+      ["npm run check", "npx vitest run check"],
+      ["npm run build", "npm test build"],
+      // `cd` spoofing, every shape: unrelated absolute, escape above the root,
+      // same basename elsewhere, character-prefix sibling, parent directory.
+      ["npm test", "cd /tmp/other && npm test"],
+      ["npm test", "cd .. && npm test"],
+      ["npm run check -w packages/api", "cd ../api && npm run check"],
+      ["npm run check -w packages/api", "cd packages/apix && npm run check"],
+      ["npm run check -w packages/api", "cd packages && npm run check"],
+    ]
+    for (const [prescribed, observed] of SEPARATE) {
+      expect(observedCoversPrescribed(prescribed, observed), `${prescribed} <- ${observed}`).toBe(false)
+      expect(observedCoversPrescribed(observed, prescribed), `${observed} <- ${prescribed}`).toBe(false)
+    }
+
+    // One-directional on purpose: a `cd` into a subdirectory re-expresses its
+    // targets from the repo root, so it must not cover the WIDER prescription
+    // (below) while the wider observed run does legitimately cover it (the
+    // partial order this module exists to express).
+    expect(observedCoversPrescribed("go test ./internal/...", "cd internal/calc && go test ./...")).toBe(false)
+    expect(observedCoversPrescribed("cd internal/calc && go test ./...", "go test ./internal/...")).toBe(true)
+  })
+
+  it("regression fence — a package manager's own subcommand is never the script of that name", () => {
+    for (const subcommand of [
+      "ci", "install", "add", "publish", "pack", "audit", "link", "exec", "dlx",
+      "create", "init", "config", "cache", "why", "prune",
+    ]) {
+      expect(observedCoversPrescribed(`npm run ${subcommand}`, `npm ${subcommand}`), subcommand).toBe(false)
+      expect(observedCoversPrescribed(`npm run ${subcommand}`, `pnpm ${subcommand}`), subcommand).toBe(false)
+    }
+  })
+
+  it("a workspace selector's value is normalised, so `./packages/api/` is `packages/api`", () => {
+    expect(observedCoversPrescribed("npm run check -w ./packages/api/", "cd packages/api && npm run check")).toBe(true)
+    expect(observedCoversPrescribed("npm run check -w ./packages/api/", "npm run check -w packages/api")).toBe(true)
+    expect(observedCoversPrescribed("npm run check -w packages/api", "npm run check -w ./packages/api/")).toBe(true)
+    // Normalisation only makes two spellings of ONE directory agree.
+    expect(observedCoversPrescribed("npm run check -w ./packages/api/", "npm run check -w packages/web")).toBe(false)
   })
 })

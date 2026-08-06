@@ -4,7 +4,7 @@ import { join } from "node:path"
 import { afterEach, describe, expect, it } from "vitest"
 import { observedCoversPrescribed } from "../../src/v2/coverage.js"
 import type { Manifest, ResolveContext, ResolveDeps } from "../../src/v2/resolve.js"
-import { classifyPathEcosystem, resolveVerifier } from "../../src/v2/resolve.js"
+import { classifyPathEcosystem, isUnsafeScriptBody, resolveVerifier } from "../../src/v2/resolve.js"
 import { buildManifest } from "../../src/v2/wiring/manifest.js"
 
 /** Helper: build ResolveDeps from a fixed manifest (or null). */
@@ -186,15 +186,26 @@ describe("Dataset: Narrowest-verifier resolution (fixture layout, all 10 rows)",
     expect(result.rationale).toBe("fallback:package-script")
   })
 
-  it("row 10: outside-worktree exclusion — caller has already filtered the path out, changedPaths arrives empty", () => {
-    // ResolveContext.changedPaths is documented as "already filtered to inside the
-    // worktree by the caller" — `../outside/x.ts` never reaches resolveVerifier. This
-    // test asserts the function behaves correctly given that already-filtered
-    // (in this case empty) list: it must never fabricate a command for paths it never
-    // saw, and must degrade cleanly to none so the caller can log resolution:none and
-    // exclude the path from `Observed:`.
-    const result = resolveVerifier(ctx([]), deps({ scripts: { test: "vitest run" } }))
+  it("row 10: outside-worktree exclusion — the path is EXCLUDED here, and nothing is prescribed for it", () => {
+    // This row used to be asserted by handing the resolver an EMPTY path list:
+    // empty in, none out, which is equally true of a function that does nothing
+    // at all — it could not fail. Row 10 is about a path that IS supplied and
+    // lies outside the worktree, which is the case the caller never filters
+    // (`ResolveContext.changedPaths`) and which `isInsideAnyRoot` enforces here.
+    const result = resolveVerifier(
+      ctx(["/home/dev/other-repo/src/x.ts"]),
+      deps({ scripts: { test: "vitest run" }, workspaceRoot: "/work/monorepo" }),
+    )
     expect(result).toEqual({ command: null, rationale: "none", matchedPaths: [] })
+
+    // ...and the same path INSIDE the root does resolve, so the assertion above
+    // is about the bound and not about the manifest being unusable.
+    const inside = resolveVerifier(
+      ctx(["/work/monorepo/src/x.ts"]),
+      deps({ scripts: { test: "vitest run" }, workspaceRoot: "/work/monorepo" }),
+    )
+    expect(inside.command).toBe("npm test")
+    expect(inside.matchedPaths).toEqual(["src/x.ts"])
   })
 })
 
@@ -841,7 +852,7 @@ describe("FIX 1: a widened prescription is coverable by the run a real repo make
   it("THE FIELD CASE — `{check, dev}`, and the repo is a pnpm repo", () => {
     const prescribed = prescribeFor({ check: "tsc --noEmit && eslint .", dev: "vite" })
     expect(prescribed).toBe("npm run check")
-    for (const observed of ["pnpm check", "pnpm run check", "yarn check", "bun run check", "npm run check -s"]) {
+    for (const observed of ["pnpm check", "pnpm run check", "yarn run check", "bun run check", "npm run check -s"]) {
       expect(observedCoversPrescribed(prescribed, observed), observed).toBe(true)
     }
   })
@@ -1014,9 +1025,21 @@ describe("FIX 3: a script that mutates the workspace is never prescribed", () =>
     ["a build that cleans its own output", "rm -rf dist && tsc -p ."],
     ["a build that cleans a glob under dist", "rm -rf dist/* && tsc -p ."],
     ["a build that copies into dist", "tsc -p . && cp scripts/plugin.cjs dist/plugin.cjs"],
-    ["an aggregate of safe parts", "npm run lint && npm run typecheck"],
   ])("still prescribes a `check` that is %s (discrimination)", (_label, body) => {
     const result = resolveVerifier(ctx(["src/misc.ts"]), deps({ scripts: { check: body } }))
+    expect(result.command).toBe("npm run check")
+  })
+
+  it("still prescribes an aggregate whose PARTS are all safe (discrimination, transitively)", () => {
+    // Was `{check: "npm run lint && npm run typecheck"}` with neither part
+    // declared, i.e. two unresolvable references. Since FIX 1 chases references,
+    // the fixture has to be a real package.json for the assertion to mean
+    // anything — and now it proves the walk ACCEPTS a safe chain, not just that
+    // it rejects an unsafe one.
+    const result = resolveVerifier(
+      ctx(["src/misc.ts"]),
+      deps({ scripts: { check: "npm run lint && npm run typecheck", lint: "eslint .", typecheck: "tsc --noEmit" } }),
+    )
     expect(result.command).toBe("npm run check")
   })
 
@@ -1081,10 +1104,29 @@ describe("FIX 4: the worktree bound is enforced here, not assumed of the caller"
     expect(result.matchedPaths).toEqual(["src/a.ts"])
   })
 
-  it("story verifiers do not rescue an outside-only change either", () => {
+  it("REGRESSION — a story's OWN verifiers survive the bound; only INFERENCE is bounded", () => {
+    // The previous wave put the filter ahead of tier 1, so a turn whose every
+    // changed path arrived absolute-and-outside threw away the plan's declared
+    // verifiers and degraded to `resolution:none` — swapping the strongest
+    // prescription this module has for the weakest. The bound exists to stop an
+    // outside path being INFERRED into a command; a declared verifier is not
+    // inferred from anything.
     const result = resolveVerifier(
       ctx(["/home/dev/other/x.ts"], ["npm test"]),
       deps({ scripts: {}, workspaceRoot: "/work/monorepo" }),
+    )
+    expect(result.command).toBe("npm test")
+    expect(result.rationale).toBe("story")
+    // ...and the bound still governs what is REPORTED as covered.
+    expect(result.matchedPaths).toEqual([])
+  })
+
+  it("...while INFERENCE from the same outside path is still refused", () => {
+    // The other half of the same assertion: with no story to defer to, the
+    // outside path resolves to nothing at all.
+    const result = resolveVerifier(
+      ctx(["/home/dev/other/x.ts"]),
+      deps({ scripts: { test: "vitest run" }, workspaceRoot: "/work/monorepo" }),
     )
     expect(result).toEqual({ command: null, rationale: "none", matchedPaths: [] })
   })
@@ -1218,9 +1260,10 @@ describe("E2E (real temp repo): the prescription a repo gets is one its agent ca
       "npm run check",
       "pnpm check",
       "pnpm run check",
-      "yarn check",
+      "yarn run check",
       "bun run check",
       "npm run check --silent",
+      "pnpm -w run check",
       "pnpm check 2>&1 | tail -20",
     ]) {
       expect(observedCoversPrescribed(prescribed!, observed, root), observed).toBe(true)
@@ -1298,5 +1341,389 @@ describe("E2E (real temp repo): the prescription a repo gets is one its agent ca
       { readManifest: () => manifest },
     )
     expect(result).toEqual({ command: null, rationale: "none", matchedPaths: [] })
+  })
+})
+
+// ===========================================================================
+// FIX 1 (this wave) — the write-back control was bypassed by ONE hop.
+//
+// `preferredScript` inspected only the NAMED script's own body, and the
+// commonest aggregate-script shape in the wild puts the dangerous half one
+// reference away. The harness prescribed `npm run check` for
+// `{check: "npm run lint:fix && vitest run", "lint:fix": "eslint --fix ."}`,
+// i.e. it told the agent to rewrite the user's tree as a verification step —
+// the exact instruction the control exists to never give.
+// ===========================================================================
+
+/** The command a repo with exactly these scripts is prescribed for a plain source change. */
+function prescribeFor(scripts: Record<string, string>): string | null {
+  return resolveVerifier(ctx(["src/misc.ts"]), deps({ scripts })).command
+}
+
+describe("FIX 1: script references are resolved transitively", () => {
+  it("KILLER — `check` is clean, the script it calls rewrites the tree", () => {
+    expect(prescribeFor({ check: "npm run lint:fix && vitest run", "lint:fix": "eslint --fix ." })).toBeNull()
+  })
+
+  it("KILLER — and the fall-through still finds the next SAFE preference", () => {
+    expect(
+      prescribeFor({
+        check: "npm run lint:fix && vitest run",
+        "lint:fix": "eslint --fix .",
+        build: "tsc -p .",
+      }),
+    ).toBe("npm run build")
+  })
+
+  it.each([
+    ["npm run", "npm run fixit"],
+    ["pnpm run", "pnpm run fixit"],
+    ["yarn run", "yarn run fixit"],
+    ["bun run", "bun run fixit"],
+    ["a bare `<pm> <script>`", "pnpm fixit"],
+    ["a pnpm workspace-root run", "pnpm -w run fixit"],
+    ["npm-run-all", "npm-run-all fixit"],
+    ["npm-run-all2", "npm-run-all2 fixit"],
+    ["run-s", "run-s fixit"],
+    ["run-p", "run-p fixit"],
+    ["run-series", "run-series fixit"],
+    ["run-parallel", "run-parallel fixit"],
+    ["npm-run-all with flags", "npm-run-all -p -c fixit"],
+    ["a reference in the SECOND segment", "tsc --noEmit && run-s fixit"],
+  ])("follows %s to the script that writes back", (_label, body) => {
+    expect(prescribeFor({ check: body, fixit: "eslint --fix ." })).toBeNull()
+    // ...and the same shape pointing at a SAFE script is still prescribed, so
+    // the assertion above is about the reference and not about the spelling.
+    expect(prescribeFor({ check: body, fixit: "tsc --noEmit" })).toBe("npm run check")
+  })
+
+  it("expands an `npm-run-all` glob against the manifest's own keys", () => {
+    expect(prescribeFor({ check: "npm-run-all lint:*", "lint:js": "eslint --fix ." })).toBeNull()
+    expect(prescribeFor({ check: "npm-run-all lint:*", "lint:js": "eslint ." })).toBe("npm run check")
+    // A glob matching NOTHING is a reference that cannot be resolved.
+    expect(prescribeFor({ check: "npm-run-all lint:*" })).toBeNull()
+  })
+
+  it("an UNRESOLVABLE reference is unknown, and unknown is unsafe", () => {
+    expect(prescribeFor({ check: "npm run lint && vitest run" })).toBeNull()
+  })
+
+  it("a package manager's own SUBCOMMAND is not an unresolvable script", () => {
+    // `npm ci` is not `scripts.ci`; refusing it as "unknown" would be a false
+    // positive on an extremely ordinary body.
+    expect(prescribeFor({ check: "npm ci && vitest run" })).toBe("npm run check")
+  })
+
+  it("DEPTH — a chain 8 references deep is still inspected, and 9 is refused as pathological", () => {
+    const chain = (length: number, tail: string): Record<string, string> => {
+      const scripts: Record<string, string> = { check: "npm run s1" }
+      for (let index = 1; index < length; index++) scripts[`s${index}`] = `npm run s${index + 1}`
+      scripts[`s${length}`] = tail
+      return scripts
+    }
+    // 8 hops, all safe -> prescribed. 8 hops ending in a write-back -> refused,
+    // which is the half that proves the walk actually reached the bottom.
+    expect(prescribeFor(chain(8, "tsc --noEmit"))).toBe("npm run check")
+    expect(prescribeFor(chain(8, "eslint --fix ."))).toBeNull()
+    // 9 hops is past the bound: unknown, therefore unsafe, even though the
+    // bottom of this particular chain is harmless.
+    expect(prescribeFor(chain(9, "tsc --noEmit"))).toBeNull()
+  })
+
+  it("a CYCLE is unsafe on its own merits — running it never returns", () => {
+    expect(prescribeFor({ check: "npm run a", a: "npm run check" })).toBeNull()
+    expect(prescribeFor({ check: "npm run a", a: "npm run b", b: "npm run a" })).toBeNull()
+  })
+
+  it("a DIAMOND is not exponential and is still judged on its parts", () => {
+    expect(
+      prescribeFor({ check: "run-s left right", left: "npm run leaf", right: "npm run leaf", leaf: "tsc --noEmit" }),
+    ).toBe("npm run check")
+    expect(
+      prescribeFor({
+        check: "run-s left right",
+        left: "npm run leaf",
+        right: "npm run leaf",
+        leaf: "prettier --write .",
+      }),
+    ).toBeNull()
+  })
+})
+
+describe("FIX 1: a script that shells out to an opaque FILE is unknown, not safe", () => {
+  it.each([
+    ["bash", "bash scripts/fix-all"],
+    ["sh", "sh scripts/fix-all"],
+    ["zsh", "zsh scripts/fix-all"],
+    ["dash", "dash scripts/fix-all"],
+    ["ksh", "ksh scripts/fix-all"],
+    ["fish", "fish scripts/fix-all"],
+    ["a `.sh` entry point", "scripts/ci.sh"],
+    ["an executable relative path", "./scripts/ci"],
+    ["an executable parent path", "../scripts/ci"],
+    ["an absolute path", "/opt/ci/run"],
+  ])("refuses to prescribe a `check` that runs %s", (_label, body) => {
+    expect(prescribeFor({ check: body })).toBeNull()
+  })
+
+  it("...but an INLINE `bash -c` command is fully visible and is judged on its text", () => {
+    expect(prescribeFor({ check: 'bash -c "eslint ."' })).toBe("npm run check")
+    expect(prescribeFor({ check: 'bash -lc "eslint ."' })).toBe("npm run check")
+    expect(prescribeFor({ check: 'bash -c "eslint --fix ."' })).toBeNull()
+  })
+
+  it("...and a spelled-out node_modules binary is a program, not a project script", () => {
+    expect(prescribeFor({ check: "./node_modules/.bin/vitest run" })).toBe("npm run check")
+  })
+
+  it("WHERE THE LINE IS — an interpreter running a program file is NOT opaque", () => {
+    // Refusing every `node scripts/x.mjs` would refuse this repo's own
+    // `node scripts/uat-harness.mjs` and re-open the `resolution:none`
+    // starvation that widening tier 3 exists to fix. A SHELL script is
+    // different in kind: running other commands is its entire job.
+    expect(prescribeFor({ check: "node scripts/verify.mjs" })).toBe("npm run check")
+    expect(prescribeFor({ check: "python scripts/check.py" })).toBe("npm run check")
+  })
+})
+
+// ===========================================================================
+// FIX 2 — write-back spellings the detector missed, and one it got backwards.
+// ===========================================================================
+
+describe("FIX 2: the write-back detector is tool-aware", () => {
+  it.each([
+    ["prettier's `-w` shorthand", "prettier -w ."],
+    ["prettier's `-w` behind npx", "npx prettier -w src"],
+    ["biome's --apply", "biome check --apply"],
+    ["biome's --apply-unsafe", "biome check --apply-unsafe"],
+    ["biome's --unsafe-apply", "biome check --unsafe-apply"],
+    ["jest's -u", "jest -u"],
+    ["jest --updateSnapshot", "jest --updateSnapshot"],
+    ["vitest run -u", "vitest run -u"],
+    ["vitest --update", "vitest run --update"],
+    ["ava -u", "ava -u"],
+    ["cargo insta --accept", "cargo insta --accept"],
+    ["--update-snapshot", "vitest run --update-snapshot"],
+    ["--updateSnapshots", "vitest run --updateSnapshots"],
+    ["--update-snapshots", "vitest run --update-snapshots"],
+    ["--snapshot-update", "pytest --snapshot-update"],
+    ["--in-place", "taplo format --in-place"],
+    ["eslint --fix", "eslint --fix ."],
+    ["prettier --write", "prettier --write ."],
+    ["sed -i", "sed -i s/a/b/ src/x.ts"],
+    ["sed -ri", "sed -ri s/a/b/ src/x.ts"],
+    ["perl -pi", "perl -pi -e s/a/b/ src/x.ts"],
+  ])("refuses a `check` that rewrites via %s", (_label, body) => {
+    expect(isUnsafeScriptBody(body)).toBe(true)
+    expect(prescribeFor({ check: body })).toBeNull()
+  })
+
+  it("KILLER — `-l` is LINE LENGTH for black/isort/rustfmt, not `--list-different`", () => {
+    // Listing `-l` as a read-only format flag made every one of these score
+    // SAFE while rewriting every file it touched.
+    for (const body of ["black -l 100 .", "isort -l 100 .", "cargo fmt -l", "rustfmt -l 100 src/lib.rs"]) {
+      expect(isUnsafeScriptBody(body), body).toBe(true)
+    }
+  })
+
+  it("`-w` and `-u` stay harmless for the tools where they mean something else", () => {
+    // `-w` is jest/vitest's worker count and npm's workspace selector; `-u` is
+    // nothing in particular outside a snapshot runner. Over-refusal here is how
+    // `resolution:none` starvation comes back.
+    for (const body of ["jest -w 4", "vitest run -w 2", "tsc --noEmit -u"]) {
+      expect(isUnsafeScriptBody(body), body).toBe(false)
+    }
+  })
+
+  it.each([
+    ["black", "black ."],
+    ["isort", "isort ."],
+    ["rustfmt", "rustfmt src/lib.rs"],
+    ["autopep8", "autopep8 src/x.py"],
+    ["yapf", "yapf src/x.py"],
+    ["gofmt", "gofmt src/x.go"],
+    ["ruff format", "ruff format ."],
+    ["dprint fmt", "dprint fmt"],
+    ["cargo fmt", "cargo fmt"],
+    ["go fmt", "go fmt ./..."],
+  ])("%s rewrites by default and is refused", (_label, body) => {
+    expect(isUnsafeScriptBody(body)).toBe(true)
+  })
+
+  it.each([["--check"], ["--check-only"], ["--diff"], ["--dry-run"], ["--list-different"]])(
+    "%s turns a default-writing formatter back into a reporter",
+    (flag) => {
+      // The read-only table is deliberately tool-agnostic (a formatter added to
+      // the table later inherits it), so each entry is pinned the same way.
+      expect(isUnsafeScriptBody(`black ${flag} .`)).toBe(false)
+    },
+  )
+})
+
+// ===========================================================================
+// FIX 5 — the effectful-command check matched SUBSTRINGS OF ARGUMENTS, so
+// perfectly ordinary test invocations were refused and the repo fell back to
+// reciting a category list.
+// ===========================================================================
+
+describe("FIX 5: effectful COMMANDS are refused, arguments that merely contain the word are not", () => {
+  it.each([
+    ["a test file named after publishing", "vitest run src/publish.test.ts"],
+    ["a vitest project named release", "vitest run --project release"],
+    ["a jest pattern naming deploy", "jest --testPathPattern 'deploy'"],
+    ["a pytest expression excluding release", "python -m pytest -k 'not release'"],
+    ["a node script named verify-release", "node scripts/verify-release.mjs"],
+    ["a deselecting pytest marker", "pytest -m 'not upload'"],
+    ["a test directory named deploy", "vitest run tests/deploy"],
+  ])("still prescribes %s", (_label, body) => {
+    expect(isUnsafeScriptBody(body)).toBe(false)
+    expect(prescribeFor({ check: body })).toBe("npm run check")
+  })
+
+  it.each([
+    ["deploy", "fly deploy"],
+    ["publish", "wrangler publish"],
+    ["release", "gh release create"],
+    ["upload", "twine upload dist/x"],
+    ["push", "docker push myimage"],
+    ["semantic-release", "semantic-release"],
+    ["deploy behind npx", "npx wrangler deploy"],
+    ["deploy in the second segment", "tsc --noEmit && fly deploy"],
+  ])("refuses the effectful command word %s", (_label, body) => {
+    expect(isUnsafeScriptBody(body)).toBe(true)
+  })
+
+  it.each([
+    "commit",
+    "push",
+    "add",
+    "checkout",
+    "switch",
+    "reset",
+    "clean",
+    "rebase",
+    "merge",
+    "tag",
+    "stash",
+  ])("refuses `git %s`", (subcommand) => {
+    expect(isUnsafeScriptBody(`tsc --noEmit && git ${subcommand} .`)).toBe(true)
+    // A READ-ONLY git subcommand is not refused, so the assertion above is
+    // about the subcommand and not about the word "git".
+    expect(isUnsafeScriptBody("tsc --noEmit && git status")).toBe(false)
+  })
+})
+
+describe("never-exiting shapes (each blocklist entry pinned)", () => {
+  it.each([["--watch"], ["--watchAll"], ["--watch-all"], ["--hot"]])("%s never returns", (flag) => {
+    expect(isUnsafeScriptBody(`vitest run ${flag}`)).toBe(true)
+  })
+
+  it("`--watch=false` is the CI spelling and exits like anything else", () => {
+    expect(isUnsafeScriptBody("vitest --watch=false")).toBe(false)
+  })
+
+  it.each([
+    "nodemon src/index.js",
+    "watchexec tsc",
+    "http-server dist",
+    "live-server dist",
+    "serve dist",
+    "vite dev",
+    "vite serve",
+    "webpack dev",
+    "webpack serve",
+    "snowpack dev",
+    "snowpack serve",
+    "next dev",
+    "nuxt dev",
+    "astro dev",
+    "remix dev",
+    "gatsby dev",
+  ])("`%s` starts a long-running process", (body) => {
+    expect(isUnsafeScriptBody(body)).toBe(true)
+  })
+})
+
+describe("`rm` operands (each generated-location entry pinned)", () => {
+  it.each([
+    "dist",
+    "build",
+    "out",
+    "output",
+    "es",
+    "esm",
+    "cjs",
+    "coverage",
+    "target",
+    "tmp",
+    "temp",
+    "node_modules",
+    ".next",
+    ".nuxt",
+    ".turbo",
+    ".cache",
+    ".svelte-kit",
+    ".parcel-cache",
+    ".vite",
+    ".output",
+  ])("a build may clean `%s`", (dir) => {
+    expect(isUnsafeScriptBody(`rm -rf ${dir} && tsc --noEmit`)).toBe(false)
+    expect(isUnsafeScriptBody(`rm -rf ./${dir}/inner && tsc --noEmit`)).toBe(false)
+  })
+
+  it("a build may clean its own .tsbuildinfo", () => {
+    expect(isUnsafeScriptBody("rm -f tsconfig.tsbuildinfo && tsc --noEmit")).toBe(false)
+  })
+
+  it("KILLER — `lib/` is SOURCE in a large share of packages and is no longer a free target", () => {
+    // Listing `lib` as a generated location had the harness prescribe a script
+    // that deletes the user's source. A false positive costs one prescription;
+    // this false negative costs the tree.
+    expect(isUnsafeScriptBody("rm -rf lib && tsc -p .")).toBe(true)
+    expect(isUnsafeScriptBody("rm -rf libs && tsc -p .")).toBe(true)
+  })
+
+  it.each([
+    ["rm", "rm -rf src && tsc"],
+    ["rmdir", "rmdir src && tsc"],
+    ["rimraf", "rimraf src && tsc"],
+    ["npx rimraf", "npx rimraf src && tsc"],
+    ["shx rm (via the inner rm)", "shx rm -rf src && tsc"],
+  ])("%s outside a generated location is refused", (_label, body) => {
+    expect(isUnsafeScriptBody(body)).toBe(true)
+  })
+
+  it("...and the same wrappers cleaning a GENERATED location are still prescribed", () => {
+    expect(isUnsafeScriptBody("shx rm -rf dist && tsc --noEmit")).toBe(false)
+    expect(isUnsafeScriptBody("npx rimraf dist && tsc --noEmit")).toBe(false)
+  })
+})
+
+describe("SCRIPT_QUALITY: which names outrank `nearest manifest wins` (sign-off EXTRA B)", () => {
+  it.each([["test", "npm test"], ["check", "npm run check"], ["verify", "npm run verify"]])(
+    "a root `%s` beats a nested `build`",
+    (name, expected) => {
+      // Quality 0 (runs the project's own assertions) overrules nearest-wins;
+      // drop the entry and the nested static-only script takes the prescription.
+      const result = resolveVerifier(
+        ctx(["packages/api/src/h.ts"]),
+        deps({
+          scripts: { [name]: "vitest run" },
+          workspaces: [{ root: "packages/api", scripts: { build: "tsc -p ." } }],
+        }),
+      )
+      expect(result.command).toBe(expected)
+    },
+  )
+
+  it("...while at EQUAL quality the nearest manifest still wins", () => {
+    const result = resolveVerifier(
+      ctx(["packages/api/src/h.ts"]),
+      deps({
+        scripts: { test: "vitest run" },
+        workspaces: [{ root: "packages/api", scripts: { test: "vitest run" } }],
+      }),
+    )
+    expect(result.command).toBe("npm test -w packages/api")
   })
 })
