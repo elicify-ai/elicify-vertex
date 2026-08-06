@@ -1,7 +1,11 @@
-import { describe, expect, it } from "vitest"
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { afterEach, describe, expect, it } from "vitest"
 import { observedCoversPrescribed } from "../../src/v2/coverage.js"
 import type { Manifest, ResolveContext, ResolveDeps } from "../../src/v2/resolve.js"
 import { classifyPathEcosystem, resolveVerifier } from "../../src/v2/resolve.js"
+import { buildManifest } from "../../src/v2/wiring/manifest.js"
 
 /** Helper: build ResolveDeps from a fixed manifest (or null). */
 function deps(manifest: Manifest | null): ResolveDeps {
@@ -792,12 +796,15 @@ describe("B-4 (c): ABSOLUTE changed paths are relativised against manifest.works
     expect(result.matchedPaths).toEqual(["src/x.ts"])
   })
 
-  it("a path OUTSIDE the workspace root is left absolute — never silently rebased into the repo", () => {
+  it("a path OUTSIDE the workspace root is never silently rebased into the repo", () => {
+    // FIX 4 strengthened this from "left absolute" to "excluded entirely": a
+    // file in another repo is not this session's business, and leaving it in the
+    // set kept it reachable by the marker heuristic below.
     const result = resolveVerifier(
       ctx(["/tmp/elsewhere/x.ts"]),
       deps({ scripts: { test: "vitest run" }, workspaceRoot: "/work/app" }),
     )
-    expect(result.matchedPaths).toEqual(["/tmp/elsewhere/x.ts"])
+    expect(result).toEqual({ command: null, rationale: "none", matchedPaths: [] })
   })
 
   it("the workspace root itself is never reduced to an empty path", () => {
@@ -811,6 +818,322 @@ describe("B-4 (c): ABSOLUTE changed paths are relativised against manifest.works
   it("a manifest with no workspaceRoot is unchanged (unit-test and null-manifest callers)", () => {
     const result = resolveVerifier(ctx(["src/misc.ts"]), deps({ scripts: { test: "vitest run" } }))
     expect(result.matchedPaths).toEqual(["src/misc.ts"])
+  })
+})
+
+// ===========================================================================
+// FIX 1 — the prescription B-4 (a) unlocked was uncoverable in any repo that
+// does not use npm. `resolve.ts` emits `npm run <script>` unconditionally
+// (nothing in the manifest says which package manager the repo uses), and
+// `coverage.ts` matched it only byte-identically, so `pnpm check` against a
+// prescribed `npm run check` was a relevance gap — which `plugin.ts` folds into
+// `success`, recording a passing verification as FAILED and minting no receipt.
+// Before B-4 the same run minted one, because tier 3 returned null.
+// ===========================================================================
+
+describe("FIX 1: a widened prescription is coverable by the run a real repo makes", () => {
+  function prescribeFor(scripts: Record<string, string>): string {
+    const command = resolveVerifier(ctx(["src/games/memory.js"]), deps({ scripts })).command
+    expect(command).not.toBeNull()
+    return command!
+  }
+
+  it("THE FIELD CASE — `{check, dev}`, and the repo is a pnpm repo", () => {
+    const prescribed = prescribeFor({ check: "tsc --noEmit && eslint .", dev: "vite" })
+    expect(prescribed).toBe("npm run check")
+    for (const observed of ["pnpm check", "pnpm run check", "yarn check", "bun run check", "npm run check -s"]) {
+      expect(observedCoversPrescribed(prescribed, observed), observed).toBe(true)
+    }
+  })
+
+  it("the same holds for every widened script name, not just `check`", () => {
+    expect(observedCoversPrescribed(prescribeFor({ build: "tsc" }), "pnpm build")).toBe(true)
+    expect(observedCoversPrescribed(prescribeFor({ typecheck: "tsc --noEmit" }), "yarn typecheck")).toBe(true)
+    expect(observedCoversPrescribed(prescribeFor({ verify: "make verify" }), "bun run verify")).toBe(true)
+  })
+
+  it("and the widening did NOT make a different script count (resolve<->coverage pairing intact)", () => {
+    const prescribed = prescribeFor({ check: "tsc --noEmit", build: "tsc" })
+    expect(observedCoversPrescribed(prescribed, "npm run build")).toBe(false)
+    expect(observedCoversPrescribed(prescribed, "pnpm build")).toBe(false)
+    expect(observedCoversPrescribed(prescribed, "npm test")).toBe(false)
+    expect(observedCoversPrescribed(prescribed, "npm ci")).toBe(false)
+  })
+
+  it("a workspace-scoped prescription is covered by the `cd` spelling of the same run", () => {
+    const prescribed = resolveVerifier(
+      ctx(["packages/api/src/h.ts"]),
+      deps({ scripts: {}, workspaces: [{ root: "packages/api", scripts: { check: "tsc --noEmit" } }] }),
+    ).command!
+    expect(prescribed).toBe("npm run check -w packages/api")
+    expect(observedCoversPrescribed(prescribed, "cd packages/api && pnpm check")).toBe(true)
+    // ...and a root-level run of the same script still does not count.
+    expect(observedCoversPrescribed(prescribed, "npm run check")).toBe(false)
+  })
+})
+
+// ===========================================================================
+// FIX 2 — precedence. `resolvePackageScript` picked the WORKSPACE first and the
+// script second, so a nested package's weakest script beat the root's strongest.
+// ===========================================================================
+
+describe("FIX 2: cross-manifest script QUALITY breaks the nearest-manifest tie", () => {
+  it("REGRESSION — a nested `build` no longer beats the root's `test`", () => {
+    const result = resolveVerifier(
+      ctx(["packages/api/src/h.ts"]),
+      deps({
+        scripts: { test: "vitest run" },
+        workspaces: [{ root: "packages/api", scripts: { build: "tsc -p ." } }],
+      }),
+    )
+    // Pre-B-4 this repo prescribed `npm test`; B-4 downgraded it to
+    // `npm run build -w packages/api`, which a root `npm test` cannot cover.
+    expect(result.command).toBe("npm test")
+    expect(observedCoversPrescribed(result.command!, "npm test")).toBe(true)
+  })
+
+  it.each([
+    ["lint", { lint: "eslint ." }],
+    ["typecheck", { typecheck: "tsc --noEmit" }],
+    ["build", { build: "tsc -p ." }],
+  ])("a nested `%s` (static-only) loses to a root `test`", (_name, nested) => {
+    const result = resolveVerifier(
+      ctx(["packages/api/src/h.ts"]),
+      deps({ scripts: { test: "vitest run" }, workspaces: [{ root: "packages/api", scripts: nested }] }),
+    )
+    expect(result.command).toBe("npm test")
+  })
+
+  it("a root `check` also outranks a nested static-only script", () => {
+    const result = resolveVerifier(
+      ctx(["packages/api/src/h.ts"]),
+      deps({
+        scripts: { check: "tsc --noEmit && vitest run" },
+        workspaces: [{ root: "packages/api", scripts: { lint: "eslint ." } }],
+      }),
+    )
+    expect(result.command).toBe("npm run check")
+  })
+
+  it("NEAREST STILL WINS at equal quality — dataset row 9 and B-4's nested `check` are unchanged", () => {
+    const rowNine = resolveVerifier(
+      ctx(["packages/api/src/h.ts"]),
+      deps({
+        scripts: { test: "vitest run" },
+        workspaces: [{ root: "packages/api", scripts: { test: "vitest run" } }],
+      }),
+    )
+    expect(rowNine.command).toBe("npm test -w packages/api")
+
+    const nestedCheck = resolveVerifier(
+      ctx(["packages/api/src/h.ts"]),
+      deps({
+        scripts: { test: "vitest run" },
+        workspaces: [{ root: "packages/api", scripts: { check: "tsc --noEmit" } }],
+      }),
+    )
+    expect(nestedCheck.command).toBe("npm run check -w packages/api")
+  })
+
+  it("nearest still wins between two static-only scripts (quality is a tie-break, not an override)", () => {
+    const result = resolveVerifier(
+      ctx(["packages/api/src/h.ts"]),
+      deps({
+        scripts: { build: "tsc -p ." },
+        workspaces: [{ root: "packages/api", scripts: { lint: "eslint ." } }],
+      }),
+    )
+    expect(result.command).toBe("npm run lint -w packages/api")
+  })
+
+  it("a root script never hijacks a path that is not under it — the root always contains every path", () => {
+    // Discrimination: the winner must still be a workspace the path lives in.
+    const result = resolveVerifier(
+      ctx(["packages/api/src/h.ts"]),
+      deps({
+        scripts: {},
+        workspaces: [
+          { root: "packages/api", scripts: { build: "tsc -p ." } },
+          { root: "packages/web", scripts: { test: "vitest run" } },
+        ],
+      }),
+    )
+    expect(result.command).toBe("npm run build -w packages/api")
+  })
+})
+
+// ===========================================================================
+// FIX 3 — the preference list is closed by NAME, and the BODY was unexamined.
+// `{lint: "eslint --fix . && prettier --write ."}` resolved to `npm run lint`,
+// which `findings.ts` renders as "Run `npm run lint` and cite its observed
+// result" — the harness instructing the agent to rewrite the user's source as a
+// side effect of verifying. Prescribing nothing is a survivable degrade
+// (`resolution:none`, already logged); mutating the tree is not undoable.
+// ===========================================================================
+
+describe("FIX 3: a script that mutates the workspace is never prescribed", () => {
+  it("THE CASE — `lint` writes back, so the next safe preference is used instead", () => {
+    const result = resolveVerifier(
+      ctx(["src/misc.ts"]),
+      deps({ scripts: { lint: "eslint --fix . && prettier --write .", build: "tsc -p ." } }),
+    )
+    expect(result.command).toBe("npm run build")
+  })
+
+  it("THE OTHER CASE — a build that deploys is not a verifier", () => {
+    const result = resolveVerifier(ctx(["src/misc.ts"]), deps({ scripts: { build: "rm -rf dist && ./deploy.sh" } }))
+    expect(result).toEqual({ command: null, rationale: "none", matchedPaths: [] })
+  })
+
+  it.each([
+    ["eslint write-back", "eslint --fix ."],
+    ["prettier write-back", "prettier --write ."],
+    ["black rewrites by default", "black ."],
+    ["isort rewrites by default", "isort ."],
+    ["cargo fmt rewrites by default", "cargo fmt"],
+    ["go fmt rewrites by default", "go fmt ./..."],
+    ["sed in place", "sed -i 's/a/b/' src/x.ts"],
+    ["git history", "vitest run && git commit -am wip"],
+    ["publishes", "npm publish"],
+    ["deploys", "vite build && fly deploy"],
+    ["pushes", "tsc && git push"],
+    ["never exits (watch)", "vitest --watch"],
+    ["never exits (dev server)", "vite dev"],
+    ["never exits (nodemon)", "nodemon src/index.js"],
+    ["deletes source", "rm -rf src && tsc"],
+  ])("refuses to prescribe a `check` that %s", (_label, body) => {
+    const result = resolveVerifier(ctx(["src/misc.ts"]), deps({ scripts: { check: body } }))
+    expect(result.command).toBeNull()
+  })
+
+  it.each([
+    ["a plain type check", "tsc --noEmit"],
+    ["a lint that only reports", "eslint ."],
+    ["a formatter in --check mode", "prettier --check . && eslint ."],
+    ["cargo fmt --check", "cargo fmt --check"],
+    ["a build that cleans its own output", "rm -rf dist && tsc -p ."],
+    ["a build that cleans a glob under dist", "rm -rf dist/* && tsc -p ."],
+    ["a build that copies into dist", "tsc -p . && cp scripts/plugin.cjs dist/plugin.cjs"],
+    ["an aggregate of safe parts", "npm run lint && npm run typecheck"],
+  ])("still prescribes a `check` that is %s (discrimination)", (_label, body) => {
+    const result = resolveVerifier(ctx(["src/misc.ts"]), deps({ scripts: { check: body } }))
+    expect(result.command).toBe("npm run check")
+  })
+
+  it("an unsafe script in a NESTED workspace does not win over a safe root one", () => {
+    const result = resolveVerifier(
+      ctx(["packages/api/src/h.ts"]),
+      deps({
+        scripts: { check: "tsc --noEmit" },
+        workspaces: [{ root: "packages/api", scripts: { check: "eslint --fix ." } }],
+      }),
+    )
+    expect(result.command).toBe("npm run check")
+  })
+
+  it("a blank body is still not a verifier (the original rule survives)", () => {
+    expect(resolveVerifier(ctx(["src/misc.ts"]), deps({ scripts: { check: "   " } })).command).toBeNull()
+  })
+})
+
+// ===========================================================================
+// FIX 4 — this module's documented precondition ("changedPaths are already
+// filtered to inside the worktree by the caller") was FALSE:
+// `index.ts:changedPathsFromTool` records opencode's raw `filePath` and nothing
+// between there and here compares it to the worktree. So an outside path reached
+// `normalizeChangedPath`'s marker heuristic, which hunts for `/<root>/` anywhere
+// in the string — resurrecting, from another repo, the exact mis-scoping bug
+// B-4 (c) killed.
+// ===========================================================================
+
+describe("FIX 4: the worktree bound is enforced here, not assumed of the caller", () => {
+  it("KILLER — a path in ANOTHER repo is not scoped into this repo's workspace", () => {
+    const result = resolveVerifier(
+      ctx(["/home/dev/other/packages/api/x.ts"]),
+      deps({
+        scripts: { test: "vitest run" },
+        workspaceRoot: "/work/monorepo",
+        workspaces: [{ root: "packages/api", scripts: { check: "tsc --noEmit" } }],
+      }),
+    )
+    expect(result.command).not.toBe("npm run check -w packages/api")
+    expect(result).toEqual({ command: null, rationale: "none", matchedPaths: [] })
+  })
+
+  it("KILLER — an outside Go path is not scoped into a same-named project root", () => {
+    const result = resolveVerifier(
+      ctx(["/elsewhere/services/api/main.go"]),
+      deps({
+        scripts: {},
+        workspaceRoot: "/work/monorepo",
+        projectRoots: [{ ecosystem: "go", root: "services/api" }],
+      }),
+    )
+    expect(result.command).toBeNull()
+  })
+
+  it("an outside path is dropped from a MIXED set, and the inside ones still resolve", () => {
+    const result = resolveVerifier(
+      ctx(["/work/monorepo/src/a.ts", "/home/dev/other/src/b.ts"]),
+      deps({ scripts: { test: "vitest run" }, workspaceRoot: "/work/monorepo" }),
+    )
+    expect(result.command).toBe("npm test")
+    expect(result.matchedPaths).toEqual(["src/a.ts"])
+  })
+
+  it("story verifiers do not rescue an outside-only change either", () => {
+    const result = resolveVerifier(
+      ctx(["/home/dev/other/x.ts"], ["npm test"]),
+      deps({ scripts: {}, workspaceRoot: "/work/monorepo" }),
+    )
+    expect(result).toEqual({ command: null, rationale: "none", matchedPaths: [] })
+  })
+
+  it("INSIDE paths are untouched — the filter is a bound, not a narrowing", () => {
+    const result = resolveVerifier(
+      ctx(["/work/monorepo/packages/api/src/h.ts"]),
+      deps({
+        scripts: { test: "vitest run" },
+        workspaceRoot: "/work/monorepo",
+        workspaces: [{ root: "packages/api", scripts: { test: "vitest run" } }],
+      }),
+    )
+    expect(result.command).toBe("npm test -w packages/api")
+    expect(result.matchedPaths).toEqual(["packages/api/src/h.ts"])
+  })
+
+  it("a SECOND spelling of the root is inside it — one directory, two true names", () => {
+    // The session was opened through a symlink; the tool reports the realpath
+    // (or the other way round). Without the alias, FIX 4's bound would push
+    // every changed path out of the worktree and take the session with it.
+    const result = resolveVerifier(
+      ctx(["/link/app/src/x.ts"]),
+      deps({ scripts: { test: "vitest run" }, workspaceRoot: "/real/app", workspaceRootAliases: ["/link/app"] }),
+    )
+    expect(result.command).toBe("npm test")
+    expect(result.matchedPaths).toEqual(["src/x.ts"])
+  })
+
+  it("...and an alias widens nothing else — an unrelated path is still outside", () => {
+    const result = resolveVerifier(
+      ctx(["/home/dev/other/src/x.ts"]),
+      deps({ scripts: { test: "vitest run" }, workspaceRoot: "/real/app", workspaceRootAliases: ["/link/app"] }),
+    )
+    expect(result).toEqual({ command: null, rationale: "none", matchedPaths: [] })
+  })
+
+  it("with NO workspaceRoot the module cannot judge and keeps every path (fail open, as before)", () => {
+    const result = resolveVerifier(ctx(["/tmp/elsewhere/x.ts"]), deps({ scripts: { test: "vitest run" } }))
+    expect(result.command).toBe("npm test")
+    expect(result.matchedPaths).toEqual(["/tmp/elsewhere/x.ts"])
+  })
+
+  it("a relative path is never judged outside, whatever the root is", () => {
+    const result = resolveVerifier(
+      ctx(["src/misc.ts"]),
+      deps({ scripts: { test: "vitest run" }, workspaceRoot: "/work/monorepo" }),
+    )
+    expect(result.command).toBe("npm test")
   })
 })
 
@@ -837,5 +1160,143 @@ describe("classifyPathEcosystem", () => {
     expect(classifyPathEcosystem("Dockerfile")).toBeNull()
     expect(classifyPathEcosystem("config/app.yaml")).toBeNull()
     expect(classifyPathEcosystem("netlify.toml")).toBeNull()
+  })
+})
+
+// ===========================================================================
+// END TO END, on a REAL temp repo, through the REAL manifest reader.
+//
+// Each unit above can be green while the seam is broken — that is exactly how
+// B-4 shipped a prescription that `coverage.ts` could not match. These drive
+// `buildManifest` (real fs) -> `resolveVerifier` -> `observedCoversPrescribed`,
+// with changed paths spelled the way `changedPathsFromTool` actually spells them
+// (absolute), and ask the only question that matters at the plugin boundary:
+// would the command an agent really runs in this repo mint a receipt?
+// ===========================================================================
+
+describe("E2E (real temp repo): the prescription a repo gets is one its agent can satisfy", () => {
+  const roots: string[] = []
+
+  afterEach(() => {
+    while (roots.length > 0) rmSync(roots.pop()!, { recursive: true, force: true })
+  })
+
+  function repo(files: Record<string, string>): string {
+    const root = mkdtempSync(join(tmpdir(), "vertex-resolve-e2e-"))
+    roots.push(root)
+    for (const [rel, body] of Object.entries(files)) {
+      const full = join(root, rel)
+      mkdirSync(join(full, ".."), { recursive: true })
+      writeFileSync(full, body)
+    }
+    return root
+  }
+
+  function prescribe(root: string, changed: string[], manifestRoot = root): string | null {
+    const manifest = buildManifest(manifestRoot)
+    return resolveVerifier(
+      { changedPaths: changed.map((rel) => join(root, rel)), storyVerifiers: null },
+      { readManifest: () => manifest },
+    ).command
+  }
+
+  it("FIX 1 REGRESSION — the measured `{check, dev}` repo, verified with pnpm/yarn/bun", () => {
+    const root = repo({
+      "package.json": '{"name":"neon-arcade","scripts":{"check":"tsc --noEmit","dev":"vite"}}',
+      "pnpm-lock.yaml": "lockfileVersion: '9.0'\n",
+      "index.html": "<!doctype html>",
+      "src/games/memory.js": "export const memory = 1\n",
+    })
+
+    const prescribed = prescribe(root, ["src/games/memory.js", "index.html"])
+    expect(prescribed).toBe("npm run check")
+
+    // The whole point: the run this repo's agent actually makes must COUNT.
+    // Each of these scored as a relevance gap before FIX 1, which suppressed the
+    // receipt AND recorded the passing command as a failed verification.
+    for (const observed of [
+      "npm run check",
+      "pnpm check",
+      "pnpm run check",
+      "yarn check",
+      "bun run check",
+      "npm run check --silent",
+      "pnpm check 2>&1 | tail -20",
+    ]) {
+      expect(observedCoversPrescribed(prescribed!, observed, root), observed).toBe(true)
+    }
+
+    // ...and running something else still does not count.
+    for (const observed of ["npm run dev", "npm test", "npx vitest run", "npm ci"]) {
+      expect(observedCoversPrescribed(prescribed!, observed, root), observed).toBe(false)
+    }
+  })
+
+  it("FIX 2 REGRESSION — a real monorepo whose nested package only builds", () => {
+    const root = repo({
+      "package.json": '{"name":"root","workspaces":["packages/*"],"scripts":{"test":"vitest run"}}',
+      "packages/api/package.json": '{"name":"api","scripts":{"build":"tsc -p ."}}',
+      "packages/api/src/h.ts": "export const h = 1\n",
+    })
+
+    const prescribed = prescribe(root, ["packages/api/src/h.ts"])
+    // B-4 prescribed `npm run build -w packages/api` here, which the root suite
+    // could not cover; pre-B-4 it prescribed `npm test`, which it can.
+    expect(prescribed).toBe("npm test")
+    expect(observedCoversPrescribed(prescribed!, "npm test", root)).toBe(true)
+    expect(observedCoversPrescribed(prescribed!, "pnpm test", root)).toBe(true)
+  })
+
+  it("FIX 2/1 together — a nested package with its own tests keeps the narrower prescription", () => {
+    const root = repo({
+      "package.json": '{"name":"root","workspaces":["packages/*"],"scripts":{"test":"vitest run"}}',
+      "packages/api/package.json": '{"name":"api","scripts":{"test":"vitest run"}}',
+      "packages/api/src/h.ts": "export const h = 1\n",
+    })
+
+    const prescribed = prescribe(root, ["packages/api/src/h.ts"])
+    expect(prescribed).toBe("npm test -w packages/api")
+    expect(observedCoversPrescribed(prescribed!, "cd packages/api && npm test", root)).toBe(true)
+    expect(observedCoversPrescribed(prescribed!, "npm test", root)).toBe(false)
+  })
+
+  it("FIX 3 — a real package.json whose only scripts mutate resolves to nothing at all", () => {
+    const root = repo({
+      "package.json": '{"name":"x","scripts":{"lint":"eslint --fix .","build":"tsc && npm publish"}}',
+      "src/app.ts": "export const a = 1\n",
+    })
+    expect(prescribe(root, ["src/app.ts"])).toBeNull()
+  })
+
+  it("FIX 4 — a SYMLINKED workspace root still resolves, in EITHER spelling", () => {
+    const root = repo({
+      "package.json": '{"name":"x","scripts":{"check":"tsc --noEmit"}}',
+      "src/app.ts": "export const a = 1\n",
+    })
+    const link = `${root}-link`
+    symlinkSync(root, link)
+    roots.push(link)
+
+    // The session is rooted at the SYMLINK. A changed path may arrive as the
+    // REALPATH (what opencode's tools report) or through the link (what the
+    // agent typed). Both name the same file, and FIX 4's worktree bound must not
+    // turn a spelling mismatch into `resolution:none` for the whole session.
+    expect(prescribe(root, ["src/app.ts"], link)).toBe("npm run check")
+    expect(prescribe(link, ["src/app.ts"], link)).toBe("npm run check")
+  })
+
+  it("FIX 4 — a real path from ANOTHER repo prescribes nothing for this one", () => {
+    const root = repo({
+      "package.json": '{"name":"root","workspaces":["packages/*"],"scripts":{"test":"vitest run"}}',
+      "packages/api/package.json": '{"name":"api","scripts":{"check":"tsc -p ."}}',
+    })
+    const other = repo({ "packages/api/x.ts": "export const x = 1\n" })
+
+    const manifest = buildManifest(root)
+    const result = resolveVerifier(
+      { changedPaths: [join(other, "packages/api/x.ts")], storyVerifiers: null },
+      { readManifest: () => manifest },
+    )
+    expect(result).toEqual({ command: null, rationale: "none", matchedPaths: [] })
   })
 })
