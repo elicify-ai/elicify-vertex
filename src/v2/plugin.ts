@@ -1201,9 +1201,14 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
             state.anomalyPending = { expectText: state.turnExpect.text, observedSummary: summaryLine, failureClass }
           }
           state.turnExpect = null
-        } else if (!state.expectAbsentLoggedThisTurn) {
+        } else if (composer.claimOncePerTurn(sid, "expect:absent")) {
+          // Once per turn, on the COMPOSER's turn clock. This used to be a
+          // wiring boolean cleared only in `resetTurnState`, which the gate's
+          // continuation path never reaches (`gate.ts` advances the turn with
+          // `composer.newTurn` alone) — so in an unattended run the flag stayed
+          // spent after the first turn and every later turn's missing EXPECT
+          // went unrecorded.
           logger("expect:absent", { sessionID: sid })
-          state.expectAbsentLoggedThisTurn = true
         }
 
         // FR-034 compliance join
@@ -1514,19 +1519,29 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
         })
       }
 
-      // FR-061: a turn in which nearly every directive was dropped means the
-      // model is being starved of guidance. `renderResult.dropped` already
-      // carries the data; it was only ever going to the JSONL sink.
-      {
-        const attempted = renderResult.renderedFamilies.length + renderResult.dropped.length
-        if (attempted >= 5 && renderResult.renderedFamilies.length / attempted <= 0.1) {
-          void visibility.notify("health", {
-            sessionID: sid,
-            family: "directive:starved",
-            message: `${renderResult.dropped.length} of ${attempted} directives dropped this turn — the model is getting almost no guidance`,
-            variant: "warning",
-          })
-        }
+      // FR-061: a family the harness keeps offering that never reaches the
+      // model is starvation. The composer owns the accounting (see
+      // `STARVATION_BUDGET_DROPS`) and reports each family at most once per
+      // turn, so this loop needs no dedupe of its own.
+      //
+      // THIS REPLACES A DETECTOR THAT COULD NOT FIRE. The previous form counted
+      // `rendered + dropped` in ONE invocation and needed `attempted >= 5` with
+      // a >=90% drop rate. Measured on the same 78-invocation differential that
+      // signed off the producer gating: pre-gate 22 fires with max `attempted`
+      // 5; post-gate 0 fires with max `attempted` 4 — permanently one short of
+      // its own floor, because every drop it had been counting was a per-turn-cap
+      // drop from a producer re-minting a finding the composer was already
+      // committed to discarding. It had no test, which is why nothing caught it.
+      // A detector that cannot fire but still appears in the health list is
+      // worse than none, so the quantity has been re-based rather than the
+      // threshold nudged.
+      for (const s of renderResult.starved) {
+        void visibility.notify("health", {
+          sessionID: sid,
+          family: "directive:starved",
+          message: `${s.family} lost the injection budget ${s.budgetDrops} times this turn and never reached the model`,
+          variant: "warning",
+        })
       }
 
       if (renderResult.text) {
@@ -1577,9 +1592,16 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
         // exists to make "did the model answer the scaffold?" decidable, and
         // one record per turn answers that; twelve only inflate the
         // denominator of every rate computed from this log.
+        //
+        // FIX 2: "this turn" is the COMPOSER's turn, not a wiring boolean.
+        // Both boundaries advance the composer (`chat.message` at the
+        // activation branch, and `gate.ts`'s continuation dispatch); only ONE
+        // of them calls `resetTurnState`. Keyed on a wiring flag, a
+        // continuation turn's parse miss was silently dropped — the exact
+        // blind spot this event was introduced to close, reintroduced by its
+        // own dedupe guard.
         const keyLine = findCriteriaKeyLine(textOutput.text)
-        if (keyLine !== null && !state.criteriaParseMissLoggedThisTurn) {
-          state.criteriaParseMissLoggedThisTurn = true
+        if (keyLine !== null && composer.claimOncePerTurn(sid, "criteria:parse-miss")) {
           logger("criteria:parse-miss", { sessionID: sid, keyLine: keyLine.slice(0, 200) })
         }
       }

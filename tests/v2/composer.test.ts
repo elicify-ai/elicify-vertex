@@ -672,3 +672,230 @@ describe("blockedBeforeBudget", () => {
     expect(composer.blockedBeforeBudget("a", "story-completion")).toBe(false)
   })
 })
+
+// ===========================================================================
+// FR-061 — directive:starved, RE-BASED.
+//
+// The old detector counted `rendered + dropped` in ONE `render()` call and
+// needed `attempted >= 5` at a >=90% drop rate. Every drop it counted was a
+// per-turn-cap drop minted by a producer re-offering a finding the composer
+// had already committed to discarding, so it read loudest exactly when the
+// model had been told everything its caps allowed — and once the producers
+// started asking `blockedBeforeBudget` first, the maximum `attempted` fell to
+// 4 and it could never fire again. It had no test. These are that test, for
+// the quantity that actually means starvation: a family the composer was
+// offered again and again across a whole turn, that survived cap and cooldown
+// every time, and that the 2-slot budget trim threw away until the turn ended
+// without the model ever seeing it.
+// ===========================================================================
+
+describe("FR-061 starvation (RenderResult.starved)", () => {
+  const f = (family: string, priority: Finding["priority"] = "correction") => makeFinding({ family, priority })
+
+  /** Two corrections that hold both slots without ever capping out. */
+  const twoBlockers = () => [f("no-cap-a"), f("no-cap-b")]
+
+  it("reports a family the turn lost THREE times and never rendered, at the turn boundary", () => {
+    const logger = vi.fn()
+    const composer = new InjectionComposer({ logger })
+    composer.newTurn("s1")
+
+    for (let invocation = 1; invocation <= 3; invocation++) {
+      const r = composer.render("s1", [...twoBlockers(), f("pinned-criteria-reinject", "enrichment")], never)
+      expect(r.dropped).toEqual([{ family: "pinned-criteria-reinject", reason: "budget" }])
+      // Mid-turn the question is undecided: the very next invocation could
+      // still deliver it. Nothing is reported yet.
+      expect(r.starved, `invocation ${invocation}`).toEqual([])
+    }
+    expect(logger).not.toHaveBeenCalledWith("directive:starved", expect.anything())
+
+    // The turn ends. NOW it is decidable, and the verdict is logged there and
+    // then — it does not depend on anyone collecting it.
+    composer.newTurn("s1")
+    expect(logger).toHaveBeenCalledWith(
+      "directive:starved",
+      expect.objectContaining({ sessionID: "s1", family: "pinned-criteria-reinject", budgetDrops: 3, turnIndex: 1 }),
+    )
+
+    // ...and it is handed to the caller once, by the next render.
+    expect(composer.render("s1", [], never).starved).toEqual([
+      { family: "pinned-criteria-reinject", budgetDrops: 3 },
+    ])
+    expect(composer.render("s1", [], never).starved, "handed over exactly once").toEqual([])
+  })
+
+  it("stays silent when the turn lost it only TWICE", () => {
+    const logger = vi.fn()
+    const composer = new InjectionComposer({ logger })
+    composer.newTurn("s1")
+
+    for (let i = 0; i < 2; i++) {
+      composer.render("s1", [...twoBlockers(), f("pinned-criteria-reinject", "enrichment")], never)
+    }
+    composer.newTurn("s1")
+
+    expect(logger).not.toHaveBeenCalledWith("directive:starved", expect.anything())
+    expect(composer.render("s1", [], never).starved).toEqual([])
+  })
+
+  it("does NOT report a family that reached the model — crowded is not starved", () => {
+    const logger = vi.fn()
+    const composer = new InjectionComposer({ logger })
+    composer.newTurn("s1")
+
+    // Ten straight losses...
+    for (let i = 0; i < 10; i++) {
+      const r = composer.render("s1", [...twoBlockers(), f("story-completion", "phase-guidance")], never)
+      expect(r.dropped).toEqual([{ family: "story-completion", reason: "budget" }])
+    }
+    // ...then it wins a slot on the eleventh. `story-completion` has no cap
+    // entry, so nothing but the budget was ever stopping it.
+    expect(
+      composer.render("s1", [f("no-cap-a"), f("story-completion", "phase-guidance")], never).renderedFamilies,
+    ).toContain("story-completion")
+
+    composer.newTurn("s1")
+    expect(logger).not.toHaveBeenCalledWith("directive:starved", expect.anything())
+    expect(composer.render("s1", [], never).starved).toEqual([])
+  })
+
+  it("counts BUDGET losses only — cap and cooldown drops are not starvation", () => {
+    // This is the whole re-basing, as an assertion. `scope-watchdog` is cap 1:
+    // once it has rendered, every later offer is a per-turn-cap drop, which
+    // means the model HAS been told. Counting those is what made the old
+    // detector read loudest when the harness was working correctly.
+    const logger = vi.fn()
+    const composer = new InjectionComposer({ logger })
+    composer.newTurn("s1")
+
+    expect(composer.render("s1", [f("scope-watchdog")], never).renderedFamilies).toEqual(["scope-watchdog"])
+    for (let i = 0; i < 20; i++) {
+      expect(composer.render("s1", [f("scope-watchdog")], never).dropped).toEqual([
+        { family: "scope-watchdog", reason: "per-turn-cap" },
+      ])
+    }
+    composer.newTurn("s1")
+    expect(logger).not.toHaveBeenCalledWith("directive:starved", expect.anything())
+
+    // A family a caller has DISABLED with a cap of 0 renders nothing, ever, so
+    // "it never rendered this turn" is true of it by construction. It is
+    // switched off, not starved — and this is the one cap case whose drops are
+    // not accompanied by a render, i.e. the one a `dropped`-counting
+    // implementation would get wrong.
+    const disabledLogger = vi.fn()
+    const disabled = new InjectionComposer({ logger: disabledLogger, familyCaps: { "verify-gap": 0 } })
+    disabled.newTurn("s3")
+    for (let i = 0; i < 20; i++) {
+      expect(disabled.render("s3", [f("verify-gap")], never).dropped).toEqual([
+        { family: "verify-gap", reason: "per-turn-cap" },
+      ])
+    }
+    disabled.newTurn("s3")
+    expect(disabledLogger).not.toHaveBeenCalledWith("directive:starved", expect.anything())
+
+    // ...and a family blocked purely by COOLDOWN, likewise: it is suppressed
+    // on purpose, and it rendered in the turn the cooldown started from.
+    const coolLogger = vi.fn()
+    const cooling = new InjectionComposer({ logger: coolLogger, cooldowns: { "no-cap-a": 50 } })
+    cooling.newTurn("s2")
+    cooling.render("s2", [f("no-cap-a")], never)
+    cooling.newTurn("s2")
+    for (let i = 0; i < 20; i++) {
+      expect(cooling.render("s2", [f("no-cap-a")], never).dropped).toEqual([
+        { family: "no-cap-a", reason: "cooldown" },
+      ])
+    }
+    cooling.newTurn("s2")
+    expect(coolLogger).not.toHaveBeenCalledWith("directive:starved", expect.anything())
+  })
+
+  it("counts per turn, not per session — losses do not accumulate across turns", () => {
+    const logger = vi.fn()
+    const composer = new InjectionComposer({ logger })
+    const lose = () => composer.render("s1", [...twoBlockers(), f("elevate", "phase-guidance")], never)
+
+    // Two losses per turn, over four turns: eight in total, none reported.
+    for (let turn = 0; turn < 4; turn++) {
+      composer.newTurn("s1")
+      lose()
+      lose()
+    }
+    composer.newTurn("s1")
+    expect(logger).not.toHaveBeenCalledWith("directive:starved", expect.anything())
+  })
+
+  it("is per session and per family", () => {
+    const logger = vi.fn()
+    const composer = new InjectionComposer({ logger })
+    composer.newTurn("a")
+    composer.newTurn("b")
+
+    for (let i = 0; i < 3; i++) {
+      composer.render("a", [...twoBlockers(), f("elevate", "phase-guidance")], never)
+      composer.render("a", [...twoBlockers(), f("pre-commitment", "phase-guidance")], never)
+      composer.render("b", [...twoBlockers(), f("elevate", "phase-guidance")], never)
+    }
+    // Session b's turn has not ended, so its own count is still open.
+    composer.newTurn("a")
+
+    expect(composer.render("a", [], never).starved).toEqual([
+      { family: "elevate", budgetDrops: 3 },
+      { family: "pre-commitment", budgetDrops: 3 },
+    ])
+    expect(composer.render("b", [], never).starved).toEqual([])
+    expect(logger).not.toHaveBeenCalledWith("directive:starved", expect.objectContaining({ sessionID: "b" }))
+  })
+})
+
+// ===========================================================================
+// FIX 2 — claimOncePerTurn.
+//
+// Wiring kept two "already logged this turn" booleans (`expect:absent`,
+// `criteria:parse-miss`) that only `resetTurnState` cleared. There are TWO
+// turn boundaries and `resetTurnState` is on one of them, so every
+// continuation turn of an unattended run inherited a spent flag. The latch
+// lives on the composer's clock now, which both boundaries advance.
+// ===========================================================================
+
+describe("claimOncePerTurn", () => {
+  it("grants the first claim of a turn and refuses every later one", () => {
+    const composer = new InjectionComposer({ logger: vi.fn() })
+    composer.newTurn("s1")
+
+    expect(composer.claimOncePerTurn("s1", "expect:absent")).toBe(true)
+    expect(composer.claimOncePerTurn("s1", "expect:absent")).toBe(false)
+    expect(composer.claimOncePerTurn("s1", "expect:absent")).toBe(false)
+  })
+
+  it("re-arms on a turn advance — the boundary a gate continuation also crosses", () => {
+    const composer = new InjectionComposer({ logger: vi.fn() })
+    composer.newTurn("s1")
+    expect(composer.claimOncePerTurn("s1", "criteria:parse-miss")).toBe(true)
+    expect(composer.claimOncePerTurn("s1", "criteria:parse-miss")).toBe(false)
+
+    composer.newTurn("s1")
+    expect(composer.claimOncePerTurn("s1", "criteria:parse-miss")).toBe(true)
+  })
+
+  it("keys are independent of each other, of the session, and of rendering", () => {
+    const composer = new InjectionComposer({ logger: vi.fn() })
+    composer.newTurn("s1")
+    composer.newTurn("s2")
+
+    expect(composer.claimOncePerTurn("s1", "expect:absent")).toBe(true)
+    expect(composer.claimOncePerTurn("s1", "criteria:parse-miss")).toBe(true)
+    expect(composer.claimOncePerTurn("s2", "expect:absent")).toBe(true)
+
+    // A render is NOT a turn boundary: a latch spent before one is still spent
+    // after it. (This is the B-2 confusion the latch must never re-introduce —
+    // `blockedBeforeBudget` is the render question, this is not.)
+    composer.render("s1", [makeFinding({ family: "verify-gap", priority: "correction" })], never)
+    expect(composer.claimOncePerTurn("s1", "expect:absent")).toBe(false)
+  })
+
+  it("works before the first newTurn — turn 0 is a turn", () => {
+    const composer = new InjectionComposer({ logger: vi.fn() })
+    expect(composer.claimOncePerTurn("fresh", "expect:absent")).toBe(true)
+    expect(composer.claimOncePerTurn("fresh", "expect:absent")).toBe(false)
+  })
+})

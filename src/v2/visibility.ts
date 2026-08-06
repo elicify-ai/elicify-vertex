@@ -63,8 +63,10 @@ export type VisibilityMode = "off" | "gates" | "all"
  *     refused). Low volume, high importance.
  *   - `"health"` — a harness health or failure signal: `verify:relevance-gap`,
  *     `verifier:unavailable`, a verified command that minted no receipt, or a
- *     turn whose directive drop rate hit ≥90% (FR-061). This is the class of
- *     event whose invisibility cost 94 minutes in the field session.
+ *     directive family a whole turn starved (FR-061/FR-061a — the drop-RATE
+ *     form this comment used to describe was re-based; see
+ *     `composer.ts`'s `STARVATION_BUDGET_DROPS`). This is the class of event
+ *     whose invisibility cost 94 minutes in the field session.
  */
 export type VisibilityEventKind = "directive" | "gate" | "health"
 
