@@ -1235,17 +1235,35 @@ export const VERIFIER_TOTAL_BUDGET_MS = resolveVerifierBudgetMs()
  * absence. Without the second sentence, a verifier that cannot run a tool has
  * no compliant way to express doubt and will reach for the fabrication
  * again.
+ *
+ * B-3b (operator ruling, 2026-08-06) adds the criteria the prompt never
+ * actually stated. "The judge should not go by exit codes — they are
+ * information, but not a real criterion for the judge. The judge needs simply
+ * to judge if the goal was achieved, all stories delivered, and generally
+ * validated." Before this, the only criterion-shaped sentence in the whole
+ * prompt was the re-run-your-verifiers instruction, framed entirely around
+ * making an EXIT CODE reliable — so the one thing the judge was told to
+ * optimise for was the shell result, and the three things it is actually for
+ * (goal, delivery, does it hold up) were never named. Exit codes stay in the
+ * payload and stay citable; they stop being the test. The deterministic half
+ * of this ruling lives in `wiring/gate.ts` (`verdictIsSubstantiated`): a
+ * failure must name a DECLARED acceptance item, and a pass must have judged
+ * every one of them — so neither a red command nor a green one can carry a
+ * verdict on its own.
  */
 const VERIFIER_SYSTEM_PROMPT = [
   "You are an independent completion auditor for a coding plan whose stories have been claimed complete.",
   "You receive a plan digest (stories, their acceptance items, and the verifier commands each story declares), a diff summary, verifier output summaries, and the parent agent's last response plus a short recent transcript, as a JSON object.",
   "THE SESSION TRANSCRIPT IS YOUR LEADING EVIDENCE. It is the record of what was actually asked, decided and done, and you are expected to reason from it — with common sense — rather than treat it as hearsay. Your tools (read, grep, glob, list, bash) are there to CHECK what the transcript leaves doubtful, not to replace reading it.",
   "A verdict reached by reading the evidence carefully is a valid verdict. You are not required to run a command to be believed; you are required to say WHICH acceptance item failed and WHY, in that item's note. An unexplained failure will be discarded.",
+  "YOUR CRITERIA ARE THESE THREE AND NOTHING ELSE: was the GOAL of the plan achieved; is EVERY story delivered against the acceptance items it declares; and does that delivery HOLD UP UNDER SCRUTINY rather than merely appear to.",
+  "Exit codes, command results and verifier summaries are EVIDENCE you may cite — they are never the test. A failing command does not by itself make an acceptance item unmet: name the acceptance item that is not delivered and say what is missing. A passing command does not by itself make an acceptance item met: an item is met when what it asks for is actually there, which a green suite can be entirely silent about.",
+  "Judge every acceptance item of every story you were asked to audit, using that item's own id from the plan digest. A verdict that skips acceptance items, or that fails a story on something the story does not declare, is not a verdict on that story and will be discarded.",
   "Read the files a claim references before crediting it.",
   'The same rule binds in the opposite direction and binds harder: you must not report an item as "met": false on the grounds that a file or directory is missing, empty, or lacks some content unless you have just observed that yourself in this session with read, glob, grep or bash.',
   "The payload is never evidence that something is absent — only that it was not quoted to you.",
   'If you cannot make that observation, say exactly that in the item\'s note (for example "could not verify: no observation of research/x.json") instead of claiming the file or its content does not exist.',
-  'Where a story declares verifiers, re-run them with bash when that is feasible within your budget: run each verifier as a standalone command, never chained with ";" and never piped, so its exit code is reliable.',
+  'Where a story declares verifiers, re-run them with bash when that is feasible within your budget: run each verifier as a standalone command, never chained with ";" and never piped, so its exit code is reliable — then read the output and judge what it actually tells you about the acceptance items. The result informs your verdict; it does not decide it.',
   "You must not modify anything: you have no write or edit capability, and bash is for running verifiers and read-only inspection only.",
   'Respond with exactly one JSON object and nothing else, matching this shape: {"stories": [{"storyId": "S1", "pass": true|false, "summary": "...", "items": [{"itemId": "A1", "met": true|false, "note": "..."}]}]}.',
   "Emit one story entry per story you were asked to audit, and one item entry per acceptance item of that story.",

@@ -1096,6 +1096,150 @@ describe("handleVerifierAudit — verdict reconciliation", () => {
     expect(h.storyEngine.getPlan(sid)!.stories[0].status, "an unexplained failure must not revert work").toBe("complete")
   })
 
+  // =========================================================================
+  // B-3b (operator ruling, 2026-08-06): "the judge should not go by exit codes
+  // — they are information, but not a real criterion for the judge. The judge
+  // needs simply to judge if the goal was achieved, all stories delivered, and
+  // generally validated."
+  //
+  // Exit codes stay in the payload as evidence the judge may cite. What they
+  // may no longer do is CARRY a verdict. The deterministic half of the ruling
+  // is that a verdict must be about the story's DECLARED acceptance items, in
+  // both directions — because "the command went red" and "the command went
+  // green" are exactly the two verdicts that arrive naming no item, or naming
+  // one item and skipping the rest.
+  // =========================================================================
+
+  it("B-3b: a failure named against something the story does not declare is not applied", async () => {
+    const h = harness({ verifierEnabled: true })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid) // declares exactly one acceptance item: A1
+    // The shape a verdict-from-an-exit-code actually takes: a note that reads
+    // like a reason, attached to nothing the story ever promised. The old rule
+    // accepted it — the note was non-empty — and reverted delivered work on it.
+    stubVerifier(h, {
+      stories: [
+        {
+          storyId: "S1",
+          pass: false,
+          summary: "the suite is red",
+          items: [{ itemId: "verifier", met: false, note: "npm test exited 1" }],
+        },
+      ],
+    })
+
+    await handleSessionIdle(h.ctx, sid)
+
+    expect(loggedEventTypes(h.logger)).toContain("verifier:unverified")
+    expect(h.storyEngine.getPlan(sid)!.stories[0].status, "a red command is not a finding about A1").toBe("complete")
+    expect(h.storyEngine.getPlan(sid)!.stories[0].verifier!.unapplied).toBe("unverified")
+  })
+
+  it("B-3b: a failure that names a declared item still applies, extra undeclared items and all", async () => {
+    const h = harness({ verifierEnabled: true })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid)
+    // One real finding about A1 plus an exit-code observation the judge chose
+    // to volunteer. The finding must survive the company it keeps — discarding
+    // it would be the tool-call floor's mistake in a new costume.
+    stubVerifier(h, {
+      stories: [
+        {
+          storyId: "S1",
+          pass: false,
+          summary: "no sources",
+          items: [
+            { itemId: "A1", met: false, note: "x.md has no Sources section" },
+            { itemId: "build", met: false, note: "npm test exited 1" },
+          ],
+        },
+      ],
+    })
+
+    await handleSessionIdle(h.ctx, sid)
+
+    expect(loggedEventTypes(h.logger)).not.toContain("verifier:unverified")
+    expect(h.storyEngine.getPlan(sid)!.stories[0].status, "a reasoned failure about a declared item reverts").toBe("active")
+  })
+
+  it("B-3b: a pass that skips a declared acceptance item is not applied as a pass", async () => {
+    const h = harness({ verifierEnabled: true })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    h.storyEngine.createPlan(sid, [
+      {
+        text: "Research wave",
+        acceptanceItems: ["x.md has cited sources", "x.md renders in the viewer"],
+        scopeGlobs: [],
+        verifiers: [],
+        tasks: [{ text: "write it" }],
+      },
+    ])
+    h.storyEngine.checkpoint(sid, "S1.T1", "complete")
+    // A green suite and one blanket item. A2 — the half a test suite is
+    // silent about — was never judged, so this is a verdict about the command.
+    stubVerifier(h, {
+      stories: [{ storyId: "S1", pass: true, summary: "tests are green", items: [{ itemId: "A1", met: true, note: "npm test exited 0" }] }],
+    })
+
+    await handleSessionIdle(h.ctx, sid)
+
+    const stamp = h.storyEngine.getPlan(sid)!.stories[0].verifier!
+    expect(stamp.unapplied, "an unjudged acceptance item is not a delivered story").toBe("unverified")
+    const said = continuations(h.prompt)
+      .map((c) => c.text)
+      .join("\n")
+    expect(said).not.toContain("independently verified")
+  })
+
+  it("B-3b: a pass covering every declared item applies, and item ids are matched leniently", async () => {
+    const h = harness({ verifierEnabled: true })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    h.storyEngine.createPlan(sid, [
+      {
+        text: "Research wave",
+        acceptanceItems: ["x.md has cited sources", "x.md renders in the viewer"],
+        scopeGlobs: [],
+        verifiers: [],
+        tasks: [{ text: "write it" }],
+      },
+    ])
+    h.storyEngine.checkpoint(sid, "S1.T1", "complete")
+    // `itemId` is LLM-authored prose: "a1." and "A-2" name A1 and A2. Coverage
+    // must turn on which item was judged, never on its punctuation.
+    stubVerifier(h, {
+      stories: [
+        {
+          storyId: "S1",
+          pass: true,
+          summary: "both delivered",
+          items: [
+            { itemId: "a1.", met: true, note: "x.md lists four URLs under ## Sources" },
+            { itemId: "A-2", met: true, note: "opened x.md in the viewer, it renders" },
+          ],
+        },
+      ],
+    })
+
+    await handleSessionIdle(h.ctx, sid)
+
+    const stamp = h.storyEngine.getPlan(sid)!.stories[0].verifier!
+    expect(stamp.unapplied).toBeUndefined()
+    expect(stamp.pass).toBe(true)
+    expect(loggedEventTypes(h.logger)).not.toContain("verifier:unverified")
+  })
+
   it("FR-005: pass:false with every item met is dropped per story, leaving the story untouched", async () => {
     const h = harness({ verifierEnabled: true })
     const sid = "s1"

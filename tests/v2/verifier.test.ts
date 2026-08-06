@@ -1186,6 +1186,52 @@ describe("runVerifier", () => {
     expect(system).toMatch(/instead of claiming the file or its content does not exist/i)
   })
 
+  // =========================================================================
+  // B-3b (operator ruling, 2026-08-06): "the judge should not go by exit codes
+  // — they are information, but not a real criterion for the judge. The judge
+  // needs simply to judge if the goal was achieved, all stories delivered, and
+  // generally validated."
+  //
+  // This is a PROMPT change and nothing else: there is no behaviour here to
+  // assert beyond the text the model receives. What these tests buy is that a
+  // later edit cannot quietly drop the criteria and leave the suite green —
+  // the failure mode this prompt has actually suffered before (the only
+  // criterion-shaped sentence it ever contained was about exit-code
+  // reliability).
+  // =========================================================================
+
+  it("B-3b: the prompt states the judge's three criteria — goal achieved, every story delivered, holds up", async () => {
+    const system = await assembledVerifierSystemPrompt()
+    expect(system).toMatch(/was the GOAL of the plan achieved/i)
+    expect(system).toMatch(/is EVERY story delivered against the acceptance items it declares/i)
+    expect(system).toMatch(/HOLD UP UNDER SCRUTINY/i)
+  })
+
+  it("B-3b: exit codes are named as citable evidence and explicitly disqualified as the test", async () => {
+    const system = await assembledVerifierSystemPrompt()
+    expect(system).toMatch(/exit codes, command results and verifier summaries are EVIDENCE you may cite/i)
+    expect(system).toMatch(/they are never the test/i)
+    // Both directions, because both are how a command result smuggles itself
+    // in as a verdict.
+    expect(system).toMatch(/a failing command does not by itself make an acceptance item unmet/i)
+    expect(system).toMatch(/a passing command does not by itself make an acceptance item met/i)
+  })
+
+  it("B-3b: re-running a declared verifier is kept, but its result informs the verdict rather than deciding it", async () => {
+    const system = await assembledVerifierSystemPrompt()
+    // The instruction survives (it is how evidence is gathered) ...
+    expect(system).toMatch(/run each verifier as a standalone command/i)
+    // ... with its standing demoted.
+    expect(system).toMatch(/the result informs your verdict; it does not decide it/i)
+  })
+
+  it("B-3b: the prompt demands a judgement on every acceptance item, by the digest's own item id", async () => {
+    const system = await assembledVerifierSystemPrompt()
+    expect(system).toMatch(/judge every acceptance item of every story you were asked to audit/i)
+    expect(system).toMatch(/using that item's own id from the plan digest/i)
+    expect(system).toMatch(/fails a story on something the story does not declare/i)
+  })
+
   it("FR-011: the pre-existing positive-direction instruction is kept, not replaced", async () => {
     const system = await assembledVerifierSystemPrompt()
     expect(system).toContain("Read the files a claim references before crediting it.")
