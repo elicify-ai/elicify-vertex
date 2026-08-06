@@ -50,6 +50,10 @@ function harness(opts: {
   childParts?: Array<{ type: string }>
   /** The verdict the stubbed verifier subturn returns. */
   verifierVerdict?: unknown
+  /** B-3 (d): `""` leaves the payload with no diff summary. With the stub
+   * transcript also empty that is the `insufficient-evidence` shape — the one
+   * verdict decided before any subturn is attempted. */
+  diffText?: string
 } = {}) {
   const stateDir = temporaryRoot()
   const logger = vi.fn()
@@ -98,7 +102,7 @@ function harness(opts: {
     // it means "no file evidence AND no transcript", which makes
     // `runVerifier` return `insufficient-evidence` without prompting anyone
     // — see the dedicated test for that path in `verifier.test.ts`.
-    diffSummary: () => ({ text: "no changed paths recorded" }),
+    diffSummary: () => ({ text: opts.diffText ?? "no changed paths recorded" }),
     composer,
     // Redesign point 9: a real DelegationTracker (never records a `task`
     // call in these pure gate tests, so it never defers), and a HIGH
@@ -994,6 +998,20 @@ function stubVerifier(
   }
 }
 
+/**
+ * How many verifier subturns were actually attempted.
+ *
+ * It MUST read the wrapper `stubVerifier` installs on the client. `h.prompt` is
+ * the ORIGINAL mock, and the wrapper only delegates NON-agent prompts to it —
+ * so a count taken there is permanently 0, and any assertion about it passes
+ * with the feature under test deleted. The M3 cap test below did exactly that:
+ * it compared 0 to 0 for its whole life.
+ */
+function verifierSubturns(h: ReturnType<typeof harness>): number {
+  const prompt = (h.ctx.client.session as unknown as { prompt: ReturnType<typeof vi.fn> }).prompt
+  return prompt.mock.calls.filter((c: unknown[]) => (c[0] as { body?: { agent?: string } })?.body?.agent === "vertex-verifier").length
+}
+
 /** A single-story plan whose only task is already claimed complete. */
 function claimedStory(h: ReturnType<typeof harness>, sid: string, verifiers: string[] = []): void {
   h.storyEngine.createPlan(sid, [
@@ -1577,14 +1595,11 @@ describe("handleVerifierAudit — verdict reconciliation", () => {
       stories: [{ storyId: "S1", pass: false, summary: "still not done", items: [{ itemId: "A1", met: false, note: "no sources cited" }] }],
     })
 
-    const verifierSubturns = (): number =>
-      h.prompt.mock.calls.filter((c: unknown[]) => (c[0] as { body?: { agent?: string } })?.body?.agent === "vertex-verifier")
-        .length
-
     await handleSessionIdle(h.ctx, sid) // revert 1 of 1
     h.storyEngine.checkpoint(sid, "S1.T1", "complete")
     await handleSessionIdle(h.ctx, sid) // cap reached
-    const atCap = verifierSubturns()
+    const atCap = verifierSubturns(h)
+    expect(atCap, "the counter must see the subturns, or the bound below is 0 === 0").toBe(2)
 
     const stamp = h.storyEngine.getPlan(sid)!.stories[0].verifier!
     expect(stamp.unapplied).toBe("capped")
@@ -1593,7 +1608,7 @@ describe("handleVerifierAudit — verdict reconciliation", () => {
     await handleSessionIdle(h.ctx, sid)
     await handleSessionIdle(h.ctx, sid)
     await handleSessionIdle(h.ctx, sid)
-    expect(verifierSubturns()).toBe(atCap)
+    expect(verifierSubturns(h)).toBe(atCap)
   })
 
   // A capped story WAS audited — saying it was "never verified" would be
@@ -1820,6 +1835,158 @@ describe("handleVerifierAudit — a verdict retires when the code moves", () => 
   // SETTLED plan, so the close-out branch is unreachable and any assertion
   // about it passes with the feature deleted. Verified — the unit version of
   // this test survived removing the guard; UAT J3 kills it.)
+})
+
+// ===========================================================================
+// EVERY AUDIT ROUND MUST LEAVE THE STORY BOUNDED (2026-08-06).
+//
+// Three exits from `handleVerifierAudit` never stamped `story.verifier`: the
+// verifier produced no verdict at all, it produced one that named no audited
+// story, and B-3 (d)'s `insufficient-evidence` return — which answers BEFORE a
+// subturn is even attempted. The selector re-picks on `!story.verifier`, and
+// the cap is only ever consulted through `verdictOutdatedByEdits`, which
+// REQUIRES an existing verdict. So the counter climbed and nothing read it.
+//
+// Measured on the unfixed build, cap 3, 8 edit+idle rounds:
+//   - the verifier omits an audited story: 8 subturns, `storyReaudits.S2 = 7`,
+//     S2's stamp `undefined` forever, 0 escalations.
+//   - `insufficient-evidence`: 8 rounds, 0 subturns, `storyReaudits.S1 = 8`,
+//     no stamp, no continuation ever. PERMANENT SILENCE — worse than the storm,
+//     because nothing tells the user the work was never verified.
+//   - a malformed verdict: 8 subturns, `storyReaudits.S1 = 8`, no stamp.
+//
+// The bound is the same one `boundUnappliedVerdicts` already provides: stamp
+// the story, charge the round, and let the cap hand the plan to
+// `emitUnauditedEscalation`, which says it once and then stops.
+// ===========================================================================
+describe("handleVerifierAudit — an answerless round still bounds the story", () => {
+  /** The escalation is the ONE thing the harness is allowed to say about a
+   * story it could not verify. Matched on its own wording, so an unrelated
+   * stop-block continuation in the same round is not miscounted. */
+  const escalations = (h: ReturnType<typeof harness>): string[] =>
+    continuations(h.prompt).map((c) => c.text).filter((t) => t.includes("did not pass") && t.includes("audit"))
+
+  /** Drive `rounds` idles, each followed by an edit — the live shape, and the
+   * one that keeps `verdictOutdatedByEdits` true so the loop can run. */
+  async function editIdleRounds(
+    h: ReturnType<typeof harness>,
+    sid: string,
+    state: ReturnType<typeof freshSessionState>,
+    rounds: number,
+  ): Promise<void> {
+    for (let i = 0; i < rounds; i++) {
+      state.idleContinuationInFlight = false
+      await handleSessionIdle(h.ctx, sid)
+      h.evidenceLedger.recordChangedFiles(sid, `src/round${i}.ts`)
+    }
+  }
+
+  it("bounds a story the verifier never names", async () => {
+    const h = harness({ verifierEnabled: true, maxStoryReaudits: 3 })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    h.storyEngine.createPlan(sid, [
+      { text: "Research wave", acceptanceItems: ["x.md cites sources"], scopeGlobs: [], verifiers: [], tasks: [{ text: "write it" }] },
+      { text: "Chart wave", acceptanceItems: ["chart renders"], scopeGlobs: [], verifiers: [], tasks: [{ text: "build it" }] },
+    ])
+    h.storyEngine.checkpoint(sid, "S1.T1", "complete")
+    h.storyEngine.checkpoint(sid, "S2.T1", "complete")
+    // The live shape: a two-story audit whose verdict names only S1. S2 is
+    // asked about on every round and answered about on none.
+    stubVerifier(h, {
+      stories: [{ storyId: "S1", pass: true, summary: "delivered", items: [{ itemId: "A1", met: true, note: "seen" }] }],
+    })
+
+    await editIdleRounds(h, sid, state, 8)
+
+    expect(verifierSubturns(h), "an unnamed story must not buy a subturn per idle").toBe(3)
+    expect(state.storyReaudits.S2, "the round must be charged to the story that went unanswered").toBe(3)
+    const s2 = h.storyEngine.getPlan(sid)!.stories[1]
+    expect(s2.verifier?.unapplied, "an unanswered story must be stamped, or the selector re-picks it forever").toBe("unverified")
+    expect(s2.verifier?.pass, "the harness must not launder silence into a pass").toBe(false)
+    expect(escalations(h), "the harness must say it once — and only once").toHaveLength(1)
+    expect(escalations(h)[0]).toContain("S2")
+  })
+
+  it("bounds a story the verifier has no evidence to judge", async () => {
+    // `diffText: ""` plus the stub's empty transcript is B-3 (d)'s
+    // `insufficient-evidence`: `runVerifier` answers before creating a child
+    // session, so this loop is INVISIBLE in a subturn count — it showed up as
+    // a harness that had simply gone quiet forever.
+    const h = harness({ verifierEnabled: true, maxStoryReaudits: 3, diffText: "" })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid)
+    stubVerifier(h, {
+      stories: [{ storyId: "S1", pass: true, summary: "never reached", items: [{ itemId: "A1", met: true, note: "seen" }] }],
+    })
+
+    await editIdleRounds(h, sid, state, 8)
+
+    const refusals = h.logger.mock.calls.filter((c) => c[0] === "verifier:insufficient-evidence").length
+    expect(verifierSubturns(h), "the refusal is decided before any subturn").toBe(0)
+    expect(refusals, "a verifier that cannot judge must not be re-asked forever").toBe(3)
+    expect(state.storyReaudits.S1).toBe(3)
+    const s1 = h.storyEngine.getPlan(sid)!.stories[0]
+    expect(s1.verifier?.unapplied, "an unjudgeable story must still be stamped").toBe("unverified")
+    // THE POINT OF THIS TEST. "The harness cannot verify" must not mean "the
+    // harness never speaks again" — the user is told, exactly once.
+    expect(escalations(h), "silence is the failure mode this test exists to kill").toHaveLength(1)
+    expect(escalations(h)[0]).toContain("S1")
+  })
+
+  it("bounds a story whose verifier is unavailable or malformed", async () => {
+    const h = harness({ verifierEnabled: true, maxStoryReaudits: 3 })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid)
+    // Not a verdict shape at all — `runVerifier` returns `malformed`.
+    stubVerifier(h, "not json at all")
+
+    await editIdleRounds(h, sid, state, 8)
+
+    expect(verifierSubturns(h), "a broken verifier must not buy a subturn per idle").toBe(3)
+    expect(state.storyReaudits.S1).toBe(3)
+    const s1 = h.storyEngine.getPlan(sid)!.stories[0]
+    expect(s1.verifier?.unapplied, "a verdictless round must still stamp the story").toBe("unverified")
+    expect(escalations(h)).toHaveLength(1)
+  })
+
+  // REGRESSION GUARD. The fix above must not reach the paths that were always
+  // right: a substantiated failure still reverts, the cap still stamps
+  // `capped` after exactly `maxStoryReaudits` reverts, and the plan terminates.
+  it("regression: an evidenced, substantiated failure still reverts, caps and terminates", async () => {
+    const h = harness({ verifierEnabled: true, maxStoryReaudits: 3 })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid)
+    stubVerifier(h, {
+      stories: [{ storyId: "S1", pass: false, summary: "no sources", items: [{ itemId: "A1", met: false, note: "no sources cited" }] }],
+    })
+
+    for (let i = 0; i < 8; i++) {
+      state.idleContinuationInFlight = false
+      await handleSessionIdle(h.ctx, sid)
+      if (i === 0) expect(h.storyEngine.getPlan(sid)!.stories[0].status, "a substantiated failure must revert").toBe("active")
+      h.evidenceLedger.recordChangedFiles(sid, `src/fix${i}.ts`)
+      h.storyEngine.checkpoint(sid, "S1.T1", "complete")
+    }
+
+    expect(verifierSubturns(h), "3 revert rounds plus the round that caps them").toBe(4)
+    const s1 = h.storyEngine.getPlan(sid)!.stories[0]
+    expect(s1.verifier?.unapplied, "a story the verifier DID judge is disputed, not unverified").toBe("capped")
+    const said = continuations(h.prompt).map((c) => c.text).join("\n")
+    expect(said, "a capped story was audited — calling it unverified would be false").toContain("DISPUTED")
+    expect(escalations(h)).toHaveLength(1)
+  })
 })
 
 // ===========================================================================

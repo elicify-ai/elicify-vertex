@@ -1102,6 +1102,66 @@ function boundUnappliedVerdicts(
 }
 
 /**
+ * THE ANSWERLESS ROUND — the last three unbounded exits (2026-08-06).
+ *
+ * `boundUnappliedVerdicts` bounds a round the verifier ANSWERED and the harness
+ * refused to act on. Three exits produced no answer to bound at all, and each
+ * of them merely `bumpReaudit`ed (or did not even do that) and returned:
+ *
+ *   1. `!result.verdict` — unavailable / unsupported / malformed.
+ *   2. a verdict that names none of the audited stories, or (the case three
+ *      reviewers found and the two above hid) SOME of them: a two-story audit
+ *      answered only about S1 leaves S2 unanswered on every single round.
+ *   3. B-3 (d)'s `insufficient-evidence`, which returns before a subturn is
+ *      even attempted.
+ *
+ * A bump alone does nothing, because the ONLY reader of the counter is
+ * `verdictOutdatedByEdits`, and that requires an existing verdict — so a story
+ * with no stamp is re-selected by `!story.verifier` forever while the counter
+ * climbs past a cap nobody consults. Measured on the unfixed build, cap 3, over
+ * 8 edit+idle rounds:
+ *   - unanswered story: 8 subturns, `storyReaudits.S2 = 7`, stamp `undefined`.
+ *   - malformed verdict: 8 subturns, `storyReaudits.S1 = 8`, stamp `undefined`.
+ *   - `insufficient-evidence`: 8 rounds, ZERO subturns, `storyReaudits.S1 = 8`,
+ *     stamp `undefined`, and not one word to the user — the harness simply went
+ *     silent about work it had never verified. That is worse than the storm.
+ *
+ * So an answerless round is bounded exactly like a refused one: the story is
+ * stamped, the round is charged, and once the cap binds the selector stops and
+ * `emitUnauditedEscalation` says it ONCE. `"unverified"` is the honest reason —
+ * these stories were not verified against the worktree, which is precisely what
+ * that stamp means and what the escalation already says about it. The specific
+ * cause is carried in the stamp's summary (and in the event log) rather than in
+ * a new enum member, so no persisted plan schema changes.
+ *
+ * NOT "retry until the cap, then stamp": a stamp is what makes the cap
+ * readable at all. Retries still happen — `verdictOutdatedByEdits` re-audits a
+ * bounding stamp whenever the code moves, up to the cap — so a transient
+ * outage recovers, and a permanent one terminates.
+ */
+function boundAnswerlessRound(
+  ctx: GateContext,
+  sid: string,
+  state: V2SessionState,
+  storyIds: Iterable<string>,
+  why: string,
+): void {
+  const verdicts: VerifierStoryVerdict[] = [...storyIds].map((storyId) => ({
+    storyId,
+    // `false`, never `true`: "nobody judged this" must not read downstream as
+    // "this passed" — the C2 laundering `unapplied` exists to prevent.
+    pass: false,
+    summary: why,
+    // No items: there is no verdict to record. `verdictIsSubstantiated`
+    // already treats an empty `items` as unsubstantiated, which is the same
+    // judgement this stamp is recording.
+    items: [],
+  }))
+  if (verdicts.length === 0) return
+  boundUnappliedVerdicts(ctx, sid, state, verdicts, "unverified")
+}
+
+/**
  * FR-001 — drop the individual `met:false` items whose note asserts a path is
  * absent when that path demonstrably exists inside the worktree.
  *
@@ -1435,14 +1495,21 @@ async function handleVerifierAudit(ctx: GateContext, sid: string, state: V2Sessi
       message: `the completion verifier did not run (${result.reason ?? "unknown"}) — claimed stories are unverified`,
       variant: "warning",
     })
-    // CHARGE THE ROUND. Every other exit from this function reaches a bump —
-    // `boundUnappliedVerdicts` for a bounded verdict, the revert path for a
-    // failing one. These two returns predate both, so a story that keeps being
-    // re-selected by staleness got a free verifier subturn on every idle
-    // forever. Measured: 6 extra subturns over 6 rounds with the counter stuck
-    // at 1. Charged here, and NOT at selection, so the ordinary revert path is
-    // not double-billed.
-    for (const storyId of auditIds) bumpReaudit(state, storyId)
+    // BOUND THE ROUND, don't just charge it. Charging alone was the previous
+    // fix and it did nothing: the counter's only reader needs a verdict to
+    // exist, and this path never wrote one, so the selector's `!story.verifier`
+    // test kept re-picking the story and the cap was never consulted. Measured
+    // unfixed: 8 subturns over 8 rounds against a cap of 3 (and for
+    // `insufficient-evidence`, 8 rounds of total silence with no subturn at
+    // all). `boundAnswerlessRound` bumps as well, so the round is still charged
+    // exactly once and the ordinary revert path is not double-billed.
+    boundAnswerlessRound(
+      ctx,
+      sid,
+      state,
+      auditIds,
+      `the completion verifier produced no verdict (${result.reason ?? "unknown"})`,
+    )
     return false
   }
 
@@ -1450,18 +1517,25 @@ async function handleVerifierAudit(ctx: GateContext, sid: string, state: V2Sessi
   // the verifier was told what to audit; anything else it chose to opine on is
   // not grounded in this run's payload.
   const onTarget = result.verdict.stories.filter((v) => auditIds.has(v.storyId))
-  if (onTarget.length === 0) {
+  // EVERY audited story must leave this round bounded, not just the ones the
+  // verifier chose to answer about. The old code only handled the all-or-
+  // nothing case (`onTarget.length === 0`), so a PARTIAL answer — a two-story
+  // audit whose verdict names S1 and forgets S2 — stamped S1 and left S2
+  // unstamped, and `!story.verifier` re-selected S2 on every idle forever.
+  // Measured unfixed: 8 subturns over 8 rounds with `storyReaudits.S2` at 7 and
+  // S2's stamp still `undefined`. Three reviewers found this independently.
+  const answered = new Set(onTarget.map((v) => v.storyId))
+  const unanswered = [...auditIds].filter((storyId) => !answered.has(storyId))
+  if (unanswered.length > 0) {
     ctx.logger("verifier:off-target", {
       sessionID: sid,
       requested: [...auditIds],
       received: result.verdict.stories.map((v) => v.storyId),
+      unanswered,
     })
-    // Same reasoning as the `!result.verdict` return above: an off-target
-    // verdict is a round spent, or a verifier that never names the right story
-    // buys unlimited subturns.
-    for (const storyId of auditIds) bumpReaudit(state, storyId)
-    return false
+    boundAnswerlessRound(ctx, sid, state, unanswered, "the completion verifier's verdict did not mention this story")
   }
+  if (onTarget.length === 0) return false
 
   // FR-014 — the tool-call floor. The audited session's verifier fabricated
   // filesystem claims it never looked at; a live probe reproduced it in 9.8s
