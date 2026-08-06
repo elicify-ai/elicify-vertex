@@ -280,8 +280,16 @@ if (section("D. One-time star ask")) {
 
   await s.idle()
   await sleep(PAUSE_MS + 400)
-  const asks = s.sent().filter((t) => t.includes("star elicify-ai/elicify-vertex"))
-  assert("D3-asked-on-quiet-turn", asks.length === 1, `${asks.length} asks`)
+  // INVISIBLE CHANNEL: armed on a quiet turn, delivered by the next
+  // system.transform. It must never be a continuation — that is a user-role
+  // message, and it put the harness's own machinery on the user's screen.
+  const sysAsk = await s.system()
+  assert("D3-asked-on-quiet-turn", sysAsk.includes("star elicify-ai/elicify-vertex"), "not injected")
+  assert(
+    "D3b-never-a-continuation",
+    s.sent().filter((t) => t.includes("star elicify-ai")).length === 0,
+    "leaked into chat",
+  )
 
   // The record now holds `{state, attempts}`: the attempt count persists (it
   // bounds retries across sessions and restarts) but the one-shot is NOT spent
@@ -312,10 +320,7 @@ if (section("D. One-time star ask")) {
   await legacy.say("/elicify-vertex\n\nbuild it")
   await legacy.idle()
   await sleep(PAUSE_MS + 400)
-  assert(
-    "D7-legacy-prompted-ignored",
-    legacy.sent().filter((t) => t.includes("star elicify-ai/elicify-vertex")).length === 1,
-  )
+  assert("D7-legacy-prompted-ignored", (await legacy.system()).includes("star elicify-ai/elicify-vertex"))
   rmSync(consentPath, { force: true })
 }
 
@@ -327,21 +332,23 @@ if (!ONLY || "D".startsWith(ONLY)) {
   // CRIT-001: the ask must go through the continuation path, so its echo is
   // consumed. Dispatching it raw made the host redeliver it as a real user
   // message, which resets the ledger and downgrades `deep` to `normal`.
-  // ORDERING MATTERS. A real host delivers the echoed `chat.message` while
-  // `session.prompt` is STILL PENDING — that is when the in-flight guard is
-  // up. A stub that resolves instantly inverts it and every continuation,
-  // including the gate's own, then looks like user intent. So the echo is
-  // delivered from inside the prompt call.
-  const echo = await scenario({ echoContinuations: true })
-  await echo.say("/elicify-vertex\n\ndeploy the auth migration to production")
-  await echo.tool("edit", { filePath: join(echo.work, "a.ts") })
-  await echo.idle()
+  // The echo tests that lived here are gone with the continuation: there is
+  // no user-role message to echo any more. The stronger property replaces
+  // them — across a whole session the ask never reaches the chat at all.
+  const quiet = await scenario()
+  await quiet.say("/elicify-vertex\n\ndeploy the auth migration to production")
+  await quiet.tool("edit", { filePath: join(quiet.work, "a.ts") })
+  await quiet.idle()
   await sleep(PAUSE_MS + 400)
-  await echo.idle()
+  await quiet.system()
+  await quiet.say("carry on")
+  await quiet.idle()
   await sleep(PAUSE_MS + 400)
-  const asksAfterEcho = echo.sent().filter((t) => t.includes("star elicify-ai/elicify-vertex")).length
-  assert("D8-star-ask-dispatched-for-echo-test", asksAfterEcho > 0)
-  assert("D9-echo-does-not-re-ask", asksAfterEcho === 1, `${asksAfterEcho} asks after echo`)
+  assert(
+    "D8-never-reaches-the-chat",
+    quiet.sent().filter((t) => t.includes("star elicify-ai")).length === 0,
+    `${quiet.sent().filter((t) => t.includes("star elicify-ai")).length} leaked`,
+  )
 
   // MAJ-002: it must not speak in the same idle as a real continuation.
   rmSync(consentPath, { force: true })

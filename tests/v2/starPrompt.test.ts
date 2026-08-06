@@ -47,8 +47,10 @@ interface Harness {
   prompts: Array<{ body?: { parts?: Array<{ text?: string }> } }>
   /** Continuation texts sent to the parent session (no agent tag). */
   sent: () => string[]
-  /** Texts that are the star ask specifically. */
+  /** Star asks observed on the system channel (the invisible one). */
   starAsks: () => string[]
+  /** Run a system.transform, as the host does at the start of the next turn. */
+  transform: () => Promise<string>
 }
 
 async function harness(): Promise<Harness> {
@@ -74,7 +76,21 @@ async function harness(): Promise<Harness> {
   const sid = `star-${Math.random().toString(36).slice(2)}`
   const sent = (): string[] =>
     prompts.filter((p) => !p?.body?.agent).map((p) => String(p?.body?.parts?.[0]?.text ?? ""))
-  return { hooks, sid, prompts, sent, starAsks: () => sent().filter((t) => t.includes("star elicify-ai/elicify-vertex")) }
+
+  // Every injection seen on the system channel, accumulated across turns —
+  // `system.transform` drains the pending flag, so it is observable once.
+  const injected: string[] = []
+  const transform = async (): Promise<string> => {
+    const out = { system: [] as string[] }
+    await hooks["experimental.chat.system.transform"]!(
+      { sessionID: sid, model: { providerID: "anthropic", id: "claude-opus-4" } } as never,
+      out,
+    )
+    const text = out.system.join("\n")
+    if (text.includes("star elicify-ai/elicify-vertex")) injected.push(text)
+    return text
+  }
+  return { hooks, sid, prompts, sent, transform, starAsks: () => injected }
 }
 
 async function userTurn(h: Harness, text: string): Promise<void> {
@@ -86,6 +102,9 @@ async function userTurn(h: Harness, text: string): Promise<void> {
 
 async function idle(h: Harness): Promise<void> {
   await h.hooks.event!({ event: { type: "session.idle", properties: { sessionID: h.sid } } as never })
+  // The host runs a system.transform at the start of the next turn; that is
+  // where the armed ask is delivered.
+  await h.transform()
 }
 
 /** The model calls the `question` tool — `args` decides whether it is OUR ask. */
@@ -105,18 +124,23 @@ const STAR_WORD_ASKS = [
 ]
 
 describe("star ask — delivery", () => {
-  it("is NOT injected into the system prompt", async () => {
+  // INVISIBLE CHANNEL. The user must never watch the harness instruct the
+  // model to ask them something. It was briefly a continuation — a user-role
+  // message — which put that machinery on screen.
+  it("is NEVER sent as a continuation", async () => {
     const h = await harness()
     await userTurn(h, "/elicify-vertex\n\nbuild the thing")
-    const out = { system: [] as string[] }
-    await h.hooks["experimental.chat.system.transform"]!(
-      { sessionID: h.sid, model: { providerID: "anthropic", id: "claude-opus-4" } } as never,
-      out,
-    )
-    expect(out.system.join("\n")).not.toContain("star elicify-ai/elicify-vertex")
+    await idle(h)
+    expect(h.sent().filter((t) => t.includes("star elicify-ai"))).toHaveLength(0)
   })
 
-  it("is delivered as a continuation on a quiet turn", async () => {
+  it("is not injected before a quiet turn arms it", async () => {
+    const h = await harness()
+    await userTurn(h, "/elicify-vertex\n\nbuild the thing")
+    expect(await h.transform()).not.toContain("star elicify-ai/elicify-vertex")
+  })
+
+  it("is injected on the system channel after a quiet turn", async () => {
     const h = await harness()
     await userTurn(h, "/elicify-vertex\n\nbuild the thing")
     await idle(h)
