@@ -99,13 +99,43 @@ describe("the slash template does not drift from the agent prompt", () => {
 // user being asked every session.
 // ---------------------------------------------------------------------------
 describe("the star bullet tells the model to name the repo", () => {
+  /**
+   * THE BULLET, AND NOTHING AFTER IT.
+   *
+   * This used to split the body on `\n(?=- **)` and take the block containing
+   * the star bullet. The star bullet is the LAST `- **` item in its section, so
+   * that block ran on to the next `- **` bullet ANYWHERE in the file — 1429
+   * characters spanning the end of `<how_you_work>`, all of `<grounding>`'s
+   * prose and its numbered list. Every assertion below was then matched
+   * against three sections of prompt instead of against the bullet, so a
+   * phrase that moved out of the bullet into neighbouring text (or was never
+   * in the bullet at all) still read as present.
+   *
+   * A markdown list item is its own `- ` line plus the INDENTED lines that
+   * continue it, and that is the boundary used here. The extraction itself is
+   * guarded by its own test below, because a silently-too-wide extractor is
+   * how this guard stopped guarding the first time.
+   */
   function starBullet(): string {
-    const bullet = behaviorBody()
-      .split(/\n(?=- \*\*)/)
-      .find((block) => block.includes("Settle the star question"))
-    if (!bullet) throw new Error("the star bullet is gone from the agent prompt")
-    return bullet
+    const lines = behaviorBody().split("\n")
+    const start = lines.findIndex((line) => line.startsWith("- **") && line.includes("Settle the star question"))
+    if (start === -1) throw new Error("the star bullet is gone from the agent prompt")
+    let end = start + 1
+    while (end < lines.length && /^\s+\S/.test(lines[end])) end += 1
+    return lines.slice(start, end).join("\n")
   }
+
+  // MUTATION PROOF: restore the `split(/\n(?=- \*\*)/)` extraction -> the
+  // "bullet" is 1429 chars, carries `</how_you_work>` and `<grounding>`, and
+  // all three assertions go RED.
+  it("extracts the bullet itself, not every section after it", () => {
+    const bullet = starBullet()
+
+    expect(bullet.startsWith("- **Settle the star question")).toBe(true)
+    expect(bullet, "the extraction ran out of the bullet and into the next section").not.toContain("</how_you_work>")
+    expect(bullet).not.toContain("<grounding>")
+    expect(bullet.length, "a bullet this long is not a bullet — the boundary has slipped").toBeLessThan(1000)
+  })
 
   // MUTATION PROOF: delete the "write the slug verbatim" sentence from the
   // agent markdown (and re-sync) -> RED.

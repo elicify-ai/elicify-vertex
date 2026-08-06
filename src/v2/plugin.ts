@@ -790,7 +790,10 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       // Work happened: whatever the timer was measuring, it was not a pause.
       if (typeof toolInput?.sessionID === "string") cancelPauseJudge(toolInput.sessionID)
 
-      // The star ask is recorded HERE, and only here — on an OBSERVED
+      const sid = toolInput.sessionID
+      if (isSelf(sid)) return
+
+      // The star ask is recorded HERE as well as at dispatch — on an OBSERVED
       // `question` call carrying our repo. Nothing else writes `asked`.
       //
       // B-6 removed the runtime arm/inject/retry loop, so there is no longer a
@@ -799,16 +802,23 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       // observation nothing would ever write `asked`,
       // `elicify_vertex_star_status` would answer "none" forever, and the
       // agent would re-raise starring EVERY session — worse nagging than the
-      // loop that was deleted. A pure repo match is the whole gate.
+      // loop that was deleted. A repo-and-star match is the whole gate.
       // Matching rule + write live in `recordStarAskIfOurs` (wiring/tools.ts)
       // so both observation points share one implementation — see the twin in
       // `tool.execute.before`, which is the one that survives a question the
       // user escapes.
-      if (toolInput?.tool === "question" && typeof toolInput.sessionID === "string") {
-        if (recordStarAskIfOurs(toolInput.args)) logger("star:asked", { sessionID: toolInput.sessionID })
+      //
+      // PLACEMENT MATTERS, and it matches the twin exactly: AFTER `isSelf`
+      // (a `question` inside one of the harness's own subturn sessions is not
+      // an ask the user ever saw, and must not spend the machine-wide
+      // one-shot) and BEFORE the `state.active` check (a question put to the
+      // user in a session the harness has not activated is still a real ask,
+      // and the whole point of the marker is that it is machine-wide). The
+      // twin sits at the same two boundaries; this site used to sit above
+      // both, which is only moot because subturns are zero-tool today.
+      if (toolInput?.tool === "question" && typeof sid === "string") {
+        if (recordStarAskIfOurs(toolInput.args)) logger("star:asked", { sessionID: sid })
       }
-      const sid = toolInput.sessionID
-      if (isSelf(sid)) return
       const state = states.get(sid)
       if (!state || !state.active) return
 

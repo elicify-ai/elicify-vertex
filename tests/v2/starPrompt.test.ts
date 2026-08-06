@@ -27,8 +27,9 @@ import { dirname, join } from "node:path"
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
+import { eventsPath } from "../../src/measurement.js"
 import { ElicifyVertexPluginV2 } from "../../src/v2/plugin.js"
-import { readStarConsent, starConsentPath } from "../../src/v2/wiring/tools.js"
+import { readStarConsent, recordStarAskIfOurs, starConsentPath, writeStarConsent } from "../../src/v2/wiring/tools.js"
 import type { Hooks, PluginInput } from "@opencode-ai/plugin"
 
 let configRoot: string
@@ -55,10 +56,30 @@ interface Harness {
   transform: () => Promise<string>
   /** Call the read-only status tool and return its `consent` value. */
   status: () => Promise<string>
+  /** Session ids the HARNESS ITSELF created (subturn children). */
+  created: () => string[]
 }
 
-async function harness(): Promise<Harness> {
+/** A subagent that can do nothing at all — enough to satisfy the intake
+ *  subturn's capability probe (src/v2/subturn.ts), which otherwise skips and
+ *  no child session is ever created. Only the self-created-session test needs
+ *  it, so it is opt-in: every other test here keeps the agent-less client it
+ *  has always had. */
+function denyAllAgent(name: string): unknown {
+  return {
+    name,
+    mode: "subagent",
+    builtIn: false,
+    permission: { edit: "deny", write: "deny", bash: { "*": "deny" }, webfetch: "deny", task: "deny" },
+    tools: { bash: false, edit: false, write: false, webfetch: false, read: false, task: false, "*": false },
+    options: {},
+  }
+}
+
+async function harness(opts: { subturnsPossible?: boolean } = {}): Promise<Harness> {
   const prompts: Array<{ body?: { agent?: string; parts?: Array<{ text?: string }> } }> = []
+  const created: string[] = []
+  let childCounter = 0
   const client = {
     session: {
       prompt: async (a: never) => {
@@ -66,11 +87,20 @@ async function harness(): Promise<Harness> {
         return { data: { info: {}, parts: [] }, error: undefined }
       },
       messages: async () => ({ data: [] }),
-      create: async () => ({ data: { id: "child" } }),
+      create: async () => {
+        childCounter += 1
+        const id = `child-${childCounter}`
+        created.push(id)
+        return { data: { id } }
+      },
       delete: async () => ({ data: {} }),
     },
-    app: { agents: async () => ({ data: [] }) },
-    tool: { ids: async () => ({ data: [] }) },
+    app: {
+      agents: async () => ({
+        data: opts.subturnsPossible ? [denyAllAgent("vertex-verifier"), denyAllAgent("vertex-intake")] : [],
+      }),
+    },
+    tool: { ids: async () => ({ data: opts.subturnsPossible ? ["bash", "edit", "write", "webfetch", "read"] : [] }) },
   }
   const workDir = mkdtempSync(join(tmpdir(), "vertex-star-work-"))
   const hooks = await ElicifyVertexPluginV2(
@@ -95,7 +125,7 @@ async function harness(): Promise<Harness> {
     ).elicify_vertex_star_status.execute({}, { sessionID: sid })
     return JSON.parse(raw).consent
   }
-  return { hooks, sid, sent, transform, status }
+  return { hooks, sid, sent, transform, status, created: () => [...created] }
 }
 
 async function userTurn(h: Harness, text: string): Promise<void> {
@@ -183,6 +213,74 @@ const REPO_WORK_ASKS = [
   { questions: [{ question: "Which elicify-vertex directive family should own this?" }] },
 ]
 
+// ---------------------------------------------------------------------------
+// THE OVER-CORRECTION. The widening above deliberately avoided the words
+// `star` and `github`, which is exactly why it caught none of this: the widened
+// rule was "repo name ANYWHERE in the args, plus the SUBSTRING star or github
+// ANYWHERE in the args", and every row below satisfied it while being ordinary
+// work on this repo. `start`, `restart` and `getting-started` all contain
+// `star`; a repo that lives on GitHub says `github` in release chores, Actions
+// runs and `.github/` paths constantly.
+//
+// One match spends a MACHINE-WIDE, permanent one-shot — for every project on
+// that machine, not just this one — and the only recovery is deleting
+// `~/.config/opencode/.elicify-vertex-consent` by hand.
+//
+// MUTATION PROOFS, one per rule (each kills a different subset, which is why
+// all three rules are needed):
+//  - substring instead of `\bstar(ring)?\b`  -> the start/restart/getting-started rows go RED
+//  - `github` restored as a topic word       -> the Actions/release/picker rows go RED
+//  - repo+topic merely somewhere in the args -> the picker and the two path rows go RED
+//  - the "star as a noun modifier" check gone -> the star-badge row goes RED
+// ---------------------------------------------------------------------------
+const REPO_WORK_FALSE_POSITIVES: Array<[string, Record<string, unknown>]> = [
+  ["start (the substring trap)", { questions: [{ question: "Should I start the elicify-vertex dev server?" }] }],
+  ["restart", { questions: [{ question: "elicify-vertex is stale — should I restart opencode?" }] }],
+  [
+    "getting-started, with a repo path in a sibling arg",
+    {
+      questions: [{ question: "Where should the getting-started section go?" }],
+      filePath: "/home/dev/elicify-vertex/README.md",
+    },
+  ],
+  ["a star BADGE (star as a noun)", { questions: [{ question: "Should I add a star badge to the elicify-vertex README?" }] }],
+  [
+    "a GitHub Actions run",
+    { questions: [{ question: "The GitHub Actions run for elicify-vertex is failing — rerun?" }] },
+  ],
+  ["a release chore", { questions: [{ question: "Publish elicify-vertex 0.13.5 and push the tag to GitHub?" }] }],
+  [
+    "a repo picker that lists ours",
+    {
+      questions: [
+        {
+          question: "Which repo should I open on GitHub?",
+          options: ["elicify-ai/elicify-vertex", "elicify-ai/elicify-devpods"],
+        },
+      ],
+    },
+  ],
+  [
+    "a repo picker that offers to star one of several",
+    {
+      questions: [
+        {
+          question: "Which of these repos should I star for you?",
+          options: ["elicify-ai/elicify-vertex", "sindresorhus/ky"],
+        },
+      ],
+    },
+  ],
+  [
+    "a workflow path under the repo, next to the word github",
+    {
+      questions: [{ question: "Which GitHub workflow should I fix?" }],
+      filePath: "/home/dev/elicify-vertex/.github/workflows/ci.yml",
+    },
+  ],
+  ["how many stars (a count, not the ask)", { questions: [{ question: "How many stars does elicify-vertex have?" }] }],
+]
+
 describe("the ask is recorded whatever wording the model chooses", () => {
   // MUTATION PROOF: restore the old rule (require the full `STAR_REPO` slug)
   // -> five of these seven record nothing and go RED.
@@ -199,6 +297,22 @@ describe("the ask is recorded whatever wording the model chooses", () => {
     const h = await harness()
     await questionTool(h, args)
     expect(readStarConsent(), "only OUR ask may spend the one-shot").toBeNull()
+  })
+
+  // ORDINARY WORK ON THIS REPO MUST NOT BURN THE ONE-SHOT.
+  it.each(REPO_WORK_FALSE_POSITIVES)("does not spend the one-shot on %s", async (_label, args) => {
+    const h = await harness()
+    await questionTool(h, args)
+    expect(readStarConsent(), "a false burn kills the ask for EVERY project on this machine, forever").toBeNull()
+    expect(await h.status()).toBe("none")
+  })
+
+  // The same corpus at the DISPATCH hook, which is the one that writes for a
+  // question the user never answers — a false positive there is unanswerable.
+  it.each(REPO_WORK_FALSE_POSITIVES)("does not spend the one-shot on %s at dispatch either", async (_label, args) => {
+    const h = await harness()
+    await questionDispatched(h, args)
+    expect(readStarConsent()).toBeNull()
   })
 })
 
@@ -285,11 +399,25 @@ describe("only the documented union counts as a record", () => {
   })
 
   // Guard the guard: normalising case must not throw away real decisions.
+  //
+  // The two JSON rows with padded VALUES are the only ones that pin
+  // `normalizeStarConsent`'s `.trim()`. The bare-word row does not:
+  // `readStarState` trims the whole file before it ever looks at the word, so
+  // `"  declined  "` survives with or without the normaliser's own trim. A
+  // padded value INSIDE the JSON reaches the normaliser untouched — a
+  // hand-edited or pretty-printed marker is exactly where that whitespace
+  // comes from, and dropping the trim turns the user's recorded decision into
+  // "no record at all".
+  //
+  // MUTATION PROOF: `raw.toLowerCase()` without `.trim()` -> both padded JSON
+  // rows read as null and go RED.
   it.each([
     ['{"state":"YES"}', "yes"],
     ['{"state":"Declined"}', "declined"],
     ["ASKED", "asked"],
     ["  declined  ", "declined"],
+    ['{"state":"  declined  "}', "declined"],
+    ['{"state":"\\n\\tYES "}', "yes"],
   ])("still honours %s as %s", async (contents, expected) => {
     plant(contents)
     expect(readStarConsent()).toBe(expected)
@@ -427,6 +555,117 @@ describe("the one-shot is spent only on an OBSERVED ask", () => {
     const h = await harness()
     await questionTool(h, OUR_ASK)
     expect(readStarConsent()).toBe("yes")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// A RECORD THAT DID NOT PERSIST IS NOT A RECORD. `writeStarConsent` swallows
+// every write error (it runs inside a hook and must not throw into the host),
+// and `recordStarAskIfOurs` used to `return true` regardless — so on an
+// unwritable config root the harness logged `star:asked` TWICE (once per
+// observation point) for a marker that was never written. The event log said
+// the one-shot was spent; the disk said nothing had happened.
+// ---------------------------------------------------------------------------
+describe("the ask is only reported as recorded when it actually persisted", () => {
+  /** Point XDG_CONFIG_HOME under a FILE: `mkdirSync` then fails with ENOTDIR
+   *  for every user, including root — a chmod-based read-only directory does
+   *  not hold when the suite runs as root. */
+  function blockTheConfigRoot(): void {
+    const root = mkdtempSync(join(tmpdir(), "vertex-star-blocked-"))
+    const blocker = join(root, "not-a-directory")
+    writeFileSync(blocker, "")
+    process.env.XDG_CONFIG_HOME = join(blocker, "config")
+  }
+
+  function starAskedEvents(): unknown[] {
+    const path = eventsPath()
+    if (!existsSync(path)) return []
+    return readFileSync(path, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as { event_type?: string })
+      .filter((event) => event.event_type === "star:asked")
+  }
+
+  let previousData: string | undefined
+  beforeEach(() => {
+    previousData = process.env.VERTEX_DATA
+    process.env.VERTEX_DATA = mkdtempSync(join(tmpdir(), "vertex-star-events-"))
+  })
+  afterEach(() => {
+    if (previousData === undefined) delete process.env.VERTEX_DATA
+    else process.env.VERTEX_DATA = previousData
+  })
+
+  // MUTATION PROOF: `writeStarConsent("asked"); return true` (the old body)
+  // -> this returns true for a marker that does not exist and goes RED.
+  it("recordStarAskIfOurs returns false when the write cannot land", () => {
+    blockTheConfigRoot()
+    expect(writeStarConsent("asked"), "the write cannot possibly have succeeded").toBe(false)
+    expect(recordStarAskIfOurs(OUR_ASK), "reporting a record that is not on disk is the bug").toBe(false)
+    expect(existsSync(starConsentPath())).toBe(false)
+  })
+
+  // MUTATION PROOF: same revert -> TWO `star:asked` events are logged (one per
+  // observation point) with nothing on disk, and this goes RED.
+  it("logs no star:asked at all when nothing could be written", async () => {
+    blockTheConfigRoot()
+    const h = await harness()
+    await questionTool(h, OUR_ASK)
+    expect(existsSync(starConsentPath())).toBe(false)
+    expect(starAskedEvents(), "an event for a record that does not exist").toHaveLength(0)
+    expect(await h.status()).toBe("none")
+  })
+
+  // Guard the guard, and the idempotency of the two observation points: a
+  // writable root logs exactly ONE event across dispatch + completion.
+  it("logs exactly one star:asked when the record does land", async () => {
+    const h = await harness()
+    await questionTool(h, OUR_ASK)
+    expect(readStarConsent()).toBe("asked")
+    expect(starAskedEvents()).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The harness's OWN subturn sessions are not the user. `tool.execute.before`
+// returns early for a self-created session before it ever reaches the star
+// branch; `tool.execute.after` recorded ABOVE its `isSelf` check, so the two
+// observation points disagreed about whose `question` counts. Moot only while
+// subturns are zero-tool — the marker is machine-wide and permanent, so the
+// site that can spend it must not be the lenient one.
+// ---------------------------------------------------------------------------
+describe("a question inside the harness's own subturn never spends the one-shot", () => {
+  // MUTATION PROOF: move the star block back above `if (isSelf(sid)) return`
+  // in `tool.execute.after` -> the child session's question records `asked`
+  // and this goes RED.
+  it("ignores our star ask when it comes from a self-created child session", async () => {
+    const h = await harness({ subturnsPossible: true })
+    // A deep ask makes the plugin run its own intake-classification subturn,
+    // which is what registers a genuinely self-created session id — a stub id
+    // would prove nothing about `isSelf`.
+    await userTurn(h, "/elicify-vertex\n\nrefactor the auth database migration end to end")
+    const childSID = h.created()[0]
+    expect(childSID, "no subturn child was created — this test would be vacuous").toBeTruthy()
+
+    await h.hooks["tool.execute.after"]!(
+      { tool: "question", sessionID: childSID, callID: "c-child", args: OUR_ASK } as never,
+      { title: "question", output: "answered", metadata: {} } as never,
+    )
+    await h.hooks["tool.execute.before"]!(
+      { tool: "question", sessionID: childSID, callID: "c-child-2" } as never,
+      { args: OUR_ASK } as never,
+    )
+
+    expect(readStarConsent(), "the user never saw a question the harness asked itself").toBeNull()
+  })
+
+  // The parent session is unaffected — the guard must not swallow real asks.
+  it("still records the same ask from the parent session", async () => {
+    const h = await harness({ subturnsPossible: true })
+    await userTurn(h, "/elicify-vertex\n\nrefactor the auth database migration end to end")
+    await questionTool(h, OUR_ASK)
+    expect(readStarConsent()).toBe("asked")
   })
 })
 

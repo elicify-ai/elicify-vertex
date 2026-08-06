@@ -91,13 +91,19 @@ describe("artifact_parse_criteria (test 10)", () => {
   // `continue`, or drop the "inline remainder must parse as an item" return,
   // and these go RED while every bullet test above stays green.
   // -------------------------------------------------------------------------
+  // THIS TEST USED TO PROVE NOTHING. Its plan list was introduced by a line of
+  // prose ("Here is how I will do it:"), and prose ends the block on its own —
+  // so it passed with the blank-line guard reverted to `continue` as happily as
+  // with it in place. The measured shape has no such cushion: the bullets
+  // follow the blank line DIRECTLY, which is the version below. The prose
+  // variant is kept as its own case rather than deleted; it is a real shape,
+  // it just cannot be the discriminating one.
   it("does not bridge a blank line into the model's plan bullets", () => {
     const text = [
       "CRITERIA:",
       "1. parser handles nesting",
       "2. errors point at inner token",
       "",
-      "Here is how I will do it:",
       "- read the tokenizer",
       "- add a depth counter",
       "- run the suite",
@@ -110,6 +116,21 @@ describe("artifact_parse_criteria (test 10)", () => {
       "parser handles nesting",
       "errors point at inner token",
     ])
+  })
+
+  it("does not bridge a blank line into a plan list introduced by prose either", () => {
+    const text = [
+      "CRITERIA:",
+      "1. parser handles nesting",
+      "2. errors point at inner token",
+      "",
+      "Here is how I will do it:",
+      "- read the tokenizer",
+      "- add a depth counter",
+      "- run the suite",
+    ].join("\n")
+
+    expect(parseCriteriaBlock(text)!.criteria).toEqual(["parser handles nesting", "errors point at inner token"])
   })
 
   it("stops at the blank line even when the next list is immediately below the key line's items", () => {
@@ -171,6 +192,114 @@ describe("artifact_parse_criteria (test 10)", () => {
     const text = "CRITERIA:\n\n1. parser handles nesting"
     expect(parseCriteriaBlock(text)).toBeNull()
     expect(findCriteriaKeyLine(text)).toBe("CRITERIA:")
+  })
+
+  // -------------------------------------------------------------------------
+  // A LOOSE MARKDOWN LIST IS STILL ONE LIST. Contiguity, applied to every blank
+  // line wherever it fell, silently DROPPED criteria the model had written:
+  // "CRITERIA:" / "1. …" / blank / "2. …" / blank / "3. …" pinned item 1 alone.
+  // Nothing logged it — `criteria:parse-miss` fires only when the parse returns
+  // null, and this returned one item — compliance was recorded, and the
+  // now non-empty pin store closed the intake-scaffold gate for the session, so
+  // the model could never replace the truncated list by answering again.
+  // Blank-separated items are ordinary markdown, not a layout the model has to
+  // be punished for.
+  //
+  // The tolerance is exactly as wide as the PROOF that the list continues: one
+  // blank line, then the item numbered `previous + 1`. Every shape that was
+  // measured pinning junk carries no such proof and is still refused (see the
+  // block above, and the rejections immediately below).
+  // -------------------------------------------------------------------------
+  describe("loose (blank-separated) numbered lists", () => {
+    // MUTATION PROOF: restore the unconditional `if (line.trim() === "") break`
+    // -> only "one" is parsed and this goes RED.
+    it("parses every item of a blank-separated numbered list", () => {
+      const text = ["CRITERIA:", "1. one", "", "2. two", "", "3. three"].join("\n")
+
+      expect(parseCriteriaBlock(text)!.criteria).toEqual(["one", "two", "three"])
+    })
+
+    it("parses a loose list that starts on the key line itself", () => {
+      const text = ["CRITERIA: 1. one", "", "2. two"].join("\n")
+
+      expect(parseCriteriaBlock(text)!.criteria).toEqual(["one", "two"])
+    })
+
+    it("mixes tight and loose spacing in one list", () => {
+      const text = ["CRITERIA:", "1. one", "2. two", "", "3. three", "4. four"].join("\n")
+
+      expect(parseCriteriaBlock(text)!.criteria).toEqual(["one", "two", "three", "four"])
+    })
+
+    it("still caps and reports truncation across the blank lines", () => {
+      const items = Array.from({ length: 12 }, (_, i) => `${i + 1}. item ${i + 1}`).join("\n\n")
+      const result = parseCriteriaBlock(`CRITERIA:\n${items}`)
+
+      expect(result!.criteria).toHaveLength(10)
+      expect(result!.truncated).toBe(true)
+    })
+
+    // ---- and the four shapes that carry no proof of continuation ----------
+    //
+    // MUTATION PROOF for all four: drop the `itemNumber(next) === lastNumber+1`
+    // condition (skip any single blank line) -> each one swallows the list
+    // below the break and goes RED.
+    it("refuses a bullet list across a blank line — bullets prove nothing", () => {
+      const text = ["CRITERIA:", "- one real criterion", "", "- a later, unrelated bullet"].join("\n")
+
+      expect(parseCriteriaBlock(text)!.criteria).toEqual(["one real criterion"])
+    })
+
+    it("refuses a second numbered list that restarts at 1", () => {
+      const text = ["CRITERIA:", "1. one", "2. two", "", "1. a fresh list, not item three"].join("\n")
+
+      expect(parseCriteriaBlock(text)!.criteria).toEqual(["one", "two"])
+    })
+
+    it("refuses a number that skips — a gap is not a continuation", () => {
+      const text = ["CRITERIA:", "1. one", "", "3. three"].join("\n")
+
+      expect(parseCriteriaBlock(text)!.criteria).toEqual(["one"])
+    })
+
+    it("refuses to cross a paragraph break (two blank lines)", () => {
+      const text = ["CRITERIA:", "1. one", "", "", "2. two"].join("\n")
+
+      expect(parseCriteriaBlock(text)!.criteria).toEqual(["one"])
+    })
+
+    it("still refuses to reach past a code fence", () => {
+      const text = ["CRITERIA:", "1. one", "", "```", "2. not a criterion, a code sample", "```"].join("\n")
+
+      expect(parseCriteriaBlock(text)!.criteria).toEqual(["one"])
+    })
+
+    // THE OTHER DIRECTION, kept intact: the relaxation must not reopen the
+    // documented reject case. The first item must still be contiguous with the
+    // key line, so a key followed by a blank line and an UNRELATED list is
+    // still nothing pinned — and still LOUD, because the key line is reported
+    // for the caller's `criteria:parse-miss`.
+    //
+    // MUTATION PROOF: let the loop skip a blank line before the first item ->
+    // both of these pin the list below and go RED.
+    it("key + blank + an unrelated list is still a parse miss, not a pin", () => {
+      const text = [
+        "CRITERIA:",
+        "",
+        "1. the module is 800 lines",
+        "2. there are three callers",
+      ].join("\n")
+
+      expect(parseCriteriaBlock(text), "the first item must touch the key line").toBeNull()
+      expect(findCriteriaKeyLine(text), "the miss must stay visible to the caller").toBe("CRITERIA:")
+    })
+
+    it("key + blank + prose is still a parse miss", () => {
+      const text = ["CRITERIA:", "", "I will work out the acceptance criteria once I have read the code."].join("\n")
+
+      expect(parseCriteriaBlock(text)).toBeNull()
+      expect(findCriteriaKeyLine(text)).toBe("CRITERIA:")
+    })
   })
 
   it("still accepts the inline first-item form", () => {

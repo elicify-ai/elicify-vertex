@@ -803,6 +803,43 @@ describe("elicify_vertex_scope_amend tool (B-2)", () => {
     expect(harness.scopeAmendments).toEqual([])
   })
 
+  // THE FIELD IS ABSENT, not empty. `execute` is reachable directly — from
+  // tests, and from any host that does not apply the schema's `.default([])` —
+  // and `amend()` above always passes `scopeGlobs: []`, so nothing here ever
+  // exercised the `?? []` that stands between an absent field and a
+  // TypeError. Without it, a `fold` with no globs dies with "Cannot read
+  // properties of undefined" instead of the refusal the model can act on.
+  //
+  // MUTATION PROOF: drop the `?? []` -> the thrown error is a TypeError whose
+  // message does not match, and this goes RED.
+  it("refuses fold/amend when the scopeGlobs field is ABSENT, with the same actionable error", async () => {
+    const harness = boot(temporaryRoot())
+    await scopedStory(harness)
+
+    for (const resolution of ["fold", "amend"] as const) {
+      await expect(
+        harness.tools.elicify_vertex_scope_amend.execute(
+          { storyId: "S1", resolution, reason: "no globs field at all" } as never,
+          { sessionID: SESSION } as never,
+        ),
+      ).rejects.toThrow(/requires at least one glob/)
+    }
+    expect(harness.scopeAmendments).toEqual([])
+  })
+
+  it("accepts revert when the scopeGlobs field is absent", async () => {
+    const harness = boot(temporaryRoot())
+    await scopedStory(harness)
+
+    const raw = (await harness.tools.elicify_vertex_scope_amend.execute(
+      { storyId: "S1", resolution: "revert", reason: "undid it" } as never,
+      { sessionID: SESSION } as never,
+    )) as string
+
+    expect((JSON.parse(raw) as { scopeGlobs: string[] }).scopeGlobs).toEqual(["src/in-scope/**"])
+    expect(harness.scopeAmendments).toEqual([{ sessionID: SESSION, resolution: "revert" }])
+  })
+
   it("throws on an unknown story id and records no compliance", async () => {
     const harness = boot(temporaryRoot())
     await scopedStory(harness)
