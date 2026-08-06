@@ -204,7 +204,8 @@ the ask. Three injections spent per machine to reliably achieve nothing.
 
 2. **Add a read-only status tool** (operator decision, 2026-08-06):
    `elicify_vertex_star_status`, no arguments, returns the consent state — e.g.
-   `{consent: "none" | "asked" | "yes" | "gave-up"}` — and **stars nothing**.
+   `{consent: "none" | "asked" | "yes" | "declined"}` — and **stars nothing**.
+   (No `gave-up`; see step 4.)
 
    Chosen over adding a `{check: true}` flag to the existing tool because
    `elicify_vertex_star` (tools.ts:637-648) takes no arguments and stars
@@ -222,10 +223,34 @@ the ask. Three injections spent per machine to reliably achieve nothing.
 legacy-`"prompted"` handling, and the uninstaller's removal of the file
 (UAT section K). Only the nagging loop goes.
 
-**Note:** `gave-up` states already written by the current build should be
-treated as "never actually asked" — the marker records a model's failure to
-comply, not a user's decision. Consider migrating `gave-up` → `none` so those
-machines get their one real ask.
+4. **Delete the `gave-up` state entirely.**
+
+   > **Operator ruling (2026-08-06):** "the gave-up case must not exist."
+
+   The consent file records what the USER decided. `gave-up` records that a
+   model failed to follow an instruction the user never saw — and because it is
+   terminal, it permanently cancels an ask that was never made. That is a
+   machine-wide, irreversible outcome produced by nobody's decision.
+
+   With the retry loop gone (step 1) there is nothing left to give up on, so the
+   state has no remaining meaning either.
+
+   - Remove `"gave-up"` from the `StarConsent` union (`tools.ts:191`) and from
+     the doc block above it (`tools.ts:184-190`).
+   - Valid states become: **no file** (never asked), `asked`, `yes`, `declined`.
+   - `readStarConsent()` must treat an existing `"gave-up"` marker exactly like
+     the legacy `"prompted"` one — **as no record at all**, so machines carrying
+     it get the one real ask they were owed. Same reasoning, same handling; put
+     them in the same branch.
+   - Delete `STAR_MAX_ATTEMPTS`, `readStarAttempts()`, `recordStarAttempt()` and
+     the `attempts` field in the file format. Nothing counts attempts any more.
+   - The `star:gave-up` event goes with it.
+
+   **Test it:** the existing legacy-marker test (`starPrompt.test.ts`, "ignores
+   a legacy 'prompted' marker and asks anyway") is the template — add the
+   `gave-up` case beside it. Mutation-test both: honouring either marker must
+   turn the test red, or the fix is inert on exactly the machines where the
+   defect was measured.
 
 ---
 
