@@ -227,8 +227,19 @@ export interface ResolveContext {
 export interface ResolveDeps {
   /** Cached per-turn by the caller — you may call this more than once per resolveVerifier call, caller is responsible for the cache, not you. */
   readManifest(): Manifest | null
-  /** Optional bounded (<=250ms) fallback the caller may inject for ambiguous cases; omit in unit tests (fixture-driven, no real fs/subprocess). Never call this yourself without a caller-supplied cap — see FR-009. */
-  fallbackProbe?: (globs: string[]) => string[]
+  // ~~/** Optional bounded (<=250ms) fallback the caller may inject for ambiguous cases; omit in
+  //   * unit tests (fixture-driven, no real fs/subprocess). Never call this yourself without a
+  //   * caller-supplied cap — see FR-009. */
+  // fallbackProbe?: (globs: string[]) => string[]~~
+  // REMOVED 2026-08-06 (backlog B-4, item 2). Neither production call site
+  // (`plugin.ts`'s verify-gap branch, `gate.ts:narrowestPrescription`) ever supplied it, so the
+  // tier only ever ran in its own unit tests. It was deleted rather than wired: `scanRepo`
+  // already collects every `*.test.*` / `*.spec.*` under the same bounds into
+  // `manifest.testFiles`, so a probe honouring those bounds can only return a SUBSET of what
+  // tier 2 was already handed — and the probe is reached only when tier 2 found nothing in that
+  // set. FR-009 permitted the probe; it never required it. Pinned by
+  // `tests/v2/resolve.test.ts` ("the bounded fallback probe tier is GONE"), which also asserts
+  // a stray probe passed in the old shape is inert. Do not reintroduce the hook.
 }
 
 /** Pure/injectable — no real fs or subprocess access inside this function. Tier order: story verifiers -> basename convention (*.test.*/*.spec.*) via manifest -> package-manifest scripts (nearest manifest wins in a monorepo, row 9) -> generic category list (rationale "none"). */
@@ -402,33 +413,87 @@ be written against this module alone and belongs to wave 3/4.
 Depends on `subturn.ts` (wave 1) — if wave 1 hasn't landed when you start, work from
 this contract and integrate against the real file once it exists; do not block.
 
+> **SUPERSEDED 2026-08-06 — this section is now DESCRIPTIVE, not prescriptive.**
+> `src/v2/verifier.ts` has shipped, and the wave-time text below was still
+> declaring a three-field required payload, a `{fit, notes}` verdict and a
+> `Promise<VerifierVerdict | null>` return — none of which the code has. The
+> signatures in this block are the ones in the code as of the B-1/B-2/B-3
+> round; read the file for the full doc comments. Superseded text is struck
+> through and the real shape follows it — the same retirement convention used
+> for FR-051 in `docs/vertex2-waves-spec.md`.
+
 ```ts
-export interface VerifierPayload { criteria: string[]; diffSummary: string; verifierSummaries: string[] }
+// ~~export interface VerifierPayload { criteria: string[]; diffSummary: string; verifierSummaries: string[] }~~
+// SUPERSEDED: the payload has SEVEN fields and every one is OPTIONAL. A field
+// emptied by the FR-031 scan is omitted entirely (that is what
+// `verifier:field-dropped` records), so "required" was never true of the
+// built payload — and B-3 (b)/(d) and the HANDOVER §5 transcript/plan fields
+// added four more.
+export interface VerifierPayload {
+  criteria?: string[]
+  diffSummary?: string
+  /** BACKLOG B-3: why `diffSummary` is not a real diff, when it isn't. */
+  diffSummaryUnavailable?: string
+  verifierSummaries?: string[]
+  lastResponse?: string
+  recentTranscript?: string
+  plan?: string
+}
+
+// The RAW input to `buildVerifierPayload` is a separate, NON-exported type in
+// which the six prose/list fields ARE required (empty string / empty array is
+// how a caller says "unavailable"); only `diffSummaryUnavailable` is optional.
+interface RawVerifierPayload {
+  criteria: string[]; diffSummary: string; diffSummaryUnavailable?: string
+  verifierSummaries: string[]; lastResponse: string; recentTranscript: string; plan: string
+}
 
 /**
- * FR-031: redactSecrets (src/redaction.ts) then the strict scan on EACH of the three
- * fields, applied to the reassembled field (not per-chunk). Strict scan = the
- * SECRET_PATTERNS already in src/redaction.ts, PLUS a Shannon-entropy rule: any
- * whitespace-delimited token >=32 chars with entropy >=4.0 bits/char is a secret. A
- * field that trips the scan has the offending hunk (diff) or line (criteria/verifier)
- * removed; if that empties the field, omit the field key entirely and log
- * verifier:field-dropped. Never include chat narrative — the caller passes you exactly
- * the three raw fields, nothing else, so there is no narrative to exclude here, but
+ * FR-031: redactSecrets (src/redaction.ts) then the strict scan on EACH field, applied
+ * to the reassembled field (not per-chunk). Strict scan = the SECRET_PATTERNS already
+ * in src/redaction.ts, PLUS a Shannon-entropy rule: any whitespace-delimited token
+ * >=32 chars with entropy >=4.0 bits/char is a secret. A field that trips the scan has
+ * the offending unit removed; if that empties the field, omit the field key entirely
+ * and log verifier:field-dropped. Never include chat narrative — the caller passes you
+ * exactly the typed fields, nothing else, so there is no narrative to exclude here, but
  * assert this in your tests via the NARRATIVE_CANARY dataset row.
+ *
+ * SHIPPED DIFFERENCES from the wave-time text above:
+ *  - ~~"the three fields"~~ — seven fields; `criteria`/`verifierSummaries` scan per
+ *    line, `diffSummary` per `@@` hunk (per LINE when hunk-less — B-3 (c)), and the
+ *    four prose fields via `scanProseField`.
+ *  - The EFFECTIVE entropy threshold is **3.95** bits/char, not 4.0:
+ *    `ENTROPY_THRESHOLD_BITS = 4.0` minus `ENTROPY_TOLERANCE_BITS = 0.05`,
+ *    because a real 32-hex-char token maxes out at ~3.97 and a literal `>= 4.0`
+ *    would never fire on one.
+ *  - Scan-THEN-truncate, not truncate-then-scan (C-9): a secret straddling a field's
+ *    char cap must be seen whole. Caps are per field
+ *    (VERIFIER_PAYLOAD_FIELD_CHAR_CAP / _TRANSCRIPT_ / _PLAN_).
  */
-export function buildVerifierPayload(raw: { criteria: string[]; diffSummary: string; verifierSummaries: string[] }, logger: EventLogger): VerifierPayload
+export function buildVerifierPayload(raw: RawVerifierPayload, logger: EventLogger): VerifierPayload
 
-export interface VerifierVerdict { fit: "pass" | "concern"; notes: string }
+// ~~export interface VerifierVerdict { fit: "pass" | "concern"; notes: string }~~
+// SUPERSEDED (HANDOVER.md point 4, user decision 2026-07-29): `{fit, notes}` was first
+// replaced by `{fit, summary, gaps}` (VERIFIER-PROMPT.md §4) and then by the structured
+// per-story / per-acceptance-item shape below. The verifier is the sole arbiter of
+// completion, so its output must name WHICH criteria are met — prose could not drive a
+// continuation. Both superseded shapes are now explicitly "malformed" input at the
+// parse boundary (`isVerifierVerdictShape`), not accepted legacy.
+export interface VerifierItemVerdict { itemId: string; met: boolean; note: string }
+export interface VerifierStoryVerdict { storyId: string; pass: boolean; summary: string; items: VerifierItemVerdict[] }
+export interface VerifierVerdict { stories: VerifierStoryVerdict[] }
 
 /**
  * Uses subturn.ts's probeCapability + runSubturn. The model is ALWAYS sessionModel —
  * the judge runs on the same model as the worker (FR-030a, rewritten 2026-08-06).
- * Exactly one model is attempted; there is no override parameter and no fallback
- * chain. Returns null on any failure (probe fail, timeout, malformed JSON, thrown
- * error) — caller logs verifier:unavailable/verifier:malformed/verifier:unsupported
- * based on which; you just return null and let the caller decide which reason (or
- * return a discriminated reason string alongside null — your call, document it in
- * your final report since wave 3 wiring needs to know exactly what you return).
+ * Exactly one model is attempted; there is no override parameter and no fallback chain.
+ *
+ * ~~Returns null on any failure … you just return null and let the caller decide which
+ * reason.~~ **SUPERSEDED 2026-08-06** — the contract's own prose left this to the
+ * implementer ("your call, document it in your final report"), and the implementer took
+ * the discriminated option. `runVerifier` returns `VerifierRunResult`, never a bare
+ * null, and it logs the verifier:* event itself at the point of detection rather than
+ * deferring to a caller that would have to re-derive the classification.
  *
  * REMOVED 2026-08-06 (backlog B-1, review OBS-001): the `verifierModelOverride`
  * parameter and the "tried first if present, falling back to sessionModel on failure"
@@ -436,12 +501,30 @@ export interface VerifierVerdict { fit: "pass" | "concern"; notes: string }
  * always [sessionModel] and the second entry was unreachable. Do not reintroduce the
  * parameter; `pauseJudge.ts` must not carry one either.
  */
+export type VerifierRunResult =
+  | { verdict: VerifierVerdict; childSessionID?: string; observedToolCall?: boolean }
+  | {
+      // "insufficient-evidence" (B-3 (d)) is decided BEFORE any model is asked:
+      // neither a diff summary nor a transcript is present, so a verdict would be
+      // invention. A missing diff ALONE never trips it.
+      verdict: null
+      reason: "unsupported" | "unavailable" | "malformed" | "insufficient-evidence"
+      childSessionID?: string
+      observedToolCall?: boolean
+    }
+
 export async function runVerifier(
   client: OpencodeClient,
   deps: { selfCreated: SelfCreatedSessions; logger: EventLogger },
   opts: { parentSessionID: string; sessionModel: { providerID: string; modelID: string }; payload: VerifierPayload }
-): Promise<VerifierVerdict | null>
+): Promise<VerifierRunResult>
 ```
+
+`childSessionID` (FR-014, `docs/VERIFIER-RELIABILITY-FIXES-SPEC.md` US12) is the id of
+the subturn session the last attempt created — captured by observing the recorder, so
+`runSubturn`'s return type did not have to change. It is normally already DELETED by
+the time the caller sees it (`runSubturn`'s `finally`), so an unreadable child session
+is INCONCLUSIVE and the gate fails open.
 
 Own tests 18, 39 and Dataset: Verifier payload hygiene (all 9 rows — this is the module
 most worth over-testing given CRIT-001/CRIT-002/MAJ-009 were the three critical/major
@@ -536,7 +619,22 @@ wiring can call them):
   `pins:disk-unavailable`, `intake:classify-skipped` / `-fallback` / `-capped` /
   `-unsupported`, `subturn:cleanup-failed`, `verifier:unavailable` / `verifier:malformed` /
   `verifier:unsupported` / `verifier:field-dropped`, `criteria:re-pinned` /
-  `criteria:truncated`, `expect:absent`.
+  `criteria:truncated`, **`criteria:parse-miss`** (ADDED 2026-08-06 — backlog B-2),
+  `expect:absent`.
+
+  **This prose list is no longer the source of truth.** It drifted once already:
+  `criteria:parse-miss` was added to the type union and to `plugin.ts` in the B-2 round
+  and appeared in neither this list nor the writer set, and the test that was supposed
+  to catch that compared its own literal copy of the writer table against itself. The
+  authority is `V2_EVENT_TYPES` in `src/measurement.ts` — a runtime `as const` array
+  that `V2EventType` is derived from — and test 42 asserts writer coverage against that
+  array in both directions. Add a type there, or it does not exist; add it there without
+  a writer, and the suite is red.
+
+  Note also that `src/v2/wiring/logger.ts` deliberately accepts event ids OUTSIDE this
+  union (`cooldown:dropped`, `per-turn-cap:dropped`, `verifier:field-truncated`,
+  `star:asked`, …) via a cast, so the on-disk ledger legitimately contains event types
+  this list has never named. See that file's header for why.
 - Every writer accepts `{ sessionID, model, ...payload }` and stamps `model` (or
   `"unknown"`) on every record (FR-033 — this must hold even for event types that
   existed before v2). The model id is stamped **verbatim**: no suffix normalisation, no

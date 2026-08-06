@@ -8,8 +8,8 @@
  *     providerID/modelID-shaped string. `fast-check` is NOT a devDependency
  *     (checked package.json — only @opencode-ai/plugin, @types/node,
  *     typescript, vitest are listed), so per the task brief this is a
- *     hand-rolled table-driven test iterating over every one of the 22 new
- *     event types instead of adding a new dependency.
+ *     hand-rolled table-driven test iterating over every member of
+ *     `V2_EVENT_TYPES` instead of adding a new dependency.
  *   - verifiersEquivalent (FR-034): Dataset "Composer budget / cooldown /
  *     decay" rows 10 and 11.
  *   - FR-033a rotation/retention, driven with small overrides (never writes
@@ -27,11 +27,13 @@ import {
   IGNORED_VERIFIER_FLAGS,
   ROTATE_MAX_BYTES,
   ROTATE_RETENTION_DAYS,
+  V2_EVENT_TYPES,
   appendEvent,
   eventsPath,
   holdoutArm,
   holdoutSuppresses,
   logCalibration,
+  logCriteriaParseMiss,
   logCriteriaRePinned,
   logCriteriaTruncated,
   logDirectiveComplied,
@@ -107,9 +109,12 @@ interface WriterCase {
   call: (input: V2EventInput) => MeasurementEvent
 }
 
-// One row per new v2 event type (the module contracts doc's list of 22, less
-// `dosing:unknown-model` — BACKLOG B-1 deleted model-conditioned dosing, so
-// there is no profile to resolve and no unknown model to report).
+// One row per member of `V2_EVENT_TYPES`, enforced in both directions by the
+// first `it` below — this table is a fixture, never the source of truth.
+// (`dosing:unknown-model` is absent because BACKLOG B-1 deleted
+// model-conditioned dosing, so there is no profile to resolve and no unknown
+// model to report; B-2's `criteria:parse-miss` is present because the source
+// declares it.)
 // Each fixture supplies the type's documented required fields; `input` (the
 // per-iteration sessionID/model override) is spread last so it wins.
 const WRITER_TABLE: WriterCase[] = [
@@ -195,6 +200,10 @@ const WRITER_TABLE: WriterCase[] = [
     call: (input) => logCriteriaTruncated({ droppedCount: 2, cap: 10, ...input }),
   },
   {
+    type: "criteria:parse-miss",
+    call: (input) => logCriteriaParseMiss({ keyLine: "CRITERIA: a, b, c", ...input }),
+  },
+  {
     type: "expect:absent",
     call: (input) => logExpectAbsent({ ...input }),
   },
@@ -211,38 +220,34 @@ const MODEL_VARIANTS: Array<string | null | undefined> = [
 
 const MODEL_SHAPE_RE = /^[^/\s]+\/[^/\s]+$/
 
-describe("test 42: event_invariants_property (all 21 surviving FR-033 event types)", () => {
-  it("covers exactly the 21 surviving event types (the contracts doc's 22, less dosing:unknown-model)", () => {
-    const expected = [
-      "directive_rendered",
-      "directive_complied",
-      "calibration",
-      "phase_transition",
-      "resolution:none",
-      "gate:multi-session-advisory",
-      "pins:disk-fallback-memory",
-      "pins:disk-recovered",
-      "pins:disk-unavailable",
-      "intake:classify-skipped",
-      "intake:classify-fallback",
-      "intake:classify-capped",
-      "intake:classify-unsupported",
-      "subturn:cleanup-failed",
-      "verifier:unavailable",
-      "verifier:malformed",
-      "verifier:unsupported",
-      "verifier:field-dropped",
-      "criteria:re-pinned",
-      "criteria:truncated",
-      "expect:absent",
-    ]
-    expect(WRITER_TABLE.map((w) => w.type).sort()).toEqual([...expected].sort())
-    expect(WRITER_TABLE).toHaveLength(21)
+describe("test 42: event_invariants_property (every FR-033 event type)", () => {
+  // This assertion used to compare the fixture table against a LITERAL COPY of
+  // itself and a hard-coded count. It could not fail: adding an event type to
+  // `V2EventType` changed neither list, which is exactly how
+  // `criteria:parse-miss` shipped in the union with no writer, no fixture and
+  // a green suite. The comparison is now against `V2_EVENT_TYPES` — the real,
+  // runtime source of truth the type itself is derived from — so a new member
+  // is red until it is registered here.
+  it("covers exactly the event types the source declares, in both directions", () => {
+    const declared = [...V2_EVENT_TYPES] as string[]
+    const covered = WRITER_TABLE.map((w) => w.type as string)
+
+    // Both directions, reported separately so the failure names the problem:
+    // a declared-but-unwritten type is an unobservable event; a
+    // written-but-undeclared one is a type error waiting to be cast away.
+    expect(declared.filter((t) => !covered.includes(t))).toEqual([])
+    expect(covered.filter((t) => !declared.includes(t))).toEqual([])
+
+    // Duplicates in either list would let the two filters above pass while the
+    // per-type invariant loop silently skipped a type.
+    expect(new Set(covered).size).toBe(covered.length)
+    expect(new Set(declared).size).toBe(declared.length)
+    expect(WRITER_TABLE).toHaveLength(V2_EVENT_TYPES.length)
+
     // BACKLOG B-1: `dosing:unknown-model` is not merely absent from the
-    // fixture table — the writer and the event type are gone. Asserting it is
-    // not in `expected` would be vacuous; asserting no surviving writer emits
-    // it is not.
-    expect(WRITER_TABLE.map((w) => w.type as string)).not.toContain("dosing:unknown-model")
+    // fixture table — the writer and the event type are gone. Assert it
+    // against the SOURCE list, not the fixture, or the check is vacuous.
+    expect(declared).not.toContain("dosing:unknown-model")
   })
 
   for (const { type, call } of WRITER_TABLE) {

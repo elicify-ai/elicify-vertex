@@ -56,6 +56,10 @@ unless stated otherwise.
 >
 > So directive text grows +20.8% for the frontier row and +70% for the standard
 > rows, and all three models now render identically — which is the point.
+> (**Corrected — see R-2 below.** The +70% on the standard rows is mostly one
+> mechanism this block does not name: falsification's `on-new-tests-only` gate,
+> which applied to the `standard` profile — the default for every unmapped
+> model. Read the table as evidence about that gate, not about model classes.)
 > Against that, the field model's total event count for the same scenario falls
 > **82 → 47 (-43%)**: the 38 `dosing:unknown-model` lines it used to emit are
 > gone (the same pathology as the 138 in the audited session).
@@ -66,6 +70,12 @@ unless stated otherwise.
 > before and after B-1 (only the constant moves, 614 → 742 chars). B-1 changes
 > the per-turn constant; it does not reopen the per-step flood B-2 closed.
 > Pinned at 40 steps by `plugin.integration.test.ts`.
+>
+> **Scope of that claim — corrected, see R-1 below.** Those numbers are a
+> UNIFORM step workload. Under a mixed one (edit / failing bash / passing bash
+> × 96) cap drops go 91 → 122, the delta being +31 `pre-commitment` drops.
+> Rendered volume does stay flat; "`dropped` = 0" and "bounded" are properties
+> of the uniform scenario, not of the harness.
 
 **The rule, stated once:** the judge runs on the same model as the worker. No
 table, no profile, no override.
@@ -106,7 +116,7 @@ contradicted. Tests referencing `frontier`/`standard` and test 36 go with it.
 
 ---
 
-## B-2 — The intake scaffold was emitted once per agent-loop STEP, and two families' compliance counts were undecidable. **[fixed 2026-08-06]**
+## B-2 — The intake scaffold was emitted once per agent-loop STEP, and two families' compliance counts were undecidable. **[fixed 2026-08-06 — for `intake-scaffold`; see R-3]**
 
 The original entry guessed at three causes ("the cap is too low, the scaffold
 too chatty, the phase re-entry duplicates findings"). All three were wrong.
@@ -180,6 +190,12 @@ re-entry, and is not a bug.
 
 **Not changed, deliberately:** the cap value (1/turn is correct), and the
 phase machine.
+
+**Not changed, NOT deliberately — see R-3 below.** The per-turn gate in item 1
+is on `intake-scaffold` alone. `verify-gap` (117 drops in a 120-step turn) and
+`scope-watchdog` (119) still re-mint on every `system.transform` invocation.
+Found by the round review; a fix is in flight this round. B-2 closed the
+per-step flood for ONE family, not in general.
 
 Note this was *not* downstream of B-1 — the profile resolved to `standard`
 either way.
@@ -572,6 +588,78 @@ status tool write consent kills 1; removing the ask observation kills 3;
 matching the bare word "star" kills 2; dropping the already-decided guard kills
 1; resurrecting a `system.transform` star injection kills 2. On the built
 artefact, honouring either `gave-up` marker turns UAT `D7b` and `D7c` red.
+
+---
+
+## Round review (2026-08-06) — where the claims above were overstated
+
+A seven-reviewer gate went over the wave-B/C claims. Three of them do not hold
+as written. The measurements were real; the generalisations drawn from them
+were not. Corrected here rather than edited into the sections above, so the
+original claim and its correction are both readable.
+
+### R-1. B-1's "`per-turn-cap:dropped` = 0, bounded" is SCENARIO-SPECIFIC
+
+The B-1 status block reports rendered volume FLAT and `per-turn-cap:dropped`
+= 0 while scaling agent-loop steps 6 → 12 → 24 → 48 → 96. That measurement
+stands **for a uniform step workload** — the same kind of step, repeated.
+
+It does not generalise. Re-run with a **mixed** workload (edit / failing bash /
+passing bash, cycled, × 96 steps), cap drops go **91 → 122** after B-1. The
+delta is **+31 `pre-commitment` drops**: a family that a uniform-step scenario
+never provokes, capped at 1/turn like the others, re-minted per step by the
+producer and thrown away by the cap.
+
+What survives unchanged: **rendered volume does stay flat.** The cap holds, so
+the model still sees the same bounded set of directives. What is wrong is the
+claim that the *drop* count is 0 or that the shape is workload-independent —
+drops are the harness minting findings it will discard, and under a realistic
+mixed workload it does that more after B-1, not less. Treat "0 drops" as a
+property of the uniform 6/12/24/48/96 scenario only.
+
+### R-2. B-1's +70% directive volume for `standard` models — the mechanism was mis-attributed
+
+The status block presents the table as a dosing effect and then lists only the
+frontier-side reductions as the cause. The dominant mechanism for the
+`standard` rows is **falsification's `on-new-tests-only` gate**, which applied
+to the `standard` profile — and `standard` was the default for **every unmapped
+model**, i.e. every model not in the two-row table, which in the field was all
+of them. So the +70% is mostly that gate lifting, not a broad re-dosing.
+
+This matters for anyone reading the table as evidence about frontier vs
+standard models: it is really evidence about one gate that happened to be
+keyed on the default profile.
+
+### R-3. B-2 fixed `intake-scaffold` only — two families still re-mint per step
+
+B-2's "What was done" (item 1) is accurate and scoped: the per-turn gate is on
+`intake-scaffold`, via `V2SessionState.intakeScaffoldOfferedForTurn`. The
+review measured what the other producers do in the same hook, and the answer is
+that the per-step flood B-2 closed for one family is still open for two:
+
+| family | drops in a 120-step turn |
+|---|---|
+| `verify-gap` | 117 |
+| `scope-watchdog` | 119 |
+
+Both are pushed from `experimental.chat.system.transform` on every invocation
+with no per-turn gate (`plugin.ts` — the `verify-gap` branch guarded only by
+`hasChangedFiles && !hasVerification`, and the `state.scopeDriftPending`
+branch, whose pending flag is cleared only when the directive actually
+RENDERS, so a dropped one re-mints next step).
+
+**Status: found, being fixed in this round — NOT done.** Do not read B-2 as
+having closed per-step re-minting in general; it closed it for
+`intake-scaffold`. This entry stays open until the fix lands with a test that
+pins the drop counts, and it should then be re-measured with the R-1 mixed
+workload, not the uniform one.
+
+### Standing lesson from this round
+
+Every number above was produced by a scenario, and the scenario was part of the
+claim. "Bounded" and "flat" are not properties of the harness; they are
+properties of the harness under a stated workload. State the workload, or the
+next round re-derives it the hard way.
 
 ---
 

@@ -2115,14 +2115,42 @@ Clean break: `story.verifier`, `verifier:*` events, `vertex-verifier` agent,
 
 ### 100–102. Star ask — closed loop
 
-`maybeAskForStar` in `plugin.ts`, consent states in `wiring/tools.ts`.
-Tests: `tests/v2/starPrompt.test.ts` (isolated via `XDG_CONFIG_HOME`), UAT D.
+> ~~`maybeAskForStar` in `plugin.ts`, consent states in `wiring/tools.ts`.~~
+> **RETIRED (2026-08-06, backlog B-6).** The arm/inject/retry loop this section
+> describes no longer exists. `maybeAskForStar`, its idle call site in
+> `wiring/gate.ts`, `GateContext.starAsk`, the `starAskDispatched` /
+> `starAskPendingInjection` sets, the `system.transform` injection block,
+> `STAR_MAX_ATTEMPTS` / `readStarAttempts()` / `recordStarAttempt()`, the
+> `attempts` field in the consent file and the `star:armed-for-injection` /
+> `star:injected` / `star:gave-up` events were all deleted.
+>
+> **Why:** the loop behaved exactly as designed and still achieved nothing —
+> weaker models simply never made the ask, so three injections were spent per
+> machine to nag a model into a request the user never saw. Operator ruling:
+> the ask belongs in the agent contract, not the idle tree.
+>
+> **What replaces it:** a read-only `elicify_vertex_star_status` tool
+> (`wiring/tools.ts`, registered in `config.ts`'s `KNOWN_TOOL_NAMES`) that takes
+> no arguments, returns `{consent: "none" | "asked" | "yes" | "declined"}` and
+> **stars nothing**; the ask itself lives in `<how_you_work>` in
+> `agents/elicify-vertex-agent.md` (and, via
+> `scripts/sync-activate-template.mjs`, in `ACTIVATE_TEMPLATE`). The
+> `tool.execute.after` observation that matches `STAR_REPO` and writes `asked`
+> is deliberately KEPT — without it nothing ever writes `asked`, the status tool
+> would answer `"none"` forever and the agent would re-ask every session, which
+> is worse nagging than the loop that was removed. `star:asked` survives with
+> it. `"gave-up"` is gone from the `StarConsent` union and is read as NO RECORD,
+> like the legacy `"prompted"` marker.
+>
+> Tests: `tests/v2/starPrompt.test.ts` (isolated via `XDG_CONFIG_HOME`), UAT D —
+> both still exist, but they now cover the status tool and the legacy-marker
+> handling. See the current mutation results in `docs/BACKLOG.md` B-6.
 
 | # | Test | Level | Property | Must fail when |
 |---|---|---|---|---|
-| 100 | `writes nothing when merely armed` / `still writes nothing after dispatch` | Unit | The one-shot is spent only on an OBSERVED ask | Consent is written at arm time — the original bug: a model that ignored the instruction burned the machine's only chance on an ask the user never saw |
-| 101 | `does not count an unrelated question call` | Unit | Only *our* question closes the loop | Any `question` call counts, which is precisely what happened live (the model asked which games to build) |
-| 102 | `gives up permanently after the attempt cap` | Unit | Bounded retry, then a terminal state | The retry is unbounded, turning a one-time ask into a recurring nag |
+| 100 | ~~`writes nothing when merely armed` / `still writes nothing after dispatch`~~ → `writes nothing across an ordinary session` + `stars NOTHING and records NOTHING` | Unit | The one-shot is still spent only on an OBSERVED ask — but there is no arm step left to spend it early, so the surviving risk is the STATUS tool writing consent as a side effect of being asked | **RETIRED as written** (nothing arms, nothing is dispatched). Replacement fails when the status tool records anything (mutation: making it write consent kills 1 test) or when a quiet session writes a marker |
+| 101 | `does not count an unrelated question call` | Unit | Only *our* question closes the loop — the observation matches the REPO, not the word "star" | Any `question` call counts, which is precisely what happened live (the model asked which games to build). Mutation: matching the bare word "star" kills 2 tests |
+| 102 | ~~`gives up permanently after the attempt cap`~~ | Unit | ~~Bounded retry, then a terminal state~~ | **RETIRED** — there is no retry to bound and no `gave-up` state. Replaced by the inverse property: a machine carrying a legacy `gave-up` or `prompted` marker gets the one real ask it was owed (mutation: honouring either marker kills 1 unit test each and turns UAT `D7b`/`D7c` red) |
 
 ### Standing requirement: tests must discriminate
 

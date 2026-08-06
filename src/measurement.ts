@@ -57,33 +57,45 @@ export type EventType =
 /**
  * Vertex 2 event types (FR-033). Additive to `EventType` — the v1 union above
  * is untouched; `MeasurementEvent.event_type` below accepts either.
+ *
+ * Declared as a runtime `as const` array rather than a bare type union
+ * ON PURPOSE. A union is erased at compile time, so the test that is supposed
+ * to prove "every v2 event type has a writer" (test 42) could only ever
+ * compare a literal list against another literal list — which it did, and
+ * which is why `criteria:parse-miss` sat in the union for a whole round with
+ * no writer and no failing test. The array is the single source of truth for
+ * BOTH the type and the coverage assertion: adding a member here without
+ * registering a writer turns test 42 red.
  */
-export type V2EventType =
-  | "directive_rendered"
-  | "directive_complied"
-  | "calibration"
-  | "phase_transition"
-  | "resolution:none"
-  | "gate:multi-session-advisory"
-  | "pins:disk-fallback-memory"
-  | "pins:disk-recovered"
-  | "pins:disk-unavailable"
-  | "intake:classify-skipped"
-  | "intake:classify-fallback"
-  | "intake:classify-capped"
-  | "intake:classify-unsupported"
-  | "subturn:cleanup-failed"
-  | "verifier:unavailable"
-  | "verifier:malformed"
-  | "verifier:unsupported"
-  | "verifier:field-dropped"
-  | "criteria:re-pinned"
-  | "criteria:truncated"
+export const V2_EVENT_TYPES = [
+  "directive_rendered",
+  "directive_complied",
+  "calibration",
+  "phase_transition",
+  "resolution:none",
+  "gate:multi-session-advisory",
+  "pins:disk-fallback-memory",
+  "pins:disk-recovered",
+  "pins:disk-unavailable",
+  "intake:classify-skipped",
+  "intake:classify-fallback",
+  "intake:classify-capped",
+  "intake:classify-unsupported",
+  "subturn:cleanup-failed",
+  "verifier:unavailable",
+  "verifier:malformed",
+  "verifier:unsupported",
+  "verifier:field-dropped",
+  "criteria:re-pinned",
+  "criteria:truncated",
   /** B-2: an unfenced `CRITERIA:` line the block grammar could not parse.
    * Without it a parse miss is indistinguishable from the model never
    * answering the intake scaffold, and both read as "0 complied". */
-  | "criteria:parse-miss"
-  | "expect:absent"
+  "criteria:parse-miss",
+  "expect:absent",
+] as const
+
+export type V2EventType = (typeof V2_EVENT_TYPES)[number]
 
 /** Payload schema is intentionally loose — measurement is observational. */
 export type EventPayload = Record<string, unknown>
@@ -494,9 +506,13 @@ export function logV2Event(eventType: V2EventType, input: V2EventInput, path?: s
 
 // ---------- typed v2 convenience writers --------------------------------------
 //
-// One wrapper per new v2 event type (the module contracts doc's list of 22,
-// less `dosing:unknown-model` — BACKLOG B-1 deleted model-conditioned dosing
-// outright, so there is no profile to resolve and no unknown model to report).
+// One wrapper per member of `V2_EVENT_TYPES` — no more, no fewer; test 42
+// asserts that correspondence against the array itself, so a new event type
+// without a writer here is a failing test, not a silent gap. (The module
+// contracts doc listed 22; `dosing:unknown-model` is gone — BACKLOG B-1
+// deleted model-conditioned dosing outright, so there is no profile to
+// resolve and no unknown model to report — and B-2's `criteria:parse-miss`
+// took the count back to 22.)
 // Each is a thin `logV2Event` call with a documentation-only payload shape —
 // `V2EventInput`'s index signature still allows extra fields, so these are
 // guides, not hard schemas. None of these payload shapes carry a raw-text
@@ -654,6 +670,19 @@ export interface CriteriaTruncatedInput extends V2EventInput {
 }
 export function logCriteriaTruncated(input: CriteriaTruncatedInput, path?: string): MeasurementEvent {
   return logV2Event("criteria:truncated", input, path)
+}
+
+/**
+ * B-2: the model wrote a `CRITERIA:` line the block grammar could not read.
+ * `keyLine` is the offending line, already truncated by the caller — it is the
+ * model's own answer to the intake scaffold, not user prompt text, and it is
+ * the only way to tell a parse miss from a model that never answered.
+ */
+export interface CriteriaParseMissInput extends V2EventInput {
+  keyLine?: string
+}
+export function logCriteriaParseMiss(input: CriteriaParseMissInput, path?: string): MeasurementEvent {
+  return logV2Event("criteria:parse-miss", input, path)
 }
 
 export type ExpectAbsentInput = V2EventInput
