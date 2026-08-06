@@ -593,12 +593,11 @@ describe("verifier close-out fires once every story has passed audit, across sta
         if (args.body?.agent !== "vertex-verifier") {
           return { data: { info: {}, parts: [{ type: "text", text: '{"multiStory":false}' }] }, error: undefined }
         }
-        // Audit 1 audits only S2 (the final story, the sole unverifiedStories claim at
-        // that point because S1 was claimed in the same batch but... see below);
-        // audit 2 audits S1. Each returns a pass for the story it was asked
-        // about. (The payload's `plan` field names the audit set; call order
-        // is deterministic — one subturn per audit, always on the session
-        // model.)
+        // Audit 1 audits only S2 (the final story — the sole story CLAIMED at
+        // that point); audit 2 audits S1, claimed afterwards. Each returns a
+        // pass for the story it was asked about. (The payload's `plan` field
+        // names the audit set; call order is deterministic — one subturn per
+        // audit, always on the session model.)
         verifierCall += 1
         const storyId = verifierCall === 1 ? "S2" : "S1"
         return {
@@ -635,21 +634,31 @@ describe("verifier close-out fires once every story has passed audit, across sta
       sid,
     )
 
-    // Claim both stories complete (a claim needs no evidence now). Each story
-    // has one task; with no cross-story deps both tasks start active at create,
-    // so each can be checkpointed in turn.
-    await callTool(hooks, "elicify_vertex_plan_checkpoint", { taskId: "S1.T1", status: "complete" }, sid)
+    // THE STAGGER IS THE CLAIMS, NOT AN UNANSWERED AUDIT. This scenario used
+    // to claim BOTH stories up front and let the verifier answer about only
+    // one of them, relying on the unstamped story being re-selected by
+    // `!story.verifier` on the next idle. That re-selection was the unbounded
+    // re-audit loop (2026-08-06): an unanswered story is now bounded and
+    // stamped like any other answerless round, so it is no longer a way to
+    // earn a second audit — and a test that depended on it was pinning the
+    // bug, not the feature. The feature is that stamps from SEPARATE audits
+    // combine into one close-out, which is exactly what staggered CLAIMS
+    // produce, and what actually happens in a live run.
+    //
+    // Each story has one task; with no cross-story deps both tasks start
+    // active at create, so the final story can be claimed first.
     await callTool(hooks, "elicify_vertex_plan_checkpoint", { taskId: "S2.T1", status: "complete" }, sid)
 
-    // Audit 1: both are unverifiedStories. The verifier (stub) returns a pass for "S2"
-    // only; the audit set is {S1,S2}, so S1 is left without a stamp -> NOT
-    // settled+allPassed -> no close-out yet.
+    // Audit 1: S2 (the FINAL story) is the sole claim, and it passes. The plan
+    // is not settled — S1 has not even been claimed — so no close-out yet.
     await idle(hooks, sid)
     let continuations = idleContinuationTexts(client, sid)
     expect(continuations.some((t) => t.includes("passed audit"))).toBe(false)
 
-    // Audit 2: S1 is the sole remaining unverifiedStories claim; it passes -> now every
-    // story has a passing stamp -> close-out fires.
+    // Audit 2: S1 is now claimed and is the sole remaining unverified claim;
+    // it passes -> every story carries a passing stamp -> close-out fires,
+    // carried by the stamp S2 earned in the PREVIOUS audit.
+    await callTool(hooks, "elicify_vertex_plan_checkpoint", { taskId: "S1.T1", status: "complete" }, sid)
     await idle(hooks, sid)
     continuations = idleContinuationTexts(client, sid)
     expect(continuations.some((t) => t.includes("passed audit"))).toBe(true)

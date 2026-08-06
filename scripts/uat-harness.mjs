@@ -525,6 +525,139 @@ if (section("J. Staleness is bounded")) {
   assert("J4-broken-verifier-is-still-capped", calls <= 4, `${calls} verifier subturns over 6 edit+idle rounds`)
 }
 
+// --- L. An answerless audit round still bounds the story -------------------
+if (section("L. Answerless audit rounds")) {
+  // J4 CANNOT SEE THIS CLASS. Its first verifier call returns a real (if
+  // unsubstantiated) verdict, so the story gets a stamp on round 1 and every
+  // later round is bounded by the STALENESS cap — the counter has a verdict to
+  // read. Take that first stamp away and the bound disappeared entirely: the
+  // selector re-picks on `!story.verifier`, and the only reader of
+  // `storyReaudits` needs a verdict to exist. Measured on the unfixed build at
+  // cap 3: 8 subturns over 8 rounds, `storyReaudits` at 7-8, no stamp, and —
+  // the part that matters — NOT ONE WORD to the user about work that was never
+  // verified.
+  const planStories = async (s) => JSON.parse(await s.hooks.tool.elicify_vertex_plan_status.execute({}, { sessionID: s.sid })).stories
+  const escalations = (s) => s.sent().filter((t) => t.includes("did not pass") && t.includes("audit"))
+
+  // L1-L3: the verifier is broken from the FIRST call, so no round ever stamps.
+  let l1calls = 0
+  const l1 = await scenario({
+    subturn: (agent) => {
+      if (agent !== "vertex-verifier") return undefined
+      l1calls++
+      return "not a verdict at all"
+    },
+  })
+  await l1.say("/elicify-vertex\n\nbuild the research portal")
+  await l1.hooks.tool.elicify_vertex_plan_create.execute(
+    { stories: [{ text: "Ship", acceptanceItems: ["A1"], scopeGlobs: [], verifiers: [], tasks: [{ text: "do" }] }] },
+    { sessionID: l1.sid },
+  )
+  await l1.hooks.tool.elicify_vertex_plan_checkpoint.execute({ taskId: "S1.T1", status: "complete" }, { sessionID: l1.sid })
+  for (let i = 0; i < 8; i++) {
+    await l1.idle()
+    await l1.tool("edit", { filePath: join(l1.work, `broken${i}.ts`) })
+  }
+  assert("L1-verdictless-rounds-are-capped", l1calls <= 3, `${l1calls} verifier subturns over 8 edit+idle rounds`)
+  assert(
+    "L2-verdictless-round-stamps-the-story",
+    (await planStories(l1))?.[0]?.verifier?.unapplied === "unverified",
+    JSON.stringify((await planStories(l1))?.[0]?.verifier ?? null),
+  )
+  // The harness must SPEAK — once. Silence about unverified work is the worse
+  // half of this defect: the storm at least told the user something.
+  assert("L3-user-is-told-exactly-once", escalations(l1).length === 1, `${escalations(l1).length} escalations`)
+
+  // L4-L5: a PARTIAL answer. The verdict names S1 and never mentions S2, on
+  // every round. The old code only handled the all-or-nothing case, so S2 was
+  // stamped by nothing and re-audited forever (measured: 8 subturns,
+  // `storyReaudits.S2 = 7`, stamp `undefined`).
+  let l4calls = 0
+  const l4 = await scenario({
+    subturn: (agent) => {
+      if (agent !== "vertex-verifier") return undefined
+      l4calls++
+      return '{"stories":[{"storyId":"S1","pass":true,"summary":"ok","items":[{"itemId":"A1","met":true,"note":"seen"}]}]}'
+    },
+  })
+  await l4.say("/elicify-vertex\n\nbuild the research portal")
+  await l4.hooks.tool.elicify_vertex_plan_create.execute(
+    {
+      stories: [
+        { text: "Research", acceptanceItems: ["A1"], scopeGlobs: [], verifiers: [], tasks: [{ text: "do" }] },
+        { text: "Chart", acceptanceItems: ["A1"], scopeGlobs: [], verifiers: [], tasks: [{ text: "draw" }] },
+      ],
+    },
+    { sessionID: l4.sid },
+  )
+  await l4.hooks.tool.elicify_vertex_plan_checkpoint.execute({ taskId: "S1.T1", status: "complete" }, { sessionID: l4.sid })
+  await l4.hooks.tool.elicify_vertex_plan_checkpoint.execute({ taskId: "S2.T1", status: "complete" }, { sessionID: l4.sid })
+  for (let i = 0; i < 8; i++) {
+    await l4.idle()
+    await l4.tool("edit", { filePath: join(l4.work, `partial${i}.ts`) })
+  }
+  assert("L4-unanswered-story-is-capped", l4calls <= 3, `${l4calls} verifier subturns over 8 edit+idle rounds`)
+  assert(
+    "L5-unanswered-story-is-named-once",
+    escalations(l4).length === 1 && escalations(l4)[0].includes("S2"),
+    `${escalations(l4).length} escalations: ${escalations(l4)[0]?.slice(0, 90) ?? ""}`,
+  )
+
+  // L6-L8: `insufficient-evidence` — B-3 (d)'s refusal, decided BEFORE any
+  // subturn. This is the loop that produced no verifier call at all, so a
+  // subturn count could never see it; the symptom was a harness that had
+  // simply stopped speaking.
+  //
+  // Reaching it against the SHIPPED build takes some care, and the shape is
+  // worth recording: the real `diffSummary` provider never returns empty text
+  // (its floor is the literal "no changed paths recorded"), so the only way
+  // the payload loses that field is the FR-031 raw-field safety cap — 100k
+  // chars, documented as existing for "a pathological or DoS-shaped input".
+  // One absurdly long changed path is exactly that input. The stub host serves
+  // no transcript either (`session.messages` returns nothing, the audited
+  // live shape), so both evidence fields are gone and the verifier refuses.
+  let l6calls = 0
+  const l6 = await scenario({
+    subturn: (agent) => {
+      if (agent !== "vertex-verifier") return undefined
+      l6calls++
+      return '{"stories":[{"storyId":"S1","pass":true,"summary":"never reached","items":[{"itemId":"A1","met":true,"note":"x"}]}]}'
+    },
+  })
+  await l6.say("/elicify-vertex\n\nbuild the research portal")
+  await l6.hooks.tool.elicify_vertex_plan_create.execute(
+    { stories: [{ text: "Ship", acceptanceItems: ["A1"], scopeGlobs: [], verifiers: [], tasks: [{ text: "do" }] }] },
+    { sessionID: l6.sid },
+  )
+  await l6.hooks.tool.elicify_vertex_plan_checkpoint.execute({ taskId: "S1.T1", status: "complete" }, { sessionID: l6.sid })
+  // BEFORE the first idle, not after it: a single round with real evidence
+  // stamps a clean pass, which is terminal, and the refusal path is never
+  // reached again. (Written the other way round first — L6 measured 1 subturn
+  // and a `pass:true` stamp, which is the correct behaviour for a round that
+  // HAD evidence, and proves nothing about the one that does not.)
+  const oversized = join(l6.work, `${"d".repeat(120_000)}.ts`)
+  await l6.tool("edit", { filePath: oversized })
+  for (let i = 0; i < 8; i++) {
+    await l6.idle()
+    await l6.tool("edit", { filePath: oversized })
+  }
+  assert(
+    "L6-refusal-costs-no-subturn",
+    l6calls === 0 && eventTypes().includes("verifier:insufficient-evidence"),
+    `${l6calls} subturns; insufficient-evidence logged=${eventTypes().includes("verifier:insufficient-evidence")}`,
+  )
+  assert(
+    "L7-unjudgeable-story-is-stamped",
+    (await planStories(l6))?.[0]?.verifier?.unapplied === "unverified",
+    JSON.stringify((await planStories(l6))?.[0]?.verifier ?? null),
+  )
+  assert(
+    "L8-cannot-verify-is-not-never-speak-again",
+    escalations(l6).length === 1,
+    `${escalations(l6).length} escalations — 0 means the harness went silent about unverified work`,
+  )
+}
+
 // --- F. No subprocess output reaches the terminal --------------------------
 if (section("F. TUI safety")) {
   // The verifier payload shells out to `git diff --stat`. Outside a repo git
