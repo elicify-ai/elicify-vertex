@@ -200,11 +200,70 @@ an over-strict `some`→`every` variant, and the four prompt sentences.
 
 ---
 
-## B-4 — `resolution:none` × 65, including turns with real edits
+## B-4 — `resolution:none` × 65, including turns with real edits **[fixed]**
 
 Most carry `changedPaths: []`, but some carry genuine ones —
 `src/games/memory.js`, `index.html`, `src/games/breakout.js` — and still
 resolved to nothing.
+
+**Root cause.** "Resolution" is the step that turns *these paths changed* into
+*run THIS command*: `resolveVerifier` (`src/v2/resolve.ts`), called from
+`plugin.ts`'s verify-gap branch and `gate.ts:narrowestPrescription`. With real
+changed paths in hand it still returned `{command: null}`, because **every tier
+missed, each for its own reason**:
+
+| tier | why it missed |
+| --- | --- |
+| 1 — story verifiers | the session declared none |
+| 2 — basename convention | `manifest.testFiles` was empty; the project genuinely had no `*.test.*` / `*.spec.*` file |
+| 3 — package scripts | `resolvePackageScript` hard-filtered on `scripts.test`, and the project's `package.json` declared only `check` and `dev` |
+| FR-009 probe | never supplied by either call site — the branch was dead code |
+
+So it fell through to the generic degrade and logged `resolution:none`. For 65
+turns the harness said "run something relevant" to a repo that had a perfectly
+good `npm run check`.
+
+**This is NOT B-3.** B-3 is the diff summary and the entropy scan; B-4 is
+command selection. They shared one trigger — an unconventional workspace — and
+nothing else.
+
+**Done:**
+
+1. **Tier 3 widened to an ordered preference** — `test` → `check` → `verify` →
+   `lint` → `typecheck` → `build`, first match wins
+   (`resolve.ts:PACKAGE_SCRIPT_PREFERENCE`). `test` keeps the bare `npm test`
+   spelling because that is the only entry in
+   `coverage.ts:WHOLE_SUITE_ALIASES`; everything else is `npm run <name>`, plus
+   npm's `-w <root>` selector in a workspace. The list is **closed** on purpose:
+   `npm run dev` starts a server that never exits, and `start`/`deploy`/`clean`
+   are worse. A script not on the list is not a verifier, and the repo still
+   degrades to `none`. Workspace precedence is unchanged — nearest manifest wins
+   first, the script preference is applied *inside* the winner.
+2. **The FR-009 fallback probe was DELETED, not wired.** It is redundant by
+   construction: `wiring/manifest.ts:scanRepo` already walks the worktree once
+   per turn and collects every `*.test.*` / `*.spec.*` into `manifest.testFiles`
+   under the same bounds and the same skip list, so a probe honouring those
+   bounds can only return a subset of what tier 2 was already handed — and the
+   probe is reached only when tier 2 found no match in that set. To find
+   anything new it would have to walk *more* of the tree than the cached scan,
+   uncached, inside `tool.execute.after`/`chat.system.transform` — exactly the
+   spend FR-009 and SC-003 bound — for a case whose defining property is that a
+   full-repo scan found zero test files. FR-009 permits the probe; it never
+   required it. The right place to spend on tier-2 recall is `scanRepo`'s
+   bounds.
+3. **Absolute changed paths are relativised** against `manifest.workspaceRoot`
+   before any path matching (`resolve.ts:relativiseToWorkspaceRoot`).
+   `changedPathsFromTool` passes opencode's absolute `filePath` through
+   verbatim, while `workspaces[].root` / `projectRoots[].root` are bare and
+   repo-relative. The old root-unaware workaround hunted for `/<root>/`
+   *anywhere* in the string, which produced a wronger prescription than none: in
+   a repo at `/work/app` with a workspace named `app`, the root-level file
+   `/work/app/src/x.ts` was scoped to `npm test -w app`.
+
+**Still open, deliberately:** tier 2's miss was not a defect — that project had
+no tests. If `resolution:none` recurs on a repo that *does* have test files, the
+suspect is `scanRepo`'s `MAX_FILES_SCANNED` / `MAX_SCAN_DEPTH` truncation, not
+the tier order.
 
 ---
 
