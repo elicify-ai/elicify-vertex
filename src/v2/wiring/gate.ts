@@ -56,18 +56,11 @@ import { incompletePlanFinding } from "./findings.js"
 import { bindSession } from "./logger.js"
 import { nextInstanceId, type V2SessionState } from "./state.js"
 import { parsePathAbsenceClaim } from "./pathClaim.js"
-import { readStarConsent, recordStarAttempt, STAR_MAX_ATTEMPTS, writeStarConsent } from "./tools.js"
 import { judgePause, PAUSE_JUDGE_DELAY_MS } from "../pauseJudge.js"
 import { evaluateStall, hasBusyChildren, type DelegationTracker } from "./watchdog.js"
 
 export interface GateContext {
   client: OpencodeClient
-  /**
-   * One-time star ask. Absent when the machine has already answered, so the
-   * gate does no work for it. `markDispatched` lets `plugin.ts` recognise the
-   * model's reply as OUR ask when it observes the `question` tool.
-   */
-  starAsk?: { markDispatched: (sessionID: string) => void }
   logger: EventLogger
   phaseEngine: PhaseEngine
   pinStore: PinStore
@@ -1651,54 +1644,6 @@ const NO_PARENT_LOOKUP = (): string | null => null
  * module holds no mutable module-level state, so two sessions running this
  * concurrently cannot read or clobber each other's decisions.
  */
-/**
- * The one-time star ask. Lives HERE, not in `plugin.ts`, for two reasons the
- * review proved with a probe:
- *
- *  - CRIT-001: dispatching via `client.session.prompt` directly set none of
- *    the continuation bookkeeping, so the host redelivered the ask as a REAL
- *    user message. That ran the activation branch, which resets the evidence
- *    ledger and re-classifies the mode — a `deep` session was downgraded to
- *    `normal`, permanently disabling the hard block, and the ask re-armed
- *    itself and fired twice. `dispatchContinuation` sets the in-flight flag
- *    and `lastContinuationText`, so the echo is consumed instead.
- *  - MAJ-002: "quiet turn" was checked with `idleContinuationInFlight`, which
- *    `release()` has already cleared by the time the idle tree returns. The
- *    ask fired in the same idle as a verifier revert. The tree now reports
- *    whether it dispatched, and that is the actual signal.
- */
-async function maybeAskForStar(ctx: GateContext, sid: string, state: V2SessionState): Promise<void> {
-  try {
-    if (!ctx.starAsk) return
-    if (readStarConsent() !== null) return
-    if (state.stallPaused || state.idleContinuationInFlight) return
-
-    const attempts = recordStarAttempt()
-    if (attempts > STAR_MAX_ATTEMPTS) {
-      // Persisted, so this is machine-wide and survives restarts — the
-      // in-memory counter only ever bounded one session, and four sessions
-      // produced twelve asks.
-      writeStarConsent("gave-up")
-      ctx.logger("star:gave-up", { sessionID: sid, attempts: attempts - 1 })
-      return
-    }
-    // ARM ONLY — do not speak. The instruction goes out on the SYSTEM channel
-    // (see `plugin.ts`'s `system.transform`), which the user never sees.
-    //
-    // It was briefly dispatched as a continuation, because that is the
-    // reliable channel and the system prompt had been ignored. But a
-    // continuation is a user-role message: the user then watched the harness
-    // instruct the model to ask them a question — internal machinery on
-    // display. What actually fixed reliability was the CLOSED LOOP (observe
-    // the `question` call, retry on the next quiet turn, bounded), not the
-    // channel. So the loop stays and the channel goes back to invisible.
-    ctx.starAsk.markDispatched(sid)
-    ctx.logger("star:armed-for-injection", { sessionID: sid, attempt: attempts })
-  } catch {
-    // Cosmetic: the star ask must never disturb a session.
-  }
-}
-
 export async function handleSessionIdle(ctx: GateContext, sid: string): Promise<void> {
   const state = ctx.states.get(sid)
   if (!state || !state.active) return
@@ -1808,9 +1753,4 @@ export async function handleSessionIdle(ctx: GateContext, sid: string): Promise<
     hasPins: criteria.length > 0,
     unverifiedChangesExist,
   })
-
-  // Reaching here means the tree had nothing to say — every branch that
-  // dispatches returns early. THAT is a quiet turn, and the only moment the
-  // star ask is allowed to speak.
-  await maybeAskForStar(ctx, sid, state)
 }

@@ -200,7 +200,7 @@ console.log(`VERTEX_DATA=${dataRoot}  XDG_CONFIG_HOME=${configRoot}`)
 if (section("A. Shipped artefact")) {
   const s = await scenario()
   assert("A1-hooks", typeof s.hooks["chat.message"] === "function" && typeof s.hooks.event === "function")
-  assert("A2-tools", Object.keys(s.hooks.tool ?? {}).length === 7, `${Object.keys(s.hooks.tool ?? {}).length} tools`)
+  assert("A2-tools", Object.keys(s.hooks.tool ?? {}).length === 8, `${Object.keys(s.hooks.tool ?? {}).length} tools`)
   const cfg = { agent: {}, command: {} }
   await s.hooks.config?.(cfg)
   const agents = Object.keys(cfg.agent)
@@ -269,31 +269,13 @@ if (section("C. Pause judge (real timer path)")) {
 }
 
 // --- D. Star ask -----------------------------------------------------------
+// B-6: the runtime arm/inject/retry loop is DELETED. The ask lives in the agent
+// prompt, gated by the read-only `elicify_vertex_star_status` tool; the harness
+// only OBSERVES a real `question` call about our repo and records `asked`.
 if (section("D. One-time star ask")) {
   const consentPath = join(configRoot, "opencode", ".elicify-vertex-consent")
   if (existsSync(consentPath)) rmSync(consentPath)
 
-  const s = await scenario()
-  await s.say("/elicify-vertex\n\nbuild it")
-  assert("D1-not-in-system-prompt", !(await s.system()).includes("star elicify-ai/elicify-vertex"))
-  assert("D2-nothing-burned-at-arm", !existsSync(consentPath))
-
-  await s.idle()
-  await sleep(PAUSE_MS + 400)
-  // INVISIBLE CHANNEL: armed on a quiet turn, delivered by the next
-  // system.transform. It must never be a continuation — that is a user-role
-  // message, and it put the harness's own machinery on the user's screen.
-  const sysAsk = await s.system()
-  assert("D3-asked-on-quiet-turn", sysAsk.includes("star elicify-ai/elicify-vertex"), "not injected")
-  assert(
-    "D3b-never-a-continuation",
-    s.sent().filter((t) => t.includes("star elicify-ai")).length === 0,
-    "leaked into chat",
-  )
-
-  // The record now holds `{state, attempts}`: the attempt count persists (it
-  // bounds retries across sessions and restarts) but the one-shot is NOT spent
-  // until an ask is observed. Assert the STATE, not the file's existence.
   const consentState = () => {
     if (!existsSync(consentPath)) return null
     const raw = readFileSync(consentPath, "utf8").trim()
@@ -303,6 +285,28 @@ if (section("D. One-time star ask")) {
       return raw || null
     }
   }
+
+  const s = await scenario()
+  const statusOf = async (sc) =>
+    JSON.parse(await sc.hooks.tool.elicify_vertex_star_status.execute({}, { sessionID: sc.sid })).consent
+
+  await s.say("/elicify-vertex\n\nbuild it")
+  assert("D1-status-none-on-a-fresh-machine", (await statusOf(s)) === "none")
+  assert("D2-status-check-writes-nothing", !existsSync(consentPath))
+
+  await s.idle()
+  await sleep(PAUSE_MS + 400)
+  // No injection, ever — the loop that used to arm one here is gone.
+  assert(
+    "D3-no-injection-on-a-quiet-turn",
+    !(await s.system()).includes("elicify-ai/elicify-vertex"),
+    "the deleted nagging loop is back",
+  )
+  assert(
+    "D3b-never-a-continuation",
+    s.sent().filter((t) => t.includes("star elicify-ai")).length === 0,
+    "leaked into chat",
+  )
   assert("D4-still-not-burned", consentState() === null, String(consentState()))
 
   // A question mentioning "star" but not OUR repo must not count — a bare
@@ -310,68 +314,35 @@ if (section("D. One-time star ask")) {
   await s.tool("question", { questions: [{ question: "Which star rating should the widget default to?" }] })
   assert("D5-star-word-question-ignored", consentState() === null, String(consentState()))
 
-  // The real ask closes the loop.
+  // The agent's real ask, on its own initiative, is what spends the one-shot.
   await s.tool("question", { questions: [{ question: "Would you like to star elicify-ai/elicify-vertex on GitHub?" }] })
   assert("D6-observed-ask-recorded", consentState() === "asked", String(consentState()))
-
-  // MAJ-007: a legacy arm-time "prompted" marker must not suppress the fix.
-  writeFileSync(consentPath, "prompted")
-  const legacy = await scenario()
-  await legacy.say("/elicify-vertex\n\nbuild it")
-  await legacy.idle()
-  await sleep(PAUSE_MS + 400)
-  assert("D7-legacy-prompted-ignored", (await legacy.system()).includes("star elicify-ai/elicify-vertex"))
-  rmSync(consentPath, { force: true })
-}
-
-// --- D8-D10. Star ask: the mutations the first version of this harness missed
-if (!ONLY || "D".startsWith(ONLY)) {
-  const consentPath = join(configRoot, "opencode", ".elicify-vertex-consent")
-  rmSync(consentPath, { force: true })
-
-  // CRIT-001: the ask must go through the continuation path, so its echo is
-  // consumed. Dispatching it raw made the host redeliver it as a real user
-  // message, which resets the ledger and downgrades `deep` to `normal`.
-  // The echo tests that lived here are gone with the continuation: there is
-  // no user-role message to echo any more. The stronger property replaces
-  // them — across a whole session the ask never reaches the chat at all.
-  const quiet = await scenario()
-  await quiet.say("/elicify-vertex\n\ndeploy the auth migration to production")
-  await quiet.tool("edit", { filePath: join(quiet.work, "a.ts") })
-  await quiet.idle()
-  await sleep(PAUSE_MS + 400)
-  await quiet.system()
-  await quiet.say("carry on")
-  await quiet.idle()
-  await sleep(PAUSE_MS + 400)
+  assert("D6b-status-reflects-it", (await statusOf(s)) === "asked")
   assert(
-    "D8-never-reaches-the-chat",
-    quiet.sent().filter((t) => t.includes("star elicify-ai")).length === 0,
-    `${quiet.sent().filter((t) => t.includes("star elicify-ai")).length} leaked`,
+    "D6c-no-attempts-field",
+    !Object.hasOwn(JSON.parse(readFileSync(consentPath, "utf8")), "attempts"),
+    readFileSync(consentPath, "utf8"),
   )
 
-  // MAJ-002: it must not speak in the same idle as a real continuation.
-  rmSync(consentPath, { force: true })
-  const busy = await scenario({
-    subturn: (a) =>
-      a === "vertex-verifier"
-        ? '{"stories":[{"storyId":"S1","pass":false,"summary":"nope","items":[{"itemId":"A1","met":false,"note":"missing"}]}]}'
-        : undefined,
-  })
-  await busy.say("/elicify-vertex\n\nbuild the research portal")
-  await busy.hooks.tool.elicify_vertex_plan_create.execute(
-    { stories: [{ text: "Ship", acceptanceItems: ["A1"], scopeGlobs: [], verifiers: [], tasks: [{ text: "do" }] }] },
-    { sessionID: busy.sid },
-  )
-  await busy.tool("edit", { filePath: join(busy.work, "x.md") })
-  await busy.hooks.tool.elicify_vertex_plan_checkpoint.execute({ taskId: "S1.T1", status: "complete" }, { sessionID: busy.sid })
-  await busy.idle()
-  const sameIdle = busy.sent()
-  assert(
-    "D10-not-in-same-idle-as-a-continuation",
-    sameIdle.some((t) => t.includes("completion verifier")) && !sameIdle.some((t) => t.includes("star elicify-ai")),
-    sameIdle.length + " continuations",
-  )
+  // MAJ-007 + B-6: neither legacy marker is a user decision. `prompted` was
+  // written at ARM time; `gave-up` recorded that a MODEL ignored an instruction
+  // the user never saw. Both must read as NO RECORD, in the same branch.
+  for (const [id, contents] of [
+    ["D7-legacy-prompted-ignored", "prompted"],
+    ["D7b-legacy-gave-up-ignored", "gave-up"],
+    ["D7c-legacy-gave-up-json-ignored", JSON.stringify({ state: "gave-up", attempts: 4 })],
+  ]) {
+    writeFileSync(consentPath, contents)
+    const legacy = await scenario()
+    await legacy.say("/elicify-vertex\n\nbuild it")
+    assert(id, (await statusOf(legacy)) === "none", `${contents} suppressed the ask`)
+  }
+
+  // Guard the guard: a REAL decision carrying a stale attempts field survives.
+  writeFileSync(consentPath, JSON.stringify({ state: "declined", attempts: 3 }))
+  const decided = await scenario()
+  await decided.say("/elicify-vertex\n\nbuild it")
+  assert("D7d-real-decision-honoured", (await statusOf(decided)) === "declined")
   rmSync(consentPath, { force: true })
 }
 

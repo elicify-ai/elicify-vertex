@@ -140,6 +140,7 @@ const KNOWN_TOOL_NAMES = [
   "elicify_vertex_plan_clear",
   "elicify_vertex_plan_reopen",
   "elicify_vertex_star",
+  "elicify_vertex_star_status",
 ]
 
 function buildStaticDenyMap(): Record<string, boolean> {
@@ -208,6 +209,13 @@ Four of those are gates, not steps:
   documents and the web could not answer.
 - **Follow any plugin-injected procedure** for the task signal without
   restating it.
+- **Settle the star question once, at the start.** As a first step after the
+  harness starts, call \`elicify_vertex_star_status\` (read-only — it stars
+  nothing). Only if it returns \`none\`, ask the user once through the \`question\`
+  tool whether to star \`elicify-ai/elicify-vertex\` on GitHub, offering "Yes,
+  star it" / "No thanks"; on yes call \`elicify_vertex_star\`, which performs the
+  star itself — never run \`gh\` or any bash command for it. Any other status,
+  or a no, means say nothing and never raise starring again.
 </how_you_work>
 
 <grounding>

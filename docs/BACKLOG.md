@@ -184,7 +184,7 @@ checked by probing that the server responds.
 
 ---
 
-## B-6 — The star one-shot is unwinnable on weaker models
+## B-6 — The star one-shot is unwinnable on weaker models — **DONE (2026-08-06)**
 
 `star:armed-for-injection` → `star:injected` → `star:gave-up` after 3 attempts.
 The bounded-retry logic behaved exactly as designed; the model simply never made
@@ -251,6 +251,45 @@ legacy-`"prompted"` handling, and the uninstaller's removal of the file
    `gave-up` case beside it. Mutation-test both: honouring either marker must
    turn the test red, or the fix is inert on exactly the machines where the
    defect was measured.
+
+### Resolution (2026-08-06)
+
+Shipped as designed above.
+
+- **Deleted:** `maybeAskForStar` and its idle call site (`gate.ts`),
+  `GateContext.starAsk`, the `starAskDispatched` / `starAskPendingInjection`
+  sets and the `system.transform` injection block (`plugin.ts`),
+  `STAR_MAX_ATTEMPTS`, `readStarAttempts()`, `recordStarAttempt()`, the
+  `attempts` field in the consent file, the `"gave-up"` member of
+  `StarConsent`, and the `star:armed-for-injection` / `star:injected` /
+  `star:gave-up` events.
+- **Added:** `elicify_vertex_star_status` — no arguments, returns
+  `{consent: "none" | "asked" | "yes" | "declined"}`, stars nothing, records
+  nothing. Registered in `KNOWN_TOOL_NAMES` (`config.ts`) alongside
+  `elicify_vertex_star`, which is unchanged and remains the only starring verb.
+- **Moved:** the ask itself into `<how_you_work>` in
+  `agents/elicify-vertex-agent.md` (and therefore, via
+  `scripts/sync-activate-template.mjs`, into `ACTIVATE_TEMPLATE`): check the
+  status tool first, ask once through the `question` tool only on `none`, call
+  the star tool on yes, otherwise never raise it again.
+- **Kept deliberately:** the `tool.execute.after` observation that matches
+  `STAR_REPO` and writes `asked`, with its `starAskDispatched` gate stripped.
+  Deleting it outright would mean nothing ever writes `asked`, the status tool
+  would answer `"none"` forever, and the agent would re-ask EVERY session —
+  worse nagging than the loop that was removed. It still matches the repo, not
+  the word "star". `star:asked` survives with it.
+- **Legacy markers:** `readStarState()` reads `"prompted"` and `"gave-up"` — in
+  either the bare-word or the `{state, attempts}` JSON shape — as NO RECORD, in
+  one branch. A real decision carrying a stale `attempts` field is still
+  honoured.
+
+Mutation results (each mutation was applied, measured, reverted): honouring a
+bare `gave-up` kills 1 test; honouring a JSON `gave-up` kills 1; re-writing an
+`attempts` field kills 1; unregistering the status tool kills 12; making the
+status tool write consent kills 1; removing the ask observation kills 3;
+matching the bare word "star" kills 2; dropping the already-decided guard kills
+1; resurrecting a `system.transform` star injection kills 2. On the built
+artefact, honouring either `gave-up` marker turns UAT `D7b` and `D7c` red.
 
 ---
 
