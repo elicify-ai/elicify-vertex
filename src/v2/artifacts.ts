@@ -141,12 +141,38 @@ export function parseCriteriaBlock(text: string): CriteriaBlock | null {
 
   // Rare inline form: "CRITERIA: 1. foo" — the remainder after the colon on
   // the key line itself is a candidate first item.
-  if (inlineRemainder) tryConsume(inlineRemainder)
+  //
+  // If it is PROSE instead ("Criteria: the dimensions I reviewed against"),
+  // this key line is a heading or a sentence, not a criteria list, and the
+  // block is over. Returning null here rather than falling through is what
+  // stops the parser adopting whatever list happens to appear below: measured,
+  // `Criteria: <prose>` followed by an orientation list pinned three junk
+  // "criteria". The caller still sees the key line via `findCriteriaKeyLine`
+  // and logs `criteria:parse-miss`, so the miss stays visible.
+  if (inlineRemainder && !tryConsume(inlineRemainder)) return null
 
   for (let i = startIdx + 1; i < lines.length; i++) {
     const { line, fenced } = lines[i]
     if (fenced) break // a code fence ends the list — don't reach past it
-    if (line.trim() === "") continue // tolerate blank lines within/after the header
+    // CONTIGUITY. A blank line ends the block, wherever it falls.
+    //
+    // Blank lines used to be skipped, which let the parser bridge across the
+    // paragraph break and swallow the NEXT list in the reply. Three shapes were
+    // measured pinning non-criteria: a correct block followed by a blank line
+    // and the model's plan bullets (the plan steps got pinned), a `Criteria:`
+    // prose line followed by an orientation list, and a review reply whose
+    // `Criteria:` heading picked up the review dimensions below it. Junk pins
+    // are not inert — they drive stop-blocks, reach the verifier, and a
+    // non-empty pin store permanently closes the intake-scaffold gate, so the
+    // model can never replace them by answering the scaffold properly.
+    //
+    // The cost is the reply that writes "CRITERIA:" then a blank line then a
+    // real list: it now parses as nothing. That case is LOUD (the caller logs
+    // `criteria:parse-miss` for it) where a bad pin is silent, and B-2 — which
+    // added the blank-line tolerance along with bullet support — was about
+    // making the failure visible, not about tolerating layout. Bullets, the
+    // part that was actually load-bearing, are untouched.
+    if (line.trim() === "") break
     if (!tryConsume(line)) break
   }
 

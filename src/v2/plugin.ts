@@ -68,7 +68,7 @@ import {
   type V2SessionState,
 } from "./wiring/state.js"
 import { injectSubagentPreamble } from "./wiring/subagentInjection.js"
-import { buildPlanTools, readStarConsent, STAR_REPO, writeStarConsent } from "./wiring/tools.js"
+import { buildPlanTools, recordStarAskIfOurs } from "./wiring/tools.js"
 import { DelegationTracker } from "./wiring/watchdog.js"
 
 export interface ElicifyVertexV2Options {
@@ -752,6 +752,20 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
         }
         return
       }
+      // The star ask is recorded at DISPATCH as well as on completion (see the
+      // twin in `tool.execute.after`). `tool.execute.after` only runs once
+      // `execute` RESOLVES, so a question the user escapes or rejects records
+      // nothing — and `asked` is the only thing that stops the agent raising
+      // starring again, so that user would be asked every session forever.
+      // Dispatch is the moment the question is put in front of them, which is
+      // the event the marker is meant to record. Writing it here can, in the
+      // rare case where the host refuses the call outright, record an ask
+      // nobody saw: that costs a star, whereas the miss costs the user a
+      // prompt every session for the rest of time. Both sites are idempotent
+      // (`recordStarAskIfOurs` writes only when nothing is recorded yet).
+      if (toolInput.tool === "question") {
+        if (recordStarAskIfOurs(toolOutput?.args)) logger("star:asked", { sessionID: sid, at: "dispatch" })
+      }
       if (!WRITE_TOOL_NAMES.has(toolInput.tool)) return
 
       const state = states.get(sid)
@@ -786,30 +800,12 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       // `elicify_vertex_star_status` would answer "none" forever, and the
       // agent would re-raise starring EVERY session — worse nagging than the
       // loop that was deleted. A pure repo match is the whole gate.
+      // Matching rule + write live in `recordStarAskIfOurs` (wiring/tools.ts)
+      // so both observation points share one implementation — see the twin in
+      // `tool.execute.before`, which is the one that survives a question the
+      // user escapes.
       if (toolInput?.tool === "question" && typeof toolInput.sessionID === "string") {
-        const askSid = toolInput.sessionID
-        if (readStarConsent() === null) {
-          // Match the REPO, not the word "star". A bare substring check burned
-          // the machine's one-shot on any question mentioning stars —
-          // "which star rating should the widget default to?", "should I use a
-          // star schema?" — recording an ask the user never saw, which is the
-          // same class of bug as the arm-time "prompted" write.
-          let asked = false
-          try {
-            // `args` is host-supplied and could be circular; this runs before
-            // the hook's early returns, with no enclosing try/catch, so an
-            // exception here would reach the host.
-            asked = JSON.stringify(toolInput.args ?? {})
-              .toLowerCase()
-              .includes(STAR_REPO.toLowerCase())
-          } catch {
-            asked = false
-          }
-          if (asked) {
-            writeStarConsent("asked")
-            logger("star:asked", { sessionID: askSid })
-          }
-        }
+        if (recordStarAskIfOurs(toolInput.args)) logger("star:asked", { sessionID: toolInput.sessionID })
       }
       const sid = toolInput.sessionID
       if (isSelf(sid)) return

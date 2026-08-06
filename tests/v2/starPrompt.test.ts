@@ -110,8 +110,29 @@ async function idle(h: Harness): Promise<void> {
   await h.transform()
 }
 
-/** The model calls the `question` tool — `args` decides whether it is OUR ask. */
+/** The model calls the `question` tool — `args` decides whether it is OUR ask.
+ *  Drives BOTH hooks, in host order: dispatch, then completion. */
 async function questionTool(h: Harness, args: Record<string, unknown>): Promise<void> {
+  await questionDispatched(h, args)
+  await h.hooks["tool.execute.after"]!(
+    { tool: "question", sessionID: h.sid, callID: `c${Math.random()}`, args } as never,
+    { title: "question", output: "answered", metadata: {} } as never,
+  )
+}
+
+/** The question is PUT TO THE USER and nothing more — `tool.execute.before`
+ *  only. This is what a question the user escapes or rejects looks like: the
+ *  host never resolves `execute`, so `tool.execute.after` never fires. */
+async function questionDispatched(h: Harness, args: Record<string, unknown>): Promise<void> {
+  await h.hooks["tool.execute.before"]!(
+    { tool: "question", sessionID: h.sid, callID: `c${Math.random()}` } as never,
+    { args } as never,
+  )
+}
+
+/** Completion only, with no dispatch — the pre-existing observation point, kept
+ *  as its own path so a regression in either hook is attributable. */
+async function questionCompletedOnly(h: Harness, args: Record<string, unknown>): Promise<void> {
   await h.hooks["tool.execute.after"]!(
     { tool: "question", sessionID: h.sid, callID: `c${Math.random()}`, args } as never,
     { title: "question", output: "answered", metadata: {} } as never,
@@ -130,6 +151,153 @@ function plant(contents: string): void {
   mkdirSync(dirname(starConsentPath()), { recursive: true })
   writeFileSync(starConsentPath(), contents)
 }
+
+// ---------------------------------------------------------------------------
+// THE PHRASING GAP. `asked` is the ONLY thing that stops the agent raising the
+// question again, and it used to be written only when the serialised `question`
+// args contained the literal `elicify-ai/elicify-vertex` — while the prompt
+// never told the model to write the slug at all. Seven plausible phrasings of
+// the prompt's own instruction were probed against the old matcher and FIVE
+// recorded nothing, so those users were asked EVERY SESSION FOREVER: strictly
+// worse than the bounded 3-attempt loop B-6 removed, on exactly the weaker
+// models B-6 was written for.
+//
+// The fix is both ends — a matcher on the repo NAME plus a star/GitHub topic
+// word, and a prompt line telling the model to include the slug (asserted in
+// tests/agent-prompt.test.ts, which also holds the config-template drift
+// guard). Neither is reliable alone: the prompt is advice, the matcher is code.
+// ---------------------------------------------------------------------------
+const PROMPT_PHRASINGS = [
+  "Would you like to star the elicify-vertex repo on GitHub?",
+  "Star elicify-vertex on GitHub?",
+  "May I star the elicify-vertex repository?",
+  "Would you like to star elicify-ai/elicify-vertex on GitHub?",
+  "Do you want to give elicify-vertex a ⭐ on GitHub?",
+  "Should I star this project (elicify-vertex) for you?",
+  "Before we start: star the elicify-vertex repo?",
+]
+
+/** Names the repo but is not the ask — the widening must not swallow these. */
+const REPO_WORK_ASKS = [
+  { questions: [{ question: "Should I refactor elicify-vertex's gate module or leave it?" }] },
+  { questions: [{ question: "Which elicify-vertex directive family should own this?" }] },
+]
+
+describe("the ask is recorded whatever wording the model chooses", () => {
+  // MUTATION PROOF: restore the old rule (require the full `STAR_REPO` slug)
+  // -> five of these seven record nothing and go RED.
+  it.each(PROMPT_PHRASINGS)("records the ask for: %s", async (question) => {
+    const h = await harness()
+    await questionTool(h, { questions: [{ question }] })
+    expect(readStarConsent(), "an ask the harness cannot see is an ask repeated forever").toBe("asked")
+    expect(await h.status()).toBe("asked")
+  })
+
+  // MUTATION PROOF: widen the matcher to a bare "star"/"github" substring
+  // (drop the repo-name requirement) -> every one of these goes RED.
+  it.each([...STAR_WORD_ASKS, ...REPO_WORK_ASKS, OTHER_ASK])("still ignores a non-ask: %j", async (args) => {
+    const h = await harness()
+    await questionTool(h, args)
+    expect(readStarConsent(), "only OUR ask may spend the one-shot").toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// THE REJECTED QUESTION. `tool.execute.after` runs only once `execute`
+// RESOLVES, so a question the user escapes or rejects reaches it never — and
+// under after-only observation that user is asked again next session, and the
+// next, with no bound. The ask is therefore recorded at DISPATCH as well: the
+// moment the question is put in front of the user is the event the marker is
+// meant to record, not the moment they get around to answering it.
+// ---------------------------------------------------------------------------
+describe("a question the user escapes or rejects still spends the one-shot", () => {
+  // MUTATION PROOF: delete the `question` branch from `tool.execute.before`
+  // -> nothing is recorded and this goes RED.
+  it("records `asked` on dispatch, with no completion hook ever firing", async () => {
+    const h = await harness()
+    await questionDispatched(h, OUR_ASK)
+    expect(readStarConsent(), "the user saw the ask; escaping it is not a reason to re-ask forever").toBe("asked")
+    expect(await h.status()).toBe("asked")
+  })
+
+  it("does not record a dispatched question that is not our ask", async () => {
+    const h = await harness()
+    for (const args of STAR_WORD_ASKS) await questionDispatched(h, args)
+    await questionDispatched(h, OTHER_ASK)
+    expect(readStarConsent()).toBeNull()
+  })
+
+  // The completion hook remains a backstop in its own right, so a host that
+  // supplies args on only one of the two hooks is still covered.
+  it("records `asked` on completion alone as well", async () => {
+    const h = await harness()
+    await questionCompletedOnly(h, OUR_ASK)
+    expect(readStarConsent()).toBe("asked")
+  })
+
+  it("writes once, not twice, when both hooks fire for the same question", async () => {
+    const h = await harness()
+    await questionTool(h, OUR_ASK)
+    expect(readStarConsent()).toBe("asked")
+    expect(JSON.parse(readFileSync(starConsentPath(), "utf8"))).toEqual({ state: "asked" })
+  })
+
+  it("never downgrades an existing decision, from either hook", async () => {
+    plant(JSON.stringify({ state: "yes" }))
+    const h = await harness()
+    await questionDispatched(h, OUR_ASK)
+    await questionTool(h, OUR_ASK)
+    expect(readStarConsent()).toBe("yes")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// JUNK IS NOT A DECISION. The marker used to pass any bare word through
+// verbatim, so `banana` / `null` / `[]` became `{"consent":"banana"}` — outside
+// the documented union, and per the prompt's "anything else = never raise it
+// again", a permanent cancellation authored by a corrupt byte. The comparison
+// was also case-sensitive, so `GAVE-UP` dodged the legacy denylist and was
+// honoured as terminal.
+// ---------------------------------------------------------------------------
+describe("only the documented union counts as a record", () => {
+  // MUTATION PROOF: restore the `prompted`/`gave-up` denylist in place of the
+  // allowlist -> every row here reads as terminal and goes RED.
+  it.each([
+    "banana",
+    "null",
+    "[]",
+    "{}",
+    "GAVE-UP",
+    "PROMPTED",
+    "Gave-Up",
+    '{"state":"banana"}',
+    '{"state":null}',
+    '{"state":[]}',
+    '{"state":"GAVE-UP"}',
+    '{"state":42}',
+    "not json at all { oops",
+  ])("reads %s as no record at all", async (contents) => {
+    plant(contents)
+    expect(readStarConsent(), "junk must never read as a terminal decision").toBeNull()
+
+    const h = await harness()
+    expect(await h.status()).toBe("none")
+  })
+
+  // Guard the guard: normalising case must not throw away real decisions.
+  it.each([
+    ['{"state":"YES"}', "yes"],
+    ['{"state":"Declined"}', "declined"],
+    ["ASKED", "asked"],
+    ["  declined  ", "declined"],
+  ])("still honours %s as %s", async (contents, expected) => {
+    plant(contents)
+    expect(readStarConsent()).toBe(expected)
+
+    const h = await harness()
+    expect(await h.status()).toBe(expected)
+  })
+})
 
 describe("elicify_vertex_star_status — the read-only check the agent prompt calls", () => {
   it('reports "none" on a machine that was never asked', async () => {

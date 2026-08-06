@@ -816,3 +816,197 @@ describe("elicify_vertex_scope_amend tool (B-2)", () => {
     expect(harness.scopeAmendments).toEqual([])
   })
 })
+
+// ===========================================================================
+// The catch-all glob — the empty-list guard's twin.
+//
+// `elicify_vertex_scope_amend` already refused `[]` because `amendStory` reads
+// it as "replace with nothing", which switches the watchdog off for that story.
+// `["**"]` does the same thing through the front door: `story.ts` compiles a
+// lone double-star to `.*`, so the scope becomes `^.*$`. Measured: after
+// `amend ["**"]`, editing `/etc/passwd` raised no watchdog AND the call still
+// recorded FR-034 compliance — the tool reporting that a drift was resolved by
+// making drift undetectable.
+// ===========================================================================
+
+describe("elicify_vertex_scope_amend refuses globs that constrain nothing", () => {
+  const OUT_OF_SCOPE = "/etc/passwd"
+
+  async function scopedStory(harness: Harness): Promise<void> {
+    await createStories(harness, [
+      { text: "narrow story", acceptanceItems: ["one"], tasks: [{ text: "a" }], scopeGlobs: ["src/in-scope/**"] },
+    ])
+  }
+
+  async function amend(
+    harness: Harness,
+    args: { storyId?: string; resolution: "fold" | "amend" | "revert"; reason: string; scopeGlobs?: string[] },
+  ): Promise<string> {
+    return (await harness.tools.elicify_vertex_scope_amend.execute(
+      { storyId: "S1", scopeGlobs: [], ...args },
+      { sessionID: SESSION } as never,
+    )) as string
+  }
+
+  // The guard is only worth having if the thing it guards against is real.
+  // This proves it is, by going around the tool: amend the story's globs to the
+  // catch-all directly on the engine and watch the watchdog fall silent.
+  it("PREMISE: a catch-all glob really does silence the scope watchdog", async () => {
+    const harness = boot(temporaryRoot())
+    await scopedStory(harness)
+    expect(harness.storyEngine.checkScope(SESSION, OUT_OF_SCOPE)).not.toBeNull()
+
+    harness.storyEngine.amendStory(SESSION, "S1", { reason: "bypass", scopeGlobs: ["**"] })
+
+    expect(harness.storyEngine.checkScope(SESSION, OUT_OF_SCOPE), "everything is now 'in scope'").toBeNull()
+  })
+
+  // MUTATION PROOF: delete the `isUnboundedGlob` check in the tool -> the
+  // amend succeeds, the watchdog goes silent and compliance is recorded. All
+  // three assertions go RED.
+  it.each(["amend", "fold"] as const)("refuses resolution=%s with a catch-all, and the watchdog survives", async (resolution) => {
+    const harness = boot(temporaryRoot())
+    await scopedStory(harness)
+
+    await expect(amend(harness, { resolution, reason: "everything is in scope really", scopeGlobs: ["**"] })).rejects.toThrow(
+      /match every path/,
+    )
+
+    expect(harness.storyEngine.getPlan(SESSION)?.stories[0].scopeGlobs).toEqual(["src/in-scope/**"])
+    expect(harness.storyEngine.checkScope(SESSION, OUT_OF_SCOPE), "the watchdog must still fire").not.toBeNull()
+    expect(harness.scopeAmendments, "a refused call resolves nothing and complies with nothing").toEqual([])
+  })
+
+  it.each([["**"], ["*"], ["**/*"], ["./**"], ["*/**"], ["?"], ["**/**"], ["/**"], ["**/?"]])(
+    "refuses %j — no literal segment anywhere",
+    async (glob) => {
+      const harness = boot(temporaryRoot())
+      await scopedStory(harness)
+      await expect(amend(harness, { resolution: "amend", reason: "why not", scopeGlobs: [glob] })).rejects.toThrow(
+        /match every path/,
+      )
+    },
+  )
+
+  it("refuses a list where only ONE entry is the catch-all", async () => {
+    const harness = boot(temporaryRoot())
+    await scopedStory(harness)
+
+    await expect(
+      amend(harness, { resolution: "fold", reason: "plus a safety net", scopeGlobs: ["src/helpers/**", "**"] }),
+    ).rejects.toThrow(/match every path/)
+    expect(harness.scopeAmendments).toEqual([])
+  })
+
+  // Guard the guard: wildcards that name real files are the normal case and
+  // must keep working, or the tool becomes unusable and the directive
+  // unanswerable again.
+  it.each([["src/**"], ["**/*.ts"], ["**/test/**"], ["packages/*/src/**"], ["a?c/**"]])(
+    "still accepts %j",
+    async (glob) => {
+      const harness = boot(temporaryRoot())
+      await scopedStory(harness)
+
+      const out = JSON.parse(await amend(harness, { resolution: "amend", reason: "real scope", scopeGlobs: [glob] })) as {
+        scopeGlobs: string[]
+      }
+
+      expect(out.scopeGlobs).toEqual([glob])
+      expect(harness.scopeAmendments).toEqual([{ sessionID: SESSION, resolution: "amend" }])
+    },
+  )
+
+  // revert applies no globs at all, so a stray argument cannot disable
+  // anything — refusing it would only block a legitimate resolution.
+  it("lets a revert through even if it carries a stray catch-all argument", async () => {
+    const harness = boot(temporaryRoot())
+    await scopedStory(harness)
+
+    const out = JSON.parse(await amend(harness, { resolution: "revert", reason: "undid it", scopeGlobs: ["**"] })) as {
+      scopeGlobs: string[]
+    }
+
+    expect(out.scopeGlobs).toEqual(["src/in-scope/**"])
+    expect(harness.storyEngine.checkScope(SESSION, OUT_OF_SCOPE)).not.toBeNull()
+    expect(harness.scopeAmendments).toEqual([{ sessionID: SESSION, resolution: "revert" }])
+  })
+})
+
+// ===========================================================================
+// Compliance is a MEASUREMENT. `scope-watchdog` only ever reports drift
+// against a story with ACTIVE TASKS (`StoryEngine.checkScope` filters to
+// exactly those), so an amend aimed anywhere else answers no directive and
+// must not be counted as having answered one.
+//
+// Known gap, documented in the tool rather than approximated: whether the new
+// globs COVER the path that drifted. The path lives in
+// `state.scopeDriftPending`, which plugin.ts nulls the moment the directive is
+// rendered — it no longer exists by the time the model can call this tool.
+// ===========================================================================
+
+describe("elicify_vertex_scope_amend only answers for a story that can be drifting", () => {
+  async function twoStories(harness: Harness): Promise<void> {
+    await createStories(harness, [
+      { text: "first", acceptanceItems: ["one"], tasks: [{ text: "a" }], scopeGlobs: ["src/first/**"] },
+      { text: "second", acceptanceItems: ["two"], tasks: [{ text: "b" }], scopeGlobs: ["src/second/**"], dependsOn: ["S1"] },
+    ])
+  }
+
+  // MUTATION PROOF: delete the active-story check -> the amend succeeds and
+  // `scopeAmendments` records a compliance for a story no watchdog could have
+  // flagged. Both assertions go RED.
+  it("refuses a story whose tasks have not started, and records no compliance", async () => {
+    const harness = boot(temporaryRoot())
+    await twoStories(harness)
+    expect(harness.storyEngine.getActiveStories(SESSION).map((s) => s.id)).toEqual(["S1"])
+
+    await expect(
+      harness.tools.elicify_vertex_scope_amend.execute(
+        { storyId: "S2", resolution: "fold", reason: "pre-emptive", scopeGlobs: ["src/other/**"] },
+        { sessionID: SESSION } as never,
+      ),
+    ).rejects.toThrow(/no active tasks/)
+
+    expect(harness.storyEngine.getPlan(SESSION)?.stories[1].scopeGlobs).toEqual(["src/second/**"])
+    expect(harness.scopeAmendments).toEqual([])
+  })
+
+  it("refuses a story that has already completed", async () => {
+    const harness = boot(temporaryRoot())
+    await twoStories(harness)
+    await checkpoint(harness, "S1.T1", "complete")
+
+    await expect(
+      harness.tools.elicify_vertex_scope_amend.execute(
+        { storyId: "S1", resolution: "revert", reason: "late tidy-up", scopeGlobs: [] },
+        { sessionID: SESSION } as never,
+      ),
+    ).rejects.toThrow(/no active tasks/)
+    expect(harness.scopeAmendments).toEqual([])
+  })
+
+  it("names the stories the model should have used", async () => {
+    const harness = boot(temporaryRoot())
+    await twoStories(harness)
+
+    await expect(
+      harness.tools.elicify_vertex_scope_amend.execute(
+        { storyId: "S2", resolution: "revert", reason: "nope", scopeGlobs: [] },
+        { sessionID: SESSION } as never,
+      ),
+    ).rejects.toThrow(/Active stories: S1/)
+  })
+
+  it("still allows the story the watchdog would actually flag", async () => {
+    const harness = boot(temporaryRoot())
+    await twoStories(harness)
+
+    const raw = (await harness.tools.elicify_vertex_scope_amend.execute(
+      { storyId: "S1", resolution: "fold", reason: "the helper belongs here", scopeGlobs: ["src/helpers/**"] },
+      { sessionID: SESSION } as never,
+    )) as string
+
+    expect((JSON.parse(raw) as { scopeGlobs: string[] }).scopeGlobs).toEqual(["src/first/**", "src/helpers/**"])
+    expect(harness.scopeAmendments).toEqual([{ sessionID: SESSION, resolution: "fold" }])
+  })
+})
