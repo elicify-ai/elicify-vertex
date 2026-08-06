@@ -4,10 +4,13 @@
  * THE BUG THIS EXISTS FOR. `npm test` was writing to the operator's actual
  * `~/.config/opencode`: a `.vertex-events.jsonl` full of events from `/tmp`
  * fixture sessions, and a `.elicify-vertex-consent` reading
- * `{"state":"gave-up","attempts":4}`. That marker is TERMINAL — running the
+ * `{"state":"gave-up","attempts":4}`. That marker was TERMINAL — running the
  * test suite silently burned the machine's one-shot GitHub-star ask, and no
  * amount of uninstalling would bring it back, because the file looked like a
- * real user decision.
+ * real user decision. (B-6 has since deleted the `gave-up` state and made
+ * `readStarState()` read any leftover marker as no record, so that particular
+ * damage is now self-healing. This isolation still stands on its own: the
+ * suite must not write to the operator's config root at all.)
  *
  * It happened because the two roots resolve differently. `starConsentPath()`
  * honours `XDG_CONFIG_HOME`, so tests that set it (starPrompt.test.ts) were

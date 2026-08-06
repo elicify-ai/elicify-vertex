@@ -1,17 +1,22 @@
 /**
- * The one-time GitHub-star ask — closed loop.
+ * The one-time GitHub-star ask — agent-driven, harness-recorded (B-6).
  *
- * THE BUG THIS EXISTS FOR. Consent was written `"prompted"` at ARM time,
- * before the model had done anything. Measured on a live session: the ask was
- * armed, the system directive injected, and the model spent its one `question`
- * call asking about something else entirely. The consent file then said
+ * THE BUG THIS EXISTS FOR, PART 1. Consent was written `"prompted"` at ARM
+ * time, before the model had done anything. The consent file then said
  * "prompted" on a machine where the user had never been prompted — and because
  * the marker is machine-wide and durable, the ask could never happen again.
  *
- * So the one-shot is now spent only on an OBSERVED `question` call, the ask is
- * delivered as a continuation on a quiet turn rather than as a line in the
- * system prompt, and an uncooperative model is retried a bounded number of
- * times before giving up for good.
+ * PART 2. The fix for part 1 was a runtime loop: arm on a quiet turn, inject a
+ * system directive, retry, and write `"gave-up"` after three failures. On
+ * weaker models the ask was never made at all, so the loop only ever spent its
+ * three injections and then permanently cancelled — via `gave-up` — an ask
+ * nobody had made. Both `"prompted"` and `"gave-up"` record a MACHINE's
+ * behaviour in a file that is supposed to record a USER's decision, so both
+ * must read as NO RECORD AT ALL. Same reasoning, same branch.
+ *
+ * The loop is gone. The ask now lives in the agent prompt, gated by the
+ * read-only `elicify_vertex_star_status` tool; the harness's only remaining
+ * job is to OBSERVE a real `question` call about our repo and record `asked`.
  *
  * `starConsentPath()` honours `XDG_CONFIG_HOME`, so every test here runs
  * against its own throwaway config root and never touches the real machine.
@@ -23,7 +28,7 @@ import { dirname, join } from "node:path"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { ElicifyVertexPluginV2 } from "../../src/v2/plugin.js"
-import { readStarConsent, STAR_MAX_ATTEMPTS, starConsentPath } from "../../src/v2/wiring/tools.js"
+import { readStarConsent, starConsentPath } from "../../src/v2/wiring/tools.js"
 import type { Hooks, PluginInput } from "@opencode-ai/plugin"
 
 let configRoot: string
@@ -44,13 +49,12 @@ afterEach(() => {
 interface Harness {
   hooks: Hooks
   sid: string
-  prompts: Array<{ body?: { parts?: Array<{ text?: string }> } }>
   /** Continuation texts sent to the parent session (no agent tag). */
   sent: () => string[]
-  /** Star asks observed on the system channel (the invisible one). */
-  starAsks: () => string[]
   /** Run a system.transform, as the host does at the start of the next turn. */
   transform: () => Promise<string>
+  /** Call the read-only status tool and return its `consent` value. */
+  status: () => Promise<string>
 }
 
 async function harness(): Promise<Harness> {
@@ -77,20 +81,21 @@ async function harness(): Promise<Harness> {
   const sent = (): string[] =>
     prompts.filter((p) => !p?.body?.agent).map((p) => String(p?.body?.parts?.[0]?.text ?? ""))
 
-  // Every injection seen on the system channel, accumulated across turns —
-  // `system.transform` drains the pending flag, so it is observable once.
-  const injected: string[] = []
   const transform = async (): Promise<string> => {
     const out = { system: [] as string[] }
     await hooks["experimental.chat.system.transform"]!(
       { sessionID: sid, model: { providerID: "anthropic", id: "claude-opus-4" } } as never,
       out,
     )
-    const text = out.system.join("\n")
-    if (text.includes("star elicify-ai/elicify-vertex")) injected.push(text)
-    return text
+    return out.system.join("\n")
   }
-  return { hooks, sid, prompts, sent, transform, starAsks: () => injected }
+  const status = async (): Promise<string> => {
+    const raw = await (
+      hooks.tool as unknown as Record<string, { execute: (a: unknown, c: unknown) => Promise<string> }>
+    ).elicify_vertex_star_status.execute({}, { sessionID: sid })
+    return JSON.parse(raw).consent
+  }
+  return { hooks, sid, sent, transform, status }
 }
 
 async function userTurn(h: Harness, text: string): Promise<void> {
@@ -102,8 +107,6 @@ async function userTurn(h: Harness, text: string): Promise<void> {
 
 async function idle(h: Harness): Promise<void> {
   await h.hooks.event!({ event: { type: "session.idle", properties: { sessionID: h.sid } } as never })
-  // The host runs a system.transform at the start of the next turn; that is
-  // where the armed ask is delivered.
   await h.transform()
 }
 
@@ -123,46 +126,97 @@ const STAR_WORD_ASKS = [
   { questions: [{ question: "Should I use a star schema for the warehouse?" }] },
 ]
 
-describe("star ask — delivery", () => {
-  // INVISIBLE CHANNEL. The user must never watch the harness instruct the
-  // model to ask them something. It was briefly a continuation — a user-role
-  // message — which put that machinery on screen.
-  it("is NEVER sent as a continuation", async () => {
+function plant(contents: string): void {
+  mkdirSync(dirname(starConsentPath()), { recursive: true })
+  writeFileSync(starConsentPath(), contents)
+}
+
+describe("elicify_vertex_star_status — the read-only check the agent prompt calls", () => {
+  it('reports "none" on a machine that was never asked', async () => {
     const h = await harness()
-    await userTurn(h, "/elicify-vertex\n\nbuild the thing")
-    await idle(h)
-    expect(h.sent().filter((t) => t.includes("star elicify-ai"))).toHaveLength(0)
+    expect(await h.status()).toBe("none")
   })
 
-  it("is not injected before a quiet turn arms it", async () => {
+  it("stars NOTHING and records NOTHING — calling it must leave no trace", async () => {
     const h = await harness()
-    await userTurn(h, "/elicify-vertex\n\nbuild the thing")
-    expect(await h.transform()).not.toContain("star elicify-ai/elicify-vertex")
+    expect(await h.status()).toBe("none")
+    expect(await h.status()).toBe("none")
+    expect(existsSync(starConsentPath()), "the status check must never write consent").toBe(false)
   })
 
-  it("is injected on the system channel after a quiet turn", async () => {
+  it.each(["asked", "yes", "declined"])('reports a real recorded decision: %s', async (state) => {
+    plant(JSON.stringify({ state }))
     const h = await harness()
-    await userTurn(h, "/elicify-vertex\n\nbuild the thing")
-    await idle(h)
-    expect(h.starAsks()).toHaveLength(1)
+    expect(await h.status()).toBe(state)
+  })
+
+  // Deliberately NOT by calling `elicify_vertex_star` — that runs a real `gh`
+  // subprocess against the live GitHub account of whoever runs the suite.
+  it('stops reporting "none" once an ask has been observed', async () => {
+    const h = await harness()
+    await questionTool(h, OUR_ASK)
+    expect(await h.status()).toBe("asked")
   })
 })
 
-describe("star ask — the one-shot is spent only on an OBSERVED ask", () => {
-  it("writes nothing when merely armed", async () => {
+// ---------------------------------------------------------------------------
+// The two markers that are NOT user decisions. Both must read as no record.
+// ---------------------------------------------------------------------------
+describe("legacy markers are NO RECORD — the machines the defects were measured on", () => {
+  // MAJ-007: the arm-time build wrote "prompted" before the model had done
+  // anything. Honouring it leaves the fix inert on exactly those machines.
+  it("ignores a legacy bare 'prompted' marker and asks anyway", async () => {
+    plant("prompted")
+    expect(readStarConsent(), "legacy arm-time burn is not a real ask").toBeNull()
+
     const h = await harness()
-    await userTurn(h, "/elicify-vertex\n\nbuild the thing")
-    expect(existsSync(starConsentPath()), "arming must not burn the one-shot").toBe(false)
+    expect(await h.status(), "an arm-time marker must not suppress the ask").toBe("none")
   })
 
-  it("records an attempt but no CONSENT after dispatch, before the model complies", async () => {
+  // B-6: the twin. `gave-up` recorded that a MODEL failed to follow an
+  // instruction the user never saw — terminal, machine-wide, and produced by
+  // nobody's decision. Same branch, same reasoning as "prompted".
+  it("ignores a legacy bare 'gave-up' marker and asks anyway", async () => {
+    plant("gave-up")
+    expect(readStarConsent(), "a model's failure is not a user decision").toBeNull()
+
+    const h = await harness()
+    expect(await h.status(), "a gave-up marker must not suppress the ask").toBe("none")
+  })
+
+  // The JSON shape the retry loop actually wrote to disk, `attempts` and all.
+  it("ignores a legacy JSON gave-up record, attempts field included", async () => {
+    plant(JSON.stringify({ state: "gave-up", attempts: 4 }))
+    expect(readStarConsent(), "a model's failure is not a user decision").toBeNull()
+
+    const h = await harness()
+    expect(await h.status(), "a gave-up record must not suppress the ask").toBe("none")
+  })
+
+  it("ignores a legacy JSON prompted record", async () => {
+    plant(JSON.stringify({ state: "prompted", attempts: 2 }))
+    expect(readStarConsent()).toBeNull()
+
+    const h = await harness()
+    expect(await h.status()).toBe("none")
+  })
+
+  // Guard the guard: the legacy branch must not swallow real decisions.
+  it("still honours a real decision carrying a stale attempts field", async () => {
+    plant(JSON.stringify({ state: "declined", attempts: 3 }))
+    expect(readStarConsent()).toBe("declined")
+
+    const h = await harness()
+    expect(await h.status()).toBe("declined")
+  })
+})
+
+describe("the one-shot is spent only on an OBSERVED ask", () => {
+  it("writes nothing across an ordinary session", async () => {
     const h = await harness()
     await userTurn(h, "/elicify-vertex\n\nbuild the thing")
     await idle(h)
-    expect(h.starAsks()).toHaveLength(1)
-    // The attempt count persists (it has to bound retries across sessions and
-    // restarts), but the one-shot is NOT spent: consent is still unanswered.
-    expect(readStarConsent(), "dispatch must not count as an ask").toBeNull()
+    expect(existsSync(starConsentPath()), "an ordinary session must not burn the one-shot").toBe(false)
   })
 
   // The exact live failure: the model used its one question call for something
@@ -170,94 +224,80 @@ describe("star ask — the one-shot is spent only on an OBSERVED ask", () => {
   it("does not count an unrelated question call", async () => {
     const h = await harness()
     await userTurn(h, "/elicify-vertex\n\nbuild the thing")
-    await idle(h)
     await questionTool(h, OTHER_ASK)
     expect(readStarConsent()).toBeNull()
+    expect(await h.status()).toBe("none")
   })
 
   it.each(STAR_WORD_ASKS)("does not count a question that merely says 'star': %j", async (args) => {
     const h = await harness()
     await userTurn(h, "/elicify-vertex\n\nbuild the thing")
-    await idle(h)
     await questionTool(h, args)
     expect(readStarConsent(), "only OUR ask may spend the one-shot").toBeNull()
   })
 
-  it("records `asked` when the model actually asks", async () => {
+  // WITHOUT the harness arming anything. There is no arm step any more, so the
+  // observation must fire on the agent's own initiative or nothing ever writes
+  // `asked` and the agent re-asks every single session.
+  it("records `asked` on the agent's own question, with no arming step at all", async () => {
     const h = await harness()
-    await userTurn(h, "/elicify-vertex\n\nbuild the thing")
-    await idle(h)
     await questionTool(h, OUR_ASK)
     expect(readStarConsent()).toBe("asked")
+    expect(await h.status()).toBe("asked")
+  })
+
+  it("persists a readable record with a known state and no attempts field", async () => {
+    const h = await harness()
+    await userTurn(h, "/elicify-vertex\n\nbuild the thing")
+    await questionTool(h, OUR_ASK)
+    const record = JSON.parse(readFileSync(starConsentPath(), "utf8"))
+    expect(record).toEqual({ state: "asked" })
+  })
+
+  it("does not overwrite an existing decision when the question is asked again", async () => {
+    plant(JSON.stringify({ state: "yes" }))
+    const h = await harness()
+    await questionTool(h, OUR_ASK)
+    expect(readStarConsent()).toBe("yes")
   })
 })
 
-describe("star ask — bounded retry", () => {
-  it("retries on later quiet turns when the model ignores it", async () => {
+// ---------------------------------------------------------------------------
+// B-6: the runtime nagging loop is GONE. These are the regression tests that
+// keep it from growing back.
+// ---------------------------------------------------------------------------
+describe("no runtime nagging", () => {
+  it("never injects a star directive into the system prompt", async () => {
+    const h = await harness()
+    await userTurn(h, "/elicify-vertex\n\nbuild the thing")
+    expect(await h.transform()).not.toContain("elicify-ai/elicify-vertex")
+    await idle(h)
+    expect(await h.transform()).not.toContain("elicify-ai/elicify-vertex")
+  })
+
+  it("never injects a star directive however many quiet turns pass", async () => {
+    const h = await harness()
+    for (let i = 0; i < 6; i++) {
+      await userTurn(h, "carry on")
+      await idle(h)
+      expect(await h.transform()).not.toContain("elicify-ai/elicify-vertex")
+    }
+  })
+
+  it("is NEVER sent as a continuation", async () => {
     const h = await harness()
     await userTurn(h, "/elicify-vertex\n\nbuild the thing")
     await idle(h)
-    expect(h.starAsks()).toHaveLength(1)
-
-    // Model ignored it; a new user turn, another quiet turn.
-    await userTurn(h, "carry on")
-    await idle(h)
-    expect(h.starAsks().length).toBeGreaterThan(1)
+    expect(h.sent().filter((t) => t.includes("star elicify-ai"))).toHaveLength(0)
   })
 
-  it("gives up permanently after the attempt cap", async () => {
+  it("never writes a terminal state on its own — only no-file or an observed ask", async () => {
     const h = await harness()
-    for (let i = 0; i < STAR_MAX_ATTEMPTS + 3; i++) {
+    for (let i = 0; i < 6; i++) {
       await userTurn(h, "carry on")
       await idle(h)
     }
-    expect(h.starAsks().length).toBeLessThanOrEqual(STAR_MAX_ATTEMPTS)
-    expect(readStarConsent()).toBe("gave-up")
-  })
-
-  it("never asks again once a terminal state is recorded", async () => {
-    const h = await harness()
-    await userTurn(h, "/elicify-vertex\n\nbuild the thing")
-    await idle(h)
-    await questionTool(h, OUR_ASK)
-    const afterAsk = h.starAsks().length
-
-    await userTurn(h, "carry on")
-    await idle(h)
-    expect(h.starAsks()).toHaveLength(afterAsk)
-  })
-})
-
-describe("star ask — never disturbs the session", () => {
-  it("does not fire when a continuation is already in flight", async () => {
-    const h = await harness()
-    await userTurn(h, "/elicify-vertex\n\nbuild the thing")
-    // Simulate the idle tree having dispatched something of its own.
-    await h.hooks.event!({ event: { type: "session.idle", properties: { sessionID: h.sid } } as never })
-    const first = h.starAsks().length
-    expect(first).toBeLessThanOrEqual(1)
-  })
-
-  it("persists a readable record with a known state", async () => {
-    const h = await harness()
-    await userTurn(h, "/elicify-vertex\n\nbuild the thing")
-    await idle(h)
-    await questionTool(h, OUR_ASK)
-    expect(readStarConsent()).toBe("asked")
-    expect(JSON.parse(readFileSync(starConsentPath(), "utf8"))).toMatchObject({ state: "asked" })
-  })
-
-  // MAJ-007: the previous build wrote "prompted" at ARM time — the very bug
-  // this closed loop fixes. Honouring it would leave the fix inert on exactly
-  // the machines where the defect was measured.
-  it("ignores a legacy 'prompted' marker and asks anyway", async () => {
-    mkdirSync(dirname(starConsentPath()), { recursive: true })
-    writeFileSync(starConsentPath(), "prompted")
-    expect(readStarConsent(), "legacy arm-time burn is not a real ask").toBeNull()
-
-    const h = await harness()
-    await userTurn(h, "/elicify-vertex\n\nbuild the thing")
-    await idle(h)
-    expect(h.starAsks()).toHaveLength(1)
+    expect(readStarConsent(), "nothing may give up on the user's behalf").toBeNull()
+    expect(await h.status()).toBe("none")
   })
 })

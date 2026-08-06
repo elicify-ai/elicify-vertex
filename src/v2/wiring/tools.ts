@@ -52,16 +52,29 @@ export interface PlanToolsDeps {
 }
 
 // ---------------------------------------------------------------------------
-// One-time "star on GitHub" consent + tool (deterministic trigger, LLM popup,
-// hidden execution).
+// One-time "star on GitHub" consent + tools (agent-driven ask, hidden
+// execution).
 //
-// The ask is a real yes/no via the model's `question` tool (the only popup
-// opencode exposes). The harness fires that ask ONCE per machine (consent file
-// gates it — see plugin.ts), not from the model's memory. The actual `gh` star
-// call runs as this plugin's OWN subprocess inside the tool below — never a
-// bash tool call — so the command and its output never appear in the chat; the
-// model only sees a clean tool result. `GH_TOKEN` is stripped so the user's own
-// `gh auth login` is used.
+// B-6 (2026-08-06). The ask used to be a runtime nagging loop: the idle gate
+// armed it on a quiet turn, `system.transform` injected a directive, and an
+// uncooperative model was retried a bounded number of times before the harness
+// wrote `gave-up`. Measured on weaker models it never produced the ask — three
+// injections spent per machine to achieve nothing — so the whole loop is gone.
+//
+// What replaces it is two tools and one line of agent prompt. The agent asks
+// `elicify_vertex_star_status` (read-only, stars NOTHING) as a first step after
+// harness start; on `none` it asks the user once via the `question` tool, and
+// on yes calls `elicify_vertex_star`. Anything other than `none` means say
+// nothing, ever again.
+//
+// Two tools, not one flag: `elicify_vertex_star` takes no arguments and stars
+// immediately, so a model that forgot a `{check:true}` flag would star the repo
+// while trying to check — a silent, irreversible, outward-facing action.
+//
+// The actual `gh` star call runs as this plugin's OWN subprocess inside the
+// star tool — never a bash tool call — so the command and its output never
+// appear in the chat; the model only sees a clean tool result. `GH_TOKEN` is
+// stripped so the user's own `gh auth login` is used.
 // ---------------------------------------------------------------------------
 
 export const STAR_REPO = "elicify-ai/elicify-vertex"
@@ -80,19 +93,23 @@ export function starConsentPath(): string {
 /** Read the consent marker. `null` = no file (never asked). */
 export interface StarState {
   state: StarConsent
-  attempts: number
 }
 
 /**
  * Read the consent record.
  *
- * Two compatibility rules, both load-bearing:
+ * Three compatibility rules, all load-bearing:
  *
  *  - the file used to hold a bare word, so a plain string still parses;
  *  - a legacy `"prompted"` is treated as NO RECORD. That value was written at
- *    ARM time by the previous build — the exact bug this closed loop fixes —
- *    so honouring it would leave the fix inert on precisely the machines where
+ *    ARM time by an older build — before the model had done anything — so
+ *    honouring it would leave the fix inert on precisely the machines where
  *    the defect was measured, including the one it was reported from.
+ *  - a legacy `"gave-up"` is treated as NO RECORD too, for the SAME reason and
+ *    in the same branch. It recorded that a MODEL failed to follow an
+ *    instruction the user never saw, and being terminal it permanently
+ *    cancelled an ask nobody ever made. The state no longer exists (B-6); a
+ *    machine carrying the marker gets the one real ask it was owed.
  */
 export function readStarState(): StarState | null {
   try {
@@ -101,40 +118,16 @@ export function readStarState(): StarState | null {
     const raw = readFileSync(path, "utf8").trim()
     if (!raw) return null
     if (raw.startsWith("{")) {
-      const parsed = JSON.parse(raw) as { state?: string; attempts?: unknown }
-      if (parsed.state === "prompted" || !parsed.state) return null
-      return { state: parsed.state as StarConsent, attempts: Number(parsed.attempts) || 0 }
+      const parsed = JSON.parse(raw) as { state?: string }
+      if (!parsed.state || parsed.state === "prompted" || parsed.state === "gave-up") return null
+      return { state: parsed.state as StarConsent }
     }
-    if (raw === "prompted") return null // legacy arm-time burn: not a real ask
-    return { state: raw as StarConsent, attempts: 0 }
+    // Legacy bare words that are not real user decisions: not a record at all.
+    if (raw === "prompted" || raw === "gave-up") return null
+    return { state: raw as StarConsent }
   } catch {
     return null
   }
-}
-
-/** Attempts made so far, ACROSS sessions and process restarts. */
-export function readStarAttempts(): number {
-  try {
-    const path = starConsentPath()
-    if (!existsSync(path)) return 0
-    const raw = readFileSync(path, "utf8").trim()
-    if (!raw.startsWith("{")) return 0
-    return Number((JSON.parse(raw) as { attempts?: unknown }).attempts) || 0
-  } catch {
-    return 0
-  }
-}
-
-/** Record an attempt without ending the loop — survives restarts (MAJ-001). */
-export function recordStarAttempt(): number {
-  const next = readStarAttempts() + 1
-  try {
-    mkdirSync(dirname(starConsentPath()), { recursive: true, mode: 0o700 })
-    writeFileSync(starConsentPath(), JSON.stringify({ attempts: next }), { mode: 0o600 })
-  } catch {
-    // Non-fatal: the in-memory counter still bounds this session.
-  }
-  return next
 }
 
 export function readStarConsent(): string | null {
@@ -167,32 +160,30 @@ export function starRepoHidden(): boolean {
   }
 }
 
-/** Write the consent marker (mode 0600). */
 /**
- * Consent states, and why there are four.
+ * Consent states, and why there are exactly three (plus "no file").
  *
- * The old code wrote `"prompted"` the moment the ask was ARMED — before the
- * model had done anything. When the model ignored the instruction (measured on
- * a live session: the ask was armed, the system directive injected, and the
- * model used its one `question` call to ask about something else entirely),
- * the one-shot was spent on an ask the user never saw, permanently, on that
- * machine. The file said "prompted" where nobody had been prompted.
+ * The file records what the USER decided, and nothing else. An older build
+ * wrote `"prompted"` the moment the ask was ARMED — before the model had done
+ * anything — and later wrote `"gave-up"` when a model ignored the instruction
+ * enough times. Both recorded a MACHINE's behaviour in a file that gates a
+ * user-facing, machine-wide, irreversible one-shot, so both burned an ask the
+ * user never saw. Neither state exists any more (B-6); `readStarState()`
+ * treats a leftover marker of either kind as no record at all.
  *
- *   asked     — the `question` tool ACTUALLY fired for our ask. Observed, not
- *               assumed. Only this ends the retry loop successfully.
+ *   (no file) — never asked. `elicify_vertex_star_status` reports "none".
+ *   asked     — the `question` tool ACTUALLY fired for our ask. Observed by
+ *               `tool.execute.after`, not assumed. Stops the agent re-asking
+ *               on every subsequent session.
  *   yes       — the user said yes and the repo was starred.
- *   declined  — asked, and the user said no. Written by `elicify_vertex_star`
- *               is not possible (it is only called on yes), so this is
- *               reserved for a future explicit-no signal; `asked` already
- *               ends the loop, so nothing is lost by not writing it today.
- *   gave-up   — retried `STAR_MAX_ATTEMPTS` times without ever observing the
- *               ask. Stop trying; the model is not going to comply.
+ *   declined  — asked, and the user said no. `elicify_vertex_star` cannot
+ *               write it (it is only called on yes), so this is reserved for a
+ *               future explicit-no signal; `asked` already silences the ask,
+ *               so nothing is lost by not writing it today.
  */
-export type StarConsent = "asked" | "yes" | "declined" | "gave-up"
+export type StarConsent = "asked" | "yes" | "declined"
 
-/** How many quiet turns to try before concluding the model will not ask. */
-export const STAR_MAX_ATTEMPTS = 3
-
+/** Write the consent marker (mode 0600). */
 export function writeStarConsent(value: StarConsent): void {
   try {
     // The config directory may not exist yet — a fresh machine, or an
@@ -200,7 +191,7 @@ export function writeStarConsent(value: StarConsent): void {
     // the catch swallows it, and consent silently never persists: the ask
     // would repeat forever with no record of it.
     mkdirSync(dirname(starConsentPath()), { recursive: true, mode: 0o700 })
-    writeFileSync(starConsentPath(), JSON.stringify({ state: value, attempts: readStarAttempts() }), { mode: 0o600 })
+    writeFileSync(starConsentPath(), JSON.stringify({ state: value }), { mode: 0o600 })
   } catch {
     // Non-fatal: worst case the user is asked again next run.
   }
@@ -630,6 +621,23 @@ export function buildPlanTools(deps: PlanToolsDeps) {
     },
   })
 
+  // READ-ONLY companion to the star tool. It stars NOTHING — its entire job is
+  // to answer "has this machine already been asked?" so the agent prompt can
+  // decide whether to raise the question at all. Kept a separate tool from
+  // `elicify_vertex_star` (rather than a `{check}` flag on it) because that
+  // tool stars on call with no arguments: a model that forgot the flag would
+  // star the repo while trying to check.
+  const starStatusTool = tool({
+    description:
+      "Check whether this machine has already been asked to star the elicify-vertex GitHub repo. Read-only: it " +
+      'stars nothing and records nothing. Returns {consent: "none" | "asked" | "yes" | "declined"}. Only "none" ' +
+      "means you may ask the user; anything else means say nothing and never raise starring again.",
+    args: {},
+    async execute() {
+      return JSON.stringify({ consent: readStarConsent() ?? "none" })
+    },
+  })
+
   // One-time star tool: the model calls this ONLY after the user agrees via
   // the `question` tool. It runs `gh` as a hidden subprocess and records
   // consent, so no bash/gh ever appears in the chat. Idempotent: a second call
@@ -656,6 +664,7 @@ export function buildPlanTools(deps: PlanToolsDeps) {
     elicify_vertex_plan_clear: clearTool,
     elicify_vertex_plan_reopen: reopenTool,
     elicify_vertex_star: starTool,
+    elicify_vertex_star_status: starStatusTool,
   }
 }
 

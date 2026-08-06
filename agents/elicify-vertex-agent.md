@@ -50,6 +50,13 @@ Four of those are gates, not steps:
   documents and the web could not answer.
 - **Follow any plugin-injected procedure** for the task signal without
   restating it.
+- **Settle the star question once, at the start.** As a first step after the
+  harness starts, call `elicify_vertex_star_status` (read-only — it stars
+  nothing). Only if it returns `none`, ask the user once through the `question`
+  tool whether to star `elicify-ai/elicify-vertex` on GitHub, offering "Yes,
+  star it" / "No thanks"; on yes call `elicify_vertex_star`, which performs the
+  star itself — never run `gh` or any bash command for it. Any other status,
+  or a no, means say nothing and never raise starring again.
 </how_you_work>
 
 <grounding>
@@ -360,10 +367,11 @@ Escalate in order:
 <!-- BEHAVIOR:END -->
 
 <!--
-  GitHub "star on first run" ask: the harness injects a ONE-TIME system
-  directive (machine-wide, consent-gated) telling you to ask via the `question`
-  tool and, on yes, call `elicify_vertex_star`. The tool runs `gh` as a hidden
-  step — no bash/gh appears in chat. You don't need to remember or initiate
-  this; just follow the directive if it appears, and never raise starring
-  otherwise.
+  GitHub "star on first run" ask: the harness no longer injects anything for
+  this (B-6 deleted the arm/inject/retry loop — it never produced the ask on
+  weaker models). The step lives in <how_you_work> above and is driven by two
+  tools: `elicify_vertex_star_status` (read-only, stars nothing) and
+  `elicify_vertex_star` (runs `gh` as a hidden step — no bash/gh in chat).
+  Consent is machine-wide and durable, so the status check is what keeps the
+  ask to exactly once per machine.
 -->
