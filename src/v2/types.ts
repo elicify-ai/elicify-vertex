@@ -9,7 +9,7 @@
  *
  * This module has no runtime behavior of its own: it only re-exports/aliases
  * types so every v2 module (phase.ts, pin.ts, artifacts.ts, resolve.ts,
- * dosing.ts, composer.ts, subturn.ts, verifier.ts, story.ts, measurement.ts)
+ * composer.ts, subturn.ts, verifier.ts, story.ts, measurement.ts)
  * imports one canonical definition instead of hand-rolling copies that could
  * drift.
  */
@@ -34,14 +34,3 @@ export type EventLogger = (eventType: string, payload: Record<string, unknown>) 
  * `.app.agents` that subturn.ts/verifier.ts/story.ts need.
  */
 export type { OpencodeClient } from "@opencode-ai/sdk"
-
-/**
- * FR-028/FR-029 dosing profile. Canonically defined in `src/v2/dosing.ts`
- * (which already exists on disk) — re-exported here as a type alias so
- * composer.ts/measurement.ts and anything else that only needs the shared
- * shared-types entry point can import it from `./types.js` without also
- * depending on `./dosing.js`. There is exactly one canonical definition
- * (dosing.ts); this is a re-export, never a second declaration, so the two
- * can never drift.
- */
-export type { Profile } from "./dosing.js"

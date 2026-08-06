@@ -153,11 +153,18 @@ async function activate(hooks: Hooks, sessionID: string, text: string, model?: {
 }
 
 async function transform(hooks: Hooks, sessionID: string): Promise<{ system: string[] }> {
+  return transformWith(hooks, sessionID, { providerID: "anthropic", id: "claude-fable-5" })
+}
+
+/** `transform` with an explicit model — BACKLOG B-1's regression tests need to
+ * vary the model id, which used to select a dosing profile. */
+async function transformWith(
+  hooks: Hooks,
+  sessionID: string,
+  model: { providerID: string; id: string },
+): Promise<{ system: string[] }> {
   const out = { system: [] as string[] }
-  await hooks["experimental.chat.system.transform"]!(
-    { sessionID, model: { providerID: "anthropic", id: "claude-fable-5" } as never },
-    out,
-  )
+  await hooks["experimental.chat.system.transform"]!({ sessionID, model: model as never }, out)
   return out
 }
 
@@ -482,6 +489,10 @@ interface LoggedEvent {
   event_type: string
   session_id: string
   payload: Record<string, unknown>
+  /** FR-033: stamped on every record. `profile` was its companion until
+   * BACKLOG B-1 removed model-conditioned dosing; it is deliberately NOT
+   * declared here, so a test that asserts on it would not compile. */
+  model?: string
 }
 
 /** Read the measurement sink written by this test run. */
@@ -1310,6 +1321,15 @@ describe("verify:non-executing", () => {
 // session was inert -- no directives, no receipts, no injected text -- but
 // "inert" has to include "writes nothing", or the event log stops being a
 // trustworthy record of which sessions the harness touched.
+//
+// BACKLOG B-1 deleted `dosing:unknown-model`, which was the event the
+// discrimination partner below asserted. Deleting that partner alone would
+// have left the inertness test passing VACUOUSLY -- "no events" is trivially
+// true if the harness logs nothing for anyone. The partner is therefore
+// REPOINTED at `directive_rendered`, an event an activated session emits on
+// the same code path (`system.transform`) and that no non-activated session
+// can reach. It discriminates exactly as before: gut the activation check the
+// wrong way and the first test still passes, but the second fails.
 // ===========================================================================
 
 describe("inertness: a non-activated session writes nothing", () => {
@@ -1324,32 +1344,152 @@ describe("inertness: a non-activated session writes nothing", () => {
       { sessionID: sid, model: { providerID: "openrouter", modelID: "z-ai/glm-5.2" } } as never,
       { message: {} as never, parts: [{ type: "text", text: "say OK" } as never] },
     )
-
-    const mine = readEvents().filter((e) => e.session_id === sid)
-    expect(mine.map((e) => e.event_type)).toEqual([])
-  })
-
-  it("DOES log dosing for an activated session (discrimination)", async () => {
-    // Without this the fix could be "never log dosing" and the test above
-    // would still pass while real telemetry disappeared.
-    const client = makeStubClient()
-    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
-    const sid = `active-${Math.random().toString(36).slice(2)}`
-
-    await activate(hooks, sid, "implement the production database migration", {
-      providerID: "openrouter",
-      id: "z-ai/glm-5.2",
-    })
-    // The shared `transform` helper hardcodes a KNOWN model, which resolves
-    // cleanly and therefore logs nothing. Drive it with the same unknown model
-    // the live G1 session used.
+    // Drive `system.transform` too -- the OTHER hook that used to log the
+    // model. A non-activated session must be silent on both.
     await hooks["experimental.chat.system.transform"]!(
       { sessionID: sid, model: { providerID: "openrouter", id: "z-ai/glm-5.2" } as never },
       { system: [] as string[] },
     )
 
     const mine = readEvents().filter((e) => e.session_id === sid)
-    expect(mine.some((e) => e.event_type === "dosing:unknown-model")).toBe(true)
+    expect(mine.map((e) => e.event_type)).toEqual([])
+  })
+
+  it("DOES log for an ACTIVATED session on the same hooks (discrimination -- without this the test above is vacuous)", async () => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = `active-${Math.random().toString(36).slice(2)}`
+
+    // Same model, same two hooks, same order as the inert case above. The
+    // ONLY difference is that this session activates.
+    await activate(hooks, sid, "implement the production database migration", {
+      providerID: "openrouter",
+      id: "z-ai/glm-5.2",
+    })
+    await hooks["experimental.chat.system.transform"]!(
+      { sessionID: sid, model: { providerID: "openrouter", id: "z-ai/glm-5.2" } as never },
+      { system: [] as string[] },
+    )
+
+    const mine = readEvents().filter((e) => e.session_id === sid)
+    expect(mine.length).toBeGreaterThan(0)
+    expect(mine.some((e) => e.event_type === "directive_rendered")).toBe(true)
+    // The model id is still stamped on every record (FR-033) -- B-1 removed
+    // the `profile` companion, not this.
+    expect(mine.every((e) => e.model === "openrouter/z-ai/glm-5.2")).toBe(true)
+  })
+})
+
+// ===========================================================================
+// BACKLOG B-1: the judge runs on the worker's model. No table, no profile,
+// no override.
+//
+// The deleted `src/v2/dosing.ts` held a two-row model->profile table and
+// `wiring/dosing.ts` used it to REWRITE or DROP findings per model. Measured
+// on this exact scenario at the pre-removal commit, one 3-turn session
+// rendered 6 directives / 1842 chars on `anthropic/claude-fable-5`
+// ("frontier") but only 3 directives / 1308 chars on `minimax/MiniMax-M3`
+// ("standard") — the same harness, the same events, a different answer
+// because of the model name. That is the coupling these tests forbid.
+// ===========================================================================
+
+describe("BACKLOG B-1: the model id does not change what the harness renders", () => {
+  // Row 1 of the deleted table ("frontier"), row 2 ("standard"), and the id
+  // the FIELD session actually reported — which missed the table on the
+  // provider segment and fell back to "standard" 138 times.
+  const MODELS = [
+    { providerID: "anthropic", id: "claude-fable-5" },
+    { providerID: "minimax", id: "MiniMax-M3" },
+    { providerID: "minimax-coding-plan", id: "MiniMax-M3" },
+  ]
+
+  async function renderFor(model: { providerID: string; id: string }) {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = `b1-${model.providerID}-${Math.random().toString(36).slice(2)}`
+
+    await activate(hooks, sid, "implement the production database migration and verify it", model)
+    await toolAfter(hooks, sid, "edit", { filePath: "src/migrate.ts" }, "updated")
+    const out = await transformWith(hooks, sid, model)
+
+    const mine = readEvents().filter((e) => e.session_id === sid)
+    return {
+      injected: out.system.join("\n---\n"),
+      families: mine
+        .filter((e) => e.event_type === "directive_rendered")
+        .map((e) => String((e.payload as { family?: string }).family))
+        .sort(),
+    }
+  }
+
+  it("renders byte-identical directives for a 'frontier'-table model, a 'standard'-table model, and a model the table never knew", async () => {
+    const [frontierRow, standardRow, unknownToTable] = await Promise.all(MODELS.map(renderFor))
+
+    // Non-vacuous: there is something to compare. Without this the test
+    // would pass on three empty strings.
+    expect(frontierRow.families.length).toBeGreaterThan(0)
+    expect(frontierRow.injected.length).toBeGreaterThan(0)
+
+    // The whole rule, in two assertions. Pre-removal the first pair differed
+    // in BOTH fields (6 families vs 3; 1842 chars vs 1308).
+    expect(standardRow).toEqual(frontierRow)
+    expect(unknownToTable).toEqual(frontierRow)
+  })
+
+  it("emits no dosing telemetry for a model the deleted table would have called unknown", async () => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = `b1-telemetry-${Math.random().toString(36).slice(2)}`
+    const model = { providerID: "minimax-coding-plan", id: "MiniMax-M3" }
+
+    await activate(hooks, sid, "implement the production database migration", model)
+    for (let step = 0; step < 5; step++) {
+      await toolAfter(hooks, sid, "edit", { filePath: `src/step-${step}.ts` }, "updated")
+      await transformWith(hooks, sid, model)
+    }
+
+    const mine = readEvents().filter((e) => e.session_id === sid)
+    // Discrimination: the session IS logging — "no dosing events" below is
+    // therefore about dosing, not about a silent harness.
+    expect(mine.length).toBeGreaterThan(0)
+    expect(mine.some((e) => e.event_type === "dosing:unknown-model")).toBe(false)
+    // FR-033's `profile` stamp went with the table. Every record on disk must
+    // now be free of it; pre-removal every one of them carried it.
+    expect(mine.every((e) => !("profile" in e))).toBe(true)
+    // The model id itself is still recorded — B-1 removed the profile, not
+    // the model attribution.
+    expect(mine.every((e) => e.model === "minimax-coding-plan/MiniMax-M3")).toBe(true)
+  })
+
+  it("composes with B-2: rendering FULL for every model does not re-open the per-step flood", async () => {
+    // B-1 raises directive volume (every session now gets the full form that
+    // only the 'frontier' row used to get). B-2 bounds emission to once per
+    // TURN. Measured across 6/12/24/48/96 agent-loop steps in one turn, both
+    // before and after B-1: rendered count is FLAT and no directive is ever
+    // built only to be thrown away by the cap. This pins that composition at
+    // a step count far past the point the pre-B-2 bug would have shown (the
+    // field session logged 179 `per-turn-cap:dropped`, all intake-scaffold).
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = `b1-bounded-${Math.random().toString(36).slice(2)}`
+    const model = { providerID: "anthropic", id: "claude-fable-5" }
+
+    await activate(hooks, sid, "implement the production database migration", model)
+    let injectedBlocks = 0
+    for (let step = 0; step < 40; step++) {
+      await toolAfter(hooks, sid, "edit", { filePath: `src/step-${step}.ts` }, "updated")
+      injectedBlocks += (await transformWith(hooks, sid, model)).system.length
+    }
+
+    const mine = readEvents().filter((e) => e.session_id === sid)
+    const family = (e: LoggedEvent) => String((e.payload as { family?: string }).family)
+    const scaffoldRenders = mine.filter((e) => e.event_type === "directive_rendered" && family(e) === "intake-scaffold")
+    const capDrops = mine.filter((e) => e.event_type === "per-turn-cap:dropped")
+
+    // 40 steps, ONE turn: one scaffold, one injected block, zero waste.
+    expect(scaffoldRenders).toHaveLength(1)
+    expect(injectedBlocks).toBe(1)
+    expect(capDrops).toHaveLength(0)
   })
 })
 

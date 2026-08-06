@@ -371,11 +371,20 @@ describe("test 29: verifier_async_fail_open", () => {
 })
 
 // ===========================================================================
-// Test 36: verifier_model_selection_and_fallback (FR-030a)
+// Test 36: verifier_model_selection (was: _and_fallback)
+//
+// BACKLOG B-1: there is no model SELECTION left to test — the judge runs on
+// the worker's model, and the `verifierModel` option and its fallback chain
+// are gone. What survives is the end-to-end proof that the subturn the gate
+// actually dispatches carries the session's own `{providerID, modelID}`, and
+// that it is dispatched exactly once. Case (b) ("falls back to the session
+// model when the configured verifierModel's attempt rejects") is deleted: it
+// configured an option that no longer exists, so under the new code its two
+// prompt calls collapse to one and its premise cannot be set up at all.
 // ===========================================================================
 
-describe("test 36: verifier_model_selection_and_fallback", () => {
-  it("(a) defaults to the session's own model when no verifierModel option is configured", async () => {
+describe("test 36: verifier_model_selection", () => {
+  it("(a) the verifier subturn runs on the session's own model — the only model it can run on", async () => {
     const client = makeStubClient({
       promptImpl: async (args) => {
         if (args.body?.agent === "vertex-verifier") {
@@ -430,22 +439,27 @@ describe("test 36: verifier_model_selection_and_fallback", () => {
     expect(continuationTexts.some((t) => t.includes("passed audit"))).toBe(true)
   })
 
-  it("(b) falls back to the session model when the configured verifierModel's attempt rejects, appending the verdict on the retry's success", async () => {
+  it("(b) BACKLOG B-1: a leftover `verifierModel` in opencode.json is INERT — the subturn still runs once, on the session model", async () => {
+    // Decision, recorded: removed options are ignored SILENTLY (no
+    // deprecation event — see `src/v2/plugin.ts`'s option-handling note).
+    // "Silently ignored" is a behaviour, so it gets a test: the same option
+    // that used to redirect the judge to `provider-x` must now change
+    // nothing at all. If the override plumbing is ever restored, the
+    // `provider-x` branch below throws and this fails.
+    let sawProviderX = false
     const client = makeStubClient({
       promptImpl: async (args) => {
         if (args.body?.agent !== "vertex-verifier") {
           return { data: { info: {}, parts: [{ type: "text", text: '{"multiStory":false}' }] }, error: undefined }
         }
-        if (args.body?.model?.providerID === "provider-x") {
-          throw new Error("provider-x unavailable")
-        }
+        if (args.body?.model?.providerID === "provider-x") sawProviderX = true
         return {
           data: {
             info: {},
             parts: [
               {
                 type: "text",
-                text: '{"stories":[{"storyId":"S1","pass":true,"summary":"fallback worked","items":[{"itemId":"A1","met":true,"note":"observed"}]}]}',
+                text: '{"stories":[{"storyId":"S1","pass":true,"summary":"ran on the session model","items":[{"itemId":"A1","met":true,"note":"observed"}]}]}',
               },
             ],
           },
@@ -455,7 +469,7 @@ describe("test 36: verifier_model_selection_and_fallback", () => {
     })
     const recordSpy = vi.spyOn(VerificationReceiptStore.prototype, "record")
     const hooks = await ElicifyVertexPluginV2(pluginInput(client), { verifierModel: "provider-x/model-y" } as never)
-    const sid = "verifier-model-fallback-session"
+    const sid = "verifier-model-ignored-option-session"
 
     const { taskId } = await setUpFinalStoryVerified(
       hooks,
@@ -474,12 +488,15 @@ describe("test 36: verifier_model_selection_and_fallback", () => {
 
     await idle(hooks, sid)
 
+    // ONE call, on the session model. Under the deleted plumbing this was two
+    // calls with `provider-x/model-y` first.
     const calls = verifierPromptCalls(client)
-    expect(calls.length).toBe(2)
-    expect(calls[0]?.body?.model).toEqual({ providerID: "provider-x", modelID: "model-y" })
-    expect(calls[1]?.body?.model).toEqual({ providerID: "minimax", modelID: "MiniMax-M3" })
+    expect(calls.length).toBe(1)
+    expect(calls[0]?.body?.model).toEqual({ providerID: "minimax", modelID: "MiniMax-M3" })
+    expect(sawProviderX).toBe(false)
 
-    // The retry's pass verdict closes the plan out.
+    // Ignoring the option is not the same as failing on it: the audit still
+    // runs and still closes the plan out.
     const continuationTexts = idleContinuationTexts(client, sid)
     expect(continuationTexts.some((t) => t.includes("passed audit"))).toBe(true)
   })
@@ -580,7 +597,8 @@ describe("verifier close-out fires once every story has passed audit, across sta
         // that point because S1 was claimed in the same batch but... see below);
         // audit 2 audits S1. Each returns a pass for the story it was asked
         // about. (The payload's `plan` field names the audit set; call order
-        // is deterministic since there is no verifierModel override.)
+        // is deterministic — one subturn per audit, always on the session
+        // model.)
         verifierCall += 1
         const storyId = verifierCall === 1 ? "S2" : "S1"
         return {

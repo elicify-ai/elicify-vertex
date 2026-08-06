@@ -1277,9 +1277,9 @@ export function observedCoversPrescribed(prescribed: string, observed: string, w
  * checks, and running one of them is acting on the nudge. `resolve.ts` also
  * `&&`-joins MIXED-ECOSYSTEM prescriptions, but there the join means the
  * opposite: "a Go suite is blind to a TypeScript change and vice versa", so
- * crediting either half alone would mark the family complied — and
- * `dosing.ts` then suppresses verify-gap for the REST OF THE SESSION, so
- * running the Go half would silence the TypeScript nudge permanently.
+ * crediting either half alone would mark the family complied on the strength
+ * of a check that never looked at the changed code — running the Go half
+ * would count as answering the TypeScript nudge.
  */
 export function verifyGapComplied(
   prescription: string,

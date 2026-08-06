@@ -1304,36 +1304,14 @@ describe("runVerifier", () => {
     expect("childSessionID" in unsupported).toBe(false)
   })
 
-  it('BDD "Configured verifierModel failure falls back to the session model": retry uses session model within the shared 5s budget', async () => {
-    mockRunSubturn
-      .mockImplementationOnce(async () => {
-        await new Promise((r) => setTimeout(r, 30)) // simulate real elapsed time before the failure
-        return { ok: false, reason: "provider rejected the request" }
-      })
-      .mockResolvedValueOnce({ ok: true, text: JSON.stringify(PASS_VERDICT) })
-
-    const client = makeClient()
-    const result = await runVerifier(
-      client,
-      { selfCreated: new SelfCreatedSessions(), logger: vi.fn() },
-      {
-        parentSessionID: "parent-1",
-        sessionModel: { providerID: "minimax", modelID: "MiniMax-M3" },
-        verifierModelOverride: { providerID: "provider-x", modelID: "model-y" },
-        payload: basePayload,
-      },
-    )
-
-    expect(mockRunSubturn).toHaveBeenCalledTimes(2)
-    const firstReq = mockRunSubturn.mock.calls[0][3]
-    const secondReq = mockRunSubturn.mock.calls[1][3]
-    expect(firstReq.model).toEqual({ providerID: "provider-x", modelID: "model-y" })
-    expect(secondReq.model).toEqual({ providerID: "minimax", modelID: "MiniMax-M3" })
-    // Shared budget: the retry's timeout is the *remaining* time, strictly
-    // less than a fresh VERIFIER_TOTAL_BUDGET_MS — never added per attempt.
-    expect(secondReq.timeoutMs).toBeLessThan(VERIFIER_TOTAL_BUDGET_MS)
-    expect(result).toEqual({ verdict: PASS_VERDICT })
-  })
+  // BACKLOG B-1: the BDD "Configured verifierModel failure falls back to the
+  // session model" case lived here, asserting two attempts with the first on
+  // `provider-x`. There is no override to configure, so the scenario is
+  // unreachable AND its assertion is now the opposite of the contract. It is
+  // deleted rather than adapted; what the removal guarantees instead — one
+  // attempt, on the session's own model, no retry — is asserted by
+  // "the judge runs on the worker's model: a single attempt is the only path"
+  // further down this describe block.
 
   // =========================================================================
   // CRITICAL fix (post-review): the capability probe + deny-map build used
@@ -1409,7 +1387,11 @@ describe("runVerifier", () => {
     expect(mockRunSubturn).not.toHaveBeenCalled()
   })
 
-  it("fix #1: if the probe/deny-map step alone consumes the entire budget, the subturn loop reports timeout (remaining <= 0) rather than attempting with a negative/zero timeout", async () => {
+  // BACKLOG B-1 kept this guard when the retry loop collapsed to one call:
+  // the probe races the SAME budget clock, so "no time left before the
+  // subturn is even reached" is still reachable and must not become a
+  // `runSubturn` with a non-positive timeout.
+  it("fix #1: if the probe/deny-map step alone consumes the entire budget, the verifier reports timeout (remaining <= 0) rather than attempting with a negative/zero timeout", async () => {
     // Fake timers (rather than a real 5s+ delay) so this test proves the
     // "remaining <= 0" branch instantly: the mocked probeCapabilityBounded
     // advances the (mocked) clock past VERIFIER_TOTAL_BUDGET_MS before
@@ -1707,7 +1689,14 @@ describe("runVerifier", () => {
     expect(logger).not.toHaveBeenCalled()
   })
 
-  it("no verifierModelOverride means a single attempt only — no retry, no fallback logic exercised", async () => {
+  // BACKLOG B-1 — the operator's rule, as an assertion: the judge runs on the
+  // same model as the worker. Before B-1 this test's premise was "no
+  // verifierModelOverride was passed"; now there is no override to pass, so a
+  // FAILING subturn is the sharpest probe available — under the old two-entry
+  // attempt list a failure is exactly what triggered the second attempt on a
+  // different model. One call, on `sessionModel`, is therefore load-bearing
+  // for both halves of the rule (same model, no fallback chain).
+  it("the judge runs on the worker's model: a single attempt is the only path, even when it fails", async () => {
     mockRunSubturn.mockResolvedValue({ ok: false, reason: "provider unreachable" })
     const client = makeClient()
     const logger = vi.fn()
@@ -1721,6 +1710,7 @@ describe("runVerifier", () => {
       },
     )
     expect(mockRunSubturn).toHaveBeenCalledTimes(1)
+    expect(mockRunSubturn.mock.calls[0][3].model).toEqual({ providerID: "minimax", modelID: "MiniMax-M3" })
     expect(logger).toHaveBeenCalledWith("verifier:unavailable", { reason: "provider unreachable" })
   })
 

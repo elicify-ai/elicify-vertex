@@ -1,8 +1,8 @@
 /**
  * elicify-vertex v2 — phase-aware guidance harness plugin entry.
  * --------------------------------------------------------------------------
- * Wires the ten `src/v2/*` modules (phase.ts, pin.ts, story.ts, composer.ts,
- * resolve.ts, dosing.ts, artifacts.ts, subturn.ts, verifier.ts) plus the
+ * Wires the `src/v2/*` modules (phase.ts, pin.ts, story.ts, composer.ts,
+ * resolve.ts, artifacts.ts, subturn.ts, verifier.ts) plus the
  * `src/v2/wiring/*` support modules into the OpenCode `Hooks` surface, per
  * `docs/vertex2-spec.md`'s "Relevant Execution Flows" table and Functional
  * Requirements.
@@ -38,7 +38,6 @@ import { computeBoundedDiffStat, formatChangedPathsSummary, NON_PATH_MUTATION_MA
 import { isNonExecutingCommand, isTestRunnerCommand, observedCoversPrescribed, verifyGapComplied } from "./coverage.js"
 import { VisibilityNotifier, resolveVisibilityMode, summarizeFinding } from "./visibility.js"
 import { InjectionComposer, type Finding } from "./composer.js"
-import { resolveProfile, type Profile } from "./dosing.js"
 import { PhaseEngine } from "./phase.js"
 import { PinStore } from "./pin.js"
 import { resolveVerifier } from "./resolve.js"
@@ -47,7 +46,6 @@ import { SelfCreatedSessions } from "./subturn.js"
 import type { OpencodeClient } from "./types.js"
 
 import { applyV2Config } from "./wiring/config.js"
-import { applyDosing } from "./wiring/dosing.js"
 import { cancelPauseJudge, forgetIdleTurn, GateContext, handleSessionIdle } from "./wiring/gate.js"
 import {
   anomalyInterruptFinding,
@@ -78,8 +76,10 @@ export interface ElicifyVertexV2Options {
   readonly activeSkillTrigger?: string
   readonly maxCriteriaBlocks?: number
   readonly intakeSubturnMax?: number
-  readonly verifierModel?: string
-  readonly dosingOverrides?: Record<string, Profile>
+  // BACKLOG B-1: `verifierModel` and `dosingOverrides` were removed, not
+  // deprecated. Both are IGNORED SILENTLY if still present in `opencode.json`
+  // — see this file's option-handling note below for why that is the chosen
+  // behaviour rather than a warning.
   readonly familyCaps?: Record<string, number>
   readonly cooldowns?: Record<string, number>
   /** FR-057: `"off" | "gates" | "all"`, default `"all"`. `VERTEX_VISIBLE=0` forces `"off"`. */
@@ -111,9 +111,6 @@ const WRITE_TOOL_NAMES = new Set(["write", "edit", "patch", "multiedit", "notebo
  * to handle `file_path` as well as `filePath`; the first version of this guard
  * checked only three of these. */
 const WRITE_TOOL_PATH_KEYS = ["filePath", "file_path", "path", "file", "notebookPath", "destination"]
-
-const TEST_PATH_RE = /\.(?:test|spec)\.[^./]+$/
-const TEST_DIR_RE = /(^|\/)tests?\//
 
 function parseModelRef(id: string | null): { providerID: string; modelID: string } | null {
   if (!id) return null
@@ -199,6 +196,19 @@ class TrackingSelfCreatedSessions extends SelfCreatedSessions {
 
 export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: PluginOptions): Promise<Hooks> => {
   const client = input.client as unknown as OpencodeClient
+  // BACKLOG B-1 — why removed options are ignored SILENTLY, with no
+  // deprecation warning. `options` has never been validated: it is cast, and
+  // every unrecognised key (a typo, a stale key, a key meant for another
+  // plugin) has always been dropped without a word. A warning for exactly two
+  // dead keys would be the only such check in the surface. It would also have
+  // to fire from plugin CONSTRUCTION, before any session activates — which is
+  // precisely the write that UAT G1 and the "a non-activated session writes
+  // nothing" test exist to forbid: a user with a leftover `verifierModel` in
+  // `opencode.json` would get a `.vertex-events.jsonl` line for every session
+  // they open, activated or not. And the removal is not a loss of function
+  // the user needs to route around: the operator's rule is that the judge
+  // runs on the worker's model, so the only correct response to the option
+  // would be to ignore it anyway.
   const userOpts = (options ?? {}) as ElicifyVertexV2Options
 
   const opts = {
@@ -206,8 +216,6 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
     activeSkillTrigger: userOpts.activeSkillTrigger ?? "/elicify-vertex",
     maxCriteriaBlocks: userOpts.maxCriteriaBlocks ?? 3,
     intakeSubturnMax: Number(process.env.VERTEX_INTAKE_SUBTURN_MAX) || userOpts.intakeSubturnMax || 3,
-    verifierModel: userOpts.verifierModel,
-    dosingOverrides: userOpts.dosingOverrides,
     familyCaps: userOpts.familyCaps,
     cooldowns: userOpts.cooldowns,
     visibility: userOpts.visibility,
@@ -230,7 +238,7 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
   const states = new Map<string, V2SessionState>()
   const getContext = (sessionID: string | undefined) => {
     const state = sessionID ? states.get(sessionID) : undefined
-    return { model: state?.modelId ?? null, profile: state?.profile ?? ("standard" as Profile) }
+    return { model: state?.modelId ?? null }
   }
   const logger = createSharedV2Logger(getContext)
 
@@ -360,7 +368,6 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
     // strictly advisory/non-gating (FR-030) and fails open via the FR-030b
     // capability probe regardless of this flag.
     verifierEnabled: process.env.VERTEX_VERIFIER !== "0",
-    verifierModelOverride: parseModelRef(opts.verifierModel ?? null) ?? undefined,
     isValidReceipt: (sessionID, receiptID) => {
       // Unlike `isFreshReceipt` (wiring/tools.ts) this had NO workspace check, so
       // a receipt naming a different `workspaceRoot` was accepted -- and stayed
@@ -417,21 +424,16 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       const state = states.get(sessionID)
       if (!state) return
       state.multiStoryPending = false
-      // FR-029 "frontier" nudge-after-compliance dose: confirming the plan
-      // IS the plan-proposal prescription's compliance.
+      // Confirming the plan IS the plan-proposal prescription's compliance —
+      // it drives the composer's own per-turn decay to the one-line form.
       composer.recordCompliance(sessionID, "plan-proposal", "plan-created")
-      state.compliedFamiliesEver.add("plan-proposal")
     },
     // B-2: the ONLY `scope-watchdog` compliance signal in the codebase.
     // Before this, the family had no `recordCompliance` call anywhere, so its
     // measured "3 rendered, 0 complied" was a structural artefact — it would
-    // have read 0 under perfect compliance. Mirrors the verify-gap join in
-    // `tool.execute.after`: record on the composer AND on the session's
-    // ever-complied set, which is what the FR-029 dosing decay reads.
+    // have read 0 under perfect compliance.
     onScopeAmended: (sessionID, resolution) => {
       composer.recordCompliance(sessionID, "scope-watchdog", `scope-${resolution}`)
-      const state = states.get(sessionID)
-      if (state) state.compliedFamiliesEver.add("scope-watchdog")
     },
   })
 
@@ -490,23 +492,11 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       if (isSelf(sid)) return
       const state = getOrCreateState(sid)
 
+      // Recording the model id is a pure in-memory assignment: no disk, no
+      // event, nothing a session that never activates the harness can leave
+      // behind (UAT G1 / the "a non-activated session writes nothing" test).
       if (msgInput.model) {
-        const modelId = `${msgInput.model.providerID}/${msgInput.model.modelID}`
-        state.modelId = modelId
-        const resolution = resolveProfile(modelId, opts.dosingOverrides)
-        state.profile = resolution.profile
-        // Resolving the profile is a pure computation and always safe, but the
-        // LOG is a side effect: it creates `.vertex-events.jsonl` in the data
-        // dir. Emitting it before the activation check meant a session that
-        // never activates the harness still left a trace on disk — UAT G1
-        // (no --agent, no trigger) caught exactly that. The sibling call site
-        // in `system.transform` is already behind `state.active`; this one now
-        // matches. On the activating message `state.active` is still false
-        // here (activation is decided further down), so the first log simply
-        // comes from `system.transform`, which runs before the model call.
-        if (resolution.unknown && state.active) {
-          logger("dosing:unknown-model", { sessionID: sid, rawModelId: resolution.rawModelId })
-        }
+        state.modelId = `${msgInput.model.providerID}/${msgInput.model.modelID}`
       }
 
       // A message of any kind means the silence ended — the pause timer is
@@ -882,7 +872,6 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
 
         const realPaths = changedPaths.filter((p) => !NON_PATH_MUTATION_MARKERS.has(p))
         for (const p of realPaths) {
-          if (TEST_PATH_RE.test(p) || TEST_DIR_RE.test(p)) state.turnIntroducedNewTestFile = true
           const result = storyEngine.checkScope(sid, p)
           if (result) {
             state.scopeDriftPending = { path: p, offer: result.offer, scopeGlobsMatchedZero: result.scopeGlobsMatchedZero }
@@ -1055,7 +1044,6 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
         if (exitCode !== undefined) {
           evidenceLedger.recordVerification(sid, command, exitCode, success ? verification.outcome : "failed")
         }
-        if (success) state.everVerifiedThisTurn = true
 
         // FIX #7: keep the most recent verifier command's real output text
         // (bounded) for the verifier payload — see gateCtx.recentVerifierSummaries.
@@ -1250,7 +1238,6 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
             })
           ) {
             composer.recordCompliance(sid, "verify-gap", rendered.instanceId)
-            state.compliedFamiliesEver.add("verify-gap")
           }
         }
 
@@ -1274,11 +1261,7 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       if (!state || !state.active) return
       if (state.compacting) return // v1 invariant: skip draining mid-compaction
 
-      const modelId = `${sysInput.model.providerID}/${sysInput.model.id}`
-      state.modelId = modelId
-      const resolution = resolveProfile(modelId, opts.dosingOverrides)
-      state.profile = resolution.profile
-      if (resolution.unknown) logger("dosing:unknown-model", { sessionID: sid, rawModelId: resolution.rawModelId })
+      state.modelId = `${sysInput.model.providerID}/${sysInput.model.id}`
 
       const findings: Finding[] = []
 
@@ -1433,16 +1416,15 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
         })
       }
 
-      const dosed = findings
-        .map((f) => applyDosing(f, state.profile, state))
-        .filter((f): f is Finding => f !== null)
-
-      const finalFindings = dosed.filter((f) => {
+      // BACKLOG B-1: findings go straight to the holdout filter. There is no
+      // per-model dose in between — every session renders the full directive,
+      // and the composer's own per-turn caps, cooldowns and compliance decay
+      // are what bound the volume.
+      const finalFindings = findings.filter((f) => {
         if (holdoutSuppresses(sid, f.family)) {
           logHoldoutSuppress(sid, `${f.family} suppressed (holdout arm=off)`, {
             family: f.family,
             model: state.modelId,
-            profile: state.profile,
           })
           return false
         }
@@ -1513,10 +1495,9 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
           logger("criteria:truncated", { sessionID: sid, kept: criteriaBlock.criteria.length })
         }
         pinStore.persist(sid)
-        // FR-029 "frontier" nudge-after-compliance dose (wiring/dosing.ts):
-        // pinning criteria IS the intake-scaffold prescription's compliance.
+        // Pinning criteria IS the intake-scaffold prescription's compliance —
+        // it drives the composer's own per-turn decay to the one-line form.
         composer.recordCompliance(sid, "intake-scaffold", "criteria-pinned")
-        state.compliedFamiliesEver.add("intake-scaffold")
       } else {
         // B-2: the model wrote a CRITERIA: line the grammar could not read.
         //

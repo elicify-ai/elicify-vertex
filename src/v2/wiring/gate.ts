@@ -79,7 +79,6 @@ export interface GateContext {
   activeSessionIDs: () => string[]
   maxCriteriaBlocks: number
   verifierEnabled: boolean
-  verifierModelOverride?: { providerID: string; modelID: string }
   isValidReceipt: (sessionID: string, receiptID: string) => boolean
   /** Recent verifier output summaries this session, for the verifier payload (best-effort, bounded). */
   recentVerifierSummaries: (sessionID: string) => string[]
@@ -726,7 +725,6 @@ async function runPauseJudge(
       lastAssistantText: lastText,
       recentTranscript: (await fetchVerifierTranscriptFields(ctx.client, sid)).recentTranscript,
       sessionModel: { providerID, modelID },
-      verifierModelOverride: ctx.verifierModelOverride,
     })
 
     ctx.logger("pause:verdict", { sessionID: sid, verdict: verdict ?? "none" })
@@ -1424,7 +1422,6 @@ async function handleVerifierAudit(ctx: GateContext, sid: string, state: V2Sessi
     {
       parentSessionID: sid,
       sessionModel: { providerID, modelID },
-      verifierModelOverride: ctx.verifierModelOverride,
       payload,
     },
   )

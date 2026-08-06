@@ -36,7 +36,6 @@ import {
   logCriteriaTruncated,
   logDirectiveComplied,
   logDirectiveRendered,
-  logDosingUnknownModel,
   logExpectAbsent,
   logGateMultiSessionAdvisory,
   logHoldoutSuppress,
@@ -108,7 +107,9 @@ interface WriterCase {
   call: (input: V2EventInput) => MeasurementEvent
 }
 
-// One row per new v2 event type (module contracts doc's exact list of 22).
+// One row per new v2 event type (the module contracts doc's list of 22, less
+// `dosing:unknown-model` — BACKLOG B-1 deleted model-conditioned dosing, so
+// there is no profile to resolve and no unknown model to report).
 // Each fixture supplies the type's documented required fields; `input` (the
 // per-iteration sessionID/model override) is spread last so it wins.
 const WRITER_TABLE: WriterCase[] = [
@@ -132,10 +133,6 @@ const WRITER_TABLE: WriterCase[] = [
   {
     type: "resolution:none",
     call: (input) => logResolutionNone({ changedPaths: ["src/x.ts"], ...input }),
-  },
-  {
-    type: "dosing:unknown-model",
-    call: (input) => logDosingUnknownModel({ rawModelId: "x/tiny-7b", ...input }),
   },
   {
     type: "gate:multi-session-advisory",
@@ -214,15 +211,14 @@ const MODEL_VARIANTS: Array<string | null | undefined> = [
 
 const MODEL_SHAPE_RE = /^[^/\s]+\/[^/\s]+$/
 
-describe("test 42: event_invariants_property (all 22 new FR-033 event types)", () => {
-  it("covers exactly the 22 event types listed in the module contracts doc", () => {
+describe("test 42: event_invariants_property (all 21 surviving FR-033 event types)", () => {
+  it("covers exactly the 21 surviving event types (the contracts doc's 22, less dosing:unknown-model)", () => {
     const expected = [
       "directive_rendered",
       "directive_complied",
       "calibration",
       "phase_transition",
       "resolution:none",
-      "dosing:unknown-model",
       "gate:multi-session-advisory",
       "pins:disk-fallback-memory",
       "pins:disk-recovered",
@@ -241,11 +237,16 @@ describe("test 42: event_invariants_property (all 22 new FR-033 event types)", (
       "expect:absent",
     ]
     expect(WRITER_TABLE.map((w) => w.type).sort()).toEqual([...expected].sort())
-    expect(WRITER_TABLE).toHaveLength(22)
+    expect(WRITER_TABLE).toHaveLength(21)
+    // BACKLOG B-1: `dosing:unknown-model` is not merely absent from the
+    // fixture table — the writer and the event type are gone. Asserting it is
+    // not in `expected` would be vacuous; asserting no surviving writer emits
+    // it is not.
+    expect(WRITER_TABLE.map((w) => w.type as string)).not.toContain("dosing:unknown-model")
   })
 
   for (const { type, call } of WRITER_TABLE) {
-    it(`${type}: session_id non-empty, model well-formed, profile set, no raw-prompt canary, across sessionID x model variants`, () => {
+    it(`${type}: session_id non-empty, model well-formed, NO profile field, no raw-prompt canary, across sessionID x model variants`, () => {
       for (const sessionID of SESSION_ID_VARIANTS) {
         for (const model of MODEL_VARIANTS) {
           const ev = call({ sessionID, model })
@@ -265,8 +266,11 @@ describe("test 42: event_invariants_property (all 22 new FR-033 event types)", (
             expect(ev.model).toBe(model)
           }
 
-          // profile is always stamped and one of the two known values.
-          expect(["standard", "frontier"]).toContain(ev.profile)
+          // BACKLOG B-1: `profile` is not stamped at all any more — not
+          // "always standard", ABSENT. A record that still carried the key
+          // would mean the dose matrix (or a stub of it) came back.
+          expect(ev).not.toHaveProperty("profile")
+          expect(Object.keys(ev)).not.toContain("profile")
 
           // no record carries raw user prompt text (scoped to this module's
           // documented payload shapes — see file header comment).
@@ -292,10 +296,12 @@ describe("test 42: event_invariants_property (all 22 new FR-033 event types)", (
       const ev = JSON.parse(line)
       expect(ev.session_id).toBe("disk-check")
       expect(typeof ev.model).toBe("string")
-      expect(["standard", "frontier"]).toContain(ev.profile)
+      // BACKLOG B-1: no `profile` key survives serialization either — this is
+      // the on-disk half of the in-memory assertion above.
+      expect(Object.keys(ev)).not.toContain("profile")
     }
     expect(JSON.parse(lines[0])).toMatchObject({ event_type: "directive_rendered", model: "anthropic/claude-fable-5" })
-    expect(JSON.parse(lines[1])).toMatchObject({ event_type: "verifier:unavailable", model: "unknown", profile: "standard" })
+    expect(JSON.parse(lines[1])).toMatchObject({ event_type: "verifier:unavailable", model: "unknown" })
     // Regression: `family` must survive into the SERIALIZED payload on disk,
     // not just the in-memory input — makeV2Event previously destructured
     // `family` out for the FR-035 holdout-arm hash and silently dropped it.
@@ -325,11 +331,11 @@ describe("test 42: event_invariants_property (all 22 new FR-033 event types)", (
     expect(complied).toMatchObject({ event_type: "directive_complied", payload: { family: "verify-gap", instanceId: "D-1" } })
   })
 
-  it("makeV2Event/logV2Event stamp session_id/model/profile identically for the same input", () => {
+  it("makeV2Event/logV2Event stamp session_id/model identically for the same input", () => {
     const built = makeV2Event("expect:absent", { sessionID: "s1", model: "anthropic/claude-fable-5" })
     expect(built.session_id).toBe("s1")
     expect(built.model).toBe("anthropic/claude-fable-5")
-    expect(built.profile).toBe("standard")
+    expect(built).not.toHaveProperty("profile")
 
     const logged = logV2Event("expect:absent", { sessionID: "s1", model: "anthropic/claude-fable-5" })
     expect(logged.session_id).toBe(built.session_id)
@@ -342,7 +348,7 @@ describe("test 42: event_invariants_property (all 22 new FR-033 event types)", (
 // v1 event writers now also carry model/profile (FR-033 applies retroactively)
 // ---------------------------------------------------------------------------
 
-describe("FR-033 also stamps v1-sourced events (model/profile), without changing v1 call sites", () => {
+describe("FR-033 also stamps v1-sourced events (model), without changing v1 call sites", () => {
   it("logHoldoutSuppress called the old 2-arg way (every existing call site) is byte-identical to before", () => {
     logHoldoutSuppress("sess-v1", "stop-block skipped (holdout arm=off)")
     const lines = readFileSync(eventsPath(), "utf8").trim().split("\n")
@@ -352,8 +358,8 @@ describe("FR-033 also stamps v1-sourced events (model/profile), without changing
       event_type: "holdout_suppress",
       payload: { reason: "stop-block skipped (holdout arm=off)" },
       model: "unknown",
-      profile: "standard",
     })
+    expect(Object.keys(ev)).not.toContain("profile")
     expect(ev.payload.family).toBeUndefined()
     expect(ev.holdout_arm).toBe(holdoutArm("sess-v1"))
   })
@@ -380,7 +386,7 @@ describe("FR-033 also stamps v1-sourced events (model/profile), without changing
     const ev = JSON.parse(lines[0])
     expect(ev.payload).toMatchObject({ reason: "elevate finding suppressed", family: "elevate" })
     expect(ev.model).toBe("anthropic/claude-fable-5")
-    expect(ev.profile).toBe("standard")
+    expect(Object.keys(ev)).not.toContain("profile")
     expect(ev.holdout_arm).toBe(arm)
   })
 })

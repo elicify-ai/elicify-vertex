@@ -9,7 +9,63 @@ unless stated otherwise.
 
 ---
 
-## B-1 — The verifier inherits the worker's model. Delete the machinery that pretends otherwise. **[priority]**
+## B-1 — The verifier inherits the worker's model. Delete the machinery that pretends otherwise. **[priority]** — ✅ DONE (code)
+
+> **Status 2026-08-06:** code landed. `src/v2/dosing.ts`, `src/v2/wiring/dosing.ts`
+> and their two test files are deleted; `verifierModel` / `dosingOverrides` /
+> `verifierModelOverride`, the two-entry fallback chain, the `dosing:unknown-model`
+> event and the `profile` stamp are gone from the event schema.
+> `runVerifier` makes exactly one subturn attempt, on `sessionModel`.
+> **The spec amendments (FR-028/FR-029, FR-030a, US-9 AS-2/AS-3, test 36) are a
+> separate change and are NOT covered here** — everything under `docs/` other
+> than this file is untouched.
+>
+> **Two decisions taken while implementing:**
+>
+> 1. **A leftover `verifierModel` / `dosingOverrides` in `opencode.json` is
+>    ignored SILENTLY — no deprecation log.** Plugin options have never been
+>    validated (they are cast; every unrecognised key has always been dropped
+>    without a word), so warning about exactly two dead keys would be the only
+>    such check in the surface. More decisively, the warning would have to fire
+>    at plugin CONSTRUCTION, before any session activates — which is the write
+>    UAT G1 and the "a non-activated session writes nothing" test exist to
+>    forbid. A user with a stale key would get a `.vertex-events.jsonl` line for
+>    every session they opened, activated or not. And there is no function to
+>    route around: the rule says the judge runs on the worker's model, so
+>    ignoring the option IS the correct response to it. Pinned by
+>    `integration-verifier.test.ts` test 36 case (b).
+> 2. **`compliedFamiliesEver`, `everVerifiedThisTurn` and
+>    `turnIntroducedNewTestFile` are REMOVED with their writers, not left
+>    documented.** `wiring/dosing.ts` was their only reader; with it gone they
+>    are unobservable — not logged, not persisted, not exposed. Write-only state
+>    reads as a capability the harness does not have. Every
+>    `composer.recordCompliance` call is retained, so the compliance record that
+>    FR-034's join actually uses is unaffected. (Removing the third field is
+>    also what makes `TEST_PATH_RE` / `TEST_DIR_RE` dead, as the removal map
+>    anticipated.)
+>
+> **Measured behaviour change.** Dosing did suppress directives, and removing it
+> raises volume — bounded, not unbounded. Same scenario (3 turns × 12
+> agent-loop steps), driven through the real hooks before and after:
+>
+> | model | before: rendered / chars | after: rendered / chars |
+> |---|---|---|
+> | `anthropic/claude-fable-5` (table row "frontier") | 6 / 1842 | 6 / 2226 |
+> | `minimax/MiniMax-M3` (table row "standard") | 3 / 1308 | 6 / 2226 |
+> | `minimax-coding-plan/MiniMax-M3` (the field id; missed the table) | 3 / 1308 | 6 / 2226 |
+>
+> So directive text grows +20.8% for the frontier row and +70% for the standard
+> rows, and all three models now render identically — which is the point.
+> Against that, the field model's total event count for the same scenario falls
+> **82 → 47 (-43%)**: the 38 `dosing:unknown-model` lines it used to emit are
+> gone (the same pathology as the 138 in the audited session).
+>
+> **B-1 × B-2 compose.** Holding turns at 1 and scaling agent-loop steps
+> 6 → 12 → 24 → 48 → 96, rendered volume is FLAT at 2 directives / 1 injected
+> block, with `per-turn-cap:dropped` = 0 at every step count — identical shape
+> before and after B-1 (only the constant moves, 614 → 742 chars). B-1 changes
+> the per-turn constant; it does not reopen the per-step flood B-2 closed.
+> Pinned at 40 steps by `plugin.integration.test.ts`.
 
 **The rule, stated once:** the judge runs on the same model as the worker. No
 table, no profile, no override.

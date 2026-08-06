@@ -19,16 +19,14 @@
  * in parallel against the same source file, so importing from it while it is
  * under concurrent edit would race.
  *
- * Dosing (FR-028/FR-029): `src/v2/dosing.ts`'s built-in table maps
- * `anthropic/claude-fable-5` (the model `plugin.integration.test.ts`'s
- * shared harness defaults to) to the `frontier` profile, which *reduces* or
- * suppresses several of the directive families this file asserts on
- * (verify-gap -> "only on a relevance gap", elevate -> "rubric + taste pass
- * only", not the full O-D-P-E / criteria-replay text the BDD scenarios and
- * task brief describe). To get the deterministic, undosed "full" form these
- * tests assert against, every `transform()`/`activate()` call in this file
- * defaults to `minimax/MiniMax-M3`, which `dosing.ts`'s table maps to
- * `standard` (Dataset: Dosing profiles, row 3).
+ * Model choice (`minimax/MiniMax-M3` in every `transform()`/`activate()` call
+ * here) is now arbitrary and kept only to avoid a needless diff. It used to
+ * be load-bearing: `src/v2/dosing.ts`'s table mapped the sibling file's
+ * `anthropic/claude-fable-5` to the `frontier` profile, which reduced several
+ * of the families this file asserts on (verify-gap -> "only on a relevance
+ * gap", elevate -> "rubric + taste pass only") and `MiniMax-M3` was picked to
+ * get the full O-D-P-E form. BACKLOG B-1 deleted the table, so every model
+ * now renders the full form and no test here depends on which one is named.
  */
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"

@@ -943,9 +943,9 @@ describe("verifyGapComplied", () => {
   })
 
   // The invariant `resolve.ts` states explicitly: a Go suite is blind to a
-  // TypeScript change and vice versa. Crediting half marks the family
-  // complied, and `dosing.ts` then suppresses verify-gap for the whole
-  // session — so running the Go half would silence the TypeScript nudge.
+  // TypeScript change and vice versa. Crediting half would mark the family
+  // complied on the strength of a check that never looked at the changed
+  // code — running the Go half would count as answering the TypeScript nudge.
   it("refuses one half of a MIXED-ECOSYSTEM prescription", () => {
     expect(verifyGapComplied(MIXED, "go test ./...", { storyScoped: false })).toBe(false)
     expect(verifyGapComplied(MIXED, "npm test", { storyScoped: false })).toBe(false)

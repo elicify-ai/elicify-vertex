@@ -23,16 +23,15 @@
  * (or drop events that don't match), this logger passes `eventType` straight
  * through to `makeV2Event` with a type-level cast: every event still reaches
  * disk under the name its emitting module actually used, and `session_id` /
- * `model` / `profile` are still stamped consistently (FR-033). `V2EventType`
- * remains useful as authoring-time documentation for measurement.ts's own
- * typed writer functions; it is not enforced as a runtime allowlist here.
+ * `model` are still stamped consistently (FR-033). `V2EventType` remains
+ * useful as authoring-time documentation for measurement.ts's own typed
+ * writer functions; it is not enforced as a runtime allowlist here.
  */
-import { appendEvent, makeV2Event, type DosingProfile, type V2EventType } from "../../measurement.js"
+import { appendEvent, makeV2Event, type V2EventType } from "../../measurement.js"
 import type { EventLogger } from "../types.js"
 
 export interface SessionLogContext {
   model: string | null
-  profile: DosingProfile
 }
 
 /**
@@ -45,8 +44,8 @@ export interface SessionLogContext {
  * fallback) when it is absent.
  *
  * `getContext` is called at LOG TIME (not logger-construction time) so the
- * resolved model id / dosing profile always reflects the session's current
- * state, not a stale snapshot from whenever the shared logger was built.
+ * resolved model id always reflects the session's current state, not a stale
+ * snapshot from whenever the shared logger was built.
  */
 export function createSharedV2Logger(getContext: (sessionID: string | undefined) => SessionLogContext): EventLogger {
   return (eventType, payload) => {
@@ -56,7 +55,6 @@ export function createSharedV2Logger(getContext: (sessionID: string | undefined)
       ...payload,
       sessionID,
       model: ctx.model,
-      profile: ctx.profile,
     })
     appendEvent(ev)
   }

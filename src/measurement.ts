@@ -64,7 +64,6 @@ export type V2EventType =
   | "calibration"
   | "phase_transition"
   | "resolution:none"
-  | "dosing:unknown-model"
   | "gate:multi-session-advisory"
   | "pins:disk-fallback-memory"
   | "pins:disk-recovered"
@@ -86,15 +85,6 @@ export type V2EventType =
   | "criteria:parse-miss"
   | "expect:absent"
 
-/**
- * FR-028/FR-029 dosing profile, mirrored locally rather than imported from
- * `src/v2/dosing.ts`/`src/v2/types.ts`. Structurally identical to that
- * module's `Profile` — kept as a local alias so this file has no compile-time
- * dependency on another wave's module (consistent with the `ResolveVerifierFn`
- * alias below; see that comment for the fuller rationale).
- */
-export type DosingProfile = "standard" | "frontier"
-
 /** Payload schema is intentionally loose — measurement is observational. */
 export type EventPayload = Record<string, unknown>
 
@@ -113,14 +103,6 @@ export interface MeasurementEvent {
    * runtime.
    */
   model?: string
-  /**
-   * FR-033: every event carries the resolved dosing profile. v1-sourced
-   * events (built via `makeEvent`, which no v1 call site can override) are
-   * always stamped `"standard"`, matching "defaulting to 'standard' when
-   * v1's engine path is active and no v2 dosing ran" from the module
-   * contracts doc.
-   */
-  profile?: DosingProfile
 }
 
 // ---------- paths (override via VERTEX_DATA) ---------------------------------
@@ -182,12 +164,11 @@ function utcNow(): string {
 /**
  * Build an event object. Does NOT write to disk.
  *
- * FR-033: `model`/`profile` are always stamped, even though no v1 call site
- * (this function's signature is unchanged, frozen by `src/index.ts`) can
- * supply them — v1 never resolved a model id or a dosing profile, so every
- * v1-sourced event is correctly, deterministically `model: "unknown"`,
- * `profile: "standard"`. v2 events are built via `makeV2Event` below, which
- * DOES accept a resolved model/profile.
+ * FR-033: `model` is always stamped, even though no v1 call site (this
+ * function's signature is unchanged, frozen by `src/index.ts`) can supply it
+ * — v1 never resolved a model id, so every v1-sourced event is correctly,
+ * deterministically `model: "unknown"`. v2 events are built via `makeV2Event`
+ * below, which DOES accept a resolved model.
  */
 export function makeEvent(
   sessionId: string | undefined | null,
@@ -201,7 +182,6 @@ export function makeEvent(
     event_type: eventType,
     payload,
     model: "unknown",
-    profile: "standard",
   }
 }
 
@@ -407,13 +387,13 @@ export function logRecoveryRepeat(
  * argument, so this insertion does not change behaviour for any existing
  * caller: `extra` stays `undefined`, the family-aware branch below never
  * runs, and the emitted event is byte-identical to before this change
- * (`model: "unknown"`, `profile: "standard"`, session-only `holdout_arm`,
- * exactly as `makeEvent` has always produced).
+ * (`model: "unknown"`, session-only `holdout_arm`, exactly as `makeEvent` has
+ * always produced).
  */
 export function logHoldoutSuppress(
   sessionId: string | undefined | null,
   reason: string,
-  extra?: { family?: string; model?: string | null; profile?: DosingProfile | null },
+  extra?: { family?: string; model?: string | null },
   path?: string,
 ): void {
   const family = extra?.family
@@ -421,7 +401,6 @@ export function logHoldoutSuppress(
   const ev = makeEvent(sessionId, "holdout_suppress", payload)
   if (extra) {
     ev.model = extra.model && extra.model.trim().length > 0 ? extra.model : "unknown"
-    ev.profile = extra.profile ?? "standard"
     ev.holdout_arm = holdoutArm(sessionId, family)
   }
   appendEvent(ev, path)
@@ -463,19 +442,17 @@ export function logOutcome(
 // wiring agent is the only caller of the writers below.
 
 /**
- * Shared input shape every v2 writer accepts: `{ sessionID, model, profile,
+ * Shared input shape every v2 writer accepts: `{ sessionID, model,
  * ...payload }` (module contracts doc, "measurement.ts extension"). `model`
- * defaults to `"unknown"` when omitted/blank; `profile` defaults to
- * `"standard"` when omitted. `family`, when present, scopes both the
- * FR-035 per-family holdout-arm hash AND is carried into the payload (the
- * BDD scenario "Directive-family holdout suppresses rendering" expects
+ * defaults to `"unknown"` when omitted/blank. `family`, when present, scopes
+ * both the FR-035 per-family holdout-arm hash AND is carried into the payload
+ * (the BDD scenario "Directive-family holdout suppresses rendering" expects
  * `holdout_suppress` logged "with family: elevate" — i.e. visible in the
  * record, not just used internally for the arm hash).
  */
 export interface V2EventInput {
   sessionID: string | undefined | null
   model?: string | null
-  profile?: DosingProfile | null
   /** FR-035: directive family, when this event is family-scoped. */
   family?: string
   [key: string]: unknown
@@ -483,16 +460,15 @@ export interface V2EventInput {
 
 /**
  * FR-033: build (without writing) a v2 event record. Every v2 writer routes
- * through this so `model`/`profile`/`session_id`/`holdout_arm` are stamped
+ * through this so `model`/`session_id`/`holdout_arm` are stamped
  * consistently. Exported (parity with `makeEvent`) so callers/tests can
  * inspect the record before deciding whether to append it (e.g. holdout
  * suppression is a caller decision — this function does not itself suppress
  * anything, it only builds the record).
  */
 export function makeV2Event(eventType: V2EventType, input: V2EventInput): MeasurementEvent {
-  const { sessionID, model, profile, family, ...rest } = input
+  const { sessionID, model, family, ...rest } = input
   const resolvedModel = model && model.trim().length > 0 ? model : "unknown"
-  const resolvedProfile: DosingProfile = profile ?? "standard"
   // `family` is consumed above for the FR-035 per-family holdout-arm hash,
   // but the BDD/FR-033 contract (mirrored by logHoldoutSuppress below) is
   // that a family-scoped event also carries `family` in its own payload —
@@ -506,7 +482,6 @@ export function makeV2Event(eventType: V2EventType, input: V2EventInput): Measur
     event_type: eventType,
     payload,
     model: resolvedModel,
-    profile: resolvedProfile,
   }
 }
 
@@ -519,7 +494,9 @@ export function logV2Event(eventType: V2EventType, input: V2EventInput, path?: s
 
 // ---------- typed v2 convenience writers --------------------------------------
 //
-// One wrapper per new v2 event type (module contracts doc's exact list of 22).
+// One wrapper per new v2 event type (the module contracts doc's list of 22,
+// less `dosing:unknown-model` — BACKLOG B-1 deleted model-conditioned dosing
+// outright, so there is no profile to resolve and no unknown model to report).
 // Each is a thin `logV2Event` call with a documentation-only payload shape —
 // `V2EventInput`'s index signature still allows extra fields, so these are
 // guides, not hard schemas. None of these payload shapes carry a raw-text
@@ -570,13 +547,6 @@ export interface ResolutionNoneInput extends V2EventInput {
 }
 export function logResolutionNone(input: ResolutionNoneInput, path?: string): MeasurementEvent {
   return logV2Event("resolution:none", input, path)
-}
-
-export interface DosingUnknownModelInput extends V2EventInput {
-  rawModelId: string | null
-}
-export function logDosingUnknownModel(input: DosingUnknownModelInput, path?: string): MeasurementEvent {
-  return logV2Event("dosing:unknown-model", input, path)
 }
 
 export interface GateMultiSessionAdvisoryInput extends V2EventInput {

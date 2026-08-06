@@ -1509,12 +1509,12 @@ function observeChildSessionID(
  *    (the contracted signature has no slot for one) — it re-derives it on
  *    every call. See the "deny map caching" note in the final report for
  *    the trade-off this implies.
- * 2. Model = `verifierModelOverride ?? sessionModel` for the first attempt. If
- *    `verifierModelOverride` was set and that attempt's subturn fails (thrown,
- *    timed out, or otherwise `{ok: false}`), retries once with
- *    `sessionModel`. Every attempt draws from the SAME `VERIFIER_TOTAL_BUDGET_MS`
- *    clock started in step 0 — each attempt's `timeoutMs` is whatever is
- *    left of the total, not a fresh budget per attempt.
+ * 2. Model = `sessionModel`, always — BACKLOG B-1: the judge runs on the same
+ *    model as the worker, and there is no override to select another. Exactly
+ *    ONE subturn attempt, and it draws from the SAME `VERIFIER_TOTAL_BUDGET_MS`
+ *    clock started in step 0 — its `timeoutMs` is whatever step 1's probe left
+ *    of the total, and a probe that consumed all of it yields a `"timeout"`
+ *    with no subturn at all.
  * 3. A successful subturn's response text is parsed as JSON and checked
  *    against the `{stories: [...]}` shape (`isVerifierVerdictShape`, HANDOVER.md
  *    point 4); anything else — including BOTH superseded shapes
@@ -1532,12 +1532,11 @@ export async function runVerifier(
   opts: {
     parentSessionID: string
     sessionModel: ModelRef
-    verifierModelOverride?: ModelRef
     payload: VerifierPayload
   },
 ): Promise<VerifierRunResult> {
   const { selfCreated, logger } = deps
-  const { parentSessionID, sessionModel, verifierModelOverride, payload } = opts
+  const { parentSessionID, sessionModel, payload } = opts
 
   // BACKLOG B-3 (d). Cheapest possible check, and it runs before the probe
   // so a hopeless audit costs nothing: with no diff summary AND no
@@ -1569,30 +1568,34 @@ export async function runVerifier(
   }
   const toolsMap = probeResult.tools
 
-  const attempts: ModelRef[] = verifierModelOverride ? [verifierModelOverride, sessionModel] : [sessionModel]
   const parts = [{ type: "text" as const, text: JSON.stringify(payload) }]
 
-  // NOTE: must carry `observedToolCall` (FR-014) — a narrower type here
-  // silently strips the flag `runSubturn` captured before deleting the child.
-  let last: SubturnResult | null = null
-
-  for (const model of attempts) {
-    const remaining = VERIFIER_TOTAL_BUDGET_MS - (Date.now() - start)
-    if (remaining <= 0) {
-      last = { ok: false, reason: "timeout" }
-      break
-    }
-    last = await runSubturn(client, recordingSelfCreated, logger, {
-      parentSessionID,
-      agent: VERIFIER_AGENT_NAME,
-      model,
-      system: VERIFIER_SYSTEM_PROMPT,
-      parts,
-      tools: toolsMap,
-      timeoutMs: remaining,
-    })
-    if (last.ok) break
-  }
+  // BACKLOG B-1: ONE attempt, on the session's own model. The judge runs on
+  // the same model as the worker — there is no override, so there is nothing
+  // to fall back FROM and the old two-entry retry loop could never run twice.
+  //
+  // The budget guard is NOT redundant with the loop it replaced: the FR-030b
+  // probe above races against the SAME `VERIFIER_TOTAL_BUDGET_MS` clock
+  // started in step 0, so a slow probe can leave <= 0ms before any subturn is
+  // reached. Calling `runSubturn` with a non-positive `timeoutMs` would be a
+  // subturn that cannot succeed; report the timeout instead.
+  //
+  // NOTE: `last` must carry `observedToolCall` (FR-014) — a narrower type
+  // here silently strips the flag `runSubturn` captured before deleting the
+  // child.
+  const remaining = VERIFIER_TOTAL_BUDGET_MS - (Date.now() - start)
+  const last: SubturnResult =
+    remaining <= 0
+      ? { ok: false, reason: "timeout" }
+      : await runSubturn(client, recordingSelfCreated, logger, {
+          parentSessionID,
+          agent: VERIFIER_AGENT_NAME,
+          model: sessionModel,
+          system: VERIFIER_SYSTEM_PROMPT,
+          parts,
+          tools: toolsMap,
+          timeoutMs: remaining,
+        })
 
   // FR-014: `observed.childSessionID` is undefined when no child was ever
   // created (e.g. `session.create` itself failed, or the budget was already
@@ -1604,10 +1607,10 @@ export async function runVerifier(
   // it deletes the child session, so the flag rides on the subturn result. Same
   // absent-vs-undefined discipline as `child` above: "we could not tell" must
   // stay an ABSENT key so the gate fails open on it.
-  const toolCall = last?.observedToolCall === undefined ? {} : { observedToolCall: last.observedToolCall }
+  const toolCall = last.observedToolCall === undefined ? {} : { observedToolCall: last.observedToolCall }
 
-  if (!last || !last.ok) {
-    logger("verifier:unavailable", { reason: last?.reason ?? "unknown" })
+  if (!last.ok) {
+    logger("verifier:unavailable", { reason: last.reason })
     return { verdict: null, reason: "unavailable", ...child, ...toolCall }
   }
 

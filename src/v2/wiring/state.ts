@@ -8,10 +8,9 @@
  * single module: activation, intake-subturn frequency caps (FR-018b), the
  * turn-scoped EXPECT artifact (FR-023), phase-entry/event "pending finding"
  * flags the composer needs re-offered every `system.transform` invocation
- * until rendered (FR-004's per-invocation budget), and the dosing profile
- * resolved for the session (FR-028).
+ * until rendered (FR-004's per-invocation budget), and the model id resolved
+ * for the session.
  */
-import type { DosingProfile } from "../../measurement.js"
 import type { ExpectArtifact } from "../artifacts.js"
 
 export interface PendingScopeDrift {
@@ -100,7 +99,6 @@ export interface V2SessionState {
 
   /** Model id last observed (`providerID/modelID`), preferring `system.transform`'s required field over `chat.message`'s optional one. */
   modelId: string | null
-  profile: DosingProfile
 
   // -- Intake classification frequency caps (FR-018b) — session-lifetime state
   //    `classifyMultiStory` itself does not self-throttle, per its own module
@@ -147,12 +145,14 @@ export interface V2SessionState {
   // -- FR-034 compliance join: verify-gap prescriptions rendered THIS turn,
   //    checked against observed verifier commands in `tool.execute.after`.
   renderedVerifyGaps: RenderedVerifyGap[]
-  /** Families with >=1 recorded compliance ever this session (FR-029 "frontier" nudge-after-compliance dose). */
-  compliedFamiliesEver: Set<string>
-  /** True once a verification has succeeded THIS turn (FR-029 "frontier" verification-prescription relevance-gap approximation). */
-  everVerifiedThisTurn: boolean
-  /** True once a changed path this turn looks like a test file (FR-029 "standard" falsification on-new-tests-only approximation). */
-  turnIntroducedNewTestFile: boolean
+  // BACKLOG B-1: `compliedFamiliesEver`, `everVerifiedThisTurn` and
+  // `turnIntroducedNewTestFile` lived here, and existed ONLY as inputs to the
+  // FR-029 dose matrix (`wiring/dosing.ts` was their sole reader). With
+  // model-conditioned dosing deleted nothing reads them, so they are gone
+  // rather than left write-only: unread state that nothing can observe reads
+  // as a capability the harness does not have. The compliance record that
+  // survives is `composer.recordCompliance` -> the `directive_complied`
+  // event, which is what FR-034's compliance join actually uses.
   /** Single-slot pending repeat-failure finding (mirrors v1's per-signature-once-per-turn cooldown via `EvidenceLedger.markRepeatFired`). */
   repeatFailurePending: { signature: string; count: number } | null
 
@@ -199,7 +199,6 @@ export function freshSessionState(workspaceRoot: string): V2SessionState {
     compacting: false,
     workspaceRoot,
     modelId: null,
-    profile: "standard",
     classifiedThisTask: false,
     intakeSubturnCount: 0,
     multiStoryPending: false,
@@ -212,9 +211,6 @@ export function freshSessionState(workspaceRoot: string): V2SessionState {
     elevatePending: false,
     needsCriteriaReinject: false,
     renderedVerifyGaps: [],
-    compliedFamiliesEver: new Set(),
-    everVerifiedThisTurn: false,
-    turnIntroducedNewTestFile: false,
     repeatFailurePending: null,
     criteriaBlocks: 0,
     activityMarker: 0,
@@ -229,7 +225,7 @@ export function freshSessionState(workspaceRoot: string): V2SessionState {
 
 /** Reset the per-TURN slice of state (called from `chat.message`, mirroring
  * v1's `EvidenceLedger.reset` / `PhaseEngine.onUserMessage` cadence). Session-
- * lifetime fields (activation, workspace root, intake caps, dosing profile,
+ * lifetime fields (activation, workspace root, intake caps, resolved model id,
  * `multiStoryPending`) are intentionally left untouched. */
 export function resetTurnState(state: V2SessionState): void {
   state.turnExpect = null
@@ -239,8 +235,6 @@ export function resetTurnState(state: V2SessionState): void {
   state.anomalyPending = null
   state.elevatePending = false
   state.renderedVerifyGaps = []
-  state.everVerifiedThisTurn = false
-  state.turnIntroducedNewTestFile = false
   state.repeatFailurePending = null
   // Stall detection (redesign point 9): a real user message is the
   // un-pause signal — the gate went silent because continuations produced

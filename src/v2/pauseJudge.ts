@@ -122,9 +122,9 @@ export interface PauseJudgeInput {
   lastAssistantText: string
   /** Bounded recent transcript for context; may be empty. */
   recentTranscript: string
-  /** The session's own model; the judge runs on it unless overridden. */
+  /** The session's own model. BACKLOG B-1: the judge runs on the worker's
+   * model, full stop — there is no override to run it anywhere else. */
   sessionModel: { providerID: string; modelID: string }
-  verifierModelOverride?: { providerID: string; modelID: string }
 }
 
 /**
@@ -142,11 +142,10 @@ export async function judgePause(input: PauseJudgeInput): Promise<PauseVerdict |
     const started = Date.now()
     const tools = await buildDenyMap(input.client)
     // MAJ-001: both fields are model output and go to the SAME destination as
-    // the verifier payload — and to a different provider entirely when
-    // `verifierModelOverride` is set. `buildVerifierPayload` routes its prose
-    // through `scanProseField` (secret patterns, entropy, adjacent-unit
-    // boundary check, oversize and length caps) and FR-031 treats that as a
-    // safety control; interpolating raw prose here would have walked around it.
+    // the verifier payload. `buildVerifierPayload` routes its prose through
+    // `scanProseField` (secret patterns, entropy, adjacent-unit boundary
+    // check, oversize and length caps) and FR-031 treats that as a safety
+    // control; interpolating raw prose here would have walked around it.
     const lastMessage = scanProseField(input.lastAssistantText, "lastResponse", input.logger, 2_000) ?? ""
     const transcript = scanProseField(input.recentTranscript, "recentTranscript", input.logger, 4_000) ?? ""
     if (!lastMessage) {
@@ -158,7 +157,7 @@ export async function judgePause(input: PauseJudgeInput): Promise<PauseVerdict |
     const result = await runSubturn(input.client, input.selfCreated, input.logger, {
       parentSessionID: input.parentSessionID,
       agent: PAUSE_JUDGE_AGENT,
-      model: input.verifierModelOverride ?? input.sessionModel,
+      model: input.sessionModel,
       system: PAUSE_JUDGE_SYSTEM,
       parts: [
         {

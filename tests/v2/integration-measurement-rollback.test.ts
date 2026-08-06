@@ -129,17 +129,14 @@ async function activate(hooks: Hooks, sessionID: string, text: string, model?: {
 }
 
 /**
- * DEVIATION from the copied pattern's own `transform()` helper: the source
- * file hardcodes `anthropic/claude-fable-5`, which `src/v2/dosing.ts`'s
- * `BUILTIN_PROFILE_TABLE` maps to the "frontier" profile — under frontier,
- * `wiring/dosing.ts`'s `applyDosing` rewrites the elevate finding's O-D-P
- * text to a short rubric-and-taste form ("Deep task's bound verifier
- * passed."), which is an orthogonal FR-029 concern this file is not testing.
- * Using `minimax/MiniMax-M3` (the OTHER model in that same built-in table,
- * explicitly mapped to "standard") keeps the elevate finding in its full
- * FR-035-relevant form so the holdout assertion below is not confounded by
- * dosing. Documented here rather than silently diverging from the source
- * pattern.
+ * Deviates from the copied pattern's own `transform()` helper (which hardcodes
+ * `anthropic/claude-fable-5`) only by historical accident. The deviation used
+ * to matter: `src/v2/dosing.ts` mapped `claude-fable-5` to the "frontier"
+ * profile, under which `applyDosing` rewrote the elevate finding's O-D-P text
+ * to a short rubric-and-taste form and confounded the FR-035 holdout
+ * assertion below; `minimax/MiniMax-M3` was the "standard" row that avoided
+ * it. BACKLOG B-1 deleted the profile table, so the elevate finding is now in
+ * its full form for every model and the choice here is cosmetic.
  */
 async function transform(hooks: Hooks, sessionID: string): Promise<{ system: string[] }> {
   const out = { system: [] as string[] }
