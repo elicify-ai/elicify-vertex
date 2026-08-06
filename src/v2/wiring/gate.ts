@@ -49,7 +49,7 @@ import type { PinStore } from "../pin.js"
 import type { StoryEngine } from "../story.js"
 import { resolveVerifier } from "../resolve.js"
 import { runVerifier, buildVerifierPayload, type VerifierStoryVerdict } from "../verifier.js"
-import type { VerifierItemNote, PlanV2 } from "../story.js"
+import type { VerifierItemNote, PlanV2, StoryV2 } from "../story.js"
 import type { SelfCreatedSessions } from "../subturn.js"
 import type { ManifestCache } from "./manifest.js"
 import { incompletePlanFinding } from "./findings.js"
@@ -309,7 +309,56 @@ async function promptContinuation(
  *
  * Returns `true` iff a continuation was actually dispatched.
  */
+/**
+ * Per-idle dispatch bookkeeping.
+ *
+ * G002 — the harness must not speak while the worker is still working. Every
+ * branch runs off `session.idle`, but nothing checked that the turn had
+ * actually CONCLUDED by the time a message went out: the model can start
+ * working again between idle firing and a branch deciding to dispatch, and
+ * the user then sees the harness interrupt an attempt to collect the very
+ * proof it asked for. The pause judge already re-checks `activityMarker`;
+ * this generalises it to every branch.
+ *
+ * G003 — at most one continuation per idle. True today only because each
+ * branch returns early after dispatching; recorded explicitly so a future
+ * branch cannot quietly break it.
+ */
+const idleDispatch = new Map<string, { marker: number; spoken: boolean }>()
+
+/** Called at the top of every `session.idle`, before any branch runs. */
+export function beginIdleTurn(sid: string, marker: number): void {
+  idleDispatch.set(sid, { marker, spoken: false })
+}
+
+export function forgetIdleTurn(sid: string): void {
+  idleDispatch.delete(sid)
+}
+
 async function dispatchContinuation(ctx: GateContext, sid: string, state: V2SessionState, text: string): Promise<boolean> {
+  const turn = idleDispatch.get(sid)
+  if (turn) {
+    if (turn.spoken) {
+      ctx.logger("gate:dispatch-suppressed", { sessionID: sid, reason: "already spoke this idle" })
+      return false
+    }
+    if (state.activityMarker !== turn.marker) {
+      // The worker resumed after idle fired. Whatever this branch decided, it
+      // decided it about a turn that is no longer over.
+      ctx.logger("gate:dispatch-suppressed", { sessionID: sid, reason: "turn resumed since idle" })
+      return false
+    }
+    turn.spoken = true
+  }
+  return dispatchContinuationInner(ctx, sid, state, text)
+}
+
+async function dispatchContinuationInner(
+  ctx: GateContext,
+  sid: string,
+  state: V2SessionState,
+  text: string,
+): Promise<boolean> {
   const verdict = evaluateStall({
     activityMarker: state.activityMarker,
     markerAtLastContinuation: state.markerAtLastContinuation,
@@ -1164,6 +1213,33 @@ function verdictIsSubstantiated(v: VerifierStoryVerdict): boolean {
   return v.items.filter((i) => !i.met).every((i) => (i.note ?? "").trim().length > 0)
 }
 
+/**
+ * Has the code moved since this verdict was formed?
+ *
+ * A verdict is a SNAPSHOT. The only freshness test used to be
+ * `verifiedAt < completedAt`, which never fires when an ALREADY-COMPLETE story
+ * is edited — and that is the common case, because the harness's own nudges
+ * ask the model to go fix things. Measured live: the verifier failed two
+ * stories at 06:43:46 naming specific defects, the model fixed both at
+ * 06:44:46, and the harness re-litigated the dead verdict until the session
+ * was abandoned. Both of its claims were false by then; the worker was right.
+ *
+ * So a mutation observed after `verifiedAt` retires the verdict. The story is
+ * re-audited rather than argued about — which makes "who is right" settle
+ * itself instead of becoming a standoff.
+ */
+function verdictOutdatedByEdits(ctx: GateContext, sid: string, story: StoryV2): boolean {
+  const verifiedAt = story.verifier?.verifiedAt
+  if (!verifiedAt) return false
+  const lastMutationAt = ctx.evidenceLedger.getLastMutationAt(sid)
+  // `<=`, not `<`. Both stamps are millisecond ISO strings, so an edit landing
+  // in the same millisecond as the verdict is indistinguishable from one
+  // landing just after it. Ambiguity resolves toward RE-AUDITING: the cost is
+  // one extra audit, versus escalating a verdict the code may already have
+  // moved past — which is the standoff this exists to end.
+  return lastMutationAt !== null && verifiedAt <= lastMutationAt
+}
+
 async function emitUnauditedEscalation(
   ctx: GateContext,
   sid: string,
@@ -1172,6 +1248,10 @@ async function emitUnauditedEscalation(
 ): Promise<boolean> {
   // (guard moved below, once the unresolved set is known)
   if (!plan.stories.every((story) => story.status === "complete" && story.verifier !== undefined)) return false
+  // Never escalate a verdict the code has already moved past: the selector
+  // above will re-audit it, and announcing a dead verdict is exactly the
+  // standoff this whole change exists to end.
+  if (plan.stories.some((story) => verdictOutdatedByEdits(ctx, sid, story))) return false
   // A capped story WAS audited — the verifier failed it and the harness stopped
   // reverting. Reporting it as "never verified" would be false, so the two
   // groups are named separately.
@@ -1224,7 +1304,10 @@ async function handleVerifierAudit(ctx: GateContext, sid: string, state: V2Sessi
   const unverifiedStories = plan.stories.filter(
     (story) =>
       story.status === "complete" &&
-      (!story.verifier || (story.completedAt !== undefined && story.verifier.verifiedAt < story.completedAt)),
+      (!story.verifier ||
+        (story.completedAt !== undefined && story.verifier.verifiedAt < story.completedAt) ||
+        // The code moved under the verdict — re-audit rather than re-litigate.
+        verdictOutdatedByEdits(ctx, sid, story)),
   )
   if (unverifiedStories.length === 0) return emitUnauditedEscalation(ctx, sid, state, plan)
 
@@ -1571,6 +1654,7 @@ async function maybeAskForStar(ctx: GateContext, sid: string, state: V2SessionSt
 export async function handleSessionIdle(ctx: GateContext, sid: string): Promise<void> {
   const state = ctx.states.get(sid)
   if (!state || !state.active) return
+  beginIdleTurn(sid, state.activityMarker)
 
   // Re-entrancy, per session. `promptContinuation` sets this flag while its
   // `session.prompt` is outstanding, and that prompt re-enters the host's

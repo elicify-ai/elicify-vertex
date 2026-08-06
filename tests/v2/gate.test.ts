@@ -1495,6 +1495,126 @@ describe("handleVerifierAudit — verdict reconciliation", () => {
 // "Green-light this and I'll create the plan and start" — a model correctly
 // waiting for the approval the agent contract requires.
 // ===========================================================================
+// ===========================================================================
+// A verdict must not outlive the code it judged (live session, 2026-08-06).
+//
+// The verifier failed two stories at 06:43:46 naming specific defects. The
+// model fixed both at 06:44:46. The harness then re-litigated the dead verdict
+// until the session was abandoned — both of its claims were false by then, and
+// the worker was right. The only freshness test compared `verifiedAt` against
+// `completedAt`, which never moves when an ALREADY-COMPLETE story is edited,
+// and editing a complete story is exactly what the harness's own nudges ask
+// for.
+// ===========================================================================
+describe("handleVerifierAudit — a verdict retires when the code moves", () => {
+  it("re-audits a story whose files changed after the verdict", async () => {
+    const h = harness({ verifierEnabled: true })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid)
+
+    const audits = (): number =>
+      h.logger.mock.calls.filter((c) => c[0] === "story:verifier-audit").length
+
+    stubVerifier(h, {
+      stories: [{ storyId: "S1", pass: false, summary: "nope", items: [{ itemId: "A1", met: false, note: "missing" }] }],
+    })
+    await handleSessionIdle(h.ctx, sid)
+    const first = audits()
+    expect(first, "the first audit must run").toBeGreaterThan(0)
+
+    // The model goes and fixes it — an edit to an ALREADY-COMPLETE story, so
+    // `completedAt` does not move and the old freshness test saw nothing.
+    h.storyEngine.checkpoint(sid, "S1.T1", "complete")
+    h.evidenceLedger.recordChangedFiles(sid, "src/fixed.ts")
+    state.idleContinuationInFlight = false
+    await handleSessionIdle(h.ctx, sid)
+
+    expect(audits(), "the edit must earn a fresh audit, not a repeat of the old verdict").toBeGreaterThan(first)
+  })
+
+  it("does not escalate a verdict the edits have already retired", async () => {
+    const h = harness({ verifierEnabled: true })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid)
+    stubVerifier(h, { stories: [{ storyId: "S1", pass: false, summary: "nope", items: [] }] })
+    await handleSessionIdle(h.ctx, sid)
+
+    h.evidenceLedger.recordChangedFiles(sid, "src/fixed.ts")
+    state.idleContinuationInFlight = false
+    const escalationsBefore = h.logger.mock.calls.filter((c) => c[0] === "verifier:unaudited-escalation").length
+    await handleSessionIdle(h.ctx, sid)
+
+    // A re-audit MAY dispatch its own fresh verdict — that is the point. What
+    // must not happen is ESCALATING the retired one, which is the standoff.
+    expect(
+      h.logger.mock.calls.filter((c) => c[0] === "verifier:unaudited-escalation").length,
+      "announcing a dead verdict is the standoff this exists to end",
+    ).toBe(escalationsBefore)
+  })
+})
+
+// ===========================================================================
+// The harness must not speak while the worker is still working.
+// ===========================================================================
+describe("dispatch is gated on a concluded turn", () => {
+  // The marker has to move DURING the idle tree — between `beginIdleTurn` and
+  // a branch deciding to speak — because that is the real race: the worker
+  // resumes while the harness is still making up its mind. Driven here by
+  // bumping it from inside the verifier subturn.
+  it("suppresses a dispatch when the worker resumed after idle fired", async () => {
+    const h = harness({ verifierEnabled: true })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid)
+    stubVerifier(h, {
+      stories: [{ storyId: "S1", pass: false, summary: "nope", items: [{ itemId: "A1", met: false, note: "missing" }] }],
+    })
+    // The worker resumes while the AUDIT SUBTURN is in flight. Only the
+    // subturn call bumps the marker; the stub's own behaviour is untouched, so
+    // the verdict still arrives and the revert would otherwise be dispatched.
+    // Bump from the logger, which definitely runs mid-tree: the audit logs
+    // `story:verifier-audit` before the revert is dispatched. (Bumping from
+    // the prompt stub does not work — `stubVerifier` does not route through
+    // it, so the marker never moved and the test passed for the wrong reason.)
+    const originalLogger = h.logger.getMockImplementation()
+    h.logger.mockImplementation((event: string, payload?: unknown) => {
+      if (event === "story:verifier-audit") state.activityMarker += 1
+      return originalLogger?.(event, payload)
+    })
+
+    await handleSessionIdle(h.ctx, sid)
+
+    // Sanity: the audit really ran, so the assertion below is about
+    // suppression and not about the path never executing.
+    expect(loggedEventTypes(h.logger), "the audit must have run").toContain("story:verifier-audit")
+
+    // Observable outcome, not an internal event name: nothing was said.
+    expect(
+      continuations(h.prompt).filter((c) => c.text.includes("independently audited")),
+      "the harness must not talk over a resumed turn",
+    ).toHaveLength(0)
+  })
+
+  it("speaks at most once per idle", async () => {
+    const h = harness({})
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.lastAssistantText = "I'll add the tests next."
+    h.evidenceLedger.recordChangedFiles(sid, "src/app.ts")
+
+    await handleSessionIdle(h.ctx, sid)
+    expect(continuations(h.prompt).length).toBeLessThanOrEqual(1)
+  })
+})
+
 describe("handleSessionIdle — pause judge", () => {
   // The timer map is module-level and keyed by session id, which these tests
   // reuse. Production ids are unique and a fired timer deletes its own entry,

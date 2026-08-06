@@ -23,6 +23,13 @@ describe("isMutatingBashCommand", () => {
     "touch src/new.ts",
     "echo hello > out.txt", // redirect into the workspace
     "sed -i 's/a/b/' file.ts",
+    // A turn that only installs a dependency used to read as "nothing
+    // changed" — it writes node_modules and the lockfile.
+    "npm install left-pad",
+    "pnpm add react",
+    "yarn remove lodash",
+    "npm ci",
+    "bun install",
   ])("treats as a mutation: %s", (cmd) => {
     expect(isMutatingBashCommand(cmd)).toBe(true)
   })
@@ -38,13 +45,6 @@ describe("isMutatingBashCommand", () => {
     "python3 -c 'print(1)'",
     "curl -s https://example.com", // download without a write target
     "node --version 2>/dev/null", // a probe redirect is not a mutation
-    // NOT a mutation today: `MUTATING_BASH_RE` anchors `install\b` to the
-    // segment head, so bare `install` matches but `npm install` does not.
-    // Asserted as-is because this test exists to restore lost coverage, not
-    // to change behaviour on an assumption — but it is a real gap: installing
-    // a dependency writes node_modules and the lockfile, and the harness will
-    // read that turn as "nothing changed".
-    "npm install left-pad",
   ])("does not treat as a mutation: %s", (cmd) => {
     expect(isMutatingBashCommand(cmd)).toBe(false)
   })

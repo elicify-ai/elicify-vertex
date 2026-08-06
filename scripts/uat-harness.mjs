@@ -420,6 +420,46 @@ if (section("E. Verifier audit")) {
   assert("E4-no-legacy-judge-field", !("judge" in (plan.stories?.[0] ?? {})))
 }
 
+// --- I. A verdict must not outlive the code it judged ----------------------
+if (section("I. Verdict staleness")) {
+  // The live failure, replayed against the shipped build: the verifier failed
+  // a story at 06:43:46, the model fixed it at 06:44:46, and the harness
+  // re-litigated the dead verdict until the session was abandoned. Both of the
+  // verifier's claims were false by then; the worker was right.
+  let audits = 0
+  const s = await scenario({
+    subturn: (agent) => {
+      if (agent !== "vertex-verifier") return undefined
+      audits++
+      // UNSUBSTANTIATED, so the verdict is bounded and the story stays
+      // `complete` with an `unapplied` stamp — the exact live shape. A
+      // substantiated failure would revert the story to `active`, which is a
+      // different (and already correct) path owned by plan-incomplete.
+      return '{"stories":[{"storyId":"S1","pass":false,"summary":"nope","items":[]}]}'
+    },
+  })
+  await s.say("/elicify-vertex\n\nbuild the research portal")
+  await s.hooks.tool.elicify_vertex_plan_create.execute(
+    { stories: [{ text: "Ship", acceptanceItems: ["A1"], scopeGlobs: [], verifiers: [], tasks: [{ text: "do" }] }] },
+    { sessionID: s.sid },
+  )
+  await s.tool("edit", { filePath: join(s.work, "x.md") })
+  await s.hooks.tool.elicify_vertex_plan_checkpoint.execute({ taskId: "S1.T1", status: "complete" }, { sessionID: s.sid })
+  await s.idle()
+  const afterFirst = audits
+  assert("I1-first-audit-ran", afterFirst > 0, `${afterFirst} audits`)
+
+  // The model fixes it — an edit ONLY, no re-checkpoint. That is the live
+  // case, and the one the old test missed: `completedAt` does not move, so
+  // `verifiedAt < completedAt` stays false and the dead verdict looked
+  // current. (Re-checkpointing here would move `completedAt` and trigger the
+  // OLD path, which is how the first version of this scenario passed even
+  // with staleness disabled.)
+  await s.tool("edit", { filePath: join(s.work, "x.md") })
+  await s.idle()
+  assert("I2-edit-earns-a-fresh-audit", audits > afterFirst, `${audits} audits total`)
+}
+
 // --- F. No subprocess output reaches the terminal --------------------------
 if (section("F. TUI safety")) {
   // The verifier payload shells out to `git diff --stat`. Outside a repo git

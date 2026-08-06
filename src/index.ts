@@ -63,6 +63,17 @@ const MAX_TRACKED_CHANGED_PATHS = 10
 
 interface SessionLedger {
   changedFilesSeen: boolean
+  /**
+   * When the most recent file mutation was observed, ISO-8601.
+   *
+   * A verifier verdict is a SNAPSHOT of the worktree. Without this the harness
+   * had no way to notice the code had moved under one: measured live, the
+   * verifier failed two stories at 06:43:46, the model fixed both at 06:44:46,
+   * and the harness went on re-litigating the old verdict because the only
+   * freshness test compared `verifiedAt` against `completedAt` — which does
+   * not move when a completed story is edited.
+   */
+  lastMutationAt: string | null
   /** Distinct kinds of files changed — path-kind classifier. */
   changedFileKinds: Set<FileKind>
   /** Distinct changed paths this turn (capped) — surfaced in stop-block reasons. */
@@ -87,6 +98,7 @@ export class EvidenceLedger {
   ): SessionLedger {
     return {
       changedFilesSeen: false,
+      lastMutationAt: null,
       changedFileKinds: new Set(),
       changedFilePaths: [],
       taskMode: mode,
@@ -112,6 +124,7 @@ export class EvidenceLedger {
     const l = this.ledgers.get(sessionID)
     if (!l) return
     l.changedFilesSeen = true
+    l.lastMutationAt = new Date().toISOString()
     const kind = classifyFileKind(filePath)
     l.changedFileKinds.add(kind)
     if (filePath && !l.changedFilePaths.includes(filePath) && l.changedFilePaths.length < MAX_TRACKED_CHANGED_PATHS) {
@@ -151,6 +164,11 @@ export class EvidenceLedger {
 
   hasChangedFiles(sessionID: string): boolean {
     return this.ledgers.get(sessionID)?.changedFilesSeen ?? false
+  }
+
+  /** ISO timestamp of the last observed mutation, or null. See `lastMutationAt`. */
+  getLastMutationAt(sessionID: string): string | null {
+    return this.ledgers.get(sessionID)?.lastMutationAt ?? null
   }
 
   /** Check if the same failure signature appeared >=2 times this turn. */
@@ -332,7 +350,11 @@ const READER_HEAD_RE = /^(?:grep|rg|man|ls|pwd|which|whereis|help|info|file|stri
 // mutation flags like `--write`/`--fix` (e.g. `npm version --write`) are
 // checked separately by MUTATING_BASH_FLAG_RE below. `tee` is NOT here —
 // handled by teeIsMutation so device-sink discards don't false-positive.
-const MUTATING_BASH_RE = /^(?:apply_patch\b|chmod\b|mkdir\b|mv\b|cp\b|rm\b|touch\b|install\b|ln\b|truncate\b|sed\s+-i|perl\s+-pi|git\s+(?:add|commit|checkout|switch|restore|reset|clean|apply|am|merge|rebase|cherry-pick)|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?build\b)/i
+// `install\b` is anchored to the segment head, so bare `install` matched but
+// `npm install` did not — a turn that only added a dependency read as
+// "nothing changed", even though it writes node_modules and the lockfile.
+// The package managers are named explicitly for the same reason `build` is.
+const MUTATING_BASH_RE = /^(?:apply_patch\b|chmod\b|mkdir\b|mv\b|cp\b|rm\b|touch\b|install\b|ln\b|truncate\b|sed\s+-i|perl\s+-pi|git\s+(?:add|commit|checkout|switch|restore|reset|clean|apply|am|merge|rebase|cherry-pick)|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?build\b|(?:npm|pnpm|yarn|bun)\s+(?:install|add|remove|uninstall|ci|update|upgrade)\b)/i
 /** In-segment mutation flags (checked anywhere in the segment). Separate
  * from MUTATING_BASH_RE so segment-start anchoring does not hide
  * `--write`/`--fix` flags that mutate later in the segment. */
