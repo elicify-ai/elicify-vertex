@@ -88,6 +88,15 @@ export interface RenderResult {
   text: string | null
   renderedFamilies: string[]
   dropped: Array<{ family: string; reason: "budget" | "per-turn-cap" | "cooldown" }>
+  /**
+   * FR-061: families the COMPLETED turn starved — offered at least
+   * `STARVATION_BUDGET_DROPS` times and never once rendered. The verdict is
+   * reached at the turn boundary (see `STARVATION_BUDGET_DROPS` for why it
+   * cannot honestly be reached mid-turn) and handed to the caller by the first
+   * `render()` of the following turn, exactly once, so the caller needs no
+   * dedupe of its own.
+   */
+  starved: Array<{ family: string; budgetDrops: number }>
 }
 
 /**
@@ -119,6 +128,65 @@ export const DEFAULT_FAMILY_CAPS: Record<string, number> = {
 /** Directives rendered per `render()` call, before priority trimming. */
 const INVOCATION_BUDGET = 2
 
+/**
+ * FR-061 starvation threshold: how many times one family's findings may lose
+ * the per-invocation budget across a COMPLETED turn — having rendered zero
+ * times in it — before the harness reports that family as starved.
+ *
+ * WHY THE QUANTITY WAS RE-BASED, not the number nudged.
+ *
+ * FR-061's original form counted `rendered + dropped` in ONE `render()` call
+ * and fired at `attempted >= 5` with a >=90% drop rate. Every drop it counted
+ * was a per-turn-cap drop from a producer re-minting a finding whose family
+ * had already spent its cap, so it measured the PRODUCERS' waste and read
+ * loudest exactly when the model had already been told everything its caps
+ * allowed. Once the producers learned to ask `blockedBeforeBudget` first that
+ * waste vanished, the maximum `attempted` fell 5 -> 4 (measured over the same
+ * 78-invocation differential that signed the gating off), and the detector was
+ * left permanently one short of its own floor. Re-basing the threshold on the
+ * same quantity would only have made a wrong measurement fire again.
+ *
+ * WHY BUDGET DROPS. A cap or cooldown drop is not starvation: for a cap-1
+ * family, `blockedBeforeBudget` being true means the family DID reach the
+ * model this turn. The one drop reason that means "eligible, re-offered, and
+ * never heard" is the budget trim — and it is precisely the one
+ * `blockedBeforeBudget` deliberately cannot model, because it depends on the
+ * whole findings array of an invocation. So the gate and this detector cover
+ * disjoint halves of the same question.
+ *
+ * WHY AT THE TURN BOUNDARY. Losing the budget mid-turn is normal and usually
+ * self-correcting: corrections cap out within a few invocations and the
+ * phase-guidance behind them lands. Judging within the turn would report a
+ * directive that arrives one invocation later — the "delayed" case, not the
+ * starved one. Evaluating the turn once it is over is also what FR-061 says in
+ * its own words ("a turn whose directive drop rate..."), and it is what lets
+ * the threshold be small enough to actually fire.
+ *
+ * WHY 3.
+ *   - Measured noise floor: instrumenting every budget drop over the whole
+ *     pre-existing test suite (1843 tests) plus the UAT harness (54
+ *     assertions) recorded 25 budget drops — 11 `pre-commitment`, 6
+ *     `intake-scaffold`, 4 `pinned-criteria-reinject`, 4 `elevate`, and 0 in
+ *     UAT — and every single one was the FIRST of its turn. Highest
+ *     per-family per-turn count observed: 1. 3 is three times that floor,
+ *     and the same instrumentation reports zero starvation verdicts across
+ *     the whole corpus.
+ *   - Measured ceiling: with the default cap table the reachable maximum is
+ *     about 6 in a maximally busy turn (verify-gap's cap of 3 plus one other
+ *     correction covers the first three invocations; scope-watchdog,
+ *     anomaly-interrupt, repeat-failure, intake-scaffold, elevate and
+ *     pre-commitment supply the rest), because every other family caps out.
+ *     A threshold of 5 would sit at the top of that range and reproduce the
+ *     original defect — a detector that is technically live and never fires.
+ *   - Meaning: "the harness offered this guidance on three separate
+ *     invocations of one turn, and the turn ended without the model ever
+ *     hearing it." The sharp case is FR-014's post-compaction criteria
+ *     re-injection: it survives into later turns, but a turn spent working
+ *     from context that was just compacted is exactly the turn it was meant
+ *     to be in.
+ */
+export const STARVATION_BUDGET_DROPS = 3
+
 const PRIORITY_RANK: Record<Priority, number> = {
   correction: 0,
   "phase-guidance": 1,
@@ -134,6 +202,24 @@ interface SessionState {
   lastRenderedTurn: Map<string, number>
   /** family -> turn index at which `recordCompliance` was last called for it. */
   complianceTurn: Map<string, number>
+  /** FR-061: family -> budget drops accumulated THIS turn (reset on `newTurn()`). */
+  turnBudgetDrops: Map<string, number>
+  /**
+   * FR-061: verdicts for turns that have already ENDED, waiting to be handed
+   * to the caller by the next `render()`.
+   *
+   * The verdict is reached in `advanceTurn` — the only moment "this family
+   * never rendered all turn" is decidable — but `newTurn()` returns void and
+   * one of its two callers (`wiring/gate.ts`'s continuation dispatch) has no
+   * `RenderResult` to put it in. Queuing it here means the report reaches the
+   * caller from whichever boundary advanced the turn. The durable record does
+   * not depend on the handoff: `advanceTurn` logs `directive:starved` at the
+   * moment of the verdict, so a session whose last turn starves a family still
+   * leaves the evidence even though no further `render()` collects it.
+   */
+  pendingStarvation: RenderResult["starved"]
+  /** `claimOncePerTurn` latches, cleared on `newTurn()`. */
+  turnClaims: Set<string>
 }
 
 function renderFullForm(f: Finding): string {
@@ -185,6 +271,9 @@ export class InjectionComposer {
         turnSpend: new Map(),
         lastRenderedTurn: new Map(),
         complianceTurn: new Map(),
+        turnBudgetDrops: new Map(),
+        pendingStarvation: [],
+        turnClaims: new Set(),
       }
       this.sessions.set(sessionID, state)
     }
@@ -201,9 +290,26 @@ export class InjectionComposer {
     return cd === undefined ? 1 : cd
   }
 
-  private advanceTurn(state: SessionState): void {
+  private advanceTurn(sessionID: string, state: SessionState): void {
+    // FR-061: the turn is over, so "was this family ever heard?" is finally
+    // decidable. A family that lost the budget repeatedly and still rendered
+    // at least once was crowded, not starved — the model got the guidance.
+    for (const [family, budgetDrops] of state.turnBudgetDrops) {
+      if (budgetDrops < STARVATION_BUDGET_DROPS) continue
+      if ((state.turnSpend.get(family) ?? 0) > 0) continue
+      state.pendingStarvation.push({ family, budgetDrops })
+      this.logger("directive:starved", {
+        sessionID,
+        family,
+        budgetDrops,
+        turnIndex: state.turnIndex,
+      })
+    }
+
     state.turnIndex += 1
     state.turnSpend.clear()
+    state.turnBudgetDrops.clear()
+    state.turnClaims.clear()
   }
 
   /** EAGER turn advance. Call once per `chat.message` (new user message) and
@@ -219,7 +325,7 @@ export class InjectionComposer {
    * the cancellation the same boundary would be counted twice — once by the
    * reply cycle, once by the continuation it triggered. */
   newTurn(sessionID: string): void {
-    this.advanceTurn(this.getState(sessionID))
+    this.advanceTurn(sessionID, this.getState(sessionID))
   }
 
   /**
@@ -260,6 +366,35 @@ export class InjectionComposer {
     return state.turnIndex > lastTurn && state.turnIndex < lastTurn + cooldown
   }
 
+  /**
+   * A per-TURN one-shot latch on a caller-chosen key. Returns `true` the first
+   * time it is called with `key` in the current turn and `false` for every
+   * later call until the turn advances.
+   *
+   * This is the composer's turn CLOCK exposed as a latch — nothing more. It is
+   * NOT a render gate and must never be used as one: `blockedBeforeBudget` is
+   * the render question, and B-2 shipped the bug that comes from confusing the
+   * two (a one-shot spent at OFFER time silences a family for the whole turn
+   * the first time it loses the 2-slot budget).
+   *
+   * It exists because wiring owns two "log this at most once per turn" flags —
+   * `expect:absent` and `criteria:parse-miss` — and wiring's own per-turn reset
+   * (`resetTurnState`) runs on ONE of the two turn boundaries. `wiring/gate.ts`
+   * dispatches a continuation with `composer.newTurn(sid)` and nothing else, so
+   * a flag cleared only in `resetTurnState` stayed spent for every continuation
+   * turn of an unattended run: an unreadable `CRITERIA:` line written in the
+   * turn after the first went unlogged, which is precisely the blind spot the
+   * `criteria:parse-miss` event was added to end. Keying off the composer means
+   * both boundaries clear it, because both call `newTurn`, and there is one
+   * definition of "this turn" instead of two that can drift apart.
+   */
+  claimOncePerTurn(sessionID: string, key: string): boolean {
+    const state = this.getState(sessionID)
+    if (state.turnClaims.has(key)) return false
+    state.turnClaims.add(key)
+    return true
+  }
+
   /** Called by wiring when FR-034 detects a compliance match. Feeds the next
    * `render()`'s decay decision for that family: a compliance recorded at
    * turn T decays rendering of that family at turn T+1 (FR-006 — "after a
@@ -291,6 +426,9 @@ export class InjectionComposer {
    *      `opts.priorCompliance(family)` is true or a compliance was recorded
    *      for that family last turn; otherwise render the full O-D-P-E form.
    *   5. Pass the assembled envelope through `redactSecrets`.
+   *   6. FR-061: accumulate this turn's budget drops per family. The verdict
+   *      itself is reached in `advanceTurn` once the turn is over and handed
+   *      back by the FOLLOWING `render()` in `RenderResult.starved`.
    *
    * Every drop is logged (`budget:dropped` / `per-turn-cap:dropped` /
    * `cooldown:dropped`) and reported in `RenderResult.dropped`. Dropped
@@ -309,6 +447,11 @@ export class InjectionComposer {
     // boundary itself) is what bounds the advance to at most one per render
     // no matter how many boundary signals arrived — see the module doc.
     const dropped: RenderResult["dropped"] = []
+
+    // FR-061: drain any starvation verdicts the last turn boundary reached.
+    // Handed over exactly once, so the caller needs no dedupe of its own.
+    const starved = state.pendingStarvation
+    state.pendingStarvation = []
 
     // Provisional per-call spend, keyed by family: `state.turnSpend` only
     // updates once a finding actually renders (at the bottom of this
@@ -371,6 +514,9 @@ export class InjectionComposer {
     const overBudget = byPriority.slice(INVOCATION_BUDGET)
     for (const f of overBudget) {
       dropped.push({ family: f.family, reason: "budget" })
+      // FR-061 accounting: this turn's running loss count for the family.
+      // Only the budget trim contributes — see `STARVATION_BUDGET_DROPS`.
+      state.turnBudgetDrops.set(f.family, (state.turnBudgetDrops.get(f.family) ?? 0) + 1)
       this.logger("budget:dropped", {
         sessionID,
         family: f.family,
@@ -405,6 +551,8 @@ export class InjectionComposer {
       text: envelope === null ? null : redactSecrets(envelope),
       renderedFamilies,
       dropped,
+      // FR-061: verdicts reached at the last turn boundary, handed over once.
+      starved,
     }
   }
 }

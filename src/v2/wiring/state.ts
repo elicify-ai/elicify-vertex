@@ -110,17 +110,23 @@ export interface V2SessionState {
 
   // -- EXPECT artifact (FR-023) — expires at turn end.
   turnExpect: ExpectArtifact | null
-  expectAbsentLoggedThisTurn: boolean
-  /**
-   * B-2 follow-up: `criteria:parse-miss` has already been logged this turn.
-   *
-   * Exactly `expectAbsentLoggedThisTurn`'s job, for exactly its reason —
-   * `text.complete` fires once per assistant TEXT PART, and the unreadable
-   * `CRITERIA:` line that produces the event is typically repeated in every
-   * part of the same reply (measured: 12 parts -> 12 events). The sibling had
-   * this guard from the start; this one was written without it.
-   */
-  criteriaParseMissLoggedThisTurn: boolean
+
+  // NO `expectAbsentLoggedThisTurn` / `criteriaParseMissLoggedThisTurn`.
+  //
+  // Both were booleans meaning "this event has already been logged THIS TURN",
+  // and both were cleared only by `resetTurnState` — which is reached from
+  // `chat.message`'s activation branch and from nowhere else. There are TWO
+  // turn boundaries: that one, and `wiring/gate.ts`'s continuation dispatch,
+  // which advances the turn with `composer.newTurn(sid)` alone. So on every
+  // continuation turn of an unattended run both flags were still spent from
+  // the previous turn, and the turn's missing EXPECT / unreadable `CRITERIA:`
+  // line went unrecorded — the very blind spot each event exists to close,
+  // reintroduced by its own dedupe guard. It is the same divergence B-2's
+  // `intakeScaffoldOfferedForTurn` died of, one layer down.
+  //
+  // The fix is the same in kind: stop keeping a second definition of "this
+  // turn" in wiring. `InjectionComposer.claimOncePerTurn` is the latch now,
+  // and it sits on the one clock BOTH boundaries advance.
 
   // NO `intakeScaffoldOfferedForTurn`. B-2 added it (a composer turn index
   // stamped when the scaffold was OFFERED) and it could suppress the scaffold
@@ -204,8 +210,6 @@ export function freshSessionState(workspaceRoot: string): V2SessionState {
     intakeSubturnCount: 0,
     multiStoryPending: false,
     turnExpect: null,
-    expectAbsentLoggedThisTurn: false,
-    criteriaParseMissLoggedThisTurn: false,
     precommitmentPending: false,
     scopeDriftPending: null,
     anomalyPending: null,
@@ -230,8 +234,11 @@ export function freshSessionState(workspaceRoot: string): V2SessionState {
  * `multiStoryPending`) are intentionally left untouched. */
 export function resetTurnState(state: V2SessionState): void {
   state.turnExpect = null
-  state.expectAbsentLoggedThisTurn = false
-  state.criteriaParseMissLoggedThisTurn = false
+  // NOT the two `…LoggedThisTurn` flags — they are gone. Their per-turn reset
+  // now rides on `InjectionComposer.claimOncePerTurn`, which BOTH turn
+  // boundaries clear (this one advances the composer too; `wiring/gate.ts`'s
+  // continuation advances it and never reaches this function). See the
+  // interface above.
   state.precommitmentPending = false
   state.scopeDriftPending = null
   state.anomalyPending = null

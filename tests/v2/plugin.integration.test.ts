@@ -2562,3 +2562,266 @@ describe("B-2: an unreadable CRITERIA block is logged instead of vanishing", () 
     expect(out.system.join("\n")).not.toContain("OUTCOME:")
   })
 })
+
+// ===========================================================================
+// FIX 2 — the SECOND turn boundary.
+//
+// `resetTurnState` is reached from `chat.message`'s activation branch and from
+// nowhere else. `wiring/gate.ts` opens a turn too, with `composer.newTurn(sid)`
+// and nothing else. So every once-per-turn flag that lived in wiring state was
+// still spent on a continuation turn, and in an unattended run — where the
+// continuation loop IS the only turn boundary that ever arrives — the harness
+// recorded these two events exactly once for the whole session.
+//
+// Both events exist to make a model behaviour DECIDABLE from the log. A
+// dedupe guard that silences every turn but the first does not reduce noise,
+// it removes the measurement.
+// ===========================================================================
+
+describe("FIX 2: once-per-turn log guards re-open on a gate continuation turn", () => {
+  function parseMisses(sid: string) {
+    return readEvents().filter((e) => e.event_type === "criteria:parse-miss" && e.session_id === sid)
+  }
+  function expectAbsents(sid: string) {
+    return readEvents().filter((e) => e.event_type === "expect:absent" && e.session_id === sid)
+  }
+
+  it("criteria:parse-miss is recorded again after a continuation, with no chat.message in between", async () => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "fix2-parse-miss-continuation"
+
+    // A DEEP ask: the zero-criteria stop-block is the continuation this test
+    // needs, and it is scoped to deep mode.
+    await activate(hooks, sid, "implement the production database migration")
+    await completeText(hooks, sid, "CRITERIA: it should all just work")
+    expect(parseMisses(sid), "turn 1's miss").toHaveLength(1)
+    // Same turn, more text parts: still one. The dedupe itself must survive.
+    await completeText(hooks, sid, "CRITERIA: it should all just work")
+    expect(parseMisses(sid)).toHaveLength(1)
+
+    // Unverified mutation + idle -> the gate dispatches a continuation, which
+    // calls `composer.newTurn(sid)` and never reaches `resetTurnState`.
+    await toolAfter(hooks, sid, "edit", { filePath: "src/foo.ts" }, "updated")
+    await idle(hooks, sid)
+    expect(idleContinuationTexts(client, sid).length).toBeGreaterThan(0)
+
+    // The new turn's unreadable CRITERIA line is a NEW fact about the model.
+    // Pre-fix: still 1, for the rest of the session.
+    await completeText(hooks, sid, "CRITERIA: still not a list")
+    expect(parseMisses(sid)).toHaveLength(2)
+    expect(parseMisses(sid)[1].payload.keyLine).toBe("CRITERIA: still not a list")
+
+    // ...and the guard is still a guard within THAT turn.
+    await completeText(hooks, sid, "CRITERIA: still not a list")
+    expect(parseMisses(sid)).toHaveLength(2)
+  })
+
+  it("expect:absent is recorded again after a continuation, with no chat.message in between", async () => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "fix2-expect-absent-continuation"
+
+    await activate(hooks, sid, "implement the production database migration")
+    await toolAfter(hooks, sid, "edit", { filePath: "src/foo.ts" }, "updated")
+
+    // A FAILING verifier: it still runs the EXPECT comparison, but leaves the
+    // ledger unverified so the zero-criteria fallback can fire below.
+    await toolAfter(hooks, sid, "bash", { command: "npx vitest run" }, "1 failed", { exit: 1 })
+    expect(expectAbsents(sid), "turn 1's missing EXPECT").toHaveLength(1)
+    await toolAfter(hooks, sid, "bash", { command: "npx vitest run" }, "1 failed", { exit: 1 })
+    expect(expectAbsents(sid), "deduped within the turn").toHaveLength(1)
+
+    await idle(hooks, sid)
+    expect(idleContinuationTexts(client, sid).length).toBeGreaterThan(0)
+
+    // Pre-fix: still 1. The whole point of the event is "how often does the
+    // model verify without declaring an expectation" — unanswerable if it is
+    // recorded once per SESSION.
+    await toolAfter(hooks, sid, "bash", { command: "npx vitest run" }, "1 failed", { exit: 1 })
+    expect(expectAbsents(sid)).toHaveLength(2)
+    await toolAfter(hooks, sid, "bash", { command: "npx vitest run" }, "1 failed", { exit: 1 })
+    expect(expectAbsents(sid)).toHaveLength(2)
+  })
+
+  it("a real user message still re-opens both — the ordinary boundary is untouched", async () => {
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = "fix2-ordinary-boundary"
+
+    await activate(hooks, sid, "implement the parser feature")
+    await completeText(hooks, sid, "CRITERIA: it should all just work")
+    await toolAfter(hooks, sid, "bash", { command: "npx vitest run" }, "1 failed", { exit: 1 })
+    expect(parseMisses(sid)).toHaveLength(1)
+    expect(expectAbsents(sid)).toHaveLength(1)
+
+    await activate(hooks, sid, "try again please")
+    await completeText(hooks, sid, "CRITERIA: still not a list")
+    await toolAfter(hooks, sid, "bash", { command: "npx vitest run" }, "1 failed", { exit: 1 })
+    expect(parseMisses(sid)).toHaveLength(2)
+    expect(expectAbsents(sid)).toHaveLength(2)
+  })
+})
+
+// ===========================================================================
+// FIX 1 / FR-061 — `directive:starved`, END TO END, on the DEFAULT cap table.
+//
+// The old detector was a per-invocation drop RATE with a floor of 5 attempted
+// findings, and the drops it counted were per-turn-cap drops from producers
+// re-minting findings the composer had already committed to discarding. It
+// therefore read loudest when the harness was working correctly, and once the
+// producers learned to ask `blockedBeforeBudget` first it could not fire at
+// all: measured over the 78-invocation differential that signed the gating
+// off, max `attempted` fell from 5 to 4, permanently under its own floor. It
+// had no test, which is why nothing caught it.
+//
+// The scenario below uses NO configuration overrides — the shipped cap table,
+// the shipped budget of 2 — which is the property that makes the re-based
+// signal a live detector rather than another one that only fires on paper.
+// ===========================================================================
+
+describe("FR-061: directive:starved reports a family a whole turn never delivered", () => {
+  const NARROW_STORY_FR061 = {
+    stories: [
+      {
+        text: "narrow story",
+        acceptanceItems: ["A1"],
+        scopeGlobs: ["src/in-scope/**"],
+        verifiers: ["npx vitest run"],
+        tasks: [{ text: "do the work" }],
+      },
+    ],
+  }
+
+  function clientWithToast() {
+    const showToast = vi.fn(async (_opts: { body: { message: string } }) => ({ data: true, error: undefined }))
+    const client = makeStubClient()
+    ;(client as unknown as { tui: unknown }).tui = { showToast }
+    return { client, showToast }
+  }
+
+  /**
+   * One busy turn on the default cap table:
+   *   step 1  verify-gap + scope-watchdog  (two corrections)
+   *   step 2  verify-gap + intake-scaffold (scope-watchdog's cap is spent)
+   *   step 3  verify-gap + repeat-failure  (the scaffold's cap is spent)
+   * Three invocations, both slots taken every time, and the enrichment behind
+   * them — the post-compaction criteria re-injection — never gets through.
+   */
+  async function busyTurn(hooks: Hooks, sid: string, opts: { compacted: boolean }) {
+    await activate(hooks, sid, "implement the production database migration")
+    await hooks.tool!.elicify_vertex_plan_create!.execute!(NARROW_STORY_FR061 as never, { sessionID: sid } as never)
+    if (opts.compacted) {
+      await hooks.event!({ event: { type: "session.compacted", properties: { sessionID: sid } } as never })
+    }
+    for (let step = 0; step < 3; step++) {
+      await toolAfter(hooks, sid, "edit", { filePath: `src/elsewhere/step-${step}.ts` }, "updated")
+      if (step === 2) {
+        // Same signature twice -> the repeat-failure correction arms, holding
+        // the second slot on the invocation where the scaffold's cap is gone.
+        await toolAfter(hooks, sid, "bash", { command: "npx vitest run" }, "AssertionError: boom", { exit: 1 })
+        await toolAfter(hooks, sid, "bash", { command: "npx vitest run" }, "AssertionError: boom", { exit: 1 })
+      }
+      await transform(hooks, sid)
+    }
+  }
+
+  function starvedEvents(sid: string) {
+    return readEvents().filter((e) => e.event_type === "directive:starved" && e.session_id === sid)
+  }
+
+  it("fires for pinned-criteria-reinject, at the turn boundary, with the default caps", async () => {
+    const { client, showToast } = clientWithToast()
+    // A busy turn renders six directives before the boundary, which is exactly
+    // FR-063's default toast budget for a minute — so the toast under test
+    // would be suppressed by the rate limiter, not by the detector. Raise the
+    // cap so this test measures FR-061 and not FR-063.
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), { maxToastsPerMinute: 100 } as never)
+    const sid = `fr061-starved-${Math.random().toString(36).slice(2)}`
+
+    await busyTurn(hooks, sid, { compacted: true })
+
+    const mine = readEvents().filter((e) => e.session_id === sid)
+    const family = (e: LoggedEvent) => String((e.payload as { family?: string }).family)
+    const count = (type: string, fam: string) => mine.filter((e) => e.event_type === type && family(e) === fam).length
+
+    // NON-VACUITY: the families that took the slots really did reach the
+    // model. Without this the test could "pass" on a turn where nothing was
+    // produced at all.
+    expect(count("directive_rendered", "verify-gap"), "verify-gap held a slot each step").toBe(3)
+    expect(count("directive_rendered", "scope-watchdog")).toBe(1)
+    expect(count("directive_rendered", "intake-scaffold")).toBe(1)
+    // ...and the victim was offered every invocation and never once rendered.
+    expect(count("budget:dropped", "pinned-criteria-reinject")).toBe(3)
+    expect(count("directive_rendered", "pinned-criteria-reinject")).toBe(0)
+
+    // Mid-turn the harness stays quiet: the next invocation could still
+    // deliver it, so calling it starved before the turn ends would be a guess.
+    expect(starvedEvents(sid), "nothing reported while the turn is still open").toHaveLength(0)
+
+    // The next user message closes the turn. NOW the verdict is decidable.
+    await activate(hooks, sid, "carry on then")
+    const starved = starvedEvents(sid)
+    expect(starved).toHaveLength(1)
+    expect(starved[0].payload.family).toBe("pinned-criteria-reinject")
+    expect(starved[0].payload.budgetDrops).toBe(3)
+    expect(starved[0].payload.turnIndex).toBe(1)
+
+    // FR-061's own requirement: it reaches the operator as a warning toast.
+    // That is carried by the first render of the following turn.
+    showToast.mockClear()
+    await transform(hooks, sid)
+    const toasts = showToast.mock.calls.map((c) => JSON.stringify(c[0]))
+    const starvationToast = toasts.find((t) => t.includes("pinned-criteria-reinject") && t.includes("never reached"))
+    expect(starvationToast, `no starvation toast in: ${toasts.join(" | ")}`).toBeDefined()
+    expect(starvationToast).toContain("warning")
+
+    // Handed over exactly once — a later invocation must not re-toast it.
+    showToast.mockClear()
+    await transform(hooks, sid)
+    expect(showToast.mock.calls.map((c) => JSON.stringify(c[0])).join("|")).not.toContain("never reached")
+  })
+
+  it("stays silent on the same busy turn when the directive is not actually being starved", async () => {
+    // Byte-for-byte the same pressure, minus the compaction. Nothing is
+    // waiting behind the budget, so nothing is starved — this is the control
+    // that stops the detector from simply reporting "busy turn".
+    const client = makeStubClient()
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = `fr061-control-${Math.random().toString(36).slice(2)}`
+
+    await busyTurn(hooks, sid, { compacted: false })
+    await activate(hooks, sid, "carry on then")
+
+    expect(starvedEvents(sid)).toHaveLength(0)
+  })
+
+  it("stays silent for a family whose offers are dropped by the per-turn CAP, however many", async () => {
+    // The old detector's loudest case, and the reason it had to be re-based:
+    // `plan-proposal` has a cap of 1 and an ungated producer, so once it has
+    // rendered every later offer is a cap drop — which means the model HAS
+    // been told. Counting those is what made the signal read highest when the
+    // harness was working exactly as designed.
+    const client = makeStubClient({ promptText: () => '{"multiStory":true}' })
+    const hooks = await ElicifyVertexPluginV2(pluginInput(client), undefined)
+    const sid = `fr061-capdrops-${Math.random().toString(36).slice(2)}`
+
+    await activate(hooks, sid, "implement the production database migration")
+    for (let step = 0; step < 12; step++) {
+      await toolAfter(hooks, sid, "read", { filePath: `src/step-${step}.ts` }, "contents")
+      await transform(hooks, sid)
+    }
+    await activate(hooks, sid, "carry on then")
+
+    const mine = readEvents().filter((e) => e.session_id === sid)
+    const family = (e: LoggedEvent) => String((e.payload as { family?: string }).family)
+    // NON-VACUITY: the cap drops this asserts about really happened.
+    expect(
+      mine.filter((e) => e.event_type === "per-turn-cap:dropped" && family(e) === "plan-proposal").length,
+      "plan-proposal must really be cap-dropping here",
+    ).toBeGreaterThanOrEqual(5)
+    expect(mine.filter((e) => e.event_type === "directive_rendered" && family(e) === "plan-proposal")).toHaveLength(1)
+
+    expect(starvedEvents(sid)).toHaveLength(0)
+  })
+})
