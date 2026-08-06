@@ -13,7 +13,12 @@ import { PinStore } from "../../src/v2/pin.js"
 import { StoryEngine } from "../../src/v2/story.js"
 import { SelfCreatedSessions } from "../../src/v2/subturn.js"
 import type { OpencodeClient } from "../../src/v2/types.js"
-import { handleSessionIdle, type GateContext } from "../../src/v2/wiring/gate.js"
+import { handleSessionIdle, type GateContext,
+  beginIdleTurn,
+  forgetIdleTurn,
+  idleTurnCount,
+  dispatchContinuation,
+} from "../../src/v2/wiring/gate.js"
 import { ManifestCache } from "../../src/v2/wiring/manifest.js"
 import { freshSessionState, resetTurnState } from "../../src/v2/wiring/state.js"
 import { cancelPauseJudge } from "../../src/v2/wiring/gate.js"
@@ -1518,16 +1523,20 @@ describe("handleVerifierAudit — a verdict retires when the code moves", () => 
     const audits = (): number =>
       h.logger.mock.calls.filter((c) => c[0] === "story:verifier-audit").length
 
-    stubVerifier(h, {
-      stories: [{ storyId: "S1", pass: false, summary: "nope", items: [{ itemId: "A1", met: false, note: "missing" }] }],
-    })
+    // `items: []` — unsubstantiated, so the verdict is STAMPED and the story
+    // stays `complete`. That is the live shape: a substantiated fail reverts
+    // the story to `active`, which needs a re-checkpoint to become auditable
+    // again, and that re-checkpoint moves `completedAt` — firing the OLD
+    // freshness test and hiding whether this feature works at all.
+    stubVerifier(h, { stories: [{ storyId: "S1", pass: false, summary: "nope", items: [] }] })
     await handleSessionIdle(h.ctx, sid)
     const first = audits()
     expect(first, "the first audit must run").toBeGreaterThan(0)
 
-    // The model goes and fixes it — an edit to an ALREADY-COMPLETE story, so
-    // `completedAt` does not move and the old freshness test saw nothing.
-    h.storyEngine.checkpoint(sid, "S1.T1", "complete")
+    // The model goes and fixes it — an edit to an ALREADY-COMPLETE story. NO
+    // re-checkpoint: `completedAt` must not move, or the OLD freshness test
+    // fires and this asserts nothing. (It did exactly that, and passed with
+    // the whole feature deleted.)
     h.evidenceLedger.recordChangedFiles(sid, "src/fixed.ts")
     state.idleContinuationInFlight = false
     await handleSessionIdle(h.ctx, sid)
@@ -1557,6 +1566,44 @@ describe("handleVerifierAudit — a verdict retires when the code moves", () => 
       "announcing a dead verdict is the standoff this exists to end",
     ).toBe(escalationsBefore)
   })
+
+  // ==========================================================================
+  // MAJ-2/3/4. The first cut of this feature retired verdicts unconditionally,
+  // which put the audit loop straight back: measured at 5 verifier subturns
+  // over 5 edit+idle rounds with the cap never engaging, and 3 settled-plan
+  // close-outs for 2 post-settlement edits. Staleness must spend cap budget,
+  // and a clean pass must stay terminal.
+  // ==========================================================================
+  it("stops re-auditing at the cap instead of once per edit", async () => {
+    // An explicit small cap: the harness default is 999, which would make the
+    // bound below vacuously true.
+    const h = harness({ verifierEnabled: true, maxStoryReaudits: 2 })
+    const sid = "s1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid)
+    // `items: []` — unsubstantiated, so the verdict is stamped and the story
+    // stays complete. This is the shape that looped forever.
+    stubVerifier(h, { stories: [{ storyId: "S1", pass: false, summary: "nope", items: [] }] })
+
+    const audits = (): number => h.logger.mock.calls.filter((c) => c[0] === "story:verifier-audit").length
+    for (let i = 0; i < 6; i++) {
+      state.idleContinuationInFlight = false
+      await handleSessionIdle(h.ctx, sid)
+      h.evidenceLedger.recordChangedFiles(sid, `src/edit${i}.ts`)
+    }
+    // Without the cap check this was one audit per round, unbounded.
+    expect(audits(), "an edit must not buy an unlimited number of model calls").toBeLessThanOrEqual(
+      h.ctx.maxStoryReaudits + 1,
+    )
+  })
+
+  // (The "a clean pass is terminal" net lives in `scripts/uat-harness.mjs`
+  // section J, not here: this fixture's `claimedStory` never produces a
+  // SETTLED plan, so the close-out branch is unreachable and any assertion
+  // about it passes with the feature deleted. Verified — the unit version of
+  // this test survived removing the guard; UAT J3 kills it.)
 })
 
 // ===========================================================================
@@ -2007,5 +2054,48 @@ describe("renderPlanDigest — FR-006 / MIN-002: audited stories render first", 
     expect(digest.indexOf("test -f research/third.md")).toBeLessThan(
       digest.indexOf("test -f research/first.md"),
     )
+  })
+})
+
+// ===========================================================================
+// MIN-001/009: two guards shipped without a test under them.
+//
+// `idleDispatch` is a module-level Map keyed by session id. Nothing removed
+// entries, so a long-lived host accumulated one per session it had ever seen —
+// and the `spoken` flag it carries is what stops one idle turn dispatching two
+// continuations, so the leak and the guard are the same object.
+// ===========================================================================
+describe("idle-turn bookkeeping", () => {
+  it("does not retain an entry once the session is gone", () => {
+    const before = idleTurnCount()
+    for (let i = 0; i < 50; i++) beginIdleTurn(`leaky-${i}`, 0)
+    expect(idleTurnCount(), "every session must be tracked while it is live").toBe(before + 50)
+    for (let i = 0; i < 50; i++) forgetIdleTurn(`leaky-${i}`)
+    expect(idleTurnCount(), "a deleted session must not be retained forever").toBe(before)
+  })
+
+  it("re-arming a session replaces its entry rather than adding one", () => {
+    const before = idleTurnCount()
+    beginIdleTurn("same", 1)
+    beginIdleTurn("same", 2)
+    expect(idleTurnCount()).toBe(before + 1)
+    forgetIdleTurn("same")
+  })
+
+  // The `spoken` latch: a second dispatch inside ONE idle turn is the
+  // double-message symptom — the harness talking over itself.
+  it("lets only the first continuation of an idle turn through", async () => {
+    const h = harness({ verifierEnabled: true })
+    const sid = "spoken-1"
+    const state = quietSession(h, sid)
+    state.modelId = "anthropic/claude-opus-4"
+    state.workspaceRoot = h.stateDir
+    claimedStory(h, sid)
+    beginIdleTurn(sid, state.activityMarker)
+    const first = await dispatchContinuation(h.ctx, sid, state, "[vertex] first line")
+    const second = await dispatchContinuation(h.ctx, sid, state, "[vertex] second line")
+    expect(first, "the first continuation of a turn must be delivered").toBe(true)
+    expect(second, "the harness must not talk over itself within one idle turn").toBe(false)
+    forgetIdleTurn(sid)
   })
 })

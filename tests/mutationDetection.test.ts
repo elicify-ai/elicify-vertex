@@ -13,6 +13,30 @@ import { describe, expect, it } from "vitest"
 import { changedPathsFromTool, isMutatingBashCommand } from "../src/index.js"
 
 describe("isMutatingBashCommand", () => {
+  // MIN-007/008. Package managers were added to the mutation set for the
+  // dependency-install case, and the first cut got both directions wrong:
+  // `npm i` and any `sudo`-prefixed command were invisible, while a
+  // `--dry-run` rehearsal — which writes nothing — counted as real work and
+  // could satisfy the evidence floor on its own.
+  it.each([
+    "npm i",
+    "npm i lodash",
+    "sudo npm install",
+    "sudo rm -rf build",
+    "pnpm add -D vitest",
+  ])("counts %j as a mutation", (cmd) => {
+    expect(isMutatingBashCommand(cmd)).toBe(true)
+  })
+
+  it.each([
+    "npm install --dry-run",
+    "npm i --dry-run",
+    "git apply --check patch.diff",
+    "sudo npm install --dry-run",
+  ])("does NOT count the rehearsal %j", (cmd) => {
+    expect(isMutatingBashCommand(cmd), "a --dry-run writes nothing").toBe(false)
+  })
+
   it.each([
     "git commit -m wip",
     "cat x; git commit -m y", // segment anchoring: not just the first command

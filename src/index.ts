@@ -166,7 +166,16 @@ export class EvidenceLedger {
     return this.ledgers.get(sessionID)?.changedFilesSeen ?? false
   }
 
-  /** ISO timestamp of the last observed mutation, or null. See `lastMutationAt`. */
+  /**
+   * ISO timestamp of the last observed mutation, or null.
+   *
+   * TURN-SCOPED, not session-scoped: `reset()` installs a fresh ledger on
+   * every activated user message, so this returns null again at the start of
+   * each turn. That is the right scope for its one caller — verdict staleness
+   * asks "did the code move since the verdict, within this turn?" — but it
+   * does mean a verdict does NOT go stale across a user message. Callers that
+   * need durability across turns cannot use this field.
+   */
   getLastMutationAt(sessionID: string): string | null {
     return this.ledgers.get(sessionID)?.lastMutationAt ?? null
   }
@@ -354,7 +363,15 @@ const READER_HEAD_RE = /^(?:grep|rg|man|ls|pwd|which|whereis|help|info|file|stri
 // `npm install` did not — a turn that only added a dependency read as
 // "nothing changed", even though it writes node_modules and the lockfile.
 // The package managers are named explicitly for the same reason `build` is.
-const MUTATING_BASH_RE = /^(?:apply_patch\b|chmod\b|mkdir\b|mv\b|cp\b|rm\b|touch\b|install\b|ln\b|truncate\b|sed\s+-i|perl\s+-pi|git\s+(?:add|commit|checkout|switch|restore|reset|clean|apply|am|merge|rebase|cherry-pick)|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?build\b|(?:npm|pnpm|yarn|bun)\s+(?:install|add|remove|uninstall|ci|update|upgrade)\b)/i
+/**
+ * A rehearsal is not a mutation. `npm install --dry-run`, `git apply --check`
+ * and friends print what they WOULD do and touch nothing, but they match the
+ * mutation patterns head-on — which let a read-only command satisfy the
+ * evidence floor that exists to prove work actually happened.
+ */
+const DRY_RUN_RE = /(?:^|\s)(?:--dry-run|--dryrun|-n(?=\s|$)|--check)(?:\s|$)/i
+
+const MUTATING_BASH_RE = /^(?:sudo\s+)?(?:apply_patch\b|chmod\b|mkdir\b|mv\b|cp\b|rm\b|touch\b|install\b|ln\b|truncate\b|sed\s+-i|perl\s+-pi|git\s+(?:add|commit|checkout|switch|restore|reset|clean|apply|am|merge|rebase|cherry-pick)|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?build\b|(?:sudo\s+)?(?:npm|pnpm|yarn|bun)\s+(?:i|install|add|remove|uninstall|ci|update|upgrade)\b)/i
 /** In-segment mutation flags (checked anywhere in the segment). Separate
  * from MUTATING_BASH_RE so segment-start anchoring does not hide
  * `--write`/`--fix` flags that mutate later in the segment. */
@@ -522,7 +539,7 @@ export function isMutatingBashCommand(command: string): boolean {
   // Check every segment against MUTATING_BASH_RE (anchored to segment head)
   // and MUTATING_BASH_FLAG_RE (in-segment flags like `--write`/`--fix`).
   const anyMutator = segments.some(
-    (seg) => MUTATING_BASH_RE.test(seg) || MUTATING_BASH_FLAG_RE.test(seg),
+    (seg) => !DRY_RUN_RE.test(seg) && (MUTATING_BASH_RE.test(seg) || MUTATING_BASH_FLAG_RE.test(seg)),
   )
     || segments.some((seg) => downloaderIsMutation(seg))
     || shellRedirectTargetsWorkspace(command)

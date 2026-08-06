@@ -460,6 +460,64 @@ if (section("I. Verdict staleness")) {
   assert("I2-edit-earns-a-fresh-audit", audits > afterFirst, `${audits} audits total`)
 }
 
+// --- J. Staleness must not become the loop it replaced ---------------------
+if (section("J. Staleness is bounded")) {
+  // Section I's fix, applied unconditionally, put the audit loop straight
+  // back: every edit retired the verdict again, and because the bounded-stamp
+  // path returns before the cap is consulted, `maxStoryReaudits` never
+  // engaged. Measured on the shipped build at 5 verifier subturns over 5
+  // edit+idle rounds. A re-audit earned by staleness spends cap budget like
+  // any other.
+  let audits = 0
+  const s = await scenario({
+    subturn: (agent) => {
+      if (agent !== "vertex-verifier") return undefined
+      audits++
+      return '{"stories":[{"storyId":"S1","pass":false,"summary":"nope","items":[]}]}'
+    },
+  })
+  await s.say("/elicify-vertex\n\nbuild the research portal")
+  await s.hooks.tool.elicify_vertex_plan_create.execute(
+    { stories: [{ text: "Ship", acceptanceItems: ["A1"], scopeGlobs: [], verifiers: [], tasks: [{ text: "do" }] }] },
+    { sessionID: s.sid },
+  )
+  await s.hooks.tool.elicify_vertex_plan_checkpoint.execute({ taskId: "S1.T1", status: "complete" }, { sessionID: s.sid })
+  for (let i = 0; i < 5; i++) {
+    await s.idle()
+    await s.tool("edit", { filePath: join(s.work, `e${i}.ts`) })
+  }
+  assert("J1-reaudits-are-capped", audits <= 3, `${audits} verifier subturns over 5 edit+idle rounds`)
+
+  // A CLEAN PASS IS TERMINAL. gate.ts states the invariant outright — "it
+  // cannot re-fire on a later idle" — and retiring passed verdicts broke it:
+  // 3 settled-plan close-outs for 2 post-settlement edits. The user-visible
+  // symptom is the harness repeating "report what was delivered" after every
+  // save, which is the standoff this whole change exists to end.
+  let closeouts = 0
+  const p2 = await scenario({
+    subturn: (agent) =>
+      agent === "vertex-verifier"
+        ? '{"stories":[{"storyId":"S1","pass":true,"summary":"ok","items":[{"itemId":"A1","met":true,"note":"seen"}]}]}'
+        : undefined,
+  })
+  await p2.say("/elicify-vertex\n\nbuild the research portal")
+  await p2.hooks.tool.elicify_vertex_plan_create.execute(
+    { stories: [{ text: "Ship", acceptanceItems: ["A1"], scopeGlobs: [], verifiers: [], tasks: [{ text: "do" }] }] },
+    { sessionID: p2.sid },
+  )
+  await p2.hooks.tool.elicify_vertex_plan_checkpoint.execute({ taskId: "S1.T1", status: "complete" }, { sessionID: p2.sid })
+  await p2.idle()
+  closeouts = p2.sent().filter((t) => t.includes("Report what was delivered")).length
+  assert("J2-closeout-fires-once-on-settling", closeouts === 1, `${closeouts} close-outs`)
+
+  for (let i = 0; i < 2; i++) {
+    await p2.tool("edit", { filePath: join(p2.work, `after${i}.ts`) })
+    await p2.idle()
+  }
+  const after = p2.sent().filter((t) => t.includes("Report what was delivered")).length
+  assert("J3-closeout-does-not-re-fire", after === 1, `${after} close-outs after 2 post-settlement edits`)
+}
+
 // --- F. No subprocess output reaches the terminal --------------------------
 if (section("F. TUI safety")) {
   // The verifier payload shells out to `git diff --stat`. Outside a repo git

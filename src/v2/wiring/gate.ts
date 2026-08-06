@@ -331,11 +331,17 @@ export function beginIdleTurn(sid: string, marker: number): void {
   idleDispatch.set(sid, { marker, spoken: false })
 }
 
+/** Live entry count — test-only observability for the unbounded-growth fix. */
+export function idleTurnCount(): number {
+  return idleDispatch.size
+}
+
 export function forgetIdleTurn(sid: string): void {
   idleDispatch.delete(sid)
 }
 
-async function dispatchContinuation(ctx: GateContext, sid: string, state: V2SessionState, text: string): Promise<boolean> {
+/** Exported for the `spoken`-latch test; not part of the plugin surface. */
+export async function dispatchContinuation(ctx: GateContext, sid: string, state: V2SessionState, text: string): Promise<boolean> {
   const turn = idleDispatch.get(sid)
   if (turn) {
     if (turn.spoken) {
@@ -1228,9 +1234,30 @@ function verdictIsSubstantiated(v: VerifierStoryVerdict): boolean {
  * re-audited rather than argued about — which makes "who is right" settle
  * itself instead of becoming a standoff.
  */
-function verdictOutdatedByEdits(ctx: GateContext, sid: string, story: StoryV2): boolean {
-  const verifiedAt = story.verifier?.verifiedAt
-  if (!verifiedAt) return false
+function verdictOutdatedByEdits(ctx: GateContext, sid: string, state: V2SessionState, story: StoryV2): boolean {
+  const verdict = story.verifier
+  const verifiedAt = verdict?.verifiedAt
+  if (!verdict || !verifiedAt) return false
+
+  // A CLEAN PASS IS TERMINAL. Re-judging a story that already passed lets an
+  // oscillating verifier flip it, and `clearReaudit` on a pass resets the
+  // streak — so the cap could never trip: revert, fix, pass, edit, revert,
+  // unbounded. It also made the settled-plan close-out re-fire on any later
+  // file touch (measured: 3 close-outs for 2 post-settlement edits), which is
+  // the "harness will not shut up" failure this change exists to end.
+  if (verdict.pass && verdict.unapplied === undefined) return false
+
+  // THE CAP STILL BINDS. Without this, staleness re-audited a bounded story on
+  // every idle that followed any edit — measured at 5 verifier subturns over 5
+  // rounds with `unapplied` stuck and the cap never firing, which is exactly
+  // the unbounded audit loop `maxStoryReaudits` was added to stop.
+  if (reaudits(state, story.id) >= ctx.maxStoryReaudits) return false
+
+  // SCOPE LIMIT, stated rather than implied: the ledger is turn-scoped and
+  // in-memory, so it is empty after a user message and after a host restart.
+  // A verdict therefore never goes stale ACROSS a turn — only within the one
+  // where the fix landed, which is the case that looped. Widening this needs
+  // durable mutation timestamps, not a change here.
   const lastMutationAt = ctx.evidenceLedger.getLastMutationAt(sid)
   // `<=`, not `<`. Both stamps are millisecond ISO strings, so an edit landing
   // in the same millisecond as the verdict is indistinguishable from one
@@ -1248,10 +1275,10 @@ async function emitUnauditedEscalation(
 ): Promise<boolean> {
   // (guard moved below, once the unresolved set is known)
   if (!plan.stories.every((story) => story.status === "complete" && story.verifier !== undefined)) return false
-  // Never escalate a verdict the code has already moved past: the selector
-  // above will re-audit it, and announcing a dead verdict is exactly the
-  // standoff this whole change exists to end.
-  if (plan.stories.some((story) => verdictOutdatedByEdits(ctx, sid, story))) return false
+  // (A guard for stale verdicts stood here and was provably dead: the audit
+  // selector includes any stale story, so `unverifiedStories` is non-empty and
+  // this function is never reached in that case. Removed rather than left as
+  // decoration.)
   // A capped story WAS audited — the verifier failed it and the harness stopped
   // reverting. Reporting it as "never verified" would be false, so the two
   // groups are named separately.
@@ -1307,8 +1334,13 @@ async function handleVerifierAudit(ctx: GateContext, sid: string, state: V2Sessi
       (!story.verifier ||
         (story.completedAt !== undefined && story.verifier.verifiedAt < story.completedAt) ||
         // The code moved under the verdict — re-audit rather than re-litigate.
-        verdictOutdatedByEdits(ctx, sid, story)),
+        verdictOutdatedByEdits(ctx, sid, state, story)),
   )
+  // A staleness-driven re-audit spends cap budget like any other, or the cap
+  // is decorative on exactly the branch that can loop.
+  for (const story of unverifiedStories) {
+    if (verdictOutdatedByEdits(ctx, sid, state, story)) bumpReaudit(state, story.id)
+  }
   if (unverifiedStories.length === 0) return emitUnauditedEscalation(ctx, sid, state, plan)
 
   const [providerID, ...rest] = state.modelId.split("/")
@@ -1654,7 +1686,6 @@ async function maybeAskForStar(ctx: GateContext, sid: string, state: V2SessionSt
 export async function handleSessionIdle(ctx: GateContext, sid: string): Promise<void> {
   const state = ctx.states.get(sid)
   if (!state || !state.active) return
-  beginIdleTurn(sid, state.activityMarker)
 
   // Re-entrancy, per session. `promptContinuation` sets this flag while its
   // `session.prompt` is outstanding, and that prompt re-enters the host's
@@ -1664,6 +1695,12 @@ export async function handleSessionIdle(ctx: GateContext, sid: string): Promise<
   // so the gate enforces it itself rather than trusting one caller. It is a
   // per-session flag, so a busy session never gates an idle peer.
   if (state.idleContinuationInFlight) return
+
+  // AFTER the re-entrancy guard, not before. Stamping the turn on an idle the
+  // gate is about to abandon overwrote the marker of the turn still in flight,
+  // so the `spoken`/marker checks in `dispatchContinuation` were comparing
+  // against a turn that never ran.
+  beginIdleTurn(sid, state.activityMarker)
 
   // Redesign point 9 (stall): the gate paused itself after a run of
   // continuations that produced no observable activity. It stays silent
