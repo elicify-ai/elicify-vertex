@@ -29,12 +29,13 @@ vi.mock("../../src/v2/subturn.js", async (importOriginal) => {
   }
 })
 
-import { buildVerifierPayload, VERIFIER_TOTAL_BUDGET_MS, runVerifier, parseVerifierResponse } from "../../src/v2/verifier.js"
+import { buildVerifierPayload, VERIFIER_TOTAL_BUDGET_MS, runVerifier, parseVerifierResponse, scanProseField } from "../../src/v2/verifier.js"
 import { VERIFIER_PROBE_POLICY, probeCapabilityBounded, runSubturn, SelfCreatedSessions } from "../../src/v2/subturn.js"
 import {
   DIFF_UNAVAILABLE_GIT_FAILED,
   DIFF_UNAVAILABLE_NOT_A_REPO,
   DIFF_UNAVAILABLE_NO_CHANGES,
+  UNTRACKED_FILES_HEADER,
   formatChangedPathsSummary,
 } from "../../src/v2/diffstat.js"
 import type { OpencodeClient } from "../../src/v2/types.js"
@@ -695,6 +696,58 @@ describe("buildVerifierPayload", () => {
     const kept = buildVerifierPayload(raw, logger).plan!
     expect(kept.startsWith("PLAN_HEADER"), "a front-loaded field keeps its head").toBe(true)
     expect(kept.includes("PLAN_FOOTER")).toBe(false)
+  })
+
+  // =========================================================================
+  // B-3d — the tail cut must respect the cap at EVERY cap, including the ones
+  // no field uses today.
+  //
+  // `truncateField` computed `room = Math.max(0, cap - MARKER.length)`. At any
+  // cap at or below the marker's own 28 characters that clamps to zero and the
+  // function returned the MARKER ALONE: 28 characters for a cap of 1 — over
+  // the cap, with 100% of the content dropped, and still a non-empty, defined
+  // field, so nothing downstream (not the insufficient-evidence guard, not the
+  // judge) could tell it was reading a label instead of evidence. Latent under
+  // today's 2000/4000/16000 caps and reachable the moment anyone adds a small
+  // one; a bound that inverts below 28 is a trap, so it is closed rather than
+  // documented. `scanProseField` takes its cap as an argument, which is what
+  // makes this directly testable.
+  // =========================================================================
+  it("B-3d: a tail cut below the marker's own length ships CONTENT within the cap, never the marker alone", () => {
+    // Ordinary prose, no token anywhere near the 32-char entropy floor: this
+    // test is about the cap arithmetic, and a field the scan drops would prove
+    // nothing about it.
+    const text = "the run began quietly and then the newest words arrived right at the very end HERE"
+    for (const cap of [1, 5, 27, 28]) {
+      const logger = vi.fn()
+      const out = scanProseField(text, "recentTranscript", logger, cap)!
+      expect(out, `cap=${cap}: something must survive`).toBeDefined()
+      expect(out.length, `cap=${cap}: the cap must bind`).toBeLessThanOrEqual(cap)
+      expect(out, `cap=${cap}: must be real content, not the marker`).toBe(text.slice(text.length - cap))
+      expect(logger, `cap=${cap}: the cut is still announced in the log`).toHaveBeenCalledWith("verifier:field-truncated", {
+        field: "recentTranscript",
+        originalLength: text.length,
+        cap,
+        keep: "tail",
+      })
+    }
+  })
+
+  it("B-3d: a cap of 0 omits the field entirely rather than emitting the whole text", () => {
+    // `text.slice(-0)` is `text.slice(0)` — the WHOLE string. The zero case
+    // has to be handled explicitly or the "fix" leaks the entire field.
+    const out = scanProseField("secretish content here", "recentTranscript", vi.fn(), 0)
+    expect(out).toBeUndefined()
+  })
+
+  it("B-3d: at a cap with room for both, the marker is still emitted and still inside the budget", () => {
+    // The property the fix must not break: above the marker's length the
+    // marker is part of the budget, not added on top of it.
+    const text = "x".repeat(500) + "TAIL"
+    const out = scanProseField(text, "recentTranscript", vi.fn(), 40)!
+    expect(out.startsWith("…[")).toBe(true)
+    expect(out.endsWith("TAIL")).toBe(true)
+    expect(out.length).toBeLessThanOrEqual(40)
   })
 
   it("§5: lastResponse over 2000 chars is truncated at the SAME cap as the other fields", () => {
@@ -2166,19 +2219,103 @@ describe("B-3: the diff summary the harness produces survives the harness's own 
   })
 })
 
+// ---------------------------------------------------------------------------
+// Every test in this block must ISOLATE one detector: disable that detector
+// and this test dies; leave it in place and no other mutation kills it. Two
+// tests here used to fail that bar and were replaced (B-3b/FIX-4):
+//
+//  - "a complete sk-live token on one line of a `git diff --stat`-shaped
+//    summary is removed" survived BOTH the pattern-scan and the entropy-rule
+//    mutation (measured: 0 of the 2 pattern deaths, 0 of the 19 entropy
+//    deaths), because that token trips both. It proved nothing that the
+//    hunter2 case (pattern, isolated) and the base64 case (entropy, isolated)
+//    below do not already prove, and its hunk-less `--stat` shape is asserted
+//    by both of them too. Its slot now holds the span-pass isolator.
+//  - "an unlabelled 40-char hex token on its own line still trips the entropy
+//    rule" survived BOTH the entropy-rule and the hex-run mutations for the
+//    same reason, and its comment — "the entropy rule is the only thing that
+//    catches it" — was simply false: 40 chars of hex is also a 32+ hex run.
+//    Its slot now holds the hex-run isolator, the detector that had NO
+//    isolating test in this block at all.
+// ---------------------------------------------------------------------------
 describe("B-3 SAFETY (FR-031): per-line scanning of a hunk-less diff summary still catches real secrets", () => {
-  it("a complete sk-live token on one line of a `git diff --stat`-shaped summary is removed", () => {
+  it("B-3b: a key wrapped across THREE lines — the case only the span pass can catch — is removed whole", () => {
+    // Reproduced leak, verbatim. 40 chars of base64 key at 5.12 bits/char,
+    // split 12 / 6 / 25. No unit reaches the 32-char entropy floor alone and
+    // no ADJACENT PAIR does either (18 and 31 chars), so passes 1 and 2 are
+    // both blind and the whole key shipped — recoverable by stripping the
+    // newlines — with not a single event logged.
+    //
+    // Dies for the span pass alone: restore SPAN_MAX_UNITS to 2 (or delete
+    // the third pass) and the key comes straight back.
     const logger = vi.fn()
-    const summary = [
-      " src/config.ts | 2 +-",
-      '+const key = "sk-live-abc123def456ghi789jkl012mno345pqr"',
-      " 1 file changed, 1 insertion(+), 1 deletion(-)",
-    ].join("\n")
+    const key = "HMEr3sTxobYfDaktWCrSXRdwBMkQvZpNjLgUeIoA"
+    const summary = [" src/config.ts | 2 +-", "+  HMEr3sTxo", "bYfDak", "tWCrSXRdwBMkQvZpNjLgUeIoA"].join("\n")
     const payload = buildVerifierPayload(b3Raw(summary), logger)
-    expect(payload.diffSummary).toBeDefined()
-    expect(payload.diffSummary).not.toContain("sk-live")
-    expect(payload.diffSummary).toContain("src/config.ts")
-    expect(logger).toHaveBeenCalledWith("verifier:field-partial-drop", { field: "diffSummary", kept: 2, dropped: 1 })
+    expect(payload.diffSummary).toBe(" src/config.ts | 2 +-")
+    expect((payload.diffSummary ?? "").replace(/[\r\n]/g, "")).not.toContain(key)
+    expect(logger).toHaveBeenCalledWith("verifier:field-partial-drop", { field: "diffSummary", kept: 1, dropped: 3 })
+  })
+
+  it("B-3b: the SAME three-way wrap in recentTranscript is removed too — this is not a diffSummary-only fix", () => {
+    // The hole was documented as applying to all six fields, and the fields
+    // where a three-way wrap is actually PRODUCIBLE are the free-form ones:
+    // `computeBoundedDiffStat` only ever emits `--stat` lines and filenames,
+    // while a transcript carries whatever the model and the user pasted.
+    // Hardening diffSummary alone would have fixed the least exposed field.
+    const logger = vi.fn()
+    const key = "HMEr3sTxobYfDaktWCrSXRdwBMkQvZpNjLgUeIoA"
+    const payload = buildVerifierPayload(
+      {
+        criteria: [],
+        diffSummary: "",
+        verifierSummaries: [],
+        lastResponse: "",
+        recentTranscript: ["assistant: the key is", "+  HMEr3sTxo", "bYfDak", "tWCrSXRdwBMkQvZpNjLgUeIoA"].join("\n"),
+        plan: "",
+      },
+      logger,
+    )
+    expect(JSON.stringify(payload).replace(/\\n/g, "")).not.toContain(key)
+    expect(payload.recentTranscript).toBe("assistant: the key is")
+  })
+
+  it("B-3b: three lines of unindented compact JSON are NOT dropped — the span pass must not re-open FR-006a", () => {
+    // The counterweight to the two tests above, and a measured one: without
+    // `spanLooksLikeOneWrappedToken` the span pass deleted all three of these
+    // lines. They fuse into a 45-char token over 4 bits/char with no
+    // word-meets-word join, i.e. it clears every other bar the pass applies.
+    // A wrapped KEY is one uninterrupted run of key alphabet; this token's
+    // punctuation is interior and load-bearing, which is what tells them apart.
+    const logger = vi.fn()
+    const lines = ['{"storyId":"S1",', '"pass":true,', '"summary":"done"}']
+    const payload = buildVerifierPayload(
+      { criteria: [], diffSummary: "", verifierSummaries: [], lastResponse: lines.join("\n"), recentTranscript: "", plan: "" },
+      logger,
+    )
+    expect(payload.lastResponse).toBe(lines.join("\n"))
+    expect(logger).not.toHaveBeenCalled()
+  })
+
+  it("B-3b: a connection string wrapped across three lines IS still dropped — the JSON exemption is entropy-only", () => {
+    // `postgres://user:pw@host` is exactly a token whose middle is full of
+    // structural punctuation, so exempting "punctuation in the middle"
+    // unconditionally would have handed a wrapped connection string a free
+    // pass. The exemption is applied only to an entropy-driven hit; a
+    // SECRET_PATTERNS match is shape-specific and is never exonerated by it.
+    //
+    // Split so that neither individual line and neither ADJACENT PAIR carries
+    // a whole `scheme://user:pass@host`, which is what forces the span pass to
+    // be the thing that catches it: "see postgres://us" + "er:pw1" is 23 chars
+    // with no `@`, "er:pw123@dbhost/mydb now" has no scheme.
+    const logger = vi.fn()
+    const lines = ["see postgres://us", "er:pw1", "23@dbhost/mydb now", "and we are done"]
+    const payload = buildVerifierPayload(
+      { criteria: [], diffSummary: "", verifierSummaries: [], lastResponse: lines.join("\n"), recentTranscript: "", plan: "" },
+      logger,
+    )
+    expect(payload.lastResponse).toBe("and we are done")
+    expect(JSON.stringify(payload)).not.toContain("pw123")
   })
 
   it("a secret SPLIT across two adjacent lines is still caught — the adjacent-pair pass survives the unit change", () => {
@@ -2194,13 +2331,21 @@ describe("B-3 SAFETY (FR-031): per-line scanning of a hunk-less diff summary sti
     expect(payload.diffSummary).not.toContain("def456ghi789")
   })
 
-  it("an unlabelled 40-char hex token on its own line still trips the entropy rule", () => {
+  it("a LOW-entropy 32-char hex run — the case only the hex-run backstop can catch — is still removed", () => {
     const logger = vi.fn()
-    // 3.971 bits/char over 40 chars — redactSecrets alone misses this; the
-    // entropy rule is the only thing that catches it, and it still does.
-    const summary = [" src/config.ts | 2 +-", "+const token = 4702a3465c59e203612b5411f9dc37870f86aebd"].join("\n")
+    // Deliberately picked so exactly one detector can see it. 32 characters
+    // of pure hex, but only four distinct symbols: 2.156 bits/char, far under
+    // the entropy rule's 3.95 effective threshold, so `tripsEntropyScan`
+    // never fires. No `:`/`=` and no recognised token prefix, so
+    // `redactSecrets` never fires either. Only the C-15 hex-run backstop is
+    // left — and this block had NO test isolating it until now.
+    //
+    // (The 40-char hex token this replaced measured 3.971 bits/char, over the
+    // entropy bar AND a 32+ hex run, so it survived removing either one.)
+    const summary = [" src/config.ts | 2 +-", "+const token is deadbeefdeadbeefdeadbeefdeadbeef here"].join("\n")
     const payload = buildVerifierPayload(b3Raw(summary), logger)
     expect(payload.diffSummary).toBe(" src/config.ts | 2 +-")
+    expect(payload.diffSummary).not.toContain("deadbeef")
   })
 
   it("an UNLABELLED, non-hex high-entropy key — the case only the entropy rule can catch — is still removed", () => {
@@ -2218,8 +2363,8 @@ describe("B-3 SAFETY (FR-031): per-line scanning of a hunk-less diff summary sti
     // Deliberately below every other tripwire: "hunter2hunter2" is 14 chars
     // (the entropy rule ignores anything under 32) and is not hex, so if
     // `redactSecrets` ever stopped being consulted this line would sail
-    // through. The three cases above all have a second catcher and would
-    // not notice.
+    // through. Measured: this is 1 of only 2 tests in the whole suite that
+    // die when `tripsPatternScan` is stubbed out.
     const logger = vi.fn()
     const summary = [" src/config.ts | 2 +-", "+password: hunter2hunter2", " 1 file changed, 1 insertion(+)"].join("\n")
     const payload = buildVerifierPayload(b3Raw(summary), logger)
@@ -2233,6 +2378,73 @@ describe("B-3 SAFETY (FR-031): per-line scanning of a hunk-less diff summary sti
       b3Raw('AKIAIOSFODNN7EXAMPLE aws_secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"'),
       logger,
     )
+    expect(payload.diffSummary).toBeUndefined()
+    expect(logger).toHaveBeenCalledWith("verifier:field-dropped", { field: "diffSummary" })
+  })
+})
+
+describe("B-3c: a path list the scan emptied is ABSENT, not present-but-empty", () => {
+  /** Three paths outside the workspace root. `toWorkspaceRelative` leaves
+   * these ABSOLUTE on purpose (a `../../..` chain reads worse), so they keep
+   * the length and entropy that made B-3's original list trip. */
+  const OUTSIDE_ROOT = [
+    "/tmp/scratch-9182/src/games/memory.js",
+    "/tmp/scratch-9182/src/games/index.html",
+    "/tmp/scratch-9182/src/games/breakout.js",
+  ]
+
+  it("REPRODUCES the shape: the scan deletes every path and keeps the header", () => {
+    // Pinning the disease, not the cure: this is still exactly what the scan
+    // does to the field. What changes below is what the payload builder makes
+    // of the result.
+    const summary = formatChangedPathsSummary(OUTSIDE_ROOT, "/workspace/proj")
+    expect(summary).toContain("/tmp/scratch-9182/src/games/memory.js")
+    expect(summary.split("\n")).toHaveLength(4)
+  })
+
+  it("the field is DROPPED, not shipped as a bare header with nothing under it", () => {
+    // Before: diffSummary === "changed paths (no diff available):" — DEFINED,
+    // so the insufficient-evidence guard could not fire, and only
+    // verifier:field-partial-drop was logged. The judge was handed a promise
+    // of a file list containing zero files, which reads as "nothing changed".
+    const logger = vi.fn()
+    const payload = buildVerifierPayload(b3Raw(formatChangedPathsSummary(OUTSIDE_ROOT, "/workspace/proj")), logger)
+    expect(payload.diffSummary).toBeUndefined()
+    expect("diffSummary" in payload).toBe(false)
+    expect(logger).toHaveBeenCalledWith("verifier:field-dropped", { field: "diffSummary" })
+  })
+
+  it("so runVerifier refuses to judge when the emptied list was the only evidence", async () => {
+    // The point of the fix: the hole becomes VISIBLE to the guard that exists
+    // to catch it, instead of being papered over by a defined-but-empty field.
+    const logger = vi.fn()
+    const payload = buildVerifierPayload(b3Raw(formatChangedPathsSummary(OUTSIDE_ROOT, "/workspace/proj")), vi.fn())
+    const result = await runVerifier(
+      makeClient(),
+      { selfCreated: new SelfCreatedSessions(), logger },
+      { parentSessionID: "parent-1", sessionModel: { providerID: "minimax", modelID: "MiniMax-M3" }, payload },
+    )
+    expect(result).toEqual({ verdict: null, reason: "insufficient-evidence" })
+    expect(mockRunSubturn).not.toHaveBeenCalled()
+  })
+
+  it("ONE surviving path is still evidence — the field is not dropped for being short", () => {
+    // The other direction. This must stay narrow: a list that still names a
+    // real file is real file-level evidence, and dropping it would recreate
+    // B-3 itself.
+    const logger = vi.fn()
+    const payload = buildVerifierPayload(
+      b3Raw(formatChangedPathsSummary([...OUTSIDE_ROOT, "/workspace/proj/src/a.ts"], "/workspace/proj")),
+      logger,
+    )
+    expect(payload.diffSummary).toBe("changed paths (no diff available):\n  src/a.ts")
+    expect(logger).not.toHaveBeenCalledWith("verifier:field-dropped", { field: "diffSummary" })
+  })
+
+  it("the untracked-files header alone is treated the same way", () => {
+    // `computeBoundedDiffStat`'s other announcement line, same defect.
+    const logger = vi.fn()
+    const payload = buildVerifierPayload(b3Raw(`${UNTRACKED_FILES_HEADER}\n  /tmp/scratch-9182/src/games/breakout.js`), logger)
     expect(payload.diffSummary).toBeUndefined()
     expect(logger).toHaveBeenCalledWith("verifier:field-dropped", { field: "diffSummary" })
   })

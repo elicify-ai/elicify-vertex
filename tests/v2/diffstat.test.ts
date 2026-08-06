@@ -19,12 +19,15 @@ import { join } from "node:path"
 import { afterEach, beforeEach, describe, expect, it } from "vitest"
 
 import {
+  CHANGED_PATHS_HEADER,
   computeBoundedDiffStat,
   DIFF_UNAVAILABLE_GIT_FAILED,
   DIFF_UNAVAILABLE_NOT_A_REPO,
   DIFF_UNAVAILABLE_NO_CHANGES,
   formatChangedPathsSummary,
+  isPathListAnnouncementOnly,
   toWorkspaceRelative,
+  UNTRACKED_FILES_HEADER,
 } from "../../src/v2/diffstat.js"
 
 /** Identity in the ENV, not in a config file: the temp repo has no user
@@ -125,6 +128,47 @@ describe("formatChangedPathsSummary — B-3 fix (a)", () => {
 
   it("says so when the ledger recorded nothing", () => {
     expect(formatChangedPathsSummary([], "/workspace/x")).toBe("no changed paths recorded")
+  })
+})
+
+// ===========================================================================
+// (c) isPathListAnnouncementOnly — an emptied list is ABSENT, not empty
+//
+// `toWorkspaceRelative` deliberately leaves a path that resolves OUTSIDE the
+// workspace root absolute, and relativising against a root of "/" only strips
+// the leading slash. Either way the path lines keep the length and entropy
+// that trip the verifier's own secret scan, which then deletes every path and
+// keeps the header — a colon and a promise of a file list containing nothing,
+// shipped as a DEFINED field so the insufficient-evidence guard cannot see it.
+// ===========================================================================
+
+describe("isPathListAnnouncementOnly — B-3 fix (c)", () => {
+  it("says yes to a header with every path stripped out", () => {
+    expect(isPathListAnnouncementOnly(CHANGED_PATHS_HEADER)).toBe(true)
+    expect(isPathListAnnouncementOnly(UNTRACKED_FILES_HEADER)).toBe(true)
+    expect(isPathListAnnouncementOnly(`${CHANGED_PATHS_HEADER}\n\n${UNTRACKED_FILES_HEADER}\n`)).toBe(true)
+    expect(isPathListAnnouncementOnly(`${UNTRACKED_FILES_HEADER}\n  … and 37 more`)).toBe(true)
+  })
+
+  it("says no the moment ONE real path survives — otherwise the fix would recreate B-3 itself", () => {
+    expect(isPathListAnnouncementOnly(`${CHANGED_PATHS_HEADER}\n  src/a.ts`)).toBe(false)
+    expect(isPathListAnnouncementOnly(`${UNTRACKED_FILES_HEADER}\n  src/b.ts\n  … and 3 more`)).toBe(false)
+  })
+
+  it("says no to anything that is not a path-list announcement at all", () => {
+    // Narrow on purpose: no header means this predicate has no opinion, so a
+    // real `git diff --stat`, an empty field, or arbitrary prose is never
+    // reclassified as "an empty list".
+    expect(isPathListAnnouncementOnly("")).toBe(false)
+    expect(isPathListAnnouncementOnly("\n\n")).toBe(false)
+    expect(isPathListAnnouncementOnly(" src/v2/plugin.ts | 42 ++--\n 1 file changed")).toBe(false)
+    expect(isPathListAnnouncementOnly("no changed paths recorded")).toBe(false)
+  })
+
+  it("the header it matches is the header formatChangedPathsSummary actually prints", () => {
+    // The two must not drift: a renamed header would silently turn the check
+    // back off and restore the defect with no test failing anywhere else.
+    expect(formatChangedPathsSummary(["src/a.ts"], "/workspace/x").split("\n")[0]).toBe(CHANGED_PATHS_HEADER)
   })
 })
 
