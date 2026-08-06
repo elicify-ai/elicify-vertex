@@ -2383,6 +2383,168 @@ describe("B-3 SAFETY (FR-031): per-line scanning of a hunk-less diff summary sti
   })
 })
 
+// ---------------------------------------------------------------------------
+// The span pass, round 6. Four reproduced findings, each with its own isolator:
+//
+//  1. the wrapped-key guard leaked WHOLE KEYS whenever line 1 carried a prefix
+//     that put a non-alphabet character between itself and the key;
+//  2. the same guard's alphabet contained `.` and `/`, so it ATE tight lists of
+//     file paths — the changed-file evidence the verifier judges from;
+//  3. base32-shaped keys exonerated themselves as "words";
+//  4. `SPAN_MAX_UNITS` was pinned in neither direction (3 and 60 both left the
+//     suite green), and the pass cost 1700 ms on the worst field the raw-field
+//     safety cap admits.
+// ---------------------------------------------------------------------------
+describe("span pass round 6: the wrapped-key guard, the span window, and the cost", () => {
+  const KEY = "HMEr3sTxobYfDaktWCrSXRdwBMkQvZpNjLgUeIoA"
+  const flat = (text: string | undefined) => (text ?? "").replace(/[\r\n]/g, "")
+  const scan = (lines: string[]) => {
+    const logger = vi.fn()
+    return { out: scanProseField(lines.join("\n"), "recentTranscript", logger, 16000), logger }
+  }
+
+  it("FIX 1 (HIGH, reproduced): a quoted CLI flag on line 1 no longer buys the whole key a free pass", () => {
+    // Verbatim reproduction. The old guard demanded the fused token be ONE
+    // uninterrupted run of key alphabet; `--blob="` is alphabet, the `"` is
+    // not, and the key is alphabet — two runs, so the guard exonerated the
+    // span. Measured before this fix: this input came back BYTE-IDENTICAL with
+    // an EMPTY event list, in all six fields.
+    const { out, logger } = scan(["running deploy:", `--blob="HMEr3sTxobYf`, "DaktWCrS", `XRdwBMkQvZpNjLgUeIoA"`, "exit 0"])
+    expect(flat(out)).not.toContain(KEY)
+    expect(out).toBe("running deploy:\nexit 0")
+    expect(logger).toHaveBeenCalledWith("verifier:field-partial-drop", { field: "recentTranscript", kept: 2, dropped: 3 })
+  })
+
+  // The eight of sixteen realistic shapes that leaked. Measured over all 741
+  // three-way split points of the key above: 662 of 11,856 probes leaked
+  // before, 0 after. Each shape puts a different non-alphabet character
+  // between the prefix and the key, which is all it took.
+  it.each([
+    ['BLOB="', '"'],
+    ['"blob":"', '"'],
+    ["blob='", "'"],
+    ['--blob="', '"'],
+    ["setBlob(", ")"],
+    ["[x](", ")"],
+    ['<n v="', '"/>'],
+    ["id,blob,", ",end"],
+  ])("FIX 1: the key still goes when line 1 reads %s…", (prefix, suffix) => {
+    const { out } = scan(["running deploy:", prefix + KEY.slice(0, 12), KEY.slice(12, 20), KEY.slice(20) + suffix, "exit 0"])
+    expect(flat(out)).not.toContain(KEY)
+  })
+
+  it("FIX 1: …and a prefix whose punctuation is INTERIOR is still spared (the guard's whole reason to exist)", () => {
+    // The counterweight. Compact JSON has punctuation BETWEEN the joins, so
+    // there is no single-encoding core at all and the span is exonerated —
+    // the same verdict the old whole-token regex reached, for a reason that
+    // survives a prefix on line 1.
+    const lines = ['log: {"storyId":"S1",', '"pass":true,', '"summary":"done"}']
+    const { out, logger } = scan(lines)
+    expect(out).toBe(lines.join("\n"))
+    expect(logger).not.toHaveBeenCalled()
+  })
+
+  it("EXTRA FIX A (reproduced): a tight list of changed FILE PATHS survives byte-identical", () => {
+    // Measured: this exact field came back `undefined` — three innocent path
+    // lines in, the whole field DROPPED, the verifier left judging with no
+    // changed-file evidence at all. `.` and `/` were in the guard's key
+    // alphabet, so a path list fused into "one clean run of key material".
+    // Over 618 innocent corpora x 2 fields the span pass widened 66 of them;
+    // it now widens 0.
+    const lines = ["lib/ui/phase.mjs", "lib/api/main.rs", "internal/types/artifacts.py"]
+    const { out, logger } = scan(lines)
+    expect(out).toBe(lines.join("\n"))
+    expect(logger).not.toHaveBeenCalled()
+  })
+
+  it("EXTRA FIX A: an EXTENSIONLESS path list survives too — the dot is not what saves it", () => {
+    // `assets/api/helper` is pure `[A-Za-z0-9/]`, i.e. a legal base64 run, so
+    // the encoding test alone does not clear it. Three-or-more-segment paths
+    // in every unit do: a wrapped key chunk would need two `/` by chance in
+    // every one of its pieces.
+    const lines = ["assets/api/helper", "src/v2/index", "pkg/wiring/gate", "components/v2/artifacts"]
+    const { out, logger } = scan(lines)
+    expect(out).toBe(lines.join("\n"))
+    expect(logger).not.toHaveBeenCalled()
+  })
+
+  it("EXTRA FIX A: a snake_case identifier list survives — structured text, not key material", () => {
+    const lines = ["verifier_ui_helper", "story_db_main", "gate_adr_index", "coverage_api_tools"]
+    const { out } = scan(lines)
+    expect(out).toBe(lines.join("\n"))
+  })
+
+  it("FIX 2: a base32 key wrapped across three lines is removed — an all-caps run is not a word", () => {
+    // The measured residual. A base32 key is uppercase letters plus 2-7, so it
+    // carries no separator and no camelCase hump: `looksLikeWord` read its
+    // digit-delimited shards as vowel-bearing words and exonerated the join.
+    // Base32 was 3,584 of 12,718 whole-key leaks in a 180,000-probe sweep.
+    const b32 = "AJEN72OERLKQA3BZEV3TUHMVRWGXKZQA2PKDSUXV"
+    const { out } = scan(["deploying now", b32.slice(0, 13), b32.slice(13, 26), b32.slice(26), "done"])
+    expect(flat(out)).not.toContain(b32)
+    expect(out).toBe("deploying now\ndone")
+  })
+
+  it("EXTRA FIX B: a key wrapped across exactly SPAN_MAX_UNITS lines is removed", () => {
+    // 36 characters over six 6-character lines. Every window NARROWER than six
+    // carries at most 30 characters — under the 32-char entropy floor — so
+    // nothing but a full-width span can see this key. Lower SPAN_MAX_UNITS to
+    // 3, 4 or 5 and the key comes straight back.
+    const key = "aCreHz2wDL4keqaDIEZf8DRPIMNAygdlSQlR"
+    const units = [0, 1, 2, 3, 4, 5].map((i) => key.slice(i * 6, i * 6 + 6))
+    const { out } = scan(["deploying now:", ...units, "(done)"])
+    expect(flat(out)).not.toContain(key)
+    expect(out).toBe("deploying now:\n(done)")
+  })
+
+  it("EXTRA FIX B: the span window STOPS at SPAN_MAX_UNITS — a seven-line wrap is out of scope by design", () => {
+    // Pinning the bound, not endorsing the hole. A wrap this narrow means five
+    // characters per line, which no terminal, editor or serializer produces;
+    // the bound is what keeps the pass linear, and widening it was measured at
+    // ~10x the cost on an adversarial field. This test exists so that changing
+    // `SPAN_MAX_UNITS` — in EITHER direction — is a deliberate, visible act
+    // rather than a silent one: set it to 60 and this test fails.
+    const key = "sbmkYHSiA5H4eyTXQo0ZYjSvXZUdnhyfggW"
+    const units = [0, 1, 2, 3, 4, 5, 6].map((i) => key.slice(i * 5, i * 5 + 5))
+    const { out, logger } = scan(["deploying now:", ...units, "(done)"])
+    expect(flat(out)).toContain(key)
+    expect(logger).not.toHaveBeenCalled()
+  })
+
+  it("FIX 3: the span pass costs a bounded multiple of a plain scan on an adversarial field", () => {
+    // The worst field the raw-field safety cap admits: whitespace-free lines,
+    // so EVERY span is a candidate, each one tripping the cheap gate and then
+    // being rejected, so nothing is ever dropped and no span is skipped. That
+    // field measured 1700 ms (7600 units) / 912 ms (4000 units) before the
+    // fix and ~230 ms / ~135 ms after.
+    //
+    // Asserted as a RATIO against the same field with a space in every line —
+    // identical size and content class, but not a span candidate — so the bar
+    // does not move with the machine. Measured on this workload: 29.8-40.2x
+    // against the pre-fix build, 14.4-16.2x against a hand-reverted pre-fix
+    // SHAPE (per-join re-scan, pattern first, gate un-hoisted), 4.8-5.2x now.
+    const rows = 4000
+    const chunk = (i: number, n: number) => ((i * 2654435761) >>> 0).toString(36).padStart(7, "x").slice(0, n)
+    const adversarial: string[] = []
+    const baseline: string[] = []
+    for (let i = 0; i < rows; i++) {
+      adversarial.push(`${chunk(i, 6)}${chunk(i + 7919, 5)},`)
+      baseline.push(`${chunk(i, 6)} ${chunk(i + 7919, 5)},`)
+    }
+    const time = (lines: string[]) => {
+      const text = lines.join("\n")
+      expect(text.length).toBeLessThan(100_000) // else the field is rejected unscanned
+      scanProseField(text, "recentTranscript", () => {}, 16000)
+      const started = performance.now()
+      scanProseField(text, "recentTranscript", () => {}, 16000)
+      return performance.now() - started
+    }
+    const spaced = Math.max(time(baseline), 1)
+    const tight = time(adversarial)
+    expect(tight / spaced).toBeLessThan(10)
+  })
+})
+
 describe("B-3c: a path list the scan emptied is ABSENT, not present-but-empty", () => {
   /** Three paths outside the workspace root. `toWorkspaceRelative` leaves
    * these ABSOLUTE on purpose (a `../../..` chain reads worse), so they keep
