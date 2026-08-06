@@ -255,9 +255,14 @@ describe("MultiStoryGoalEngine", () => {
 describe("VerificationReceiptStore", () => {
   it("binds receipts to sessions and redacts command/output before storage", () => {
     const store = new VerificationReceiptStore()
+    // A REAL directory. `/work` does not exist, so the receipt's scope cannot
+    // be fingerprinted, and `isStale` deliberately FAILS CLOSED on an
+    // unfingerprintable scope — `get()` then correctly refuses to serve it.
+    // The store was behaving as designed; the fixture was fake.
+    const realRoot = mkdtempSync(join(tmpdir(), "vertex-receipt-"))
     const receipt = store.record({
       sessionID: "s1",
-      workspaceRoot: "/work",
+      workspaceRoot: realRoot,
       command: "curl -H 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz'",
       exitCode: 0,
       outcome: "verified",
