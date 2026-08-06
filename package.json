@@ -1,6 +1,6 @@
 {
   "name": "@elicify-ai/elicify-vertex",
-  "version": "0.13.0",
+  "version": "0.13.1",
   "description": "OpenCode plugin that makes any coding model behave like a mythos-class engineer: a behavioural contract, live in-loop detection and correction, and an independent verifier that verifies the work against your repo. Self-validating, evidence-driven agent loops — 'done' means proven, not claimed.",
   "type": "module",
   "main": "./dist/plugin.cjs",
