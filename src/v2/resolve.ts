@@ -37,6 +37,32 @@
  * runs (`relativiseToWorkspaceRoot`) so workspace/project-root scoping compares
  * like with like. Tier 2's miss was not a defect — the repo had no test files.
  *
+ * ## What B-4 broke, and what the follow-up fixes
+ *
+ * Widening tier 3 turned `resolution:none` into a PRESCRIPTION the coverage
+ * checker could not match, which is strictly worse: with no prescription an
+ * honest verifier run mints a receipt, while an unmatched prescription sets
+ * `relevanceGap`, flips `success` to false in `plugin.ts` and records the run as
+ * FAILED. Three consequences are addressed here and in `coverage.ts`:
+ *
+ *   - FIX 1 (`coverage.ts`): `npm run <script>` sat in no equivalence class, so
+ *     only a byte-identical spelling covered it — a pnpm repo running
+ *     `pnpm check` against a prescribed `npm run check` scored as a gap. Script
+ *     invocations now share one identity across npm/pnpm/yarn/bun, with `run`
+ *     optional, and a `-w` workspace selector is comparable with the
+ *     `cd <workspace> && …` spelling of the same run.
+ *   - FIX 2 (`resolvePackageScript`): the workspace decision came entirely before
+ *     the script decision, so a nested `build` beat the root's `test`. Script
+ *     QUALITY now breaks the tie across manifests; nearest still wins at equal
+ *     quality.
+ *   - FIX 3 (`preferredScript` / `isUnsafeScriptBody`): the preference list was
+ *     closed by NAME with the body unexamined, so `{lint: "eslint --fix ."}` had
+ *     the harness instructing the agent to rewrite the user's source as a
+ *     verification step. Bodies are inspected; unsafe ones are skipped.
+ *   - FIX 4 (`isInsideWorkspaceRoot`): this module's stated precondition
+ *     ("already filtered to inside the worktree") was never true of any caller.
+ *     It is enforced here now.
+ *
  * ## Language awareness (why tiers 2/3 are per-ecosystem)
  *
  * Tiers 2 and 3 used to know exactly one ecosystem: npm. In a polyglot repo that
@@ -132,6 +158,23 @@ export interface Manifest {
   scripts: Record<string, string>
   workspaceRoot?: string
   /**
+   * OTHER absolute spellings of the same worktree directory — the symlink the
+   * session was opened through, a bind mount, `/tmp` vs `/private/tmp`.
+   *
+   * One directory can have more than one true name, and the two sides of a
+   * changed path disagree about which one to use: the session carries the
+   * configured root while opencode's tools report the realpath of the file they
+   * touched. Since `isInsideWorkspaceRoot` now EXCLUDES paths outside the root
+   * (FIX 4), a mismatch would silently push every changed path out of the
+   * worktree and take the whole session's resolution down with it. A path under
+   * any listed spelling is inside.
+   *
+   * Optional and additive, like `testFiles`/`workspaces`/`projectRoots`:
+   * `measurement.ts`'s structural mirror declares neither, and omitting it means
+   * "the root has exactly one name", which is the usual case.
+   */
+  workspaceRootAliases?: readonly string[]
+  /**
    * Known test file paths (e.g. from a per-turn glob cache of `**\/*.test.*` /
    * `**\/*.spec.*`), used by the basename-convention tier. Optional — an absent or
    * empty list simply means the tier has nothing to match against.
@@ -160,7 +203,22 @@ export interface Manifest {
 }
 
 export interface ResolveContext {
-  /** Already filtered to inside the worktree by the caller (row 10: outside-worktree paths never reach this function). */
+  /**
+   * The paths a mutation touched, as the caller observed them — **NOT** pre-filtered.
+   *
+   * The old wording here ("already filtered to inside the worktree by the caller")
+   * was simply false, and a false stated precondition is worse than none: it is
+   * what let the B-4 (c) mis-scoping bug survive its own fix. The real chain is
+   * `index.ts:changedPathsFromTool` -> `plugin.ts`'s `tool.execute.after` ->
+   * `evidenceLedger.recordChangedFiles`, and it records opencode's raw
+   * `args.filePath` verbatim. Nothing in it compares the path to the worktree, so
+   * `/home/dev/other/packages/api/x.ts` reaches this module unchanged while the
+   * session is rooted at `/work/monorepo`.
+   *
+   * Dataset row 10 ("outside-worktree paths are excluded") is therefore enforced
+   * HERE, in `resolveVerifier`, whenever `manifest.workspaceRoot` is known — see
+   * `isInsideWorkspaceRoot`. Callers may still pre-filter; doing so is a no-op.
+   */
   changedPaths: string[]
   storyVerifiers: readonly string[] | null
 }
@@ -323,6 +381,60 @@ export function relativiseToWorkspaceRoot(path: string, workspaceRoot: string | 
 }
 
 /**
+ * Dataset row 10, enforced instead of assumed (see `ResolveContext.changedPaths`).
+ *
+ * An ABSOLUTE path that is not under a KNOWN workspace root is not this session's
+ * business, and letting it through is not merely useless — it is actively wrong.
+ * `normalizeChangedPath`'s marker heuristic hunts for `/<root>/` anywhere in the
+ * string, so with the session rooted at `/work/monorepo` an edit to
+ * `/home/dev/other/packages/api/x.ts` was reduced to `packages/api/x.ts` and
+ * prescribed `npm run check -w packages/api` — a workspace selector naming a
+ * package that the change is not merely outside of, but in a different REPO from.
+ * That is the exact defect B-4 (c) killed for paths inside the root, arriving by
+ * the one route B-4 (c) did not close.
+ *
+ * Fail-open where it cannot judge, as everywhere else in this module: a relative
+ * path, or a manifest with no (or a non-absolute) `workspaceRoot`, is kept. The
+ * root itself counts as inside, so a caller that hands over the worktree
+ * directory still resolves at the repo root instead of vanishing.
+ *
+ * The SYMLINK case (a root reached through a link, while the tool reports
+ * realpaths) is not a judgment this pure function can make — it is handled by
+ * giving it every spelling of the root instead: `wiring/manifest.ts` resolves the
+ * real path and records the other one in `Manifest.workspaceRootAliases`, and a
+ * path under ANY spelling is inside. Guessing at path equivalence, rather than
+ * being told, is what produced the bug above.
+ */
+export function isInsideWorkspaceRoot(path: string, workspaceRoot: string | undefined): boolean {
+  if (!path.startsWith("/")) return true
+  if (workspaceRoot === undefined) return true
+  const base = workspaceRoot.replace(/\/+$/, "")
+  if (base === "" || !base.startsWith("/")) return true
+  return path === base || path.startsWith(`${base}/`)
+}
+
+/** Every absolute spelling of the worktree root this manifest knows about. */
+function workspaceRootSpellings(manifest: Manifest | null): string[] {
+  const raw = manifest ? [manifest.workspaceRoot, ...(manifest.workspaceRootAliases ?? [])] : []
+  return raw.filter((root): root is string => typeof root === "string" && root.startsWith("/") && root !== "/")
+}
+
+/** Inside the worktree under ANY of its names; unknown root => cannot judge => inside. */
+function isInsideAnyRoot(path: string, roots: readonly string[]): boolean {
+  if (roots.length === 0) return true
+  return roots.some((root) => isInsideWorkspaceRoot(path, root))
+}
+
+/** Repo-relative form under the first root spelling that actually contains the path. */
+function relativiseToAnyRoot(path: string, roots: readonly string[]): string {
+  for (const root of roots) {
+    const relative = relativiseToWorkspaceRoot(path, root)
+    if (relative !== path) return relative
+  }
+  return path
+}
+
+/**
  * Residual normalisation for a path that `relativiseToWorkspaceRoot` could not
  * reduce — no `workspaceRoot` in the manifest (unit tests, `readManifest()` ->
  * null), or a path outside the root. Strips a `./` prefix, and for a still-absolute
@@ -385,11 +497,132 @@ function collectWorkspaces(manifest: Manifest): WorkspaceCandidate[] {
  */
 const PACKAGE_SCRIPT_PREFERENCE: readonly string[] = ["test", "check", "verify", "lint", "typecheck", "build"]
 
-/** The highest-preference usable script name in `scripts`, or null when it has none. */
+/**
+ * How much a script's NAME claims about behaviour. Used only to compare scripts
+ * ACROSS manifests (see `resolvePackageScript`); within one manifest the finer
+ * ordering of `PACKAGE_SCRIPT_PREFERENCE` decides.
+ *
+ * Two tiers, not six, because only one distinction is strong enough to overrule
+ * "nearest manifest wins":
+ *
+ *   0 — `test` / `check` / `verify` run the project's own assertions, or the
+ *       aggregate gate its author declared as the thing to run.
+ *   1 — `lint` / `typecheck` / `build` are static-only. They can refute a change,
+ *       but passing one says nothing about behaviour.
+ *
+ * FIX 2: `resolvePackageScript` picked the WORKSPACE first and the script second,
+ * so a nested package's weakest script beat the root's strongest one — root
+ * `{test}` + `packages/api: {build}` + a change under `packages/api` prescribed
+ * `npm run build -w packages/api`, where before B-4 (a) widened the script set it
+ * had prescribed `npm test`. B-4 (a) was supposed to widen what tier 3 can find,
+ * not to downgrade what it already found.
+ */
+const SCRIPT_QUALITY: ReadonlyMap<string, number> = new Map([
+  ["test", 0],
+  ["check", 0],
+  ["verify", 0],
+  ["lint", 1],
+  ["typecheck", 1],
+  ["build", 1],
+])
+
+function scriptQuality(name: string): number {
+  return SCRIPT_QUALITY.get(name) ?? 1
+}
+
+// ---------------------------------------------------------------------------
+// FIX 3 — a prescription must never tell the agent to MUTATE the workspace
+// ---------------------------------------------------------------------------
+//
+// `PACKAGE_SCRIPT_PREFERENCE` is closed by NAME, and until now the body behind
+// the name was unexamined: any non-blank string qualified. So
+// `{lint: "eslint --fix . && prettier --write ."}` — an entirely ordinary
+// package.json — resolved to `npm run lint`, which `findings.ts` renders to the
+// model as "Run `npm run lint` and cite its observed result". The harness would
+// then be the thing that told the agent to rewrite the user's source files, as a
+// side effect of *verifying*. `{build: "rm -rf dist && ./deploy.sh"}` is the same
+// shape with a deploy on the end.
+//
+// POSITION TAKEN, and why it is this one rather than the alternatives:
+//
+//   - Narrowing the NAME list does not work. The offending scripts are called
+//     `lint` and `build`; those names are exactly the ones `findings.ts`'s own
+//     generic category list already tells the model to run, and dropping them
+//     re-opens B-4's `resolution:none` for repos whose only verifier is a build.
+//   - Documenting the risk does not work either. A documented instruction to
+//     `--fix` the user's tree is still an instruction to `--fix` the user's tree.
+//   - So: INSPECT THE BODY, and skip a script whose body carries a write-back
+//     marker, falls through to the next preference, and prescribes nothing at all
+//     if every candidate is unsafe. Prescribing nothing costs a `resolution:none`
+//     (a known, survivable degrade with its own logging); prescribing a mutating
+//     command costs the user's working tree, which nothing can undo from here.
+//
+// The detector is a closed blocklist of shapes that actually occur, not a
+// sandbox, and it errs toward REFUSING to prescribe — a false positive here loses
+// one prescription, a false negative rewrites files.
+
+/** `--fix` (eslint, stylelint, ruff), `--write` (prettier), `sed -i`. */
+const WRITE_BACK_FLAG_RE = /(?:^|\s)(?:--fix|--write|--in-place)(?:[=\s]|$)|\bsed\s+-[A-Za-z]*i\b/
+
+/** Formatters that rewrite files unless explicitly asked not to. */
+const DEFAULT_WRITING_FORMATTER_RE = /\b(?:black|isort|rustfmt|ruff\s+format|dprint\s+fmt|cargo\s+fmt|go\s+fmt)\b/
+
+/** Flags that turn a default-writing formatter into a reporter. */
+const READ_ONLY_FORMAT_FLAG_RE = /(?:^|\s)(?:--check|--check-only|--diff|--dry-run|-l|--list-different)(?:[=\s]|$)/
+
+/** Commands with effects outside the working tree (or on git history). */
+const EFFECTFUL_COMMAND_RE =
+  /\b(?:deploy|publish|release|upload)\b|(?:^|\s)push\b|\bgit\s+(?:commit|push|add|checkout|switch|reset|clean|rebase|merge|tag|stash)\b/
+
+/** Scripts that never exit: a verification step that blocks forever is not one. */
+const NEVER_EXITING_RE =
+  /(?:^|\s)(?:--watch|--watchAll|--watch-all|--hot)(?:[=\s]|$)|\b(?:nodemon|watchexec|http-server|live-server)\b|\b(?:vite|webpack|snowpack)\s+(?:dev|serve)\b|\b(?:next|nuxt|astro|remix|gatsby)\s+dev\b|(?:^|\s)serve(?:\s|$)/
+
+/** Generated locations a build may legitimately delete and regenerate. */
+const BUILD_OUTPUT_PATH_RE =
+  /^(?:\.\/)?(?:dist|build|out|output|lib|libs|es|esm|cjs|coverage|target|tmp|temp|node_modules|\.next|\.nuxt|\.turbo|\.cache|\.svelte-kit|\.parcel-cache|\.vite|\.output)(?:[/\\].*)?$|\.tsbuildinfo$/
+
+const SHELL_OPERATOR_RE = /^(?:&&|\|\||;|\||&)$/
+
+/**
+ * `rm -rf dist` is part of building; `rm -rf src` is not. Any `rm` operand that
+ * is not a recognised generated location makes the script unsafe.
+ */
+function removesOutsideBuildOutput(body: string): boolean {
+  const tokens = body.split(/\s+/).filter((token) => token.length > 0)
+  for (let index = 0; index < tokens.length; index++) {
+    if (!/^(?:rm|rmdir|shx?)$/.test(tokens[index]) && tokens[index] !== "rimraf") continue
+    for (let arg = index + 1; arg < tokens.length; arg++) {
+      const token = tokens[arg]
+      if (SHELL_OPERATOR_RE.test(token)) break
+      if (token.startsWith("-")) continue
+      if (token === "rm" || token === "rimraf") continue // `shx rm`, `npx rimraf`
+      if (!BUILD_OUTPUT_PATH_RE.test(token)) return true
+    }
+  }
+  return false
+}
+
+/** Does running this script body change the user's workspace (or never return)? */
+export function isUnsafeScriptBody(body: string): boolean {
+  const text = body.trim()
+  if (text.length === 0) return true
+  if (WRITE_BACK_FLAG_RE.test(text)) return true
+  if (DEFAULT_WRITING_FORMATTER_RE.test(text) && !READ_ONLY_FORMAT_FLAG_RE.test(text)) return true
+  if (EFFECTFUL_COMMAND_RE.test(text)) return true
+  if (NEVER_EXITING_RE.test(text)) return true
+  if (removesOutsideBuildOutput(text)) return true
+  return false
+}
+
+/**
+ * The highest-preference usable script name in `scripts`, or null when it has
+ * none. "Usable" is name-listed AND non-blank AND non-mutating (FIX 3).
+ */
 function preferredScript(scripts: Record<string, string>): string | null {
   for (const name of PACKAGE_SCRIPT_PREFERENCE) {
     const body = scripts[name]
-    if (typeof body === "string" && body.trim().length > 0) return name
+    if (typeof body === "string" && !isUnsafeScriptBody(body)) return name
   }
   return null
 }
@@ -413,24 +646,34 @@ function packageScriptCommand(script: string, root: string): string {
  * command. "Nearest" walks from the most specific (longest) matching root down to the
  * repo root (`""`), picking the first workspace that declares any usable script.
  *
- * PRECEDENCE, unchanged by B-4 (a): the WORKSPACE decision comes first and the script
- * preference is applied inside the winner. A nested package's own `check` therefore
- * still beats the repo root's `test`, exactly as "nearest manifest wins" has always
- * meant — widening the script set must not quietly promote the root manifest.
+ * PRECEDENCE — "nearest manifest wins, at equal script QUALITY" (FIX 2).
+ *
+ * B-4 (a) left the workspace decision entirely ahead of the script decision, which
+ * was right while tier 3 only ever found `test` (every candidate was the same
+ * strength, so nearest was the only axis left) and wrong the moment the script set
+ * widened: root `{test}` + `packages/api: {build}` prescribed
+ * `npm run build -w packages/api` for a change under `packages/api`, i.e. B-4
+ * downgraded a repo that already had a working prescription. `SCRIPT_QUALITY`
+ * restores the missing axis with the minimum that fixes it — a strictly stronger
+ * ANCESTOR script wins, and at equal strength nearest still wins, so dataset row 9
+ * (root `test` vs nested `test` -> nested) and B-4's nested-`check`-beats-root-`test`
+ * case are both unchanged.
  */
 function resolvePackageScript(paths: readonly string[], manifest: Manifest): { command: string } | null {
   if (paths.length === 0) return null
 
-  const workspaces = collectWorkspaces(manifest)
+  const primaryPath = paths[0]
+  const candidates = collectWorkspaces(manifest)
     .map((workspace) => ({ root: workspace.root, script: preferredScript(workspace.scripts) }))
     .filter((workspace): workspace is { root: string; script: string } => workspace.script !== null)
-    .sort((a, b) => b.root.length - a.root.length)
+    .filter((workspace) => isWithinWorkspace(primaryPath, workspace.root))
+    // Best script QUALITY first; at equal quality the nearest (longest) manifest.
+    .sort((a, b) => scriptQuality(a.script) - scriptQuality(b.script) || b.root.length - a.root.length)
 
-  const primaryPath = paths[0]
-  const nearest = workspaces.find((workspace) => isWithinWorkspace(primaryPath, workspace.root))
-  if (!nearest) return null
+  const winner = candidates[0]
+  if (!winner) return null
 
-  return { command: packageScriptCommand(nearest.script, nearest.root) }
+  return { command: packageScriptCommand(winner.script, winner.root) }
 }
 
 /**
@@ -631,7 +874,19 @@ export function resolveVerifier(ctx: ResolveContext, deps: ResolveDeps): Resolut
   // because B-4 (c)'s relativisation needs `workspaceRoot` and every tier —
   // including the story tier's `matchedPaths` — must speak one coordinate system.
   const manifest = deps.readManifest()
-  const paths = rawPaths.map((path) => relativiseToWorkspaceRoot(path, manifest?.workspaceRoot))
+  // FIX 4: row 10 is ENFORCED here, not assumed of the caller — nothing upstream
+  // of this module compares a changed path to the worktree (see
+  // `ResolveContext.changedPaths`). Filtering before relativising is what stops an
+  // outside-the-repo path from reaching `normalizeChangedPath`'s marker heuristic
+  // and being scoped into a same-named workspace of a repo it does not live in.
+  const roots = workspaceRootSpellings(manifest)
+  const paths = rawPaths
+    .filter((path) => isInsideAnyRoot(path, roots))
+    .map((path) => relativiseToAnyRoot(path, roots))
+
+  if (paths.length === 0) {
+    return { command: null, rationale: "none", matchedPaths: [] }
+  }
 
   // Tier 1: active-story verifiers. Story precedence is absolute — a story that
   // declares its own verifiers overrides every ecosystem inference below.

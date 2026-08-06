@@ -45,6 +45,27 @@
  * module's concern — that stays with `parseVerification`. Here a pipeline is
  * reduced to its first segment, because `go test ./... | tail -50` verifies
  * exactly what `go test ./...` verifies; the tail is presentation.
+ *
+ * ## SPELLING is not meaning (FIX 1)
+ *
+ * Fail-closed governs what counts as the SAME WORK; it is not a licence to
+ * treat one command spelled two ways as two commands. Doing so is the other
+ * failure mode this module was built to end, and B-4 walked straight into it:
+ * `resolve.ts` began prescribing `npm run <script>`, which sat in no
+ * equivalence class, so in a pnpm repo the agent's correct `pnpm check` was a
+ * relevance gap — no receipt, and `plugin.ts` records the passing command as a
+ * failed verification. Three normalisations therefore run before any judgment,
+ * each of which can only make two names for ONE run agree:
+ *
+ *   - `canonicalScriptRunner` — `<pm> [run] <script>` across npm/pnpm/yarn/bun
+ *     is one runner identity. Not `npx`/`dlx` (those run a binary), not a
+ *     package-manager subcommand (`npm ci` is not the `ci` script).
+ *   - `canonicalNarrowingFlag` — `--workspace` and `-w` are one selector.
+ *   - `effectiveDirectory` — `-w packages/api` and `cd packages/api` name the
+ *     same place to run.
+ *
+ * None of them widens WHAT is compared, only how it is spelled: different
+ * scripts, different workspaces and different ecosystems stay incomparable.
  */
 
 // ===========================================================================
@@ -175,6 +196,44 @@ const NARROWING_FLAGS: ReadonlySet<string> = new Set([
 const RUNNER_NARROWING_FLAGS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   ["cargo test", new Set(["-p", "--package", "--bin", "--lib", "--example", "--bench", "--exclude"])],
 ])
+
+/**
+ * Selector flags that are two spellings of ONE selector. The recorded narrowing
+ * entry uses the canonical spelling, so `-w packages/api` and
+ * `--workspace packages/api` are the same restriction rather than two different
+ * ones.
+ *
+ * Measured: `narrowingAllows` compares the recorded strings literally, so an
+ * observed `npm run check --workspace packages/api` did not cover a prescribed
+ * `npm run check -w packages/api` — the resolver's own output, run back with the
+ * long spelling, scored as a different verification. Pure evidence starvation:
+ * the two commands are byte-for-byte the same work.
+ */
+const NARROWING_FLAG_ALIASES: ReadonlyMap<string, string> = new Map([["--workspace", "-w"]])
+
+function canonicalNarrowingFlag(flag: string): string {
+  return NARROWING_FLAG_ALIASES.get(flag) ?? flag
+}
+
+/** `-w pkg` / `--workspace pkg` — selects WHICH package runs, not which tests. */
+const WORKSPACE_SELECTOR_RE = /^(?:-w|--workspace)=(.*)$/
+
+/**
+ * The workspace directories a sub-command restricted itself to, as recorded in
+ * `narrowing`. `npm run check -w packages/api` names a DIRECTORY to run in, so
+ * it is compared against `cd packages/api && npm run check`'s `cwd` rather than
+ * against a path target — the two are the same run spelled two ways, and the
+ * second one was starving because nothing connected them.
+ */
+function workspaceSelectorDirs(narrowing: readonly string[] | undefined): string[] {
+  const dirs: string[] = []
+  for (const entry of narrowing ?? []) {
+    const match = WORKSPACE_SELECTOR_RE.exec(entry)
+    const value = match?.[1]?.replace(/^\.\//, "").replace(/\/+$/, "")
+    if (value) dirs.push(value)
+  }
+  return dirs
+}
 
 const RUNNER_NON_NARROWING_FLAGS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   ["cargo test", new Set(["--workspace", "--all"])],
@@ -388,14 +447,92 @@ export const WHOLE_SUITE_ALIASES: readonly (readonly string[])[] = [
   ["pytest", "python -m pytest", "python3 -m pytest", "py -m pytest", "uv run pytest", "poetry run pytest"],
 ]
 
+// ===========================================================================
+// PACKAGE-MANAGER SCRIPT IDENTITY
+// ===========================================================================
+
+/**
+ * Package managers that all execute the SAME `package.json` script when handed
+ * the same script name. `npx`/`bunx`/`pnpm dlx` are deliberately absent: they
+ * run a BINARY, not a script, so `npx vitest run` must never be read as
+ * "the `vitest` script".
+ */
+const PACKAGE_MANAGERS: ReadonlySet<string> = new Set(["npm", "pnpm", "yarn", "bun"])
+
+/**
+ * Words that are the package manager's OWN subcommand and can therefore never
+ * be a script name in the bare `<pm> <word>` form. Closed on purpose and
+ * fail-closed: an unknown word IS treated as a script (that is the widening
+ * this table bounds), so anything that installs, publishes or executes an
+ * arbitrary binary has to be listed here or `npm ci` would be read as the
+ * `ci` script and could cover a prescribed `npm run ci`.
+ *
+ * npm's lifecycle aliases (`test`, `start`, `stop`, `restart`) are NOT listed:
+ * they are exactly "run the script of that name", which is what this table's
+ * absence means.
+ */
+const PACKAGE_MANAGER_SUBCOMMANDS: ReadonlySet<string> = new Set([
+  "install", "i", "ci", "add", "remove", "rm", "uninstall", "un", "link", "unlink",
+  "update", "up", "upgrade", "outdated", "audit", "dedupe", "prune", "rebuild",
+  "publish", "pack", "unpublish", "deprecate", "owner", "access", "dist-tag",
+  "exec", "dlx", "x", "create", "init", "import", "patch", "patch-commit",
+  "config", "set", "get", "cache", "store", "env", "explain", "why", "ls", "list",
+  "view", "info", "search", "docs", "repo", "bugs", "fund", "doctor", "ping",
+  "login", "logout", "adduser", "whoami", "token", "team", "org", "profile",
+  "version", "root", "bin", "prefix", "help", "completion", "node", "workspace",
+  "workspaces", "global", "why-not", "licenses", "dedupe-check", "install-test",
+])
+
+/**
+ * FIX 1 (evidence starvation, measured): reduce `<pm> [run] <script>` to ONE
+ * identity, `npm run <script>`.
+ *
+ * `resolve.ts` prescribes `npm run <script>` unconditionally — it has no idea
+ * which package manager the repo uses. In a pnpm repo the agent runs
+ * `pnpm check`, in a yarn repo `yarn check`; both execute the identical
+ * `scripts.check` from the identical `package.json`, and both scored as a
+ * DIFFERENT verification, because `npm run check` sat in no equivalence class
+ * at all and only a byte-identical spelling covered it. The relevance gap that
+ * follows suppresses the receipt AND flips `success` to false in
+ * `plugin.ts`, so the turn ends worse off than if nothing had been prescribed.
+ *
+ * Where the line is drawn: SAME SCRIPT NAME, different launcher. Nothing here
+ * makes two different scripts interchangeable — `npm run build` still does not
+ * cover `npm run check`, and neither covers `npm test` (only the explicit
+ * `WHOLE_SUITE_ALIASES` class does that, and `run test`/`t`/`test` collapse
+ * into it deliberately). A command whose leading words do not reduce cleanly
+ * (`yarn vitest run`, `pnpm dlx …`) is returned unchanged and keeps matching
+ * only itself.
+ */
+function canonicalScriptRunner(runner: string): string {
+  const tokens = runner.split(" ").filter((token) => token.length > 0)
+  if (tokens.length < 2 || !PACKAGE_MANAGERS.has(tokens[0])) return runner
+  const explicit = tokens[1] === "run" || tokens[1] === "run-script"
+  const script = explicit ? tokens[2] : tokens[1]
+  const rest = tokens.slice(explicit ? 3 : 2)
+  // Extra runner words mean this is not a plain script invocation (`yarn vitest
+  // run` is a BINARY with an argument). Refuse to guess.
+  if (script === undefined || script.length === 0 || rest.length > 0) return runner
+  if (!explicit && PACKAGE_MANAGER_SUBCOMMANDS.has(script)) return runner
+  return `npm run ${script}`
+}
+
 /** runner -> index of its equivalence class in `WHOLE_SUITE_ALIASES`. */
 const ALIAS_GROUP_BY_RUNNER: ReadonlyMap<string, number> = (() => {
   const map = new Map<string, number>()
   WHOLE_SUITE_ALIASES.forEach((group, index) => {
-    for (const runner of group) map.set(normalizeRunner(runner), index)
+    for (const runner of group) map.set(canonicalScriptRunner(normalizeRunner(runner)), index)
   })
   return map
 })()
+
+/**
+ * `WHOLE_SUITE_WHEN_BARE` under the same script identity, so `pnpm test` and
+ * `bun run test` are whole-suite for the same reason `npm test` is.
+ */
+const WHOLE_SUITE_WHEN_BARE_CANONICAL: ReadonlySet<string> = new Set(
+  [...WHOLE_SUITE_WHEN_BARE].map((runner) => canonicalScriptRunner(runner)),
+)
 
 /**
  * Flags whose *value* names the program to run rather than an option to it, so
@@ -888,13 +1025,6 @@ function toSubCommand(tokens: readonly string[]): SubCommand | null {
   const bareOperandsArePaths = isBracketTest
     ? fileTestOperator !== undefined
     : FILESYSTEM_PREDICATE_RUNNERS.has(runnerTokens[0])
-  const targets = rest
-    .filter((token) => !isFlagToken(token))
-    // CRIT-1 (C4-5): `test -d "research"` kept its quotes as part of the
-    // target and therefore no longer matched the identical unquoted command.
-    // Quoting is shell syntax, not part of the path.
-    .map((token) => token.replace(/^(['"])(.*)\1$/, "$2"))
-    .filter((token) => bareOperandsArePaths || isPathShaped(token))
 
   // CRIT-2 (round 4): gating only BARE operands left the string-test bug open
   // for every operand with a dot or a slash — i.e. nearly every real file.
@@ -907,11 +1037,27 @@ function toSubCommand(tokens: readonly string[]): SubCommand | null {
     isBracketTest ? [runnerTokens[0], fileTestOperator ?? "(none)"].join(" ") : runnerTokens.join(" "),
   )
   const runnerScoped = scopedFlags(RUNNER_NON_EXECUTING_FLAGS, runner)
+  const narrowing = extractNarrowing(rest, runner)
+
+  // A workspace selector's VALUE is a package to run in, not a path to verify.
+  // Leaving `packages/api` in `targets` made `npm run check -w packages/api`
+  // demand a path target that the honest equivalent
+  // (`cd packages/api && npm run check`) can never produce; the selector is
+  // compared as a directory instead (see `workspaceSelectorDirs`).
+  const workspaceValues = new Set(workspaceSelectorDirs(narrowing))
+  const targets = rest
+    .filter((token) => !isFlagToken(token))
+    // CRIT-1 (C4-5): `test -d "research"` kept its quotes as part of the
+    // target and therefore no longer matched the identical unquoted command.
+    // Quoting is shell syntax, not part of the path.
+    .map((token) => token.replace(/^(['"])(.*)\1$/, "$2"))
+    .filter((token) => bareOperandsArePaths || isPathShaped(token))
+    .filter((token) => !workspaceValues.has(token.replace(/^\.\//, "").replace(/\/+$/, "")))
 
   return {
     runner,
     targets,
-    narrowing: extractNarrowing(rest, runner),
+    narrowing,
     nonExecuting: rest.some((token) => {
       const flag = token.split("=")[0]
       return NON_EXECUTING_FLAGS.has(flag) || runnerScoped.has(flag)
@@ -945,17 +1091,18 @@ function extractNarrowing(tokens: readonly string[], runner: string): string[] {
     const eq = token.indexOf("=")
     if (eq > 0) {
       const name = token.slice(0, eq)
-      if (narrows(name)) found.push(`${name}=${token.slice(eq + 1)}`)
+      if (narrows(name)) found.push(`${canonicalNarrowingFlag(name)}=${token.slice(eq + 1)}`)
       continue
     }
 
     if (!narrows(token)) continue
+    const canonical = canonicalNarrowingFlag(token)
     const value = tokens[i + 1]
     if (value !== undefined && !isFlagToken(value)) {
-      found.push(`${token}=${value}`)
+      found.push(`${canonical}=${value}`)
       i++
     } else {
-      found.push(`${token}=`)
+      found.push(`${canonical}=`)
     }
   }
   return found.sort()
@@ -973,8 +1120,8 @@ function extractNarrowing(tokens: readonly string[], runner: string): string[] {
  * cross-ecosystem pair and — critically — `go build` vs `go test`.
  */
 export function runnerEquivalent(a: string, b: string): boolean {
-  const left = normalizeRunner(a)
-  const right = normalizeRunner(b)
+  const left = canonicalScriptRunner(normalizeRunner(a))
+  const right = canonicalScriptRunner(normalizeRunner(b))
   if (left.length === 0 || right.length === 0) return false
   if (left === right) return true
 
@@ -1094,8 +1241,22 @@ export function targetsCover(observedTargets: readonly string[], prescribedTarge
 // ===========================================================================
 
 /** One observed sub-command covers one prescribed sub-command. */
-/** `-w pkg` / `--workspace pkg` — selects WHICH package runs, not which tests. */
-const WORKSPACE_SELECTOR_RE = /^(?:-w|--workspace)=/
+
+/**
+ * The directory a sub-command effectively runs in: an explicit `cd` if there
+ * was one, otherwise the workspace its `-w`/`--workspace` selector names.
+ *
+ * Folding the selector in here is what makes the two spellings of one run
+ * comparable — `npm run check -w packages/api` (what `resolve.ts` prescribes)
+ * and `cd packages/api && npm run check` (what an agent in a monorepo actually
+ * types). It cannot loosen the root case: a selector only ever moves the
+ * effective directory DOWN, and a bare root run against a non-root prescription
+ * is still refused below.
+ */
+function effectiveDirectory(part: SubCommand): string {
+  if (part.cwd !== undefined && part.cwd !== "") return part.cwd
+  return workspaceSelectorDirs(part.narrowing)[0] ?? ""
+}
 
 export function subCommandCovers(observed: SubCommand, prescribed: SubCommand): boolean {
   if (!runnerEquivalent(observed.runner, prescribed.runner)) return false
@@ -1103,8 +1264,8 @@ export function subCommandCovers(observed: SubCommand, prescribed: SubCommand): 
   // The observed run must happen at or ABOVE the prescribed directory. Running
   // in `backend` cannot evidence a prescription rooted at the repo; running at
   // the repo root can evidence one rooted at `backend`, subject to targets.
-  const observedCwd = observed.cwd ?? ""
-  const prescribedCwd = prescribed.cwd ?? ""
+  const observedCwd = effectiveDirectory(observed)
+  const prescribedCwd = effectiveDirectory(prescribed)
   // Only for a BARE invocation. Once a sub-command names targets they have
   // already been re-expressed from the repo root by `applyDirectoryChanges`, so
   // they describe the true scope and the directory is redundant --
@@ -1152,13 +1313,17 @@ export function subCommandCovers(observed: SubCommand, prescribed: SubCommand): 
   // `npm test -w packages/api` asserts a package was verified by a command that
   // never touched it. (This is the same hazard `go test` is excluded from
   // WHOLE_SUITE_WHEN_BARE for.)
+  // ...with ONE way out, and it is not a loosening: the observed command ran in
+  // that very workspace directory (`cd packages/api && npm run check`). That is
+  // the same work the selector names, spelled the way an agent types it, and
+  // refusing it starved the most ordinary monorepo verifier there is.
   const prescribedWorkspaces = (prescribed.narrowing ?? []).filter((n) => WORKSPACE_SELECTOR_RE.test(n))
   if (prescribedWorkspaces.length > 0) {
     const observedWorkspaces = (observed.narrowing ?? []).filter((n) => WORKSPACE_SELECTOR_RE.test(n))
-    if (observedWorkspaces.length === 0) return false
+    if (observedWorkspaces.length === 0 && observedCwd !== prescribedCwd) return false
   }
 
-  if (observed.targets.length === 0 && !WHOLE_SUITE_WHEN_BARE.has(observed.runner)) {
+  if (observed.targets.length === 0 && !WHOLE_SUITE_WHEN_BARE_CANONICAL.has(canonicalScriptRunner(observed.runner))) {
     return prescribed.targets.length === 0
   }
 

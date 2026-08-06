@@ -17,7 +17,7 @@
  * count-bounded so a pathological repo layout cannot blow the latency
  * budget or run forever.
  */
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs"
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs"
 import { join, relative } from "node:path"
 
 import type { Manifest, ProjectRoot } from "../resolve.js"
@@ -149,6 +149,32 @@ function scanRepo(root: string): { testFiles: string[]; projectRoots: ProjectRoo
   return { testFiles: results, projectRoots }
 }
 
+/**
+ * Every absolute spelling of this worktree: the real path first, then the one
+ * the session was configured with if it differs.
+ *
+ * `resolve.ts` compares changed paths against these to decide what is inside the
+ * worktree, and the two sides do not have to agree on a spelling: opencode's
+ * `edit`/`write` tools report the REALPATH of the file they touched, while the
+ * session's root is whatever the user opened — which may be a symlink (a linked
+ * worktree, `/var` -> `/private/var`, a container bind mount). One spelling on
+ * each side and no link between them means every changed path looks like it is
+ * outside the repo, and the session resolves to `none` for good.
+ *
+ * Falls back to the given root when the path cannot be resolved (it may not
+ * exist in a unit test): a missing directory is not a reason to throw out of a
+ * manifest read.
+ */
+function rootSpellings(workspaceRoot: string): { root: string; aliases: string[] } {
+  let real = workspaceRoot
+  try {
+    real = realpathSync(workspaceRoot)
+  } catch {
+    real = workspaceRoot
+  }
+  return { root: real, aliases: real === workspaceRoot ? [] : [workspaceRoot] }
+}
+
 export function buildManifest(workspaceRoot: string): Manifest {
   const rootPkg = readPackageJson(workspaceRoot)
   const scripts = rootPkg?.scripts ?? {}
@@ -160,7 +186,8 @@ export function buildManifest(workspaceRoot: string): Manifest {
     }
   }
   const { testFiles, projectRoots } = scanRepo(workspaceRoot)
-  return { scripts, workspaceRoot, testFiles, workspaces, projectRoots }
+  const { root, aliases } = rootSpellings(workspaceRoot)
+  return { scripts, workspaceRoot: root, workspaceRootAliases: aliases, testFiles, workspaces, projectRoots }
 }
 
 /** Per-turn manifest cache, keyed by workspace root. `invalidate()` is

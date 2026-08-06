@@ -979,3 +979,133 @@ describe("CR-10: a negated file test never credits the positive one", () => {
     })
   }
 })
+
+// ===========================================================================
+// FIX 1 — `npm run <script>` sat in NO equivalence class, so only a
+// byte-identical spelling covered it. MEASURED, before the fix:
+//
+//   prescribed "npm run check" <= covered by ["npm run check",
+//                                             "npm run check --silent"]
+//   prescribed "npm run build" <= covered by ["npm run build"]
+//
+// `resolve.ts` prescribes `npm run <script>` unconditionally — it cannot know
+// which package manager the repo uses — so in a pnpm or yarn repo the agent's
+// perfectly correct `pnpm check` scored as a relevance gap. That costs more than
+// a receipt: `plugin.ts` folds the gap into `success`, so the run is recorded as
+// FAILED and the story stays open. Before B-4 widened tier 3 there was no
+// prescription at all and the very same run minted a receipt.
+//
+// WHERE THE LINE IS DRAWN: same script name, different launcher. Nothing below
+// makes two different scripts, two different workspaces, or a package-manager
+// subcommand interchangeable.
+// ===========================================================================
+
+describe("FIX 1: one script, every package manager (the covering half)", () => {
+  const COVERS: Array<[string, string]> = [
+    ["npm run check", "npm run check"],
+    ["npm run check", "pnpm run check"],
+    ["npm run check", "pnpm check"],
+    ["npm run check", "yarn run check"],
+    ["npm run check", "yarn check"],
+    ["npm run check", "bun run check"],
+    ["npm run check", "npm run-script check"],
+    ["npm run check", "npm run check --silent"],
+    ["npm run check", "npm --silent run check"],
+    ["npm run check", "CI=1 pnpm run check 2>&1 | tail -5"],
+    ["npm run check", "cd . && yarn check"],
+    ["npm run build", "yarn build"],
+    ["npm run build", "pnpm build"],
+    ["npm run typecheck", "bun run typecheck"],
+    // The whole-suite alias class keeps working through the same identity.
+    ["npm test", "pnpm test"],
+    ["npm test", "bun test"],
+    ["npm test", "yarn run test"],
+    ["npm test", "npx vitest run"],
+  ]
+  for (const [prescribed, observed] of COVERS) {
+    it(`credits: ${prescribed} <- ${observed}`, () => {
+      expect(observedCoversPrescribed(prescribed, observed)).toBe(true)
+    })
+  }
+
+  it("a whole-suite run through ANY package manager covers a narrow tier-2 prescription", () => {
+    // `resolve.ts`'s basename tier prescribes a single test file; running the
+    // whole suite is broader and must count — through pnpm/yarn/bun too, or the
+    // `WHOLE_SUITE_WHEN_BARE` privilege stops at npm.
+    const prescribed = "npx vitest run tests/lexer.test.ts"
+    for (const observed of ["npm test", "pnpm test", "yarn test", "bun run test"]) {
+      expect(observedCoversPrescribed(prescribed, observed), observed).toBe(true)
+    }
+    // A non-whole-suite script is still not a whole-suite run.
+    expect(observedCoversPrescribed(prescribed, "pnpm build")).toBe(false)
+    expect(observedCoversPrescribed(prescribed, "pnpm check")).toBe(false)
+  })
+})
+
+describe("FIX 1: the widening stops at the script NAME (the fail-closed half)", () => {
+  const REFUSES: Array<[string, string]> = [
+    // A different script is not evidence for this one.
+    ["npm run check", "npm test"],
+    ["npm run check", "npm run build"],
+    ["npm run build", "npm run check"],
+    ["npm run check", "npx vitest run"],
+    ["npm run check", "pnpm build"],
+    // A package manager's OWN subcommand is not a script (`npm ci` installs).
+    ["npm run ci", "npm ci"],
+    ["npm run install", "pnpm install"],
+    ["npm run publish", "npm publish"],
+    ["npm test", "npm ci"],
+    // `npx`/`dlx` run a BINARY, so they are never "the script of that name".
+    ["npm run vitest", "npx vitest"],
+    ["npm run vitest", "pnpm dlx vitest"],
+    // Extra runner words mean this is not a plain script invocation.
+    ["npm run vitest", "yarn vitest run"],
+    // Cross-ecosystem stays impossible.
+    ["npm run check", "pytest"],
+    ["pytest", "pnpm check"],
+  ]
+  for (const [prescribed, observed] of REFUSES) {
+    it(`refuses: ${prescribed} <- ${observed}`, () => {
+      expect(observedCoversPrescribed(prescribed, observed)).toBe(false)
+    })
+  }
+})
+
+describe("FIX 1: a workspace selector is one run spelled several ways", () => {
+  const PRESCRIBED = "npm run check -w packages/api"
+
+  it("credits the long spelling of the same selector", () => {
+    expect(observedCoversPrescribed(PRESCRIBED, "npm run check --workspace packages/api")).toBe(true)
+    expect(observedCoversPrescribed(PRESCRIBED, "npm run check --workspace=packages/api")).toBe(true)
+  })
+
+  it("credits the `cd` spelling — the shape an agent actually types in a monorepo", () => {
+    expect(observedCoversPrescribed(PRESCRIBED, "cd packages/api && npm run check")).toBe(true)
+    expect(observedCoversPrescribed(PRESCRIBED, "cd packages/api && pnpm check")).toBe(true)
+  })
+
+  it("still refuses a bare root run — a root script need not enter the workspace", () => {
+    expect(observedCoversPrescribed(PRESCRIBED, "npm run check")).toBe(false)
+    expect(observedCoversPrescribed(PRESCRIBED, "pnpm check")).toBe(false)
+  })
+
+  it("still refuses a DIFFERENT workspace, in either spelling", () => {
+    expect(observedCoversPrescribed(PRESCRIBED, "npm run check -w packages/web")).toBe(false)
+    expect(observedCoversPrescribed(PRESCRIBED, "cd packages/web && npm run check")).toBe(false)
+  })
+
+  it("still refuses a narrowed run against an unnarrowed prescription (direction preserved)", () => {
+    expect(observedCoversPrescribed("npm run check", PRESCRIBED)).toBe(false)
+    expect(observedCoversPrescribed("npm test", "npm test -w packages/api")).toBe(false)
+    expect(observedCoversPrescribed("npm test", "cd packages/api && npm test")).toBe(false)
+  })
+
+  it("the selector's value is a workspace, not a path target", () => {
+    // Leaving `packages/api` in `targets` is what made the `cd` spelling
+    // impossible to credit: it demanded a path argument that the honest
+    // equivalent never produces.
+    expect(parseSubcommands(PRESCRIBED)).toEqual([
+      { runner: "npm run check", targets: [], narrowing: ["-w=packages/api"], nonExecuting: false },
+    ])
+  })
+})
