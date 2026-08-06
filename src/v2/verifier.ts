@@ -144,8 +144,15 @@ const VERIFIER_PAYLOAD_FIELD_CHAR_CAP = 2000
  * argue with, not a claim." Kept as its own named constant (not derived from
  * `VERIFIER_PAYLOAD_FIELD_CHAR_CAP * 2`) so it can be tuned independently
  * without touching the other four fields' cap.
+ *
+ * RAISED 4000 -> 16000 (operator decision, 2026-08-06, backlog B-3a). Measured
+ * on a live session: the transcript arrived at 5923 chars and was cut to 4000,
+ * so the verifier lost the most recent third of the conversation — the part
+ * describing the work it was being asked to judge. 16000 was chosen over 32000
+ * or uncapped to keep the per-audit prompt cost and the redaction scan bounded;
+ * this field is model-visible and every character goes through `scanUnits`.
  */
-const VERIFIER_TRANSCRIPT_FIELD_CHAR_CAP = 4000
+const VERIFIER_TRANSCRIPT_FIELD_CHAR_CAP = 16000
 
 /**
  * HANDOVER.md point 4: the `plan` field's cap. Originally 4000 chars, copied
@@ -805,11 +812,48 @@ type VerifierFieldName = "criteria" | "verifierSummaries" | "diffSummary" | "las
  * share it never pass this argument); `recentTranscript` passes its own
  * `VERIFIER_TRANSCRIPT_FIELD_CHAR_CAP` explicitly so the logged `cap` value
  * always reflects the bound actually applied.
+ *
+ * ── WHICH END GETS CUT (backlog B-3a) ─────────────────────────────────────
+ * This used to be `slice(0, cap)` unconditionally — keep the START, discard
+ * the end. For a CHRONOLOGICAL field that is backwards, and it was measured
+ * doing real harm: a 5923-char transcript was cut to its first 4000, so the
+ * verifier read the opening of the session and never saw the most recent
+ * messages describing the work it was judging.
+ *
+ * Operator ruling, 2026-08-06: "it needs to cut at the top not the bottom —
+ * the last messages are the relevant ones."
+ *
+ * So the direction is now per-field, not global:
+ *   - `tail` for prose that accumulates over time, where the conclusion is at
+ *     the end (`recentTranscript`, `lastResponse`);
+ *   - `head` for structured, front-loaded fields where the opening carries the
+ *     summary (`plan`, `diffSummary`, and the line-array fields).
+ * Flipping all five would have been wrong in the other direction.
+ *
+ * SAFETY: this does not weaken redaction. `scanProseField` is scan-THEN-
+ * truncate (see its doc): every unit has already been through `scanUnits`
+ * before this function sees the text, so both ends are equally clean and
+ * moving the cut point cannot expose a secret that survived the scan.
  */
-function truncateField(text: string, field: VerifierFieldName, logger: EventLogger, cap: number = VERIFIER_PAYLOAD_FIELD_CHAR_CAP): string {
+type TruncateKeep = "head" | "tail"
+
+/** Marks a tail cut so the verifier knows it is reading a fragment, not the whole. */
+const TRUNCATION_MARKER = "…[earlier content trimmed]…\n"
+
+function truncateField(
+  text: string,
+  field: VerifierFieldName,
+  logger: EventLogger,
+  cap: number = VERIFIER_PAYLOAD_FIELD_CHAR_CAP,
+  keep: TruncateKeep = "head",
+): string {
   if (text.length <= cap) return text
-  logger("verifier:field-truncated", { field, originalLength: text.length, cap })
-  return text.slice(0, cap)
+  logger("verifier:field-truncated", { field, originalLength: text.length, cap, keep })
+  if (keep === "head") return text.slice(0, cap)
+  // The marker is part of the budget, not on top of it — otherwise a "capped"
+  // field ships slightly over its cap and the bound stops being a bound.
+  const room = Math.max(0, cap - TRUNCATION_MARKER.length)
+  return TRUNCATION_MARKER + text.slice(text.length - room)
 }
 
 /**
@@ -957,7 +1001,10 @@ export function scanProseField(
   }
   logPartialDrop(units, kept, anyDropped, field, logger)
   if (kept.length === 0) return undefined
-  const truncated = truncateField(kept.join("\n"), field, logger, cap)
+  // B-3a: chronological fields keep their TAIL — the recent end is the part
+  // worth judging. `plan` is front-loaded and keeps its head.
+  const keep: TruncateKeep = field === "plan" ? "head" : "tail"
+  const truncated = truncateField(kept.join("\n"), field, logger, cap, keep)
   return truncated.length === 0 ? undefined : truncated
 }
 

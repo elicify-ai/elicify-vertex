@@ -269,6 +269,7 @@ describe("buildVerifierPayload", () => {
       field: "verifierSummaries",
       originalLength: longClean.length,
       cap: 2000,
+      keep: "head",
     })
     logger.mockClear()
 
@@ -354,6 +355,7 @@ describe("buildVerifierPayload", () => {
       field: "verifierSummaries",
       originalLength: longCleanLine.length,
       cap: 2000,
+      keep: "head",
     })
     expect(logger).not.toHaveBeenCalledWith("verifier:field-dropped", expect.anything())
   })
@@ -602,9 +604,9 @@ describe("buildVerifierPayload", () => {
     expect(logger).toHaveBeenCalledWith("verifier:field-partial-drop", { field: "recentTranscript", kept: 2, dropped: 1 })
   })
 
-  it("§5: recentTranscript is truncated to its own 4000-char cap (double the other fields' cap), not VERIFIER_PAYLOAD_FIELD_CHAR_CAP", () => {
+  it("§5: recentTranscript is truncated to its own 16000-char cap (B-3a raised it from 4000), not VERIFIER_PAYLOAD_FIELD_CHAR_CAP", () => {
     const logger = vi.fn()
-    const longClean = "assistant: ok ".repeat(400) // well past 4000 chars, no secrets
+    const longClean = "assistant: ok ".repeat(1600) // well past 16000 chars, no secrets
     const raw = {
       criteria: [],
       diffSummary: "",
@@ -615,12 +617,78 @@ describe("buildVerifierPayload", () => {
     }
     const payload = buildVerifierPayload(raw, logger)
     expect(payload.recentTranscript).toBeDefined()
-    expect(payload.recentTranscript!.length).toBeLessThanOrEqual(4000)
+    expect(payload.recentTranscript!.length).toBeLessThanOrEqual(16000)
     expect(logger).toHaveBeenCalledWith("verifier:field-truncated", {
       field: "recentTranscript",
       originalLength: longClean.length,
-      cap: 4000,
+      cap: 16000,
+      keep: "tail",
     })
+  })
+
+  // =========================================================================
+  // B-3a — WHICH END SURVIVES. Every other truncation test here asserts a
+  // LENGTH, and a length is satisfied by cutting either end, so none of them
+  // could see that chronological fields were being cut backwards. Measured on
+  // a live session: a 5923-char transcript was cut to its first 4000, so the
+  // verifier read the opening of the session and never saw the most recent
+  // messages — the ones describing the work it was judging.
+  //
+  // Operator ruling, 2026-08-06: "cut at the top not the bottom — the last
+  // messages are the relevant ones."
+  // =========================================================================
+  it("keeps the END of recentTranscript and discards the beginning", () => {
+    const logger = vi.fn()
+    // Distinguishable ends: only one of them can survive a cut.
+    const opening = "OPENING_OF_SESSION "
+    const filler = "middle chatter ".repeat(1600) // pushes well past the 16000 cap
+    const closing = " CLOSING_OF_SESSION"
+    const raw = {
+      criteria: [],
+      diffSummary: "",
+      verifierSummaries: [],
+      lastResponse: "",
+      recentTranscript: opening + filler + closing,
+      plan: "",
+    }
+    const kept = buildVerifierPayload(raw, logger).recentTranscript!
+    expect(kept.endsWith(closing), "the most recent text must survive").toBe(true)
+    expect(kept.includes(opening), "the oldest text is what gets dropped").toBe(false)
+    expect(kept.length, "the cap still binds, marker included").toBeLessThanOrEqual(16000)
+    expect(kept.startsWith("…["), "a tail cut must announce itself, or the verifier reads a fragment as a whole").toBe(true)
+  })
+
+  it("keeps the END of lastResponse — its conclusion is at the bottom", () => {
+    const logger = vi.fn()
+    const raw = {
+      criteria: [],
+      diffSummary: "",
+      verifierSummaries: [],
+      lastResponse: "FIRST_LINE " + "padding ".repeat(500) + " FINAL_VERDICT",
+      recentTranscript: "",
+      plan: "",
+    }
+    const kept = buildVerifierPayload(raw, logger).lastResponse!
+    expect(kept.endsWith("FINAL_VERDICT")).toBe(true)
+    expect(kept.includes("FIRST_LINE")).toBe(false)
+  })
+
+  // The direction is PER FIELD, not global. `plan` is front-loaded — its
+  // opening carries the story list — so it keeps its head. Flipping all five
+  // fields would have been wrong in the other direction.
+  it("keeps the START of plan", () => {
+    const logger = vi.fn()
+    const raw = {
+      criteria: [],
+      diffSummary: "",
+      verifierSummaries: [],
+      lastResponse: "",
+      recentTranscript: "",
+      plan: "PLAN_HEADER " + "story line ".repeat(2000) + " PLAN_FOOTER",
+    }
+    const kept = buildVerifierPayload(raw, logger).plan!
+    expect(kept.startsWith("PLAN_HEADER"), "a front-loaded field keeps its head").toBe(true)
+    expect(kept.includes("PLAN_FOOTER")).toBe(false)
   })
 
   it("§5: lastResponse over 2000 chars is truncated at the SAME cap as the other fields", () => {
@@ -640,6 +708,7 @@ describe("buildVerifierPayload", () => {
       field: "lastResponse",
       originalLength: longClean.length,
       cap: 2000,
+      keep: "tail",
     })
   })
 
@@ -709,6 +778,7 @@ describe("buildVerifierPayload", () => {
       field: "plan",
       originalLength: longPlan.length,
       cap: 16000,
+      keep: "head",
     })
   })
 
@@ -866,7 +936,9 @@ describe("buildVerifierPayload", () => {
     const payload = buildVerifierPayload(raw, logger)
 
     expect(payload.plan!.length).toBe(16000)
-    expect(logger).toHaveBeenCalledWith("verifier:field-truncated", { field: "plan", originalLength: 16001, cap: 16000 })
+    expect(logger).toHaveBeenCalledWith("verifier:field-truncated", { field: "plan", originalLength: 16001, cap: 16000,
+      keep: "head",
+    })
   })
 
   it("FR-006 / US6 AS3: raising the cap does not weaken redaction — a secret past the OLD 4000-char cap is still dropped", () => {
