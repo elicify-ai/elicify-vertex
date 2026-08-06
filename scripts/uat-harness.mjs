@@ -626,6 +626,64 @@ if (section("G. Fail-open")) {
   assert("G2-silent-on-failure", hostile.sent().filter((t) => t.includes("part-way through work")).length === 0)
 }
 
+// --- K. Uninstall leaves no machine-wide state behind ----------------------
+if (section("K. Uninstall is complete")) {
+  // Measured on a real machine: after `scripts/uninstall.sh` reported
+  // "Nothing to remove — elicify-vertex was not installed", two consent files
+  // (a legacy plain-text `yes` and a `{"state":"yes","attempts":2}`) and
+  // 1.65 MB of `.vertex-events.jsonl` were still on disk. The script removed
+  // what the INSTALLER wrote and nothing the HARNESS writes at runtime.
+  //
+  // A stale consent marker is not inert: `yes` is terminal, so the star ask
+  // can never fire again there, and a reinstall inherits a decision the user
+  // may never have made.
+  const root = mkdtempSync(join(tmpdir(), "vertex-uninst-"))
+  const cfg = join(root, "cfg")
+  const data = join(root, "data")
+  const fakeHome = join(root, "home")
+  mkdirSync(join(cfg, "opencode"), { recursive: true })
+  mkdirSync(data, { recursive: true })
+  mkdirSync(join(fakeHome, ".config", "opencode"), { recursive: true })
+
+  const planted = [
+    // Legacy location AND format — one directory above the opencode root.
+    [join(cfg, ".elicify-vertex-consent"), "yes"],
+    [join(cfg, "opencode", ".elicify-vertex-consent"), '{"state":"yes","attempts":2}'],
+    [join(cfg, "opencode", ".vertex-events.jsonl"), '{"e":1}'],
+    // Rotated history: removing only the live file left tens of MB behind.
+    [join(cfg, "opencode", ".vertex-events.2026-07-25T12-00-00-000Z.jsonl"), '{"e":0}'],
+    [join(cfg, "opencode", "receipt-signing.key"), "KEY"],
+    // `starConsentPath()` honours XDG_CONFIG_HOME but `defaultDataRoot()` does
+    // not, so with XDG set the log lives in a DIFFERENT root than the consent.
+    [join(data, ".vertex-events.jsonl"), '{"e":9}'],
+  ]
+  for (const [f, body] of planted) writeFileSync(f, body)
+  // The plugin is NOT registered — the exact case that printed "not installed"
+  // and then removed nothing.
+  writeFileSync(join(cfg, "opencode", "opencode.json"), '{"plugin":["@other/thing"]}\n')
+
+  const run = spawnSync("bash", [join(ROOT, "scripts", "uninstall.sh")], {
+    encoding: "utf8",
+    env: { ...process.env, XDG_CONFIG_HOME: cfg, VERTEX_DATA: data, HOME: fakeHome },
+  })
+  assert("K1-uninstaller-exits-clean", run.status === 0, `exit ${run.status}: ${run.stderr?.slice(0, 200)}`)
+
+  const survivors = planted.map(([f]) => f).filter((f) => existsSync(f))
+  assert(
+    "K2-no-state-survives-uninstall",
+    survivors.length === 0,
+    `${survivors.length} left: ${survivors.map((f) => f.replace(root, "")).join(", ")}`,
+  )
+  // Truthful summary: reporting "not installed" while deleting six files is
+  // how the gap stayed invisible.
+  assert(
+    "K3-summary-is-truthful",
+    !run.stdout.includes("Nothing to remove"),
+    `stdout said "Nothing to remove" while state existed`,
+  )
+  rmSync(root, { recursive: true, force: true })
+}
+
 // ===========================================================================
 process.on("uncaughtException", (err) => {
   console.log(`\n  FAIL  harness crashed — ${err?.message ?? err}`)

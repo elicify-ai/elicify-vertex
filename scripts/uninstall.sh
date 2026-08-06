@@ -47,6 +47,55 @@ if [[ -d "$CACHE_ROOT/@elicify-ai" ]]; then
   REMOVED=1
 fi
 
+# --- remove machine-wide state --------------------------------------------
+# THE GAP THIS CLOSES. Everything above removes what the INSTALLER wrote. The
+# harness also writes state of its own at runtime, and none of it was ever
+# removed — so "uninstall" left the star-consent marker, the event log and the
+# receipt signing key on disk. Observed on a real machine after a clean
+# uninstall run: two consent files (one legacy plain-text `yes`, one
+# `{"state":"yes","attempts":2}`) and 1.65 MB of `.vertex-events.jsonl`, with
+# the script reporting "Nothing to remove — elicify-vertex was not installed".
+#
+# A stale consent marker is not inert: `state: yes` is terminal, so the star
+# ask can never fire again on that machine, and a reinstall inherits a decision
+# the user may never have made.
+#
+# TWO ROOTS, deliberately. `starConsentPath()` honours XDG_CONFIG_HOME while
+# `defaultDataRoot()` hardcodes ~/.config/opencode, so with XDG_CONFIG_HOME set
+# the consent file and the event log live in DIFFERENT directories. Removing
+# only one root leaves the other behind.
+#
+# `if`, not `&&`: this script runs under `set -e`, where a bare `cond && cmd`
+# that evaluates false IS the statement's exit status and aborts the run. The
+# uninstaller failing silently half-way is precisely how state gets left behind.
+STATE_ROOTS=("$CONFIG_ROOT" "$HOME/.config/opencode")
+if [[ -n "${VERTEX_DATA:-}" ]]; then STATE_ROOTS+=("$VERTEX_DATA"); fi
+
+remove_state_file() {
+  [[ -e "$1" ]] || return 0
+  rm -f "$1"
+  echo "  ✓ removed $1"
+  REMOVED=1
+}
+
+for root in "${STATE_ROOTS[@]}"; do
+  remove_state_file "$root/.elicify-vertex-consent"
+  remove_state_file "$root/.vertex-events.jsonl"
+  remove_state_file "$root/receipt-signing.key"
+  # Rotated event logs: `.vertex-events.jsonl` becomes
+  # `.vertex-events.<ISO-timestamp>.jsonl` once it passes the size cap, so
+  # removing only the live file can leave tens of MB of history behind.
+  for rotated in "$root"/.vertex-events.*.jsonl; do
+    if [[ -e "$rotated" ]]; then remove_state_file "$rotated"; fi
+  done
+done
+
+# Legacy consent location. Older builds wrote the marker one directory up, in
+# plain text (`yes`) rather than JSON. Still present on machines that ran them,
+# and still terminal, so a reinstall would silently honour it.
+remove_state_file "${XDG_CONFIG_HOME:-$HOME/.config}/.elicify-vertex-consent"
+remove_state_file "$HOME/.config/.elicify-vertex-consent"
+
 # --- unregister plugin + commands from opencode.json -----------------------
 if [[ -f "$OPENCODE_JSON" ]]; then
   node -e "
