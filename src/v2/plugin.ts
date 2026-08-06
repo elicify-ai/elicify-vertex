@@ -48,7 +48,7 @@ import type { OpencodeClient } from "./types.js"
 
 import { applyV2Config } from "./wiring/config.js"
 import { applyDosing } from "./wiring/dosing.js"
-import { cancelPauseJudge, GateContext, handleSessionIdle } from "./wiring/gate.js"
+import { cancelPauseJudge, forgetIdleTurn, GateContext, handleSessionIdle } from "./wiring/gate.js"
 import {
   anomalyInterruptFinding,
   elevateFinding,
@@ -1634,7 +1634,12 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       // killed. Cancellation is idempotent and safe for unknown sessions.
       if (event.type === "session.deleted" || event.type === "session.error") {
         const endedSid = (event.properties as { sessionID?: unknown } | undefined)?.sessionID
-        if (typeof endedSid === "string") cancelPauseJudge(endedSid)
+        if (typeof endedSid === "string") {
+          cancelPauseJudge(endedSid)
+          // `idleDispatch` is keyed by session and was never cleared, so a
+          // long-lived process accumulated one entry per session seen.
+          forgetIdleTurn(endedSid)
+        }
         return
       }
       if (event.type !== "session.idle") return
