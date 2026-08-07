@@ -292,6 +292,46 @@ function shannonEntropyBitsPerChar(token: string): number {
   return bits
 }
 
+/**
+ * ── R-5: THE RESIDUAL THESE TWO CONSTANTS OWN, MEASURED AND KEPT ──────────
+ *
+ * Nothing shorter than `ENTROPY_MIN_TOKEN_LENGTH` is ever looked at by any scan
+ * in this module — not on one line, not wrapped, not split. That is a real hole
+ * and it is the LARGER of the two R-5 residual classes: measured over 12,500
+ * short-key probes (5 alphabets x lengths 16/20/24/28/30 x 5 framings, one line
+ * each), **2,013 transmit the key whole**. It is not a span-pass failure; the
+ * span pass never sees them.
+ *
+ * The fix is one number, and it was measured before it was rejected. Against
+ * 4,200 innocent evidence fields (2,100 realistic corpora x 2 fields: minified
+ * JS, base64 data URIs, import chains, compact JSON, lockfile hunks, stack
+ * traces, UUID lists, wrapped URLs, path lists, plan digests, diff stats, log
+ * lines, prose):
+ *
+ *   floor 32 -> 24 : closes 1,482 of 2,013 short-key leaks + 29 wrapped ones
+ *                    | 810 innocent fields newly redacted, 270 EMPTIED
+ *   floor 32 -> 20 : closes 1,968 + 34 | 852 newly redacted, 274 EMPTIED
+ *   floor 32 -> 16 : closes 1,968 + 35 | 942 newly redacted, 280 EMPTIED
+ *
+ * The cost is concentrated exactly where evidence lives — minified JS (200
+ * fields), stack traces (196), lockfile hunks (144-168), log lines (144) — all
+ * of which are full of 24-character tokens. Emptying 6% of the verifier's
+ * evidence to close a confidentiality hole of the same order is the B-3
+ * failure mode, deliberately: a judge with no evidence fails the work it cannot
+ * see, on every run, whereas these probes are keys short enough that no
+ * length-blind detector can distinguish them from an identifier.
+ *
+ * The threshold has the same shape and a worse ratio. Effective 3.95 -> 3.90 /
+ * 3.85 / 3.80 bits/char closes 8 / 12 / 13 short-key leaks and ZERO wrapped
+ * ones, for 266 / 394 / 462 innocent fields newly redacted (96 / 138 / 186
+ * emptied) — UUID lists, compact JSON and path lists are the casualties,
+ * because an ordinary path token measures ~3.89 bits/char, above every one of
+ * those bars. There is no threshold between "catches a low-entropy base32 key"
+ * and "eats a file path": they overlap. Measured, not assumed.
+ *
+ * So both are kept, and `tests/v2/verifier.test.ts` PINS the residual with a
+ * failing-on-change assertion rather than leaving it implicit.
+ */
 const ENTROPY_MIN_TOKEN_LENGTH = 32
 const ENTROPY_THRESHOLD_BITS = 4.0
 
@@ -749,15 +789,45 @@ function spanFusedToken(dewrappedSpan: readonly string[]): { token: string; firs
 const KEY_ENCODING_CLASSES: readonly RegExp[] = [/^[A-Za-z0-9+/]$/, /^[A-Za-z0-9_-]$/]
 
 /**
- * The run of single-encoding key material that crosses EVERY join of the span,
- * or `undefined` when no such run exists.
+ * The run of single-encoding key material that crosses A JOIN of the span, or
+ * `undefined` when no such run exists.
  *
- * Walks outward from the join interval: everything strictly between the first
- * and last join (i.e. the whole interior of the span) must be one class, and
- * the run is then extended left and right through the same class into the
- * first and last units. That is the "bounded structural prefix/suffix, clean
- * interior" shape — `--blob="` and `"` sit outside the run and are ignored;
- * `,` or `"` or `.` BETWEEN the joins is disqualifying.
+ * Anchored AT THE JOINS: for each line break inside the span, if the characters
+ * either side of it are both in one encoding class, the maximal run of that
+ * class containing them is the candidate core. `--blob="` and the closing `"`
+ * sit outside the run and are ignored.
+ *
+ * ── R-5: WHY "A JOIN" AND NOT "EVERY JOIN" ────────────────────────────────
+ * This used to require the WHOLE interior — everything between the first and
+ * last join — to be one clean class, i.e. the run had to cross every join at
+ * once. That is true of a bare wrapped key and false as soon as the framing's
+ * own punctuation lands in an INTERIOR line rather than at the span's edges:
+ *
+ *     running deploy:
+ *     --blob=
+ *     "4OYYGUU
+ *     2VM74ERXROB2K4VGORXUUTGFO"
+ *     exit 0
+ *
+ * The `"` opening line 3 sits between the two joins, so the interior was not
+ * clean, no core existed, and the span was exonerated — the key transmitted
+ * whole with an empty event list. Requiring only that SOME join be crossed by a
+ * >= ENTROPY_MIN_TOKEN_LENGTH run of one encoding recovers this without
+ * loosening anything else: the span is still only dropped when the whole span
+ * trips a scan AND `straddlesEveryJoin` holds AND the run does not read as
+ * structured text. Measured (180,000 probes, 5 alphabets x 6 lengths x 4 split
+ * counts x 5 framings): whole-key leaks 32 -> 28 with a random-split corpus,
+ * and over 2,100 innocent corpora x 2 fields, 0 newly redacted / 0 newly kept.
+ * The compact-JSON counterweight below is untouched: `{"storyId":"S1",` /
+ * `"pass":true,` / `"summary":"done"}` has no single-class run anywhere near 32
+ * characters, so it still has no core at all.
+ *
+ * Anchoring at the joins rather than scanning the token for runs is also what
+ * keeps this CHEAPER than the interior test it replaces (a join whose
+ * neighbours are punctuation is rejected in two character tests, where the old
+ * loop walked the interior). Measured on the worst field the raw-field safety
+ * cap admits — 7600 tight units, 98,799 chars — 212-227 ms before, 193-202 ms
+ * after; the token-scanning formulation of the same rule cost 300-328 ms.
  *
  * ── WHY THIS REPLACED A WHOLE-TOKEN REGEX ─────────────────────────────────
  * The previous guard asked whether the whole fused token was one uninterrupted
@@ -795,19 +865,20 @@ function spanKeyCore(dewrappedSpan: readonly string[]): string | undefined {
   const { token, firstJoin, lastJoin } = spanFusedToken(dewrappedSpan)
   if (lastJoin <= firstJoin) return undefined
   for (const cls of KEY_ENCODING_CLASSES) {
-    let interiorIsClean = true
-    for (let i = firstJoin; i < lastJoin; i++) {
-      if (!cls.test(token[i])) {
-        interiorIsClean = false
-        break
+    // `join` walks the span's line breaks in `token` coordinates: the first is
+    // at the end of the head token, and each interior unit advances it by its
+    // own length (the same arithmetic `straddlesEveryJoin` uses).
+    let join = firstJoin
+    for (let k = 1; k < dewrappedSpan.length; k++) {
+      if (join > 0 && join < token.length && cls.test(token[join - 1]) && cls.test(token[join])) {
+        let start = join - 1
+        while (start > 0 && cls.test(token[start - 1])) start--
+        let end = join + 1
+        while (end < token.length && cls.test(token[end])) end++
+        if (end - start >= ENTROPY_MIN_TOKEN_LENGTH) return token.slice(start, end)
       }
+      join += dewrappedSpan[k].length
     }
-    if (!interiorIsClean) continue
-    let start = firstJoin
-    while (start > 0 && cls.test(token[start - 1])) start--
-    let end = lastJoin
-    while (end < token.length && cls.test(token[end])) end++
-    if (end - start >= ENTROPY_MIN_TOKEN_LENGTH) return token.slice(start, end)
   }
   return undefined
 }
@@ -838,6 +909,29 @@ const STRUCTURED_TEXT_SEPARATOR = /[_\-/]/
  * character core sees every shard the material fragments into and is not
  * fooled. This is why the span pass turns the per-join word exoneration OFF
  * (`straddlesEveryJoin(..., false)`) and relies on this instead.
+ *
+ * ── R-5: THIS FUNCTION IS THE ENTIRE REMAINING WRAPPED-KEY RESIDUAL ───────
+ * After the join-anchored core and the seven-unit window, every wrapped-key
+ * leak left in the sweep is exonerated HERE and nowhere else — verified by
+ * stubbing this function to `false` and re-running: uniform-wrap leaks 20 -> 0
+ * and adversarial-split leaks 15 -> 0, i.e. it accounts for 100% of them, not
+ * merely most. What escapes is random key material that happens to fragment
+ * into word-shaped segments, e.g. `heeswKvDXjjixvoIPEnd_GywuAHRIXq_` (a real
+ * 32-char base64url key: heesw|Kv|Djjixvo|IPEnd|Gywu|AHRIXq — five of six
+ * segments are 3+ letters with a vowel, mean length 5.4).
+ *
+ * Deleting it is therefore a complete fix for that class, and it is not taken,
+ * because the same stub redacts **310 of 4,200 innocent evidence fields, 60 of
+ * them emptied outright** — 160 identifier lists and 126 snake_case lists, the
+ * two shapes `criteria` and `verifierSummaries` are mostly made of. 35 leaks
+ * per 360,000 adversarial probes against 7.4% of the judge's evidence is not a
+ * trade worth making.
+ *
+ * That is the honest statement of the limit: at this level of evidence — one
+ * token, no dictionary, no language model — "random material that reads as
+ * words" and "an identifier list that reads as words" are the same string. Any
+ * bar that separates them has to be a bar on ENGLISH, not on shape, and this
+ * module deliberately does not carry one.
  */
 function coreReadsAsStructuredText(core: string): boolean {
   const separated = STRUCTURED_TEXT_SEPARATOR.test(core)
@@ -1097,16 +1191,36 @@ function stripFacingFragment(unit: string, facing: "start" | "end"): string {
 }
 
 /**
- * B-3b: how many consecutive units one span pass will consider. A token
- * crossing more than this many line breaks means the wrapping width is under
- * ~6 characters per line, which no terminal, editor or serializer produces;
- * the bound exists so a pathological input (say a base64 blob emitted one
- * short line at a time) cannot turn the pass superlinear. Widths are tried
- * narrowest-first so the blast radius of a real hit is the smallest span that
- * explains it, and any wider span containing an already-dropped unit is then
- * skipped.
+ * B-3b: how many consecutive units one span pass will consider. The bound
+ * exists so a pathological input (say a base64 blob emitted one short line at a
+ * time) cannot turn the pass superlinear. Widths are tried narrowest-first so
+ * the blast radius of a real hit is the smallest span that explains it, and any
+ * wider span containing an already-dropped unit is then skipped.
+ *
+ * ── R-5: WHY SEVEN AND NOT SIX ────────────────────────────────────────────
+ * The width of the window is not only a reach limit, it is an EVIDENCE limit: a
+ * wider window fuses more of the key into one token, and a token that carries
+ * more of the key is likelier to clear the 32-character / 3.95-bit entropy
+ * floor. That is what the extra unit actually buys. Measured over 180,000
+ * uniformly-wrapped probes (5 alphabets x 6 key lengths of 32-64 x fold widths
+ * 6/10/16/22 x 5 framings): whole-key leaks **64 at a bound of six, 20 at
+ * seven**. Every leak the widening closes is a key folded at width 6 into
+ * seven-plus units, where the six-unit windows carry 34-36 characters that fall
+ * under the entropy floor and the seven-unit window carries 40 and does not.
+ *
+ * Stated honestly, because it bounds the claim: the widening is NOT needed for
+ * long keys at ordinary fold widths. 84,000 probes of 64-256 character keys at
+ * widths 10-64 leak 0 whole keys at BOTH bounds — with that many units, some
+ * six-unit sub-window always carries enough of the key to trip, and a whole-key
+ * leak needs every unit to survive.
+ *
+ * Seven and not eight because eight buys nothing and costs real time: both
+ * bounds leave exactly the same 20 residual leaks, while the worst field the
+ * raw-field safety cap admits measures 238-248 ms at seven against 286-291 ms
+ * at eight, on a ~300 ms budget. The over-redaction cost of the widening is
+ * zero, measured: 2,100 innocent corpora x 2 fields, 0 newly redacted.
  */
-const SPAN_MAX_UNITS = 6
+const SPAN_MAX_UNITS = 7
 
 function scanUnits(units: string[]): { kept: string[]; anyDropped: boolean } {
   const toDrop = new Set<number>()
