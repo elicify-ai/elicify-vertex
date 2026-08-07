@@ -44,7 +44,7 @@ import { PLUGIN_STATE_DIR, VerificationReceiptStore, isProtectedStatePath, resol
 import { holdoutSuppresses, logHoldoutSuppress } from "../measurement.js"
 
 import { compareExpectation, findCriteriaKeyLine, parseCriteriaBlock, parseExpectArtifact } from "./artifacts.js"
-import { computeBoundedDiffStat, formatChangedPathsSummary, NON_PATH_MUTATION_MARKERS } from "./diffstat.js"
+import { computeBoundedDiffStat, formatChangedPathsSummary, hasUnattributedMutation, realChangedPaths } from "./diffstat.js"
 import { isNonExecutingCommand, isTestRunnerCommand, observedCoversPrescribed, verifyGapComplied } from "./coverage.js"
 import { VisibilityNotifier, resolveVisibilityMode, summarizeFinding } from "./visibility.js"
 import { InjectionComposer, type Finding } from "./composer.js"
@@ -892,7 +892,11 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
 
       const command = toolName === "bash" && typeof args.command === "string" ? args.command : ""
       const verification = toolName === "bash" ? parseVerification(command, out, exitCode) : null
-      const changedPaths = changedPathsFromTool(toolName, args)
+      // `workspaceRoot` is what lets a bash write be spelled the same way an
+      // `edit` call spells it (absolute, under the worktree) and what keeps a
+      // `> /tmp/build.log` redirect out of the ledger — see `index.ts`'s
+      // BASH PATH ATTRIBUTION header.
+      const changedPaths = changedPathsFromTool(toolName, args, { workspaceRoot: state.workspaceRoot })
 
       if (changedPaths.length > 0) {
         verificationReceipts.invalidate(sid)
@@ -923,7 +927,7 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
         // write when nothing actually changed).
         pinStore.persist(sid)
 
-        const realPaths = changedPaths.filter((p) => !NON_PATH_MUTATION_MARKERS.has(p))
+        const realPaths = realChangedPaths(changedPaths)
         for (const p of realPaths) {
           const result = storyEngine.checkScope(sid, p)
           if (result) {
@@ -1003,7 +1007,7 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
         }
 
         if (rawSuccess && exitCode === 0 && !relevanceGap) {
-          const realChangedPaths = evidenceLedger.getChangedPaths(sid).filter((p) => !NON_PATH_MUTATION_MARKERS.has(p))
+          const ledgerRealPaths = realChangedPaths(evidenceLedger.getChangedPaths(sid))
           const storyForResolve = storyEngine.getActiveStory(sid)
           // M7: same reachable-bad-input guard as `resolve.ts` — these strings
           // are LLM-authored, and `observedCoversPrescribed` would throw on a
@@ -1012,7 +1016,7 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
             storyForResolve?.verifiers?.filter((v) => typeof v === "string" && v.trim().length > 0) ?? null
 
           // The prescription to compare against. Previously this whole check
-          // was gated on `realChangedPaths.length > 0`, which left a hole a
+          // was gated on `ledgerRealPaths.length > 0`, which left a hole a
           // review proved end to end: with no mutation observed yet this
           // turn, ANY passing command minted a receipt — `npx eslint .`
           // satisfied a story whose verifier was `go test ./internal/...`.
@@ -1020,7 +1024,7 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
           // before it ever consults `storyVerifiers`, so when there are no
           // changed paths we fall back to the story's own declared verifiers,
           // which are a prescription in their own right.
-          hadWorkToMeasure = realChangedPaths.length > 0 || (storyVerifiers?.length ?? 0) > 0
+          hadWorkToMeasure = ledgerRealPaths.length > 0 || (storyVerifiers?.length ?? 0) > 0
           // M5 (grill round 2): the story branch must come FIRST. Story
           // precedence is absolute — `resolveVerifier` returns tier 1
           // ("story") ahead of every ecosystem inference — so with changed
@@ -1058,12 +1062,12 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
             prescribed =
               storyVerifiers.find((verifier) => observedCoversPrescribed(verifier, command, state.workspaceRoot)) ??
               storyVerifiers[0]
-          } else if (realChangedPaths.length > 0) {
+          } else if (ledgerRealPaths.length > 0) {
             const manifest = manifests.get(state.workspaceRoot)
             prescribed = resolveVerifier(
               // `storyVerifiers` is empty on this branch by construction, so
               // passing it would be noise; tier 1 cannot apply here.
-              { changedPaths: realChangedPaths, storyVerifiers: null },
+              { changedPaths: ledgerRealPaths, storyVerifiers: null },
               { readManifest: () => manifest },
             ).command
           }
@@ -1513,7 +1517,7 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
       // composer has already spent the family's cap, i.e. only over mints
       // whose `per-turn-cap:dropped` was a foregone conclusion.
       if (evidenceLedger.hasChangedFiles(sid) && !hasVerification && !composer.blockedBeforeBudget(sid, "verify-gap")) {
-        const realPaths = changedPaths.filter((p) => !NON_PATH_MUTATION_MARKERS.has(p))
+        const realPaths = realChangedPaths(changedPaths)
         const manifest = manifests.get(state.workspaceRoot)
         const activeStory = storyEngine.getActiveStory(sid)
         const resolutionResult = resolveVerifier(
@@ -1534,6 +1538,17 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
               resolution: resolutionResult,
             }),
           )
+        } else if (realPaths.length === 0 && hasUnattributedMutation(changedPaths)) {
+          // STATE 3, not state 1 (see `diffstat.ts`'s `realChangedPaths`).
+          // `resolution:none {changedPaths: []}` is what this used to log for
+          // an entire session of bash-built files — indistinguishable in the
+          // event log from a turn that legitimately changed nothing, and the
+          // reason the measured 40 occurrences read as normal. The resolver
+          // genuinely cannot name a command without a path, so the nudge stays
+          // silent exactly as before; what changes is that the log now says
+          // WHY, and the verifier is told in prose via `diffSummary`
+          // (`UNATTRIBUTED_MUTATION_NOTE` / `DIFF_UNAVAILABLE_UNATTRIBUTED`).
+          logger("resolution:unattributed", { sessionID: sid, markers: changedPaths })
         } else {
           logger("resolution:none", { sessionID: sid, changedPaths: realPaths })
         }

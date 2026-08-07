@@ -44,6 +44,7 @@ import { verifyWaiverSignature } from "../../goals.js"
 import { holdoutSuppresses, logHoldoutSuppress } from "../../measurement.js"
 import type { InjectionComposer } from "../composer.js"
 import type { DiffStatResult } from "../diffstat.js"
+import { realChangedPaths } from "../diffstat.js"
 import type { EventLogger, OpencodeClient } from "../types.js"
 import type { PhaseEngine } from "../phase.js"
 import type { PinStore } from "../pin.js"
@@ -390,7 +391,7 @@ async function dispatchContinuationInner(
   return true
 }
 
-function narrowestPrescription(ctx: GateContext, state: V2SessionState, sid: string, storyVerifiers: readonly string[] | null): string {  const changedPaths = ctx.evidenceLedger.getChangedPaths(sid).filter((p) => !p.endsWith("-mutation"))
+function narrowestPrescription(ctx: GateContext, state: V2SessionState, sid: string, storyVerifiers: readonly string[] | null): string {  const changedPaths = realChangedPaths(ctx.evidenceLedger.getChangedPaths(sid))
   const manifest = ctx.manifests.get(state.workspaceRoot)
   const resolution = resolveVerifier(
     { changedPaths, storyVerifiers },
@@ -786,7 +787,7 @@ async function handleCriteriaReplay(ctx: GateContext, sid: string, state: V2Sess
   // evidence — an exempt session should not hard-block no matter how many
   // criteria are unmet.
   if (ctx.evidenceLedger.getMode(sid) !== "deep") return true
-  const changedPaths = ctx.evidenceLedger.getChangedPaths(sid).filter((p) => !p.endsWith("-mutation"))
+  const changedPaths = realChangedPaths(ctx.evidenceLedger.getChangedPaths(sid))
   if (changedPaths.length > 0 && changedPaths.every((p) => classifyFileKind(p) === "docs")) return true
 
   const criteria = ctx.pinStore.get(sid)

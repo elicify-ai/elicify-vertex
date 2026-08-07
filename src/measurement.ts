@@ -228,6 +228,16 @@ export const V2_EVENT_TYPES = [
   "visibility:unavailable",
 
   // -- plugin.ts and the remaining wiring ----------------------------------
+  /**
+   * The THIRD state of file-change attribution: mutations were observed, none
+   * of them named a path, so no verifier could be resolved. Distinct from
+   * `resolution:none` on purpose — that one means "we know which files
+   * changed and still cannot name a command", and logging both as
+   * `resolution:none {changedPaths: []}` is what made the attribution blind
+   * spot invisible for a whole live session (40 occurrences, all read as
+   * ordinary). See `diffstat.ts`'s `realChangedPaths`.
+   */
+  "resolution:unattributed",
   "star:asked",
   "subagent:injection-skipped",
   "workspace:unwritable-fallback",
