@@ -7,6 +7,34 @@ items there are done or explicitly recorded as open residuals.
 
 ## Q-1 — The agent under-asks. Give it a way to know when it has enough. **[priority]**
 
+> ### OPERATOR RULING (2026-08-07) — prompt only, and the bar is "no unknowns"
+>
+> **Scope: the contract, nothing else.** No harness mechanism. The hedge
+> detector, the question counter and the separate intake subturn below are all
+> **rejected** — do not build them, and do not re-propose them as "the fix with
+> evidence". They are recorded only so the reasoning survives.
+>
+> **The bar is not "enough information", it is NO UNRESOLVED UNKNOWNS.** My
+> first attempt ("can you write what done means and the command that proves
+> it") was too weak — it lets the agent fill its own blanks and proceed.
+>
+> **Enumerate, never certify.** Asking a model "are you confident?" returns yes;
+> that self-assessment is exactly the design measured at 1.84 questions. The
+> contract now makes it write the list instead: every assumption and unknown,
+> classified by source (the code told me / the user told me / I am guessing and
+> it changes the build / I am guessing and it does not). The
+> guessing-and-it-matters column must be EMPTY before code is written.
+>
+> **Nothing stays silent.** A low-stakes unknown does not earn a question but
+> must be stated aloud as a named default ("assuming Postgres 16, say if not"),
+> so one word corrects it. That split is what keeps the bar from meaning ten
+> questions about trivia.
+>
+> **Accepted limitation:** with no harness mechanism there is no compliance
+> signal, so we cannot measure whether this worked. That is a deliberate trade,
+> not an oversight — see "Why this went unnoticed" at the end of this item.
+
+
 ### The observation
 
 In live use the agent asks **exactly three questions**, every time, regardless
