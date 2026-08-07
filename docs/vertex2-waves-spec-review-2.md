@@ -269,7 +269,7 @@ state, `harnessAuthoredIds`, now on the security-critical path), MAJ-013, MAJ-02
   NOT be accepted unless ≥1 `read`/`grep`/`glob`/`webfetch` tool call has been observed in this
   session since the intake record was opened, and the entry MUST cite at least one observed
   call." Keep the free-text "what it yielded" as documentation, not as the gate. If the observed
-  call set is verifierd too coarse to attribute per-unknown, say so explicitly and drop FR-076 to a
+  call set is judged too coarse to attribute per-unknown, say so explicitly and drop FR-076 to a
   directive rather than a validator rule — an unenforceable MUST is worse than an honest SHOULD.
 
 #### [M2-002] The "evidence frozen at checkpoint" decision is **not in the spec** — CRIT-005 and CRIT-006 are wholly unaddressed

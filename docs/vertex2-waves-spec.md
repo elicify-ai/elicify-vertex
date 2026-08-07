@@ -234,7 +234,7 @@ When a wave holds two or more delivery stories and no subagent (`task`) calls we
 
 ### User Story 8 — Union scope watchdog (Priority: P1)
 
-With several stories active at once, scope drift must be verifierd against the union of their `scopeGlobs`, not one story's.
+With several stories active at once, scope drift must be judged against the union of their `scopeGlobs`, not one story's.
 
 **Why this priority**: Without it the watchdog fires on nearly every mutation during a wave, flooding the composer budget.
 

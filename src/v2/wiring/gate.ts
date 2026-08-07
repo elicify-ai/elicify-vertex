@@ -1037,7 +1037,7 @@ function formatVerifierReverts(plan: PlanV2, verdicts: readonly VerifierStoryVer
  *
  * A story needs auditing when it is `complete` and either carries no verifier
  * stamp at all or was re-claimed (`completedAt`) after its latest stamp —
- * so a verifierd-and-passed plan never re-audits, and a re-claimed story
+ * so a judged-and-passed plan never re-audits, and a re-claimed story
  * always does.
  */
 /** FR-007 — per-story consecutive-revert counter, process-local in
@@ -1766,7 +1766,7 @@ async function handleVerifierAudit(ctx: GateContext, sid: string, state: V2Sessi
   // passing verifier stamp — not only when the final story was in this audit's
   // set. `applyVerifierVerdicts` stamps `story.verifier` in place on the plan
   // object this closure holds, so `plan` already reflects the fresh stamps;
-  // a story verifierd-pass in an earlier audit keeps its stamp, so staggered
+  // a story judged-pass in an earlier audit keeps its stamp, so staggered
   // audits (final passes first, a non-final story passes in a later audit)
   // still produce the close-out line on the audit that settles the plan.
   // It cannot re-fire on a later idle: once every story is complete with a

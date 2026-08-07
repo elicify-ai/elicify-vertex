@@ -1987,7 +1987,7 @@ describe("FR-004: a story reopened while complete is audit-eligible again immedi
 
     const beforeReopen = se.getPlan("s1")!.stories[0]
     expect(beforeReopen.status).toBe("complete")
-    expect(isAuditEligible(beforeReopen)).toBe(false) // already verifierd — nothing to do
+    expect(isAuditEligible(beforeReopen)).toBe(false) // already judged — nothing to do
 
     // The observed case: previousStatus complete -> newStatus complete. There
     // is no incomplete task to re-checkpoint, so FR-003's no-op cannot be the

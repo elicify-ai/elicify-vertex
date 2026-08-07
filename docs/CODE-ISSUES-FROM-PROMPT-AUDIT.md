@@ -752,7 +752,7 @@ path.
 working recovery path existed: checkpoint the stranded pending story to
 `"blocked"`, which is an ungated transition, then reopen it again). Revisited
 on the operator's explicit instruction to do the real fix rather than accept
-the workaround, given the risk was verifierd narrow.
+the workaround, given the risk was judged narrow.
 
 **Fix applied.** `checkpoint`'s successor-promotion now fires whenever the
 active slot vacates for ANY reason — `"complete"`, `"blocked"`, or

@@ -385,7 +385,7 @@ export class VisibilityNotifier {
    *   1. **mode** — in `"off"` no work happens at all, and no clock is read,
    *      so a disabled notifier is genuinely inert.
    *   2. **window roll** — a stale window is closed (and its roll-up summary
-   *      emitted) before this event is verifierd, so an event arriving after a
+   *      emitted) before this event is judged, so an event arriving after a
    *      quiet minute is measured against a fresh budget.
    *   3. **dedupe** — a duplicate is not an event at all; it must not consume
    *      cap budget nor inflate the suppressed count.
