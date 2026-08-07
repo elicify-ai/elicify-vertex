@@ -150,7 +150,25 @@ text
 
 Module: `src/measurement.ts`. **Never** injected into the model. Append-only JSONL at `eventsPath()` = `<VERTEX_DATA|~/.config/opencode>/.vertex-events.jsonl`. Payloads pass through `redactForDisk`.
 
-Each line includes: `ts`, `session_id`, `holdout_arm` (`on`|`off`), `event_type`, `payload`.
+Each line includes: `ts`, `session_id`, `holdout_arm` (`on`|`off`), `event_type`, `payload`, `model` (a `providerID/modelID` string or `"unknown"`, stamped verbatim).
+
+`event_type` is drawn from **two** unions in `src/measurement.ts`:
+
+- **`EventType`** — the five v1 names, tabulated below. Stable; unchanged by v2.
+- **`V2_EVENT_TYPES`** — the v2 registry, **98 names as of 2026-08-07**, and the
+  **authoritative** list of everything else the harness may write (spec FR-033R). It is
+  enforced at compile time (`EventLogger` in `src/v2/types.ts` takes `V2EventType`, not
+  `string`) and by a source scan in `tests/v2/measurement.test.ts` that compares emitted
+  literals to the array in both directions. Read the array, not a doc; a dated mirror with
+  its regeneration command is in `docs/vertex2-spec.md` Appendix A.
+
+Two pairs of near-duplicate spellings are registered on purpose:
+`intake:unsupported` / `intake:classify-unsupported` and
+`receipt:scope-unverifiable` / `receipts:scope-unverifiable`. Both members of each pair are
+emitted by live code. **Do not "unify" them** — `.vertex-events.jsonl` is append-only and
+historical records key off the spelling written at the time.
+
+The table below covers the v1 union **only** — it is not the full event surface:
 
 | `event_type` | Typical payload | When |
 |--------------|-----------------|------|

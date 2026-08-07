@@ -782,6 +782,20 @@ absence is the shape most likely to be vacuous. Mutate it before trusting it.
 - **R-5** residual wrapped-key leaks: 12,532 -> 42 over 180,000 probes. 181 of
   the surviving 223 also leak with the key on ONE line, i.e. the entropy floor,
   not the span pass. Recorded rather than rounded to zero.
-- **FR-033** (`docs/vertex2-spec.md`) carries an abbreviated event list that
+- ~~**FR-033** (`docs/vertex2-spec.md`) carries an abbreviated event list that
   names no `criteria:*` type. Explicitly partial, not false; fold into a rev-4
-  amendment if the list is ever meant to be exhaustive.
+  amendment if the list is ever meant to be exhaustive.~~ **CLOSED (2026-08-07,
+  spec rev 5.)** Docs-only pass; no code changed. The list was worse than
+  abbreviated by the time it was read again — eleven names and three wildcards
+  against a registry of **98**, because the 2026-08-06 round that made
+  `V2_EVENT_TYPES` authoritative found 61 of 82 emitted names unregistered.
+  FR-033's list is struck through and **FR-033R** replaces it: the array in
+  `src/measurement.ts` is normative, the spec mirrors it. The exhaustive list is
+  now `docs/vertex2-spec.md` **Appendix A** — dated, marked non-normative, with
+  the command that regenerates and diffs it against the source, because a
+  hand-kept list in a doc drifts and this one drifted twice. `ARCHITECTURE.md`'s
+  measurement table (v1's five names, presented as if complete) and
+  `vertex2-module-contracts.md` (no count) were annotated in the same pass.
+  Recorded for whoever tidies next: `intake:unsupported` /
+  `intake:classify-unsupported` and `receipt:` / `receipts:scope-unverifiable`
+  are registered-not-renamed **on purpose** — the sink is append-only.

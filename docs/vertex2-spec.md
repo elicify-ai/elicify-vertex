@@ -3,6 +3,7 @@
 **Created**: 2026-07-25
 **Revised**: 2026-07-25 (**rev 3** — applies the independent adversarial review round)
 **Amended**: 2026-08-06 (**rev 4** — backlog B-1: model-conditioned dosing and the verifier-model override are removed)
+**Amended**: 2026-08-07 (**rev 5** — FR-033's inline event list is retired; `V2_EVENT_TYPES` in `src/measurement.ts` is the normative registry)
 **Status**: Final — revised, amended
 **Input**: Greenfield design `docs/vertex2-greenfield.html` + session design review (guide-over-gate, three-tier composer, story contracts). Full Vertex 2 scope in one spec; priorities P0–P2 map to the migration order.
 **Review**: `docs/vertex2-spec-review.md` — independent round against rev 2, verdict **BLOCK**: 3 critical, 14 major, 9 minor, 4 observation. Rev 3 resolves every CRITICAL and MAJOR finding and every mechanical MINOR/OBSERVATION finding; deferrals are listed with reasons in *Review Findings Applied (rev 3)*.
@@ -44,6 +45,53 @@ carried as *Deferred*; rev 4 resolves it.
 their identifiers so existing cross-references still resolve. Their original text is struck
 through and followed by a bold status word and a one-line reason with the date, matching the
 convention already used in `docs/vertex2-waves-spec.md` (FR-051 `~~…~~ **WITHDRAWN.**`).
+
+---
+
+## Amendment — rev 5 (2026-08-07, the open FR-033 item)
+
+> **The rule, stated once: `V2_EVENT_TYPES` in `src/measurement.ts` is the event registry.
+> This specification mirrors it; it does not define it.**
+
+FR-033 carried an inline list of "new event types" — eleven names and three `*` wildcards.
+It was written when that was the whole of v2's event surface. It is now **eleven names out
+of ninety-eight**, and it names no `criteria:*` type at all despite `criteria:parse-miss`
+having been added in the B-2 round. It was flagged in the backlog as *explicitly partial,
+not false*; the problem is that nothing in its wording said so, and **an abbreviated list
+that reads as exhaustive is worse than no list** — it is the artefact test 42 ("a property
+test over every event type in FR-033") has to resolve its domain against.
+
+**What changed underneath it (2026-08-06 registry round).** `V2_EVENT_TYPES` was
+decorative until that round: `wiring/logger.ts` cast the emitted name straight to
+`V2EventType` on the way to disk, so nothing ever consulted the array. Measured over
+`src/v2/`, **82 distinct event names were being emitted and 61 of them were unregistered**.
+The array is now authoritative in both directions:
+
+- **Compile time.** `EventLogger` (`src/v2/types.ts`) is typed to `V2EventType`, not
+  `string`, and the cast in `wiring/logger.ts` is gone. Emitting an unregistered name
+  fails `tsc` at the emitting line.
+- **Test time.** `tests/v2/measurement.test.ts` scans `src/` for emitted event literals
+  and compares them against the registry **in both directions**, so an entry whose emitter
+  was deleted is red too — the direction `tsc` cannot see.
+
+**Divergent spellings were REGISTERED, not renamed.** `story.ts` has always emitted
+`intake:unsupported` while the writer-backed declaration was `intake:classify-unsupported`;
+both are registered. Likewise `receipt:scope-unverifiable` (singular, `plugin.ts`) and
+`receipts:scope-unverifiable` (plural, `goals.ts`) are both live and both registered. These
+are **not** tidy-ups waiting to happen: renaming an event breaks continuity with every
+record already on disk in `.vertex-events.jsonl`. Leave them.
+
+**Decision — exhaustive by reference, mirrored under a date.** FR-033 now states the
+registry rule normatively and points at the code. The full ninety-eight-name list lives in
+*Appendix A*, explicitly **non-normative**, dated, carrying the one-line command that
+regenerates it, and carrying the rule that **the code wins** if the two ever disagree. A
+hand-maintained exhaustive list in a document drifts — this one drifted twice already
+(`criteria:parse-miss`, then sixty-one names at once) — so the mirror is dated and names
+its source rather than pretending to be the source.
+
+**Convention used below.** As rev 4: the retired text is struck through and followed by a
+bold status word, a date and a one-line reason. Identifiers are kept so cross-references
+still resolve.
 
 ---
 
@@ -92,7 +140,7 @@ No `docs/reference/` directory exists in this project. The v1 implementation its
 | `contextForMode`/`contextForStopMode`/`contextForReview` | **replaced** | Content moves into the pattern library rendered by the composer |
 | `parseVerification`, `isMutatingBashCommand`, `changedPathsFromTool` | kept (behavior frozen) | Regression surface |
 | `MultiStoryGoalEngine`, `VerificationReceiptStore` (src/goals.ts) | **replaced by `StoryEngine` (schemaVersion 2)** | Receipts store kept; plan schema breaks |
-| `measurement.ts` log functions | extended | `model` on every event; new event types; size/age rotation (FR-033a). *Rev 4 (2026-08-06): the `profile` stamp is removed with dosing.* |
+| `measurement.ts` log functions | extended | `model` on every event; new event types; size/age rotation (FR-033a). *Rev 4 (2026-08-06): the `profile` stamp is removed with dosing.* *Rev 5 (2026-08-07): `V2_EVENT_TYPES` here is the normative registry of every v2 event name (FR-033R) — 98 at that date, enforced by `tsc` and by a source scan; see Appendix A.* |
 | `formatDirectives`, `formatGateContinuationText` | kept | Envelope + redaction unchanged |
 | `EvidenceLedger.shouldBlockStop` | **kept as the zero-criteria fallback** | Rev 3: v1's unverified-changes trigger is preserved inside the v2 gate, not replaced (FR-015) |
 | `gateContinuationSessions` (src/index.ts) | **generalised → `selfCreatedSessions`** | Rev 3: v1 already excludes its own continuation sessions from `chat.message`; v2 adds two more `session.prompt` call sites, so the exclusion becomes a first-class rule across five hooks (FR-036) |
@@ -992,7 +1040,7 @@ Rev 3 records the spec's own threat posture so the claims are auditable. `risk` 
 | 39 | `verifier_payload_secret_scan` | Unit | Verifier payload carries evidence only | strict scan over **all three** fields on the reassembled field; unlabelled 40-hex token, entropy rule, line-wrapped token, base64 in criteria; `verifier:field-dropped` when a field empties |
 | 40 | `pins_write_fault_and_retry` | Unit | Pins write fault falls back to memory and recovers | injected `EACCES`/`ENOSPC`: memory fallback + `pins:disk-fallback-memory`; next update writes + `pins:disk-recovered`; 3 consecutive failures ⇒ `pins:disk-unavailable`, retries stop |
 | 41 | `criteria_absent_falls_back_to_v1_gate` | Integration | Deep session with no pinned criteria still blocks on unverified changes | zero pins × changed files × deep ⇒ block; caps/holdout/docs-only honoured; block text states no criteria captured |
-| 42 | `event_invariants_property` | Unit (property) | Every emitted event carries model and session id | fast-check over every FR-033 event type: `session_id` non-empty, `model` string or `"unknown"`, no raw prompt text |
+| 42 | `event_invariants_property` | Unit (property) | Every emitted event carries model and session id | fast-check over every FR-033 event type: `session_id` non-empty, `model` string or `"unknown"`, no raw prompt text. *Rev 5 (2026-08-07): "every FR-033 event type" now resolves to `V2_EVENT_TYPES` itself (FR-033R) — the test MUST iterate the imported array, never a literal copy of it. A literal copy is precisely how `criteria:parse-miss` sat in the union for a round with no writer and a green suite. The same file also carries the source scan that closes the reverse direction.* |
 | 43 | `self_created_session_is_inert` | **Integration** | Verifier subturn receives no harness injection | drives the real hook set over a simulated child session; asserts `output.system` / `output.parts` untouched, no map entries, no gate, no continuation. **Must not use a stub-only client** — a stub asserts what the plugin builds, not what the host delivers |
 | 44 | `verifier_tools_denied_or_refused` | Unit | Verifier subturn is refused when tools cannot be disabled | asserts the exact `tools` deny map and `agent: "vertex-verifier"` on the happy path; asserts **zero** `session.create`/`session.prompt` calls and one `verifier:unsupported` when the probe fails |
 | 45 | `idle_all_criteria_evidenced_closes` | Integration | Idle with all criteria evidenced closes without blocking | `elevate → close` arc; no continuation, no `would_block` |
@@ -1272,7 +1320,13 @@ Explicitly **replaced** (tests updated/retired with the change): directive id/te
 - **FR-032**: Verifier unavailability or malformed responses MUST fail open with `verifier:unavailable`/`verifier:malformed` events.
 
 **Measurement (US-10)**
-- **FR-033** (**amended** 2026-08-06, backlog B-1): Every event MUST carry `model` (or `"unknown"`) and session id; new event types: `directive_rendered`, `directive_complied`, `calibration`, `phase_transition`, `resolution:none`, `gate:multi-session-advisory`, `pins:disk-*`, `intake:classify-*`, `subturn:cleanup-failed`, `verifier:*` statuses. These invariants MUST be enforced by a property test over every event type (test 42), not only by scenario tests. *Amendment: the ~~resolved dosing profile~~ field and the ~~`dosing:unknown-model`~~ event type are removed with FR-028. `model` stays — it is the part of US-8 with measured value, and it is recorded verbatim (no suffix normalisation), because normalising it is what silently failed 138 times.*
+- **FR-033** (**amended** 2026-08-06, backlog B-1; **re-amended** 2026-08-07, rev 5): Every event MUST carry `model` (or `"unknown"`) and session id. ~~New event types: `directive_rendered`, `directive_complied`, `calibration`, `phase_transition`, `resolution:none`, `gate:multi-session-advisory`, `pins:disk-*`, `intake:classify-*`, `subturn:cleanup-failed`, `verifier:*` statuses.~~ **RETIRED (rev 5, 2026-08-07)** — that list was eleven names and three wildcards out of the ninety-eight the harness now emits, named no `criteria:*` type, and read as exhaustive while being illustrative. **Replaced by FR-033R.** These invariants MUST be enforced by a property test over every event type (test 42), not only by scenario tests. *2026-08-06 amendment, unchanged: the ~~resolved dosing profile~~ field and the ~~`dosing:unknown-model`~~ event type are removed with FR-028. `model` stays — it is the part of US-8 with measured value, and it is recorded verbatim (no suffix normalisation), because normalising it is what silently failed 138 times.*
+- **FR-033R** (**replaces the event-list clause of FR-033**, 2026-08-07): The set of v2 event types is defined by the runtime `as const` array **`V2_EVENT_TYPES` in `src/measurement.ts`**, which is **normative**. This specification mirrors it (*Appendix A*) and does not define it; where the mirror and the array disagree, **the array is correct and the mirror is stale**. Concretely:
+  1. The harness MUST NOT write an `event_type` that is absent from `V2_EVENT_TYPES`. Adding an event means adding it to that array first.
+  2. This MUST be enforced at **compile time** — `EventLogger` (`src/v2/types.ts`) takes `V2EventType`, not `string`, and no call site may cast an emitted name to `V2EventType` (the cast formerly in `wiring/logger.ts` is what made the registry decorative: 82 names were emitted, **61 unregistered**, with nothing red).
+  3. It MUST also be enforced at **test time**, in **both** directions — `tests/v2/measurement.test.ts` scans `src/` for emitted event literals and requires the registry to cover them **exactly**, so an entry left behind after its emitter was deleted also fails. `tsc` cannot see that direction.
+  4. `V2_TYPED_WRITER_EVENTS` is the declared **subset** of the registry that has a typed convenience writer, and it is what test 42 checks the writer table against. The registry as a whole is deliberately **not** held to one-writer-per-name: those writers have no callers in `src/`, so the rule would only mint sixty-odd functions nothing calls.
+  5. **Divergent spellings are registered, never renamed.** `intake:unsupported` (what `story.ts` emits) and `intake:classify-unsupported` (the writer-backed declaration) are both registered; so are `receipt:scope-unverifiable` (`plugin.ts`) and `receipts:scope-unverifiable` (`goals.ts`). Renaming an event MUST NOT be done as a tidy-up: `.vertex-events.jsonl` is append-only and every historical record keys off the spelling that was written at the time.
 - **FR-033a**: The `events.jsonl` sink MUST be size- and age-bounded: rotate at **32 MB** to `events.<timestamp>.jsonl` and delete rotated files older than **30 days**. v2 widens what lands on disk (directive text, changed-path sets, raw model ids); `redactForDisk` remains the only content control in v2.0 and no per-field classification scheme is specified (accepted risk, see the STRIDE table).
 - **FR-034**: System MUST assign instance ids to rendered prescriptions and log `directive_complied` when the prescribed **or equivalently-resolved** verifier is observed in the same turn. **Two commands are equivalent when the FR-008 resolver returns the same tier and the same target path set for both, after stripping the flags enumerated in `IGNORED_VERIFIER_FLAGS` = `{--reporter=*, --reporters=*, -v, --verbose, --silent, --no-color, --color, --bail, --run, --watch=false}`** (review MIN-008 — compliance rate drives directive ROI and therefore which prescriptions get deleted, so the equivalence relation cannot be left to the implementer). A broader suite (different tier or a superset target path set) is **not** equivalent.
 - **FR-035**: Holdout arms MUST extend to directive families (suppress rendering, log `holdout_suppress` with family), preserving v1 gate holdout behavior.
@@ -1350,6 +1404,7 @@ Explicitly **replaced** (tests updated/retired with the change): directive id/te
 | FR-031 | US-9 | payload evidence-only (three fields, strict scan) | 18, 39 |
 | FR-032 | US-9 | timeout fails open | 29 |
 | FR-033 | US-10 | every emitted event carries model and session id | 42, 30, 31 |
+| FR-033R | US-10 | `V2_EVENT_TYPES` is the normative event registry; no unregistered name may be written | 42 (both directions) + `tsc` on every emit site — see Appendix A |
 | FR-033a | US-10 | every emitted event carries model and session id (rotation/retention asserted in the same suite) | 42 |
 | FR-034 | US-10 | compliance joined by instance id (equivalence rows 10–11) | 30 |
 | FR-035 | US-10 | family holdout suppresses | 31 |
@@ -1609,3 +1664,162 @@ Rev 2 applied nine findings (F-01…F-09) as text edits. The independent round f
 - Q: What was the actual cost of keeping it? → A: 138 `dosing:unknown-model` log lines in one session and one incorrect `unknown: true` flag, plus a module, a config option, two tests, a dataset, two FRs and a user story to maintain — for zero behavioural difference.
 - Q: Does the model id stop being recorded? → A: No. `model` stays on every event (FR-033) and is recorded **verbatim**. Suffix normalisation is what silently failed; the raw string is what proved it.
 - Q: Is any published configuration key broken by this? → A: No. Neither `verifierModel` nor `dosingOverrides` appears in `docs/CONFIGURATION.md`, `docs/USAGE.md` or `README.md` — verified by grep on 2026-08-06. They existed only in `src/v2/plugin.ts`'s option type and in this specification.
+
+### 2026-08-07 — rev 5 (FR-033's event list)
+
+- Q: Was FR-033's old list wrong? → A: Not wrong — **partial and unlabelled**. Eleven names and three wildcards, all of which are still registered. The defect was that nothing in the wording said "illustrative", so it read as the complete set, and test 42 was specified against it.
+- Q: Exhaustive list, or illustrative list with a pointer? → A: **Both, split by force.** The *normative* statement is the pointer (FR-033R → `V2_EVENT_TYPES`); the *exhaustive* list is a dated, non-normative mirror in Appendix A with its regeneration command attached. An exhaustive list alone would drift — it has drifted twice — and a pointer alone leaves a reader with no way to see the surface without opening the source.
+- Q: Why not just keep the list in the spec and add a test that checks it? → A: There is no test runner for `docs/`. Adding one to make a prose list authoritative inverts the dependency: the code would then be constrained by the document. The array is already enforced two ways; the document should mirror the enforced thing, not compete with it.
+- Q: How many event types are there? → A: **98** as of 2026-08-07, of which 22 have typed convenience writers (`V2_TYPED_WRITER_EVENTS`). Do not quote this number without re-running the Appendix A command — it is a snapshot, not an invariant.
+- Q: `intake:unsupported` and `intake:classify-unsupported` both exist. Which is the typo? → A: **Neither.** `story.ts` has always emitted the short form; the writer-backed declaration was the long one. Both are registered deliberately. Same for `receipt:` / `receipts:scope-unverifiable`. Renaming either breaks continuity with every `.vertex-events.jsonl` record already written, and the sink is append-only.
+- Q: Did anything about the code change in this pass? → A: **No.** Rev 5 is a documentation amendment only. The registry work it describes landed on 2026-08-06.
+
+---
+
+## Appendix A — v2 event registry mirror (2026-08-07) — **NON-NORMATIVE**
+
+**Source of truth: `V2_EVENT_TYPES` in `src/measurement.ts`** (FR-033R). This appendix is a
+dated snapshot of that array, reproduced in source order so it can be diffed mechanically.
+It is **not** the definition. If this list and the array disagree, the array is right and
+this list is stale — regenerate it, do not "fix" the code to match it.
+
+Regenerate / verify (from the repo root — prints nothing when the mirror is current):
+
+```sh
+awk '/^export const V2_TYPED_WRITER_EVENTS = \[/,/^\] as const/' src/measurement.ts \
+  | grep -E '^[[:space:]]+"' | tr -d ' ",'   >  /tmp/registry.txt
+awk '/^export const V2_EVENT_TYPES = \[/,/^\] as const/'        src/measurement.ts \
+  | grep -E '^[[:space:]]+"' | tr -d ' ",'   >> /tmp/registry.txt
+awk '/^<!-- BEGIN EVENT MIRROR -->$/{f=1;next} /^<!-- END EVENT MIRROR -->$/{f=0} f' \
+  docs/vertex2-spec.md | grep -vE '^(```|$)' >  /tmp/mirror.txt
+diff /tmp/registry.txt /tmp/mirror.txt && echo "mirror is current"
+```
+
+(Line-filter first, then strip — do **not** fold it into one `grep -oE '^[[:space:]]*"…"'`.
+GNU grep's `-o` with a `^`-anchored bracket class silently returns every *second* match on
+this input, which yields 47 names and a diff that looks like real drift.)
+
+(Two `awk` passes because `V2_EVENT_TYPES` opens with `...V2_TYPED_WRITER_EVENTS`; the
+spread is expanded here in the same position the runtime array expands it.)
+
+**Count at this date: 98 registered event types, of which the first 22 are
+`V2_TYPED_WRITER_EVENTS`** — the subset with a typed convenience writer. Entries 1–4 are
+bare snake_case names inherited from the v1 naming era; everything after is `family:name`.
+Separately, `EventType` in the same module holds the five v1 names (`gate_fire`,
+`classify`, `outcome`, `holdout_suppress`, `recovery_repeat`), which are untouched by v2 —
+`MeasurementEvent.event_type` accepts either union.
+
+Two pairs below are **deliberate near-duplicates, not mistakes** (FR-033R.5):
+`intake:classify-unsupported` / `intake:unsupported`, and `receipt:scope-unverifiable` /
+`receipts:scope-unverifiable`. Both spellings in each pair are emitted by live code and
+both are registered rather than unified, because renaming would break continuity with the
+records already on disk.
+
+<!-- BEGIN EVENT MIRROR -->
+```text
+directive_rendered
+directive_complied
+calibration
+phase_transition
+resolution:none
+gate:multi-session-advisory
+pins:disk-fallback-memory
+pins:disk-recovered
+pins:disk-unavailable
+intake:classify-skipped
+intake:classify-fallback
+intake:classify-capped
+intake:classify-unsupported
+subturn:cleanup-failed
+verifier:unavailable
+verifier:malformed
+verifier:unsupported
+verifier:field-dropped
+criteria:re-pinned
+criteria:truncated
+criteria:parse-miss
+expect:absent
+budget:dropped
+per-turn-cap:dropped
+cooldown:dropped
+directive:starved
+gate:continuation-dispatched
+gate:continuation-echo-consumed
+gate:continuation-failed
+gate:continuation-guard-released
+gate:continuation-slow
+gate:delegation-defer
+gate:delegation-stale
+gate:dispatch-suppressed
+gate:no-progress
+gate:plan-incomplete
+gate:plan-incomplete-capped
+gate:stall-paused
+pause:armed
+pause:cancelled
+pause:judge-malformed
+pause:judge-unavailable
+pause:not-armed
+pause:verdict
+pins:disk-corrupt
+pins:gc-deferred
+pins:gc-failed
+intake:unsupported
+checkpoint:idempotent-noop
+plan:archive-failed
+plan:concurrent-merge
+plan:foreign-entry-preserved
+plan:lock-contended
+plan:replaced
+plan:unpersisted-change-lost
+plan:write-aborted
+story:disk-corrupt
+story:plan-cleared
+story:reopened
+story:v1-archive-deferred
+story:v1-archive-failed
+story:v1-archived
+story:verifier-audit
+verifier:contradicted
+verifier:crosscheck-inconclusive
+verifier:field-oversized
+verifier:field-partial-drop
+verifier:field-truncated
+verifier:insufficient-evidence
+verifier:off-target
+verifier:reaudit-capped
+verifier:unaudited-escalation
+verifier:unverified
+verifier:verdict-contradictory
+verifier:verdict-not-enforced
+verify:ambiguous-exit
+verify:non-executing
+verify:relevance-gap
+receipt:scope-unverifiable
+receipts:archive-failed
+receipts:disk-corrupt
+receipts:disk-unavailable
+receipts:evicted
+receipts:schema-archived
+receipts:scope-unverifiable
+receipts:signature-invalid
+receipts:stale-dropped
+receipts:unsigned
+visibility:cap-reached
+visibility:deduped
+visibility:mode-changed
+visibility:notify-failed
+visibility:suppressed-summary
+visibility:toast-failed
+visibility:unavailable
+star:asked
+subagent:injection-skipped
+workspace:unwritable-fallback
+```
+<!-- END EVENT MIRROR -->
+
+**If you are here to add an event:** add it to `V2_EVENT_TYPES` first (that is what makes
+`tsc` accept the emit), then re-run the command above and paste the new list back into the
+block. If you skip the paste, nothing breaks and no test goes red — the mirror is
+non-normative by design, and going stale is its expected failure mode, which is exactly
+why FR-033R points at the code and not at this page.

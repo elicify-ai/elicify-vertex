@@ -654,6 +654,14 @@ wiring can call them):
   writer, and it is what test 42 checks the writer table against in both directions. The
   registry itself is deliberately not held to one-writer-per-name: those writers have no
   callers, so the rule would only mint 60 more functions nothing calls.
+
+  **2026-08-07 — size, and where the exhaustive list lives.** The registry stands at
+  **98 event types, 22 of them typed writers**. The prose bullet above is the 22, not the
+  98; it is a writer-set list and has never been the event-set list. `docs/vertex2-spec.md`
+  FR-033R makes `V2_EVENT_TYPES` normative in the specification too (it previously carried
+  its own abbreviated list, now retired), and its **Appendix A** holds a dated, explicitly
+  non-normative mirror of all 98 names plus the one-line command that regenerates and
+  diffs it. Quote the count from that command, never from memory.
 - Every writer accepts `{ sessionID, model, ...payload }` and stamps `model` (or
   `"unknown"`) on every record (FR-033 — this must hold even for event types that
   existed before v2). The model id is stamped **verbatim**: no suffix normalisation, no

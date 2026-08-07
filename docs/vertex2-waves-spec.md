@@ -4,6 +4,15 @@
 **Status**: Draft
 **Input**: Operator finding that Vertex 2's plan model is strictly sequential (one `active` story at a time), which conflicts with parallel subagent fanout as a default execution strategy. Design agreed in session; four open decisions resolved by operator (see Clarifications).
 
+> **Note added 2026-08-07 (spec rev 5).** This document is a **Draft**, and the event names
+> it specifies — `wave:over-serialised`, `story:v2-archived`, `verifier:unavailable-at-close`,
+> `verifier:no-progress` — are **proposals**. None is present in `V2_EVENT_TYPES`
+> (`src/measurement.ts`), which is the normative registry of everything the harness actually
+> writes (`docs/vertex2-spec.md` FR-033R, mirror in its Appendix A). If this spec is
+> implemented, each name must be added to that array first — `EventLogger` is typed to it,
+> so an unregistered name will not compile. Do not read a name here as evidence that the
+> event exists.
+
 ---
 
 ## Problem Statement
