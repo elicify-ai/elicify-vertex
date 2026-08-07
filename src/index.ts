@@ -595,14 +595,522 @@ export function isMutatingBashCommand(command: string): boolean {
   return anyMutator
 }
 
-export function changedPathsFromTool(toolName: string, args: Record<string, unknown>): string[] {
+// ===========================================================================
+// BASH PATH ATTRIBUTION — "WHICH file did that shell command touch?"
+// ===========================================================================
+//
+// THE MEASURED FAILURE THIS SECTION EXISTS TO END.
+//
+// `changedPathsFromTool` used to answer every mutating bash command with the
+// single pathless marker `["bash-mutation"]`, even when the command named its
+// target in plain sight (`cat > index.html <<EOF`, `touch a.js`,
+// `echo x > src/a.js`). Downstream, `plugin.ts` and `diffstat.ts` both strip
+// markers out (`NON_PATH_MUTATION_MARKERS`) to get a list git and
+// `resolveVerifier` can use — so for a session that built its whole app
+// through the bash tool that list was ALWAYS empty.
+//
+// Measured in live session ses_0254e14e (29 min, a working web app served on
+// :8090): 0 non-empty `changedPaths` across every session in the log;
+// `hasChangedFiles` TRUE while the filtered list was EMPTY (so the verify-gap
+// producer ran and then found nothing to reason about); 40 x
+// `resolution:none` with `changedPaths: []`; `verifier:field-dropped
+// {verifierSummaries}`; `verifier:verdict-not-enforced` x4 and
+// `verifier:unverified` for all five stories. The harness was blind for the
+// whole session because a parser it never had was assumed to exist.
+//
+// The rules this parser holds itself to:
+//
+//  - ATTRIBUTE PER SEGMENT. `touch a.js && npm install` knows about `a.js`
+//    AND knows that something else changed it cannot name, so it reports
+//    BOTH — the path and the marker. Never collapse one into the other.
+//  - NEVER REGRESS TO SILENCE. The marker stays as the fallback for commands
+//    that genuinely mutate without naming a file (`npm install`,
+//    `git checkout`, `mkdir -p src`, a `python3 <<PY` inline write). "We know
+//    something changed but not what" must never degrade to "nothing changed".
+//  - OVER-EXTRACTION IS ITS OWN BUG. Attributing `/dev/null`, a URL, a flag,
+//    an unexpanded `$VAR`, a glob, a process substitution, or `/tmp/build.log`
+//    as a project change is worse than the marker: it puts a lie in the
+//    ledger, mis-scopes `resolveVerifier`, and trips the scope watchdog.
+//    `isPlausibleTargetToken` and the workspace bound are the filters.
+//  - `isMutatingBashCommand` IS NOT TOUCHED. Its true/false answers are
+//    correct today and are pinned by tests (`npm install --dry-run`,
+//    `git commit -n`, `cp -n`, `sudo -u`, …). This section only answers the
+//    SECOND question — given that it mutates, what did it touch — and only
+//    ever runs when `isMutatingBashCommand` has already said yes.
+
+/** Heads whose non-flag operands are the files they change. */
+const BASH_TARGET_ALL_OPERANDS = new Set(["touch", "rm", "unlink", "mv", "truncate"])
+/** Heads whose LAST operand is the destination they create/overwrite. */
+const BASH_TARGET_LAST_OPERAND = new Set(["cp", "ln", "install"])
+/** Options that consume the following token as their value, per head. */
+const BASH_VALUE_OPTIONS: Record<string, ReadonlySet<string>> = {
+  truncate: new Set(["-s", "--size", "-r", "--reference"]),
+  chmod: new Set(["--reference"]),
+  install: new Set(["-m", "--mode", "-o", "--owner", "-g", "--group", "-t", "--target-directory"]),
+  cp: new Set(["-t", "--target-directory", "-S", "--suffix"]),
+  mv: new Set(["-t", "--target-directory", "-S", "--suffix"]),
+  ln: new Set(["-t", "--target-directory", "-S", "--suffix"]),
+  sed: new Set(["-e", "--expression", "-f", "--file", "-l", "--line-length"]),
+  perl: new Set(["-e", "-E", "-I", "-m", "-M"]),
+}
+/** Sudo prefix accepted by MUTATING_BASH_RE, stripped before head lookup so
+ * `sudo -u ci touch a.js` still attributes `a.js`. */
+const SUDO_PREFIX_RE = /^sudo(?:\s+-[A-Za-z]+(?:\s+\S+)?)*\s+/i
+/** The `*** Add|Update|Delete File:` envelope, shared by the `apply_patch`
+ * tool and its bash invocation (opencode accepts both spellings). */
+const PATCH_FILE_ENVELOPE_RE = /^\*\*\* (?:Add|Update|Delete) File: (.+)$/gm
+/** A token that cannot be a project file: flag, URL, unexpanded expansion,
+ * glob, process substitution, fd number, or a shell operator fragment. */
+const NON_TARGET_TOKEN_RE = /[*?()<>|`$\n]|:\/\//
+/** Kernel/device pseudo-filesystems. `> /dev/null` is a discard, not a write. */
+const PSEUDO_FS_RE = /^\/(?:dev|proc|sys)(?:\/|$)/
+/** Ceiling on paths attributed to one command. A `rm -rf a b c …` with a
+ * hundred operands should not flood the ledger; past the cap the marker
+ * records that the list is incomplete. */
+const MAX_ATTRIBUTED_BASH_PATHS = 32
+
+/** Read one quote-aware shell word starting at `start`. Returns the UNQUOTED
+ * value and the index just past it. Stops at unquoted whitespace and at the
+ * operator characters that end a word. */
+function readShellWord(text: string, start: number): { token: string; next: number } {
+  let raw = ""
+  let quote: '"' | "'" | null = null
+  let i = start
+  for (; i < text.length; i++) {
+    const ch = text[i]
+    if (quote === "'") {
+      if (ch === "'") quote = null
+      else raw += ch
+      continue
+    }
+    if (quote === '"') {
+      if (ch === "\\" && i + 1 < text.length) {
+        raw += text[i + 1]
+        i++
+        continue
+      }
+      if (ch === '"') quote = null
+      else raw += ch
+      continue
+    }
+    if (ch === "\\" && i + 1 < text.length) {
+      raw += text[i + 1]
+      i++
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      continue
+    }
+    if (/[\s;|&<>()]/.test(ch)) break
+    raw += ch
+  }
+  return { token: raw, next: i }
+}
+
+/**
+ * Split one shell segment into its WORDS and its REDIRECT TARGETS, quote-aware.
+ *
+ * Doing both in one pass is what lets `touch a.js > log.txt` report `a.js` as
+ * an operand and `log.txt` as a redirect instead of counting `log.txt` twice,
+ * and what keeps a quoted path with a space (`> "my file.txt"`) in one piece —
+ * which `SHELL_FILE_REDIRECT_RE`'s `(\S+)` capture cannot do, and must not be
+ * changed to do, because that regex answers the frozen `isMutatingBashCommand`
+ * question.
+ *
+ * fd duplications (`2>&1`, `>&2`) are consumed and discarded; input redirects
+ * and heredoc openers (`< in`, `<<EOF`) are consumed so their word is never
+ * mistaken for an operand.
+ */
+function parseShellSegment(segment: string): { words: string[]; redirects: string[] } {
+  const words: string[] = []
+  const redirects: string[] = []
+  let i = 0
+  const skipBlanks = (): void => {
+    while (i < segment.length && (segment[i] === " " || segment[i] === "\t")) i++
+  }
+  const consumeWord = (): string => {
+    const read = readShellWord(segment, i)
+    i = read.next === i ? i + 1 : read.next
+    return read.token
+  }
+  while (i < segment.length) {
+    const ch = segment[i]
+    if (/\s/.test(ch)) {
+      i++
+      continue
+    }
+    if (ch === "<") {
+      // `<file`, `<<EOF`, `<<-EOF`, `<<<word` — consume the operator and the
+      // word that names its source/delimiter. Neither is a changed path.
+      while (segment[i] === "<") i++
+      if (segment[i] === "-") i++
+      skipBlanks()
+      consumeWord()
+      continue
+    }
+    if (ch === ">" || (ch === "&" && segment[i + 1] === ">")) {
+      if (ch === "&") i++
+      i++ // the `>`
+      if (segment[i] === ">") i++ // append form
+      if (segment[i] === "&") {
+        // fd duplication (`2>&1`, `>&2`): the word is a descriptor, not a file.
+        i++
+        consumeWord()
+        continue
+      }
+      if (segment[i] === "|") i++ // `>|` clobber form
+      skipBlanks()
+      const target = consumeWord()
+      if (target) redirects.push(target)
+      continue
+    }
+    if (ch === ";" || ch === "|" || ch === "&" || ch === "(" || ch === ")") {
+      i++
+      continue
+    }
+    const read = readShellWord(segment, i)
+    if (read.next === i) {
+      i++
+      continue
+    }
+    // A bare fd number immediately followed by `>` belongs to the redirect
+    // that comes next, not to the argument list.
+    const isFdPrefix = /^\d+$/.test(read.token) && segment[read.next] === ">"
+    if (!isFdPrefix) words.push(read.token)
+    i = read.next
+  }
+  return { words, redirects }
+}
+
+/**
+ * Remove heredoc BODIES before the command is parsed for paths.
+ *
+ * `cat > index.html <<EOF … EOF` names its target in the redirect; the body is
+ * the file's CONTENT and must never be mined for paths. It routinely contains
+ * text that looks exactly like a redirect once `shellSegments` has split it on
+ * newlines (a shell snippet inside a README, `<a href="x" >` in HTML), and every
+ * such hit would be a fabricated changed path. The opener line is kept so the
+ * redirect target survives; the body and its closing delimiter line are dropped.
+ *
+ * `<<<` here-strings are excluded by the lookarounds — they have no body.
+ */
+const HEREDOC_OPENER_RE = /(?<!<)<<(?!<)-?[ \t]*(?:(['"])([^'"\n]+)\1|([A-Za-z_][A-Za-z0-9_]*))/
+
+function stripHeredocBodies(command: string): string {
+  if (!command.includes("<<")) return command
+  let kept = ""
+  let offset = 0
+  for (let guard = 0; guard < 64; guard++) {
+    const opener = HEREDOC_OPENER_RE.exec(command.slice(offset))
+    if (!opener) break
+    const openerEnd = offset + opener.index + opener[0].length
+    const delimiter = opener[2] ?? opener[3]
+    const lineEnd = command.indexOf("\n", openerEnd)
+    const body = lineEnd === -1 ? "" : command.slice(lineEnd + 1)
+    const closing =
+      delimiter && lineEnd !== -1
+        ? new RegExp(`^[\\t ]*${escapeRegExp(delimiter)}[\\t ]*$`, "m").exec(body)
+        : null
+    if (!closing) {
+      // Not a heredoc after all — a `<<` inside a quoted argument
+      // (`echo "a << b" > f.txt`), or an opener whose body never closes.
+      // Keep the text and resume scanning AFTER it; dropping the remainder
+      // here would silently lose every later segment's paths.
+      kept += command.slice(offset, openerEnd)
+      offset = openerEnd
+      continue
+    }
+    kept += command.slice(offset, lineEnd + 1)
+    offset = lineEnd + 1 + closing.index + closing[0].length
+  }
+  return kept + command.slice(offset)
+}
+
+/** Could this token name a file in the project? See NON_TARGET_TOKEN_RE. */
+function isPlausibleTargetToken(token: string): boolean {
+  if (!token || token.length > 4096) return false
+  if (token.startsWith("-")) return false // a flag, not a path
+  if (token === "." || token === "..") return false
+  if (/^\d+$/.test(token)) return false // a file descriptor
+  if (NON_TARGET_TOKEN_RE.test(token)) return false
+  if (PSEUDO_FS_RE.test(token)) return false
+  if (token.endsWith("/dev/null")) return false
+  return true
+}
+
+/** Join a `cd`-relative base with a path fragment, POSIX-style. */
+function joinPathParts(base: string, fragment: string): string {
+  if (!fragment) return base
+  if (fragment.startsWith("/")) return normalizePosixPath(fragment)
+  if (!base) return normalizePosixPath(fragment)
+  return normalizePosixPath(`${base.replace(/\/+$/, "")}/${fragment}`)
+}
+
+/** Collapse `.`/`..`/duplicate separators without touching the filesystem. */
+function normalizePosixPath(path: string): string {
+  const absolute = path.startsWith("/")
+  const out: string[] = []
+  for (const part of path.split("/")) {
+    if (part === "" || part === ".") continue
+    if (part === "..") {
+      if (out.length > 0 && out[out.length - 1] !== "..") out.pop()
+      else if (!absolute) out.push("..")
+      continue
+    }
+    out.push(part)
+  }
+  const joined = out.join("/")
+  if (absolute) return `/${joined}`
+  return joined || "."
+}
+
+/** Is `candidate` at or under `root`? Both must already be absolute. */
+function isUnderRoot(candidate: string, root: string): boolean {
+  const normalizedRoot = normalizePosixPath(root).replace(/\/+$/, "")
+  if (!normalizedRoot || normalizedRoot === "/") return true
+  return candidate === normalizedRoot || candidate.startsWith(`${normalizedRoot}/`)
+}
+
+export interface BashAttributionOptions {
+  /**
+   * The session's worktree root. When known, relative targets are resolved
+   * against it (so a bash write and an `edit` call spell the same file the
+   * same way), and ABSOLUTE targets outside it are dropped — which is what
+   * keeps `> /tmp/build.log` or `touch ~/scratch/x` out of the ledger without
+   * a `/tmp` blacklist that would break every workspace that legitimately
+   * lives under a temp directory.
+   */
+  workspaceRoot?: string
+}
+
+/**
+ * The paths a mutating bash command names, plus `bash-mutation` when some part
+ * of it mutated without naming anything. Returns `[]` for a non-mutating
+ * command — `isMutatingBashCommand` remains the sole authority on that.
+ */
+export function changedPathsFromBashCommand(command: string, options: BashAttributionOptions = {}): string[] {
+  if (!isMutatingBashCommand(command)) return []
+
+  const root = options.workspaceRoot ? normalizePosixPath(options.workspaceRoot) : ""
+  const paths: string[] = []
+  let unattributed = false
+  let overflowed = false
+
+  const record = (rawToken: string, base: string): void => {
+    if (!isPlausibleTargetToken(rawToken)) return
+    // The directory the token is relative to: an absolute `cd` wins outright,
+    // otherwise the worktree root with any relative `cd` prefix applied. With
+    // no root known the base stays relative and the token is recorded as
+    // written, which is the honest answer to "relative to what?".
+    const anchor = base.startsWith("/") ? base : joinPathParts(root, base)
+    const resolved = rawToken.startsWith("/") ? normalizePosixPath(rawToken) : joinPathParts(anchor, rawToken)
+    if (PSEUDO_FS_RE.test(resolved)) return
+    if (root && resolved.startsWith("/") && !isUnderRoot(resolved, root)) return
+    if (paths.includes(resolved)) return
+    if (paths.length >= MAX_ATTRIBUTED_BASH_PATHS) {
+      overflowed = true
+      return
+    }
+    paths.push(resolved)
+  }
+
+  // `apply_patch` carries its targets inside the heredoc body — the one place
+  // a heredoc body IS the evidence — so it is read from the RAW command before
+  // the bodies are stripped.
+  let patchNamedFiles = false
+  if (/(?:^|[\s;|&(])(?:sudo\s+)?apply_?patch\b/i.test(command)) {
+    for (const match of command.matchAll(PATCH_FILE_ENVELOPE_RE)) {
+      patchNamedFiles = true
+      record(match[1].trim(), "")
+    }
+  }
+
+  let base = "" // the `cd` prefix in force for the segments that follow
+  for (const rawSegment of shellSegments(stripHeredocBodies(command))) {
+    const segment = rawSegment.replace(SUDO_PREFIX_RE, "").trim()
+    if (!segment) continue
+    const { words, redirects } = parseShellSegment(segment)
+    const head = (words[0] ?? "").toLowerCase()
+
+    if (head === "cd") {
+      const target = words[1]
+      // `cd`, `cd -`, `cd ~…` and any expansion we cannot resolve reset the
+      // base rather than guessing — a wrong base is a wrong path.
+      base = target && isPlausibleTargetToken(target) && !target.startsWith("~") ? joinPathParts(base, target) : ""
+      continue
+    }
+
+    let named = redirects.length
+    for (const target of redirects) record(target, base)
+
+    // A rehearsal changes nothing; mirror `isMutatingBashCommand`'s own guard.
+    const rehearsal = DRY_RUN_RE.test(segment)
+    const operands = rehearsal ? [] : operandTargetsForHead(head, words.slice(1))
+    named += operands.length
+    for (const target of operands) record(target, base)
+
+    // The `apply_patch` segment's own targets came from the patch envelope
+    // above, so it is already attributed even though the segment names none.
+    const attributedElsewhere = patchNamedFiles && /^apply_?patch\b/i.test(segment)
+    if (named === 0 && !rehearsal && !attributedElsewhere && segmentIsMutating(rawSegment)) unattributed = true
+  }
+
+  // An inline python/node write names its file inside a string literal we do
+  // not evaluate, so it is unattributable by construction — say so rather than
+  // implying the command changed nothing.
+  if (pythonIsMutation(command) || NODE_INLINE_WRITE_RE.test(command)) unattributed = true
+
+  if (paths.length === 0 || unattributed || overflowed) return [...paths, "bash-mutation"]
+  return paths
+}
+
+/** Segment-level twin of `isMutatingBashCommand`'s per-segment checks, used
+ * only to decide whether an un-attributed segment still owes a marker. */
+function segmentIsMutating(segment: string): boolean {
+  if (!DRY_RUN_RE.test(segment) && (MUTATING_BASH_RE.test(segment) || MUTATING_BASH_FLAG_RE.test(segment))) return true
+  return (
+    downloaderIsMutation(segment) ||
+    shellRedirectTargetsWorkspace(segment) ||
+    teeIsMutation(segment) ||
+    pythonIsMutation(segment) ||
+    NODE_INLINE_WRITE_RE.test(segment)
+  )
+}
+
+/**
+ * The operands of a known mutator head that name what it changes.
+ *
+ * Deliberately narrow. `mkdir` is absent: it names a DIRECTORY, which is not
+ * a file-level change any verifier can be resolved from and which would fire
+ * the scope watchdog on a path no one edited — `mkdir -p src` keeps the
+ * marker. `git`, `npm`, `curl`/`wget` are absent for the same reason: what
+ * they touch is not what they name.
+ */
+function operandTargetsForHead(head: string, args: readonly string[]): string[] {
+  if (head === "tee") return collectTeeTargets(args)
+  if (head === "chmod") return collectPlainOperands(head, args).slice(1) // arg 1 is the MODE
+  if (head === "sed") return collectSedTargets(args)
+  if (head === "perl") return collectPerlTargets(args)
+  if (BASH_TARGET_ALL_OPERANDS.has(head)) return collectPlainOperands(head, args)
+  if (BASH_TARGET_LAST_OPERAND.has(head)) {
+    // Only the DESTINATION changes. `cp a b` -> `b`; `cp a b c dir` -> `dir`.
+    const operands = collectPlainOperands(head, args)
+    return operands.length > 0 ? [operands[operands.length - 1]] : []
+  }
+  return []
+}
+
+/** Non-flag operands, skipping options that consume the next token. */
+function collectPlainOperands(head: string, args: readonly string[]): string[] {
+  const valueOptions = BASH_VALUE_OPTIONS[head]
+  const out: string[] = []
+  let optionsOver = false
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]
+    if (!optionsOver && arg === "--") {
+      optionsOver = true
+      continue
+    }
+    if (!optionsOver && arg.startsWith("-") && arg.length > 1) {
+      if (valueOptions?.has(arg)) i++
+      continue
+    }
+    out.push(arg)
+  }
+  return out
+}
+
+/** `tee [-a] FILE…` — every named target is written. */
+function collectTeeTargets(args: readonly string[]): string[] {
+  const out: string[] = []
+  let optionsOver = false
+  for (const arg of args) {
+    if (!optionsOver && arg === "--") {
+      optionsOver = true
+      continue
+    }
+    if (!optionsOver && arg.startsWith("-") && arg.length > 1) continue
+    optionsOver = true
+    out.push(arg)
+  }
+  return out
+}
+
+/** `sed -i[SUFFIX] [-e EXPR] SCRIPT? FILE…` — the script is not a file. */
+function collectSedTargets(args: readonly string[]): string[] {
+  if (!args.some((arg) => /^-[A-Za-z]*i/.test(arg) || arg === "--in-place" || arg.startsWith("--in-place="))) return []
+  const valueOptions = BASH_VALUE_OPTIONS.sed
+  let scriptConsumed = args.some((arg) => valueOptions.has(arg) || /^--(?:expression|file)=/.test(arg))
+  const out: string[] = []
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]
+    if (arg.startsWith("-") && arg.length > 1) {
+      if (valueOptions.has(arg)) i++
+      continue
+    }
+    if (!scriptConsumed) {
+      scriptConsumed = true // the first bare operand is the sed program
+      continue
+    }
+    out.push(arg)
+  }
+  return out
+}
+
+/** `perl -pi -e EXPR FILE…` — `-e`/`-E` swallow the program. */
+function collectPerlTargets(args: readonly string[]): string[] {
+  if (!args.some((arg) => /^-[A-Za-z]*i/.test(arg))) return []
+  const valueOptions = BASH_VALUE_OPTIONS.perl
+  const out: string[] = []
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]
+    if (arg.startsWith("-") && arg.length > 1) {
+      if (valueOptions.has(arg)) i++
+      continue
+    }
+    out.push(arg)
+  }
+  return out
+}
+
+/**
+ * Argument keys that carry a direct file path.
+ *
+ * WHAT THE HOST ACTUALLY DECLARES (read out of the shipped opencode binary,
+ * v1.18.x, not guessed): `edit` is `Struct({filePath, oldString, newString,
+ * replaceAll})`, `write` is `Struct({filePath, content})`, `read` is
+ * `Struct({filePath, …})` and `apply_patch` is `Struct({patchText})`. The
+ * host has no `multiedit` and no `notebookedit` tool at all, and it declares
+ * no `path` key anywhere — so `filePath` is the only spelling opencode itself
+ * will ever send, and the previous `filePath || file_path` pair was already
+ * right FOR OPENCODE.
+ *
+ * The list is still widened, because opencode is not the only thing that
+ * reaches this hook: `tool.execute.after` also fires for user-registered
+ * plugin tools and for MCP servers, whose argument names are theirs to choose,
+ * and `file_path` (Claude Code's spelling) was already here on exactly that
+ * reasoning. `path`, `notebookPath` and `notebook_path` are added for the same
+ * reason and cost nothing — a tool that does not send them is unaffected.
+ */
+const DIRECT_PATH_ARG_KEYS = ["filePath", "file_path", "path", "notebookPath", "notebook_path", "filepath"] as const
+
+function directPathFromArgs(args: Record<string, unknown>): string {
+  for (const key of DIRECT_PATH_ARG_KEYS) {
+    const value = args[key]
+    if (typeof value === "string" && value.trim().length > 0) return value
+  }
+  return ""
+}
+
+export function changedPathsFromTool(
+  toolName: string,
+  args: Record<string, unknown>,
+  options: BashAttributionOptions = {},
+): string[] {
   const normalized = toolName.toLowerCase()
-  const directPath = typeof args.filePath === "string"
-    ? args.filePath
-    : typeof args.file_path === "string"
-      ? args.file_path
-      : ""
   if (["edit", "write", "notebookedit", "multiedit"].includes(normalized)) {
+    const directPath = directPathFromArgs(args)
     return directPath ? [directPath] : ["edit-mutation"]
   }
   if (normalized === "apply_patch" || normalized === "patch") {
@@ -611,13 +1119,13 @@ export function changedPathsFromTool(toolName: string, args: Record<string, unkn
       : typeof args.patch === "string"
         ? args.patch
         : ""
-    const paths = [...patch.matchAll(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/gm)]
+    const paths = [...patch.matchAll(PATCH_FILE_ENVELOPE_RE)]
       .map((match) => match[1].trim())
     return paths.length > 0 ? paths : ["patch-mutation"]
   }
   if (normalized === "bash") {
     const command = typeof args.command === "string" ? args.command : ""
-    if (isMutatingBashCommand(command)) return ["bash-mutation"]
+    return changedPathsFromBashCommand(command, options)
   }
   return []
 }

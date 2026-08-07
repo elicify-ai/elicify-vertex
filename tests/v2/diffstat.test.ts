@@ -24,9 +24,13 @@ import {
   DIFF_UNAVAILABLE_GIT_FAILED,
   DIFF_UNAVAILABLE_NOT_A_REPO,
   DIFF_UNAVAILABLE_NO_CHANGES,
+  DIFF_UNAVAILABLE_UNATTRIBUTED,
   formatChangedPathsSummary,
+  hasUnattributedMutation,
   isPathListAnnouncementOnly,
+  realChangedPaths,
   toWorkspaceRelative,
+  UNATTRIBUTED_MUTATION_NOTE,
   UNTRACKED_FILES_HEADER,
 } from "../../src/v2/diffstat.js"
 
@@ -267,5 +271,85 @@ describe("computeBoundedDiffStat — B-3 fix (b)", () => {
     // match any files` and lose the real diff alongside it.
     const result = computeBoundedDiffStat(dir, ["bash-mutation", abs])
     expect(result.text).toContain("src/app.ts")
+  })
+})
+
+// ===========================================================================
+// THE THIRD STATE: "something changed and we cannot say what"
+// ===========================================================================
+//
+// Before this, an all-marker changed-path list filtered down to `[]` at every
+// call site — byte-identical to a turn that genuinely changed nothing. That
+// equivalence is what amplified the bash-attribution bug into a blind harness:
+// `hasChangedFiles` was TRUE while the filtered list was EMPTY, so the verifier
+// was handed silence and told nothing was wrong with it.
+
+describe("the unattributed-mutation state is distinguishable from a clean turn", () => {
+  it("separates the three states", () => {
+    expect(realChangedPaths([])).toEqual([])
+    expect(hasUnattributedMutation([])).toBe(false)
+
+    expect(realChangedPaths(["/w/a.ts"])).toEqual(["/w/a.ts"])
+    expect(hasUnattributedMutation(["/w/a.ts"])).toBe(false)
+
+    // State 3 — the one that used to be indistinguishable from state 1.
+    expect(realChangedPaths(["bash-mutation"])).toEqual([])
+    expect(hasUnattributedMutation(["bash-mutation"])).toBe(true)
+    expect(hasUnattributedMutation(["/w/a.ts", "bash-mutation"])).toBe(true)
+  })
+
+  it("does not claim git was asked about paths when there were none", () => {
+    // `DIFF_UNAVAILABLE_NO_CHANGES` says git "reports no tracked modification
+    // and no untracked file FOR THE RECORDED PATHS" — a false statement, and a
+    // reassuring one, when the only record was a pathless marker.
+    initRepo()
+    write("src/app.ts", "const a = 1\n")
+    git(dir, "add", "-A")
+    git(dir, "commit", "-q", "-m", "init")
+
+    const result = computeBoundedDiffStat(dir, ["bash-mutation"])
+    expect(result.text).toBe("")
+    expect(result.unavailableReason).toBe(DIFF_UNAVAILABLE_UNATTRIBUTED)
+    expect(result.unavailableReason).not.toBe(DIFF_UNAVAILABLE_NO_CHANGES)
+  })
+
+  it("still says NO_CHANGES for a genuinely clean turn", () => {
+    initRepo()
+    write("src/app.ts", "const a = 1\n")
+    git(dir, "add", "-A")
+    git(dir, "commit", "-q", "-m", "init")
+
+    expect(computeBoundedDiffStat(dir, []).unavailableReason).toBe(DIFF_UNAVAILABLE_NO_CHANGES)
+  })
+
+  it("tells the verifier a real diff is INCOMPLETE when a marker rode along with it", () => {
+    initRepo()
+    const abs = write("src/app.ts", "const a = 1\n")
+    git(dir, "add", "-A")
+    git(dir, "commit", "-q", "-m", "init")
+    writeFileSync(abs, "const a = 1\nconst b = 2\n")
+
+    const result = computeBoundedDiffStat(dir, [abs, "bash-mutation"])
+    expect(result.text).toContain("src/app.ts")
+    expect(result.text).toContain(UNATTRIBUTED_MUTATION_NOTE)
+  })
+
+  it("labels the marker in the fallback path list instead of leaving it to read as a filename", () => {
+    const summary = formatChangedPathsSummary(["bash-mutation"], "/workspace/x")
+    expect(summary).toContain("  bash-mutation")
+    expect(summary).toContain(UNATTRIBUTED_MUTATION_NOTE)
+  })
+
+  it("adds no note when every recorded entry is a real path", () => {
+    expect(formatChangedPathsSummary(["/workspace/x/src/a.ts"], "/workspace/x")).not.toContain(
+      UNATTRIBUTED_MUTATION_NOTE,
+    )
+  })
+
+  it("does not let the note keep an emptied path list looking populated", () => {
+    // B-3's guard: if the payload's secret scan deletes every path line, what
+    // is left must still read as ABSENT. Prose about the list is not the list.
+    expect(isPathListAnnouncementOnly(`${CHANGED_PATHS_HEADER}\n${UNATTRIBUTED_MUTATION_NOTE}`)).toBe(true)
+    expect(isPathListAnnouncementOnly(`${CHANGED_PATHS_HEADER}\n  src/a.ts\n${UNATTRIBUTED_MUTATION_NOTE}`)).toBe(false)
   })
 })

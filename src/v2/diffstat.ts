@@ -68,6 +68,42 @@ function escapesRoot(rel: string): boolean {
  * to git, but still worth showing the verifier in the fallback list. */
 export const NON_PATH_MUTATION_MARKERS = new Set(["edit-mutation", "patch-mutation", "bash-mutation"])
 
+/**
+ * THE THIRD STATE, and the amplifier of the attribution bug this pair of
+ * helpers exists to end.
+ *
+ * Every call site used to write `changedPaths.filter((p) => !MARKERS.has(p))`
+ * inline and read the result as "the files that changed". For a marker-only
+ * list that expression is `[]` — which is byte-identical to a genuinely clean
+ * turn. So a session that built an entire application through the bash tool
+ * (see `index.ts`'s BASH PATH ATTRIBUTION header, live session ses_0254e14e)
+ * presented as one that had touched nothing, and the harness had no way to
+ * tell the difference. 40 x `resolution:none {changedPaths: []}` in one run.
+ *
+ * There are THREE states, not two:
+ *   1. nothing changed              -> `realChangedPaths` empty, no markers
+ *   2. these files changed          -> `realChangedPaths` non-empty
+ *   3. something changed, unknown   -> `realChangedPaths` empty, markers present
+ *
+ * State 3 is now named (`hasUnattributedMutation`), logged distinctly
+ * (`resolution:unattributed`), and stated to the verifier in prose
+ * (`UNATTRIBUTED_MUTATION_NOTE` / `DIFF_UNAVAILABLE_UNATTRIBUTED`) instead of
+ * being handed to it as silence.
+ */
+export function realChangedPaths(paths: readonly string[]): string[] {
+  return paths.filter((p) => !NON_PATH_MUTATION_MARKERS.has(p))
+}
+
+/** True when at least one recorded mutation could not be attributed to a path. */
+export function hasUnattributedMutation(paths: readonly string[]): boolean {
+  return paths.some((p) => NON_PATH_MUTATION_MARKERS.has(p))
+}
+
+/** Fixed prose (never interpolated, so the payload's secret scan cannot eat
+ * it) appended to the file-level evidence whenever state 3 is in play. */
+export const UNATTRIBUTED_MUTATION_NOTE =
+  "note: at least one mutation this session named no file (a `-mutation` entry above) — a shell command such as `npm install` or `git checkout`, an inline interpreter write, or a patch with no envelope. Something changed here that could not be attributed to a path, so this file list is INCOMPLETE. Do not read it as the full set of changes."
+
 const GIT_TIMEOUT_MS = 2000
 const DIFF_STAT_MAX_CHARS = 4000
 /** Cap on the untracked-file list. A fresh repo with no `.gitignore` can have
@@ -102,6 +138,12 @@ export const DIFF_UNAVAILABLE_GIT_FAILED =
 
 export const DIFF_UNAVAILABLE_NO_CHANGES =
   "no diff: this IS a git repository, and git reports no tracked modification and no untracked file for the recorded paths — the work may already be committed, or reverted. Check with git before crediting or faulting a claim."
+
+/** State 3 (see `realChangedPaths`): mutations were observed, none of them
+ * named a file, and git therefore had no pathspec to diff. This is MISSING
+ * evidence, and it must not be presented with the same words as "clean". */
+export const DIFF_UNAVAILABLE_UNATTRIBUTED =
+  "no diff: mutations WERE observed this session, but not one of them named the file it touched (shell commands like `npm install` or `git checkout`, or an inline interpreter write), so there was no path for git to diff. Treat this as MISSING file evidence, NOT as evidence that nothing changed — inspect the workspace yourself with read, glob, grep or bash before crediting or faulting any claim that turns on it."
 
 function runGit(args: string[], cwd: string): string | undefined {
   try {
@@ -187,6 +229,10 @@ export function isPathListAnnouncementOnly(text: string): boolean {
       sawHeader = true
       continue
     }
+    // The state-3 note is prose ABOUT the list, not an entry in it. Counting it
+    // as content would let a field whose every real path the scan deleted read
+    // as "present", which is precisely the hole B-3 closed.
+    if (trimmed === UNATTRIBUTED_MUTATION_NOTE) continue
     if (LIST_OVERFLOW_LINE.test(trimmed)) continue
     return false
   }
@@ -201,7 +247,11 @@ export function isPathListAnnouncementOnly(text: string): boolean {
 export function formatChangedPathsSummary(paths: readonly string[], cwd: string): string {
   if (paths.length === 0) return "no changed paths recorded"
   const lines = paths.map((p) => `  ${toWorkspaceRelative(p, cwd)}`)
-  return [CHANGED_PATHS_HEADER, ...lines].join("\n")
+  // State 3: say out loud that a `…-mutation` entry is an unattributed change,
+  // not a filename. Without this the judge reads "bash-mutation" as a path it
+  // cannot find and quietly discounts the whole list.
+  const note = hasUnattributedMutation(paths) ? [UNATTRIBUTED_MUTATION_NOTE] : []
+  return [CHANGED_PATHS_HEADER, ...lines, ...note].join("\n")
 }
 
 /**
@@ -239,10 +289,10 @@ export function computeBoundedDiffStat(cwd: string, changedPaths: readonly strin
   // Relative pathspecs only: git resolves them against `cwd`, they are what
   // the diff prints back anyway, and an absolute path pointing outside the
   // repo makes git exit `fatal:` and take the whole summary down with it.
-  const pathspecs = changedPaths
-    .filter((p) => !NON_PATH_MUTATION_MARKERS.has(p))
+  const pathspecs = realChangedPaths(changedPaths)
     .map((p) => toWorkspaceRelative(p, cwd))
     .filter((p) => !isAbsolute(p) && !escapesRoot(p))
+  const unattributed = hasUnattributedMutation(changedPaths)
 
   const stat = runGit(pathspecs.length > 0 ? ["diff", "--stat", "--", ...pathspecs] : ["diff", "--stat"], cwd)
   if (stat === undefined) return { text: "", unavailableReason: DIFF_UNAVAILABLE_GIT_FAILED }
@@ -272,7 +322,17 @@ export function computeBoundedDiffStat(cwd: string, changedPaths: readonly strin
     )
   }
 
-  if (sections.length === 0) return { text: "", unavailableReason: DIFF_UNAVAILABLE_NO_CHANGES }
+  if (sections.length === 0) {
+    // State 3 vs state 1. `DIFF_UNAVAILABLE_NO_CHANGES` claims git was asked
+    // about "the recorded paths" — untrue and actively misleading when there
+    // were no paths to ask about, only markers.
+    return { text: "", unavailableReason: unattributed ? DIFF_UNAVAILABLE_UNATTRIBUTED : DIFF_UNAVAILABLE_NO_CHANGES }
+  }
+
+  // A real diff plus an unattributed mutation is still incomplete evidence:
+  // the diff is scoped to the paths we DID attribute (or repo-wide when we
+  // attributed none), and the marker says that scope has a hole in it.
+  if (unattributed) sections.push(UNATTRIBUTED_MUTATION_NOTE)
 
   const joined = sections.join("\n")
   const text = joined.length > DIFF_STAT_MAX_CHARS ? `${joined.slice(0, DIFF_STAT_MAX_CHARS)}\n… (truncated)` : joined
