@@ -7,12 +7,22 @@
  * `docs/vertex2-spec.md`'s "Relevant Execution Flows" table and Functional
  * Requirements.
  *
- * `src/index.ts` is FROZEN — imported for its reusable v1 primitives
+ * `src/index.ts` is the SHARED PRIMITIVES library, not a frozen v1 artefact.
+ * This comment claimed it was "FROZEN — never edited, never reimplemented"
+ * long after that stopped being true: the v1 plugin was deleted, and the file
+ * has taken nine v2-era commits since (mutation-detection widening, stop-mode
+ * collapse, the mutation timestamp the verdict-staleness fix reads, and most
+ * recently `recordVerification`'s `coversPrescribed` bit for BACKLOG R-4). A
+ * header asserting a constraint nobody is honouring is worse than no header:
+ * the next person either believes it and works around a file they were free to
+ * edit, or notices it is false and trusts nothing else here.
+ *
+ * What is still true: it is imported for primitives shared with the v2 tree
  * (`EvidenceLedger`/`shouldBlockStop`, `parseVerification`,
- * `isMutatingBashCommand` (indirectly, via `changedPathsFromTool`),
- * `changedPathsFromTool`, `formatChangedPathsForReason`,
- * `formatGateContinuationText`, `formatActivateCue`, `classifyStopMode`,
- * `failureSignature`) — never edited, never reimplemented.
+ * `changedPathsFromTool` — which routes `isMutatingBashCommand`,
+ * `formatChangedPathsForReason`, `formatGateContinuationText`,
+ * `formatActivateCue`, `classifyStopMode`, `failureSignature`). Edit it when
+ * the shared behaviour must change; do not fork a second copy into `src/v2/`.
  *
  * FR-036 (self-created-session inertness) is enforced at the top of EVERY
  * hook via `selfCreated.isSelfCreated(sessionID, selfCreatedGuard.resolveParent)`.
