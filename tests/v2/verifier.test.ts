@@ -2497,18 +2497,70 @@ describe("span pass round 6: the wrapped-key guard, the span window, and the cos
     expect(out).toBe("deploying now:\n(done)")
   })
 
-  it("EXTRA FIX B: the span window STOPS at SPAN_MAX_UNITS — a seven-line wrap is out of scope by design", () => {
-    // Pinning the bound, not endorsing the hole. A wrap this narrow means five
-    // characters per line, which no terminal, editor or serializer produces;
-    // the bound is what keeps the pass linear, and widening it was measured at
-    // ~10x the cost on an adversarial field. This test exists so that changing
-    // `SPAN_MAX_UNITS` — in EITHER direction — is a deliberate, visible act
-    // rather than a silent one: set it to 60 and this test fails.
-    const key = "sbmkYHSiA5H4eyTXQo0ZYjSvXZUdnhyfggW"
+  it("R-5: a key wrapped across SEVEN lines is removed — the sixth unit was not enough evidence", () => {
+    // 35 characters over seven 5-character lines. Every SIX-unit window carries
+    // at most 30 characters, under the 32-char entropy floor, so at the old
+    // bound of six no window could see this key and it was transmitted whole
+    // with an empty event list. Measured over 180,000 uniformly-wrapped probes:
+    // 64 whole-key leaks at a bound of six, 20 at seven, 0 innocent corpora
+    // newly redacted. Set `SPAN_MAX_UNITS` back to 6 and this key comes
+    // straight back.
+    const key = "0qsKwyvSPUnVtK63ltnEHuuWvQqOD3kkPuw"
     const units = [0, 1, 2, 3, 4, 5, 6].map((i) => key.slice(i * 5, i * 5 + 5))
+    const { out } = scan(["deploying now:", ...units, "(done)"])
+    expect(flat(out)).not.toContain(key)
+    expect(out).toBe("deploying now:\n(done)")
+  })
+
+  it("EXTRA FIX B: the span window STOPS at SPAN_MAX_UNITS — an eight-line wrap is out of scope by design", () => {
+    // Pinning the bound, not endorsing the hole. 32 characters over eight
+    // 4-character lines: a wrap this narrow means four characters per line,
+    // which no terminal, editor or serializer produces, and the bound is what
+    // keeps the pass linear — the same field measured 238-248 ms at seven and
+    // 286-291 ms at eight against a ~300 ms budget, for the same 20 residual
+    // leaks. This test exists so that changing `SPAN_MAX_UNITS` — in EITHER
+    // direction — is a deliberate, visible act rather than a silent one: set it
+    // to 60 and this test fails, set it to 6 and the test above fails.
+    const key = "AaiQePcSnHXNDdirByUwpsKFfMAb2ktz"
+    const units = [0, 1, 2, 3, 4, 5, 6, 7].map((i) => key.slice(i * 4, i * 4 + 4))
     const { out, logger } = scan(["deploying now:", ...units, "(done)"])
     expect(flat(out)).toContain(key)
     expect(logger).not.toHaveBeenCalled()
+  })
+
+  it("R-5 (reproduced): framing punctuation on an INTERIOR line no longer buys the key a free pass", () => {
+    // The largest single class in the R-5 residual sweep. `spanKeyCore` used to
+    // demand that the whole interior of the span — everything between the first
+    // and last join — be one clean encoding class. That holds for a bare
+    // wrapped key and fails the moment the framing's own quote lands on an
+    // interior line instead of at the span's edge: no core, span exonerated,
+    // key transmitted byte-identical with an empty event list. Measured before
+    // this fix: exactly the output asserted in the `.not` below.
+    const key = "4OYYGUU2VM74ERXROB2K4VGORXUUTGFO"
+    const lines = ["running deploy:", "--blob=", `"${key.slice(0, 7)}`, `${key.slice(7)}"`, "exit 0"]
+    const { out, logger } = scan(lines)
+    expect(flat(out)).not.toContain(key)
+    expect(out).toBe("running deploy:\nexit 0")
+    expect(logger).toHaveBeenCalledWith("verifier:field-partial-drop", { field: "recentTranscript", kept: 2, dropped: 3 })
+  })
+
+  it("R-5 residual, PINNED not fixed: a key under the 32-char token floor is transmitted", () => {
+    // An honest residual, asserted so it cannot be "fixed" by accident and
+    // cannot be forgotten. A 24-character key never reaches
+    // `ENTROPY_MIN_TOKEN_LENGTH`, so no scan in this module looks at it — on one
+    // line, wrapped, or split. Measured: 2,013 of 12,500 short-key probes
+    // (16-30 chars, 5 alphabets, 5 framings) transmit whole.
+    //
+    // The fix is one constant, and its cost was measured before it was
+    // rejected: dropping the floor to 24 closes 1,482 of those 2,013 and newly
+    // redacts 810 of 4,200 innocent evidence fields — 270 of them emptied
+    // outright — because minified JS, stack traces, lockfile hunks and log
+    // lines are full of 24-character tokens. That is the B-3 evidence-
+    // starvation failure, traded for a confidentiality gain of the same order.
+    // If this test ever fails, the trade was re-made: re-measure both sides.
+    const key = "soeWqMs2RN4Y52hG5pky8Ro0"
+    const { out } = scan(["running deploy:", key, "exit 0"])
+    expect(flat(out)).toContain(key)
   })
 
   it("FIX 3: the span pass costs a bounded multiple of a plain scan on an adversarial field", () => {

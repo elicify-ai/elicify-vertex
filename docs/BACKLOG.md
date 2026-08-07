@@ -730,11 +730,97 @@ resolution was weakest. Not fixed — it sits in a file another workstream owned
 this round, and changing receipt semantics deserves its own change with its own
 evidence.
 
-## R-5 — Open: one residual 3-way span leak
+## R-5 — Two thirds closed, one third measured and kept
 
 The general span-pass fix measured whole-key leaks over 400 probes per
 encoding: base64-44 92 -> 0, hex-40 193 -> 0, but **base64-40 151 -> 1**. One
 case in that class still transmits. Recorded rather than rounded to zero.
+
+### What was actually escaping (characterised before anything changed)
+
+Two corpora, both 180,000 probes (5 alphabets x 6 key lengths of 32-64 x 4
+wrap shapes x 5 framings x 300 keys), plus a 12,500-probe short-key corpus:
+
+| class | before | what it is |
+|---|---|---|
+| uniform wrap (widths 6/10/16/22) | 64 | keys folded into MORE than six units |
+| adversarial split (random cut points, 2/3/4/6-way) | 32 | framing punctuation on interior lines; low-entropy base32; word-shaped cores |
+| short key on ONE line (16-30 chars) | 2,013 / 12,500 | under `ENTROPY_MIN_TOKEN_LENGTH`; no scan ever looks at them |
+
+The single-line class is **entirely** keys shorter than the 32-character token
+floor. Measured directly: every key of 32 characters or more, in all five
+alphabets and all five framings, is caught on one line — 0 leaks in 55,000
+single-line probes at length >= 32. Nothing about the alphabet or the framing
+matters at that length; the floor is the whole story.
+
+### Changed (both free — 0 innocent content newly redacted)
+
+1. **`spanKeyCore` is anchored at the joins, not at the interior.** It used to
+   require the entire interval between the first and last join to be one clean
+   encoding class, which fails as soon as the framing's own quote lands on an
+   INTERIOR line (`--blob=` / `"4OYYGUU` / `2VM74…UTGFO"` transmitted the key
+   byte-identical with an empty event list — the largest single class in the
+   adversarial residual). It now asks whether SOME join is crossed by a >= 32
+   character run of one encoding. Side effect: it is also **cheaper** than the
+   test it replaces (a punctuation-adjacent join is rejected in two character
+   tests), which paid for the next change.
+2. **`SPAN_MAX_UNITS` 6 -> 7.** The window is an evidence limit as much as a
+   reach limit: a seven-unit window fuses 40 characters of a width-6 fold where
+   the six-unit windows fuse 34-36 and fall under the entropy floor. Seven and
+   not eight — both leave the same 20 residual leaks, and eight costs 286-291 ms
+   on the worst admissible field against a ~300 ms budget.
+
+Result, measured on the same corpora: uniform wrap **64 -> 20**, adversarial
+split **32 -> 15**, the 16-shape x 741-split regression corpus **0 -> 0**,
+innocent differential **0 widened / 0 narrowed over 2,100 corpora x 2 fields**,
+worst-case scan **211 -> 250 ms median** (257-266 ms worst, budget ~300 ms).
+
+### NOT changed, with the measurement that rejected it
+
+All against 4,200 innocent evidence fields (2,100 realistic corpora x 2 fields:
+minified JS, base64 data URIs, import chains, compact JSON, lockfile hunks,
+stack traces, UUID lists, wrapped URLs, path lists, plan digests, diff stats,
+log lines, prose, csv, identifier and snake_case lists):
+
+| candidate | leaks closed | innocent fields redacted (emptied) |
+|---|---|---|
+| entropy threshold 3.95 -> 3.90 | 0 wrapped, 8 short | 266 (96) |
+| … -> 3.85 | 0 wrapped, 12 short | 394 (138) |
+| … -> 3.80 | 0 wrapped, 13 short | 462 (186) |
+| token floor 32 -> 24 | 29 wrapped, 1,482 short | 810 (270) |
+| token floor 32 -> 20 | 34 wrapped, 1,968 short | 852 (274) |
+| token floor 32 -> 16 | 35 wrapped, 1,968 short | 942 (280) |
+| drop the word-shape exoneration | **all 35 wrapped**, 0 short | 310 (60) |
+| `SPAN_MAX_UNITS` 7 -> 8 | 0 | 0 — but 286-291 ms |
+
+Two of these are worth stating plainly.
+
+**The word-shape exoneration is 100% of the remaining wrapped residual** —
+stub `coreReadsAsStructuredText` to `false` and uniform-wrap goes 20 -> 0 and
+adversarial-split 15 -> 0. It is a complete fix, and it costs 160 identifier
+lists and 126 snake_case lists — the two shapes `criteria` and
+`verifierSummaries` are mostly made of, 60 of them emptied outright. At this
+level of evidence (one token, no dictionary, no language model) "random
+material that reads as words" and "an identifier list that reads as words" are
+the same string; separating them needs a bar on ENGLISH, not on shape.
+
+**The threshold cannot be lowered at all.** An ordinary path token measures
+~3.89 bits/char, above every bar that would catch a low-entropy base32 key —
+and lowering it closes ZERO wrapped leaks for 266+ innocent fields. The classes
+overlap; there is no cut point.
+
+### The residual, stated as a number
+
+- wrapped keys: **20 / 180,000** uniform-wrap, **15 / 180,000** adversarial —
+  all of them the word-shape exoneration above;
+- short keys: **2,013 / 12,500** at 16-30 characters — all of them the 32-char
+  token floor.
+
+Both are pinned by tests that FAIL if the constant moves, so re-making either
+trade is deliberate and visible. Six-detector isolation over a 50,000-probe
+mixed corpus confirms nothing here is decorative: disabling pattern +161
+whole-key leaks, entropy +33,886, per-unit +400, pair-join +8, span pass
++18,192, facing-fragment guard +5,755 surviving >=16-char fragments.
 
 ---
 
@@ -781,7 +867,9 @@ absence is the shape most likely to be vacuous. Mutate it before trusting it.
   change with its own evidence.
 - **R-5** residual wrapped-key leaks: 12,532 -> 42 over 180,000 probes. 181 of
   the surviving 223 also leak with the key on ONE line, i.e. the entropy floor,
-  not the span pass. Recorded rather than rounded to zero.
+  not the span pass. Recorded rather than rounded to zero. **Followed up above**
+  — two thirds of the wrap-caused residual closed at zero over-redaction cost,
+  the rest quantified and deliberately kept.
 - **FR-033** (`docs/vertex2-spec.md`) carries an abbreviated event list that
   names no `criteria:*` type. Explicitly partial, not false; fold into a rev-4
   amendment if the list is ever meant to be exhaustive.
