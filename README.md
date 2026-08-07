@@ -114,6 +114,13 @@ Requires Node **≥ 20**. Current package: **`@elicify-ai/elicify-vertex@0.13.4`
 > The `vertex-judge` subagent is registered automatically and becomes
 > `vertex-verifier` on restart — nothing to do.
 >
+> **Not a precedent.** This rename broke continuity with event records already
+> on disk, and it happened before FR-033R existed. That rule now forbids it:
+> event names are append-only, and a divergent spelling gets *registered*, not
+> renamed (`intake:unsupported` was kept rather than corrected to
+> `intake:classify-unsupported` for exactly this reason). Do not read the table
+> above as licence to rename an event type.
+>
 > Also in this release: harness continuations no longer carry a `[vertex:…]`
 > prefix. They are dispatched as ordinary user messages so the model treats
 > them as instructions rather than as automated output it can discount; every
