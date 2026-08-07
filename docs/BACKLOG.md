@@ -858,6 +858,9 @@ whole-key leaks, entropy +33,886, per-unit +400, pair-join +8, span pass
 
 # Round closed — 2026-08-06
 
+> Next round's items live in [`BACKLOG-NEXT.md`](./BACKLOG-NEXT.md).
+
+
 Two adversarial review gates ran over this round (7 reviewers, then 7 more on
 the fixes). Both found real defects in the previous pass's work. That is the
 headline result, and it is worth stating plainly: **every fix in the first wave
