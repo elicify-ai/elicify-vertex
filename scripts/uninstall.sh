@@ -37,15 +37,71 @@ for file in \
   fi
 done
 
-# --- evict opencode's resolved copy ----------------------------------------
+# --- evict every opencode-resolved copy ------------------------------------
 # Removing the npm package is not enough: opencode loads from its own plugin
 # cache, so an uninstall that skips this leaves a fully working copy behind.
-CACHE_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/opencode/packages"
-if [[ -d "$CACHE_ROOT/@elicify-ai" ]]; then
-  rm -rf "$CACHE_ROOT/@elicify-ai"
-  echo "  ✓ evicted opencode's cached copy"
-  REMOVED=1
-fi
+#
+# THE SCOPE DIRECTORY IS THE UNIT, not a guessed entry name. opencode keeps one
+# directory per plugin SPEC, and a single config line produces several: the
+# bare `elicify-vertex`, `elicify-vertex@latest`, and version-pinned forms like
+# `elicify-vertex@0.14.1`. All of them live inside `@elicify-ai/`, so sweeping
+# the scope covers every suffix by construction — including ones opencode has
+# not invented yet. Nothing outside that directory is touched.
+CACHE_ROOTS=(
+  "${XDG_CACHE_HOME:-$HOME/.cache}/opencode/packages"
+  "$HOME/Library/Caches/opencode/packages"
+)
+
+# Which build was in an entry? opencode's `<entry>/package.json` is a synthetic
+# manifest — `{"dependencies":{...}}`, with no `version` key — so reading
+# `.version` from it yields nothing and an operator cannot tell which build ran.
+# The real manifest is one level in, under node_modules; the pin is the fallback.
+cached_pin() {
+  command -v node >/dev/null 2>&1 || return 0
+  node -e '
+const fs = require("fs");
+const pkg = "@elicify-ai/elicify-vertex";
+const rd = (f) => { try { return JSON.parse(fs.readFileSync(f, "utf8")) } catch (e) { return null } };
+const entry = process.argv[1];
+const inner = rd(entry + "/node_modules/" + pkg + "/package.json");
+if (inner && inner.version) { process.stdout.write(String(inner.version)); }
+else {
+  const outer = rd(entry + "/package.json");
+  const v = outer && outer.dependencies && outer.dependencies[pkg];
+  if (v) process.stdout.write(String(v));
+}
+' "$1" 2>/dev/null || true
+}
+
+# `if`/`for` blocks and an explicit `return 0` — never `cond && cmd`. Under the
+# `set -e` this script runs with, a `&&` that evaluates false IS the statement's
+# exit status and aborts the run half-way, which is precisely how state got left
+# behind before.
+evict_cached_copies() {
+  local root scope entry name pin
+  for root in "${CACHE_ROOTS[@]}"; do
+    scope="$root/@elicify-ai"
+    if [[ ! -d "$scope" ]]; then continue; fi
+    for entry in "$scope"/*; do
+      if [[ ! -e "$entry" ]]; then continue; fi   # unmatched glob
+      name="$(basename "$entry")"
+      pin="$(cached_pin "$entry")"
+      rm -rf "$entry"
+      if [[ -n "$pin" ]]; then
+        echo "  ✓ evicted cached copy @elicify-ai/$name ($pin)"
+      else
+        echo "  ✓ evicted cached copy @elicify-ai/$name"
+      fi
+      REMOVED=1
+    done
+    # Sweep the scope itself: dot-entries the glob skipped, plus the now-empty
+    # directory. Still strictly inside `@elicify-ai/`.
+    rm -rf "$scope"
+  done
+  return 0
+}
+
+evict_cached_copies
 
 # --- remove machine-wide state --------------------------------------------
 # THE GAP THIS CLOSES. Everything above removes what the INSTALLER wrote. The

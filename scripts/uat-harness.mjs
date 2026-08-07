@@ -26,7 +26,7 @@
  */
 
 import { spawnSync } from "node:child_process"
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs"
+import { cpSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
@@ -951,6 +951,118 @@ if (section("K. Uninstall is complete")) {
     `stdout said "Nothing to remove" while state existed`,
   )
   rmSync(root, { recursive: true, force: true })
+}
+
+// --- M. opencode's plugin cache holds exactly one copy ---------------------
+if (section("M. Plugin cache holds no duplicate")) {
+  // THE DUPLICATE-INSTALL BUG, twice reported. opencode resolves plugins into
+  // its own cache, one directory per SPEC, and a single config line
+  // (`"@elicify-ai/elicify-vertex"`) yields SEVERAL entries. Observed on a real
+  // machine: `elicify-vertex` pinned to 0.14.1 and `elicify-vertex@latest`
+  // pinned to 0.14.0 — two different builds loadable at once. So the entry name
+  // can never be guessed; the SCOPE DIRECTORY is the unit of eviction.
+  const shapes = ["elicify-vertex", "elicify-vertex@latest", "elicify-vertex@0.14.1"]
+
+  // Build a cache that looks like opencode's, plus a neighbour that must live.
+  const plantCache = (cacheHome) => {
+    const scope = join(cacheHome, "opencode", "packages", "@elicify-ai")
+    for (const s of shapes) {
+      const inner = join(scope, s, "node_modules", "@elicify-ai", "elicify-vertex")
+      mkdirSync(inner, { recursive: true })
+      // opencode's OUTER manifest carries no `version` key — only a dependency
+      // pin. Reading `.version` off it is why a live incident could not be told
+      // which build had run. The real manifest is the inner one.
+      writeFileSync(join(scope, s, "package.json"), '{"dependencies":{"@elicify-ai/elicify-vertex":"0.14.0"}}')
+      writeFileSync(join(inner, "package.json"), '{"name":"@elicify-ai/elicify-vertex","version":"0.14.0"}')
+    }
+    const neighbour = join(cacheHome, "opencode", "packages", "@prevalentware", "goal-plugin@latest")
+    mkdirSync(neighbour, { recursive: true })
+    return { scope, neighbour }
+  }
+  const survivors = (scope) => (existsSync(scope) ? readdirSync(scope) : [])
+
+  // --- uninstall path ---
+  {
+    const root = mkdtempSync(join(tmpdir(), "vertex-cache-un-"))
+    const cacheHome = join(root, "cache")
+    const cfg = join(root, "cfg")
+    const home = join(root, "home")
+    mkdirSync(join(cfg, "opencode"), { recursive: true })
+    mkdirSync(home, { recursive: true })
+    const { scope, neighbour } = plantCache(cacheHome)
+
+    const run = spawnSync("bash", [join(ROOT, "scripts", "uninstall.sh")], {
+      encoding: "utf8",
+      env: { ...process.env, XDG_CACHE_HOME: cacheHome, XDG_CONFIG_HOME: cfg, HOME: home, VERTEX_DATA: join(root, "d") },
+    })
+    assert("M1-uninstall-exits-clean", run.status === 0, `exit ${run.status}`)
+    const left = survivors(scope)
+    assert("M2-uninstall-evicts-every-suffix", left.length === 0, `${left.length} left: ${left.join(", ")}`)
+    // Blast radius: only OUR scope directory may be touched.
+    assert("M3-uninstall-spares-other-scopes", existsSync(neighbour))
+    rmSync(root, { recursive: true, force: true })
+  }
+
+  // --- install path: an upgrade must REPLACE, not accumulate ---
+  {
+    const root = mkdtempSync(join(tmpdir(), "vertex-cache-in-"))
+    const cacheHome = join(root, "cache")
+    const cfg = join(root, "cfg")
+    const home = join(root, "home")
+    mkdirSync(join(cfg, "opencode"), { recursive: true })
+    mkdirSync(home, { recursive: true })
+    const { scope, neighbour } = plantCache(cacheHome)
+
+    const run = spawnSync("bash", [join(ROOT, "scripts", "install-skill.sh")], {
+      encoding: "utf8",
+      env: { ...process.env, XDG_CACHE_HOME: cacheHome, XDG_CONFIG_HOME: cfg, HOME: home },
+    })
+    assert("M4-install-exits-clean", run.status === 0, `exit ${run.status}`)
+    const left = survivors(scope)
+    assert("M5-install-evicts-every-suffix", left.length === 0, `${left.length} left: ${left.join(", ")}`)
+    assert("M6-install-spares-other-scopes", existsSync(neighbour))
+    rmSync(root, { recursive: true, force: true })
+  }
+
+  // --- THE REGRESSION THAT BROUGHT THE BUG BACK ---
+  // This script is the package's `postinstall`. When opencode populates its
+  // cache it runs npm, and npm runs our postinstall FROM INSIDE the entry it is
+  // building. An unguarded scope sweep then deletes the in-flight install, its
+  // sibling entry, and the scope — mid-write. opencode re-resolves onto the
+  // wreckage, which is how two entries pinned to two different versions appear.
+  // Measured before the guard: "AFTER scope:" was empty and the in-flight
+  // install was destroyed.
+  {
+    const root = mkdtempSync(join(tmpdir(), "vertex-cache-self-"))
+    const cacheHome = join(root, "cache")
+    const cfg = join(root, "cfg")
+    const home = join(root, "home")
+    mkdirSync(join(cfg, "opencode"), { recursive: true })
+    mkdirSync(home, { recursive: true })
+    const { scope } = plantCache(cacheHome)
+
+    // Run the copy of the installer that lives inside the cache entry, exactly
+    // as npm would during `opencode` plugin resolution.
+    const inFlight = join(scope, "elicify-vertex@latest", "node_modules", "@elicify-ai", "elicify-vertex")
+    mkdirSync(join(inFlight, "scripts"), { recursive: true })
+    for (const f of ["install-skill.sh", "register-commands.mjs"]) {
+      cpSync(join(ROOT, "scripts", f), join(inFlight, "scripts", f))
+    }
+
+    const run = spawnSync("bash", [join(inFlight, "scripts", "install-skill.sh")], {
+      encoding: "utf8",
+      env: { ...process.env, XDG_CACHE_HOME: cacheHome, XDG_CONFIG_HOME: cfg, HOME: home },
+    })
+    assert("M7-postinstall-exits-clean", run.status === 0, `exit ${run.status}`)
+    assert(
+      "M8-postinstall-spares-the-inflight-install",
+      existsSync(join(inFlight, "package.json")) || existsSync(join(inFlight, "scripts", "install-skill.sh")),
+      "the installer deleted the very tree opencode was installing",
+    )
+    const left = survivors(scope)
+    assert("M9-postinstall-leaves-cache-intact", left.length === shapes.length, `expected ${shapes.length}, found ${left.length}: ${left.join(", ")}`)
+    rmSync(root, { recursive: true, force: true })
+  }
 }
 
 // ===========================================================================
