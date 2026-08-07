@@ -2152,13 +2152,32 @@ function b3Raw(diffSummary: string, extra: Partial<{ diffSummaryUnavailable: str
 }
 
 describe("B-3: the diff summary the harness produces survives the harness's own scan", () => {
-  it("REPRODUCES the field failure: the OLD shape (absolute paths, comma-joined onto one line) empties the field", () => {
-    // Not a mutation guard — the disease, pinned. It is still true after the
-    // fix, because one line of absolute paths is still one removal unit
-    // holding a 44-char, 4.190-bits/char token. That is exactly why fix (a)
-    // changes what the harness EMITS and does not merely re-slice it.
+  it("FR-012: the audited session's absolute paths, comma-joined onto ONE line, now survive that line", () => {
+    // This assertion is INVERTED from what it was, and the inversion is the
+    // point. It used to read `toBeUndefined()` and pin the disease: the three
+    // paths measure 3.979 / 4.190 / 3.971 bits/char, over the entropy rule's
+    // 3.95 bar, so one comma-joined line was one removal unit that emptied
+    // itself and the field with it.
+    //
+    // FR-012 removes the trigger rather than the blast radius: none of these
+    // tokens carries a run of key-encoding characters that could BE a key, so
+    // the entropy rule is never asked about them. Dies the moment
+    // `tokenCouldHoldKeyMaterial` stops gating `tripsEntropyScan` — the field
+    // goes straight back to `undefined`.
     const logger = vi.fn()
     const payload = buildVerifierPayload(b3Raw(B3_FIELD_PATHS.join(", ")), logger)
+    expect(payload.diffSummary).toBe(B3_FIELD_PATHS.join(", "))
+    expect(logger).not.toHaveBeenCalled()
+  })
+
+  it("…but ONE LINE IS STILL ONE UNIT: a real secret on that line still empties the field", () => {
+    // The blast-radius fact the test above used to carry, kept with a subject
+    // that is actually a secret. Dies if `splitDiffIntoHunks` ever stops
+    // treating a hunk-less field as lines, or if the entropy rule stops
+    // seeing a bare 40-char base64 key.
+    const logger = vi.fn()
+    const key = "HMEr3sTxobYfDaktWCrSXRdwBMkQvZpNjLgUeIoA"
+    const payload = buildVerifierPayload(b3Raw([...B3_FIELD_PATHS, key].join(", ")), logger)
     expect(payload.diffSummary).toBeUndefined()
     expect(logger).toHaveBeenCalledWith("verifier:field-dropped", { field: "diffSummary" })
   })
@@ -2181,9 +2200,13 @@ describe("B-3: the diff summary the harness produces survives the harness's own 
     // field with no `@@` header: the one high-entropy line takes the two
     // innocent ones with it and the field is dropped whole.
     const logger = vi.fn()
+    // The middle line used to be `/workspace/vertextest4/src/games/index.html`
+    // (43 chars, 4.127 bits/char). FR-012 spares an ordinary path, so the
+    // offending line is now a content-addressed blob name — still one line, and
+    // still the only one that may be lost.
     const summary = [
       "  src/games/memory.js",
-      "  /workspace/vertextest4/src/games/index.html", // 43 chars, 4.127 bits/char — trips
+      "  .cache/HMEr3sTxobYfDaktWCrSXRdwBMkQvZpNjLgUeIoA",
       "  src/games/breakout.js",
     ].join("\n")
     const payload = buildVerifierPayload(b3Raw(summary), logger)
@@ -2599,12 +2622,20 @@ describe("span pass round 6: the wrapped-key guard, the span window, and the cos
 
 describe("B-3c: a path list the scan emptied is ABSENT, not present-but-empty", () => {
   /** Three paths outside the workspace root. `toWorkspaceRelative` leaves
-   * these ABSOLUTE on purpose (a `../../..` chain reads worse), so they keep
-   * the length and entropy that made B-3's original list trip. */
+   * these ABSOLUTE on purpose (a `../../..` chain reads worse).
+   *
+   * FR-012 note: these used to be plain source paths
+   * (`/tmp/scratch-9182/src/games/index.html`), which tripped the entropy rule
+   * purely for being long and punctuated. That is the false positive FR-012
+   * closes, so the fixture now names CONTENT-ADDRESSED blobs — a shape that
+   * still trips, because a 40-character base64 basename genuinely could be key
+   * material. The subject of this block is unchanged and is not the entropy
+   * rule at all: it is what `buildVerifierPayload` does when a scan leaves
+   * nothing but the announcement header. */
   const OUTSIDE_ROOT = [
-    "/tmp/scratch-9182/src/games/memory.js",
-    "/tmp/scratch-9182/src/games/index.html",
-    "/tmp/scratch-9182/src/games/breakout.js",
+    "/tmp/scratch-9182/.cache/HMEr3sTxobYfDaktWCrSXRdwBMkQvZpNjLgUeIoA",
+    "/tmp/scratch-9182/.cache/AJEN72OERLKQA3BZEV3TUHMVRWGXKZQA2PKDSUXV",
+    "/tmp/scratch-9182/.cache/aCreHz2wDL4keqaDIEZf8DRPIMNAygdlSQlRZmXt",
   ]
 
   it("REPRODUCES the shape: the scan deletes every path and keeps the header", () => {
@@ -2612,7 +2643,7 @@ describe("B-3c: a path list the scan emptied is ABSENT, not present-but-empty", 
     // does to the field. What changes below is what the payload builder makes
     // of the result.
     const summary = formatChangedPathsSummary(OUTSIDE_ROOT, "/workspace/proj")
-    expect(summary).toContain("/tmp/scratch-9182/src/games/memory.js")
+    expect(summary).toContain("/tmp/scratch-9182/.cache/HMEr3sTxobYfDaktWCrSXRdwBMkQvZpNjLgUeIoA")
     expect(summary.split("\n")).toHaveLength(4)
   })
 
@@ -2658,7 +2689,7 @@ describe("B-3c: a path list the scan emptied is ABSENT, not present-but-empty", 
   it("the untracked-files header alone is treated the same way", () => {
     // `computeBoundedDiffStat`'s other announcement line, same defect.
     const logger = vi.fn()
-    const payload = buildVerifierPayload(b3Raw(`${UNTRACKED_FILES_HEADER}\n  /tmp/scratch-9182/src/games/breakout.js`), logger)
+    const payload = buildVerifierPayload(b3Raw(`${UNTRACKED_FILES_HEADER}\n  ${OUTSIDE_ROOT[2]}`), logger)
     expect(payload.diffSummary).toBeUndefined()
     expect(logger).toHaveBeenCalledWith("verifier:field-dropped", { field: "diffSummary" })
   })
@@ -2756,5 +2787,266 @@ describe("B-3 (d): runVerifier will not judge with neither a diff nor a transcri
     const system = mockRunSubturn.mock.calls[0][3].system
     expect(system).toContain("diffSummaryUnavailable")
     expect(system).toContain("not as evidence that nothing changed")
+  })
+})
+
+// ===========================================================================
+// FR-012 — the payload was over-redacted in the field, and the fix must not
+// buy that back with a leak.
+//
+// FIELD EVIDENCE, live session `ses_0254e14e` (2026-08-07, shipped build):
+//
+//   verifier:field-dropped      {"field":"verifierSummaries"}
+//   verifier:field-partial-drop {"field":"plan", "kept":45,"dropped":18}
+//
+// The verifier was handed a plan digest with 18 of 63 units missing and no
+// verifier summaries at all, and its verdicts were then rejected as
+// unsubstantiated. Two independent defects, reproduced below against a
+// realistic digest and a realistic verifier-command output:
+//
+//   1. the per-unit ENTROPY rule fires on ordinary file paths, package specs
+//      and stack frames, because Shannon entropy rewards SYMBOL VARIETY and a
+//      path is nothing but symbol variety (`tokenCouldHoldKeyMaterial`);
+//   2. `criteria`/`verifierSummaries` used the caller's ARRAY ENTRY as the
+//      removal unit, and `plugin.ts` supplies the whole of the last verifier
+//      command's stdout as ONE entry — so one hit deleted the field
+//      (`scanLineField`).
+//
+// Every test in this block names the mutation that kills it.
+// ===========================================================================
+describe("FR-012: a realistic plan digest and verifier output reach the verifier", () => {
+  /** Shaped exactly like `wiring/gate.ts`'s `renderPlanDigest`: the FR-011
+   * worktree-root header, the audit list, per-story headers with
+   * status/claim/dependsOn, tasks, acceptance items that name files and scope
+   * globs, and `verifiers:` lines carrying real shell commands. */
+  const WORKTREE_ROOT = "/home/dev/elicify-vertex/.claude/worktrees/agent-a1f93fa89de9fb437"
+  const PLAN_DIGEST = [
+    `Worktree root (all paths below are relative to this): ${WORKTREE_ROOT}`,
+    "Plan: 3 stories. Audit these claimed-complete stories: S3, S5.",
+    'S3 (complete, claimed complete at 2026-08-07T04:11:52.318Z, dependsOn: S1): "Redaction keeps plan-shaped evidence"',
+    "  T3.1 (complete): narrow the span pass so structured digests survive",
+    "  T3.2 (complete, dependsOn: T3.1): add the plan-digest regression corpus",
+    "  A1: src/v2/verifier.ts exposes scanProseField for the plan field",
+    "  A2: tests/v2/verifier.test.ts covers scope glob src/v2/**/*.ts",
+    "  A3: docs/VERIFIER-RELIABILITY-FIXES-SPEC.md records the measured drop rate",
+    "  verifiers: npx vitest run tests/v2/verifier.test.ts && npm run build",
+    'S5 (complete, claimed complete at 2026-08-07T04:39:07.902Z, dependsOn: S3): "Verifier summaries survive the scan"',
+    "  T5.1 (complete): split verifier output into line units",
+    "  A1: src/v2/plugin.ts records the last verifier output per session",
+    "  A2: scope: src/v2/wiring/gate.ts, src/v2/wiring/findings.ts",
+    "  verifiers: node scripts/uat-harness.mjs",
+    'S1 (complete, claimed complete at 2026-08-06T21:02:44.771Z): "Bound the raw field before scanning"',
+    "  A1: src/v2/verifier.ts caps the raw field at 100000 chars",
+    "  verifiers: npx vitest run tests/v2/verifier.test.ts -t oversized",
+  ]
+
+  /** One array entry, exactly as `plugin.ts`'s `recentVerifierSummaries`
+   * supplies it: the tail of the last verifier command's real stdout. */
+  const VERIFIER_OUTPUT = [
+    "> @elicify-ai/elicify-vertex@0.14.1 test",
+    "> vitest run tests/v2/verifier.test.ts",
+    " ✓ tests/v2/verifier.test.ts (214 tests) 1204ms",
+    " Test Files  1 passed (1)",
+    "      Tests  214 passed (214)",
+    "$ git rev-parse HEAD",
+    "4cb0b02f1e6f9a2d3b8c7e5a1f0d4c9b2a6e8f31",
+    " src/v2/verifier.ts        | 42 +++++++++++++++---",
+    " 2 files changed, 132 insertions(+), 6 deletions(-)",
+  ]
+
+  const rawWith = (over: Record<string, unknown>) => ({
+    criteria: [] as string[],
+    diffSummary: "",
+    verifierSummaries: [] as string[],
+    lastResponse: "",
+    recentTranscript: "",
+    plan: "",
+    ...over,
+  })
+
+  const flat = (text: string | undefined) => (text ?? "").replace(/[\r\n]/g, "")
+
+  it("the whole plan digest transmits BYTE-IDENTICAL — 0 of 17 units dropped", () => {
+    // The reproduced field case. Before FR-012 this digest lost its FR-011
+    // worktree-root header (66-char path token, 4.563 bits/char) and its A3
+    // acceptance item (39-char doc path, 4.141 bits/char).
+    //
+    // DIES IF: `tokenCouldHoldKeyMaterial` stops gating `tripsEntropyScan`.
+    const logger = vi.fn()
+    const payload = buildVerifierPayload(rawWith({ plan: PLAN_DIGEST.join("\n") }), logger)
+    expect(payload.plan).toBe(PLAN_DIGEST.join("\n"))
+    expect(logger).not.toHaveBeenCalled()
+  })
+
+  it("the FR-011 worktree-root header specifically survives — it is what makes every other path resolvable", () => {
+    // Called out on its own because losing this ONE line is the documented
+    // cause of the verifier's signature fabrication ("research/x.json does not
+    // exist" about a file that did): a relative path is unresolvable text
+    // unless you know what it is relative to.
+    //
+    // DIES IF: the entropy precondition is removed (this token is 66 chars at
+    // 4.563 bits/char — comfortably over the 3.95 bar).
+    const logger = vi.fn()
+    const payload = buildVerifierPayload(rawWith({ plan: PLAN_DIGEST[0] }), logger)
+    expect(payload.plan).toBe(PLAN_DIGEST[0])
+    expect(payload.plan).toContain(WORKTREE_ROOT)
+  })
+
+  it("a SCREAMING-KEBAB doc filename survives — the dominant-core case the path rule alone misses", () => {
+    // `VERIFIER-RELIABILITY-FIXES-SPEC` is a 31-character single-class core in
+    // a 39-character token: dominant, and only two slash segments, so neither
+    // the dominance clause nor `PATH_TOKEN_UNIT` spares it.
+    //
+    // DIES IF: the `FILENAME_TOKEN` clause is dropped from
+    // `tokenCouldHoldKeyMaterial`.
+    const logger = vi.fn()
+    const line = "  A3: docs/VERIFIER-RELIABILITY-FIXES-SPEC.md records the measured drop rate"
+    const payload = buildVerifierPayload(rawWith({ plan: line }), logger)
+    expect(payload.plan).toBe(line)
+    expect(logger).not.toHaveBeenCalled()
+  })
+
+  it("a deep path and a deep URL survive — the >= 32-char core case", () => {
+    // `/home/dev/app/components/payload` and `vertex/blob/main/components/gate`
+    // are both 32-character single-class cores, so clause 1 admits them and
+    // only `coreIsRealPath` can spare them.
+    //
+    // DIES IF: the `PATH_TOKEN_UNIT` half of `coreIsRealPath` is dropped.
+    const logger = vi.fn()
+    const lines = [
+      "    at renderPlanDigest (/home/dev/app/components/payload.ts:118:24)",
+      "see https://github.com/elicify-ai/elicify-vertex/blob/main/components/gate.md",
+    ]
+    const payload = buildVerifierPayload(rawWith({ recentTranscript: lines.join("\n") }), logger)
+    expect(payload.recentTranscript).toBe(lines.join("\n"))
+    expect(logger).not.toHaveBeenCalled()
+  })
+
+  it("a base64 key that HAPPENS to contain two slashes is still removed — a path shape is not enough", () => {
+    // Reproduced regression, measured. The first cut of `coreIsRealPath` asked
+    // only `PATH_TOKEN_UNIT`, and `/` is a base64 character: this key reads as
+    // three "path segments" and leaked. Over the sweeps that mistake cost 690
+    // of 180,000 uniform-wrap probes and 1,059 of 180,000 adversarial-split
+    // probes, up from 18 and 24. Every leaked key was base64.
+    //
+    // DIES IF: the `coreReadsAsStructuredText` half of `coreIsRealPath` is
+    // dropped.
+    const logger = vi.fn()
+    const key = "tJO4XUrAmnL4teQbd/Pv/GoXEfvzHTIg"
+    const payload = buildVerifierPayload(rawWith({ recentTranscript: `deploying now\n${key}\nexit 0` }), logger)
+    expect(flat(payload.recentTranscript)).not.toContain(key)
+    expect(payload.recentTranscript).toBe("deploying now\nexit 0")
+  })
+
+  // A 24-character base64url key and a 24-character base32 one, each in four
+  // real framings. Every core here is UNDER the 32-char floor and none is pure
+  // hex, so clause 1's `|| dominant` half is the only thing that admits the
+  // token to the entropy test at all: the key is 24 of a 33-to-36-character
+  // token, i.e. "a key plus framing".
+  //
+  // DIES IF: `core.length * 2 < token.length` is replaced by an unconditional
+  // `return false` for sub-32 cores. Measured, that mutation re-opened 23,372
+  // of 50,000 short-key probes, which is why the half is there.
+  it.each([
+    ["setBlob(", ")"],
+    ['"blob":"', '"'],
+    ["id,blob,", ",end"],
+    ['--blob="', '"'],
+  ])("a framed 24-char key is still removed when line 2 reads %s… — the dominance clause", (pre, post) => {
+    for (const key of ["aCreHz2wDL4keqaDIEZf8DRP", "AJEN72OERLKQA3BZEV3TUHMV"]) {
+      const payload = buildVerifierPayload(rawWith({ recentTranscript: `deploying now\n${pre}${key}${post}\nexit 0` }), vi.fn())
+      expect(flat(payload.recentTranscript)).not.toContain(key)
+      expect(payload.recentTranscript).toBe("deploying now\nexit 0")
+    }
+  })
+
+  it("a 16-char PURE-HEX core is still removed even though it is neither long nor dominant", () => {
+    // `id,blob,d990aecfbc8500c9,end` fuses with its neighbours into a 39-char
+    // token whose longest key-class core is 16 characters of 39 — not long
+    // enough for clause 1 and not dominant either. It is caught because
+    // `LONG_HEX_RUN` says a 16+ character run of nothing but hex digits is
+    // secret-shaped, which is the same call `looksLikeSecretFragment` makes.
+    // Measured: without this, 24 of 12,500 short-key probes came back.
+    //
+    // DIES IF: the `LONG_HEX_RUN` admission is removed from
+    // `tokenCouldHoldKeyMaterial`.
+    const logger = vi.fn()
+    const key = "d990aecfbc8500c9"
+    const payload = buildVerifierPayload(rawWith({ recentTranscript: `running deploy:\nid,blob,${key},end\nexit 0` }), logger)
+    expect(flat(payload.recentTranscript)).not.toContain(key)
+  })
+
+  it("verifierSummaries loses ONE line to the git SHA, not the whole field", () => {
+    // The second reproduced defect, verbatim: `verifier:field-dropped
+    // {verifierSummaries}` — the field gone entirely, because `plugin.ts`
+    // hands it ONE array entry holding the whole command output and the entry
+    // was the removal unit.
+    //
+    // The SHA line still goes; that is C-15's documented, accepted hex-run
+    // false positive. What must not happen is it taking the eight innocent
+    // lines with it.
+    //
+    // DIES IF: `scanLineField` goes back to `const units = rawLines`.
+    const logger = vi.fn()
+    const payload = buildVerifierPayload(rawWith({ verifierSummaries: [VERIFIER_OUTPUT.join("\n")] }), logger)
+    expect(payload.verifierSummaries).toBeDefined()
+    expect(payload.verifierSummaries).toEqual(VERIFIER_OUTPUT.filter((l) => l !== "4cb0b02f1e6f9a2d3b8c7e5a1f0d4c9b2a6e8f31"))
+    expect(logger).toHaveBeenCalledWith("verifier:field-partial-drop", { field: "verifierSummaries", kept: 8, dropped: 1 })
+    expect(logger).not.toHaveBeenCalledWith("verifier:field-dropped", expect.anything())
+  })
+
+  it("criteria gets the same per-line treatment — the two line fields share one path", () => {
+    // DIES IF: `scanLineField` goes back to `const units = rawLines`.
+    const logger = vi.fn()
+    const entry = ["Handles empty input", "4cb0b02f1e6f9a2d3b8c7e5a1f0d4c9b2a6e8f31", "Returns a sorted list"].join("\n")
+    const payload = buildVerifierPayload(rawWith({ criteria: [entry] }), logger)
+    expect(payload.criteria).toEqual(["Handles empty input", "Returns a sorted list"])
+    expect(logger).toHaveBeenCalledWith("verifier:field-partial-drop", { field: "criteria", kept: 2, dropped: 1 })
+  })
+
+  it("SAFETY: a key wrapped across lines INSIDE one verifierSummaries entry is still caught", () => {
+    // The property the unit change could plausibly have broken. With the whole
+    // entry as one unit the split key was reunited by `dewrap`; with lines as
+    // units it is only reunited by `scanUnits`' adjacent-pair and span passes.
+    // Both the two-way and the three-way wrap must still go.
+    const key = "HMEr3sTxobYfDaktWCrSXRdwBMkQvZpNjLgUeIoA"
+    const twoWay = buildVerifierPayload(
+      rawWith({ verifierSummaries: [["running deploy:", key.slice(0, 18), key.slice(18), "exit 0"].join("\n")] }),
+      vi.fn(),
+    )
+    expect((twoWay.verifierSummaries ?? []).join("")).not.toContain(key)
+    expect(twoWay.verifierSummaries).toEqual(["running deploy:", "exit 0"])
+
+    const threeWay = buildVerifierPayload(
+      rawWith({ verifierSummaries: [["running deploy:", "+  HMEr3sTxo", "bYfDak", "tWCrSXRdwBMkQvZpNjLgUeIoA", "exit 0"].join("\n")] }),
+      vi.fn(),
+    )
+    expect((threeWay.verifierSummaries ?? []).join("")).not.toContain(key)
+    expect(threeWay.verifierSummaries).toEqual(["running deploy:", "exit 0"])
+  })
+
+  it("SAFETY: a secret ANYWHERE in the plan digest is still dropped (US6 AS3 is untouched)", () => {
+    const logger = vi.fn()
+    const key = "AJEN72OERLKQA3BZEV3TUHMVRWGXKZQA2PKDSUXV"
+    const withSecret = [...PLAN_DIGEST.slice(0, 5), `  A1: deploy with token ${key}`, ...PLAN_DIGEST.slice(5)]
+    const payload = buildVerifierPayload(rawWith({ plan: withSecret.join("\n") }), logger)
+    expect(payload.plan).toBe(PLAN_DIGEST.join("\n"))
+    expect(payload.plan).not.toContain(key)
+    expect(logger).toHaveBeenCalledWith("verifier:field-partial-drop", { field: "plan", kept: 17, dropped: 1 })
+  })
+
+  it("SAFETY: the whole digest plus a real verifier output round-trips with exactly one line lost", () => {
+    // End to end, both fields at once — the shape the field session actually
+    // sent. Before FR-012: `plan` partial-dropped and `verifierSummaries`
+    // dropped whole. After: the plan is intact and the only casualty is the
+    // git SHA.
+    const logger = vi.fn()
+    const payload = buildVerifierPayload(
+      rawWith({ plan: PLAN_DIGEST.join("\n"), verifierSummaries: [VERIFIER_OUTPUT.join("\n")] }),
+      logger,
+    )
+    expect(payload.plan!.split("\n")).toHaveLength(PLAN_DIGEST.length)
+    expect(payload.verifierSummaries).toHaveLength(VERIFIER_OUTPUT.length - 1)
+    expect(logger.mock.calls.map((c) => c[0])).toEqual(["verifier:field-partial-drop"])
   })
 })

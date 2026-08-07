@@ -396,6 +396,10 @@ function tripsEntropyScan(text: string): boolean {
     .filter((t) => t.length > 0)
   for (const token of tokens) {
     if (token.length < ENTROPY_MIN_TOKEN_LENGTH) continue
+    // FR-012: the token must be able to HOLD key material before its entropy
+    // means anything — see `tokenCouldHoldKeyMaterial` for the reproduced
+    // field failure (a plan digest's worktree-root line, deleted).
+    if (!tokenCouldHoldKeyMaterial(token)) continue
     if (shannonEntropyBitsPerChar(token) >= ENTROPY_EFFECTIVE_THRESHOLD_BITS) return true
   }
   return false
@@ -575,6 +579,17 @@ function scanJoined(joined: string): JoinedScan {
   let token: RegExpExecArray | null
   while ((token = tokenRe.exec(joined)) !== null) {
     if (token[0].length < ENTROPY_MIN_TOKEN_LENGTH) continue
+    // FR-012 note, so the asymmetry with `tripsEntropyScan` is not "fixed" by
+    // accident: `tokenCouldHoldKeyMaterial` is deliberately NOT applied here.
+    // It would be dead code. Every route into these offsets is already behind a
+    // stricter gate — the pair pass runs only when `unitTrips` (which does
+    // apply it) fires on the concatenation, and an entropy-only span must
+    // additionally clear `spanLooksLikeOneWrappedToken`, whose `spanKeyCore`
+    // demands a >= ENTROPY_MIN_TOKEN_LENGTH single-class run crossing a join,
+    // i.e. strictly more than this precondition asks for. Added, mutation-
+    // tested and removed again: no test in the suite and no probe in the
+    // 360,000-probe sweeps or the 680 innocent corpora could tell the two
+    // versions apart.
     if (shannonEntropyBitsPerChar(token[0]) < ENTROPY_EFFECTIVE_THRESHOLD_BITS) continue
     entropyTokens.push([token.index, token.index + token[0].length])
   }
@@ -998,6 +1013,217 @@ const PATH_TOKEN_UNIT = /^\/?[A-Za-z0-9_.@~-]+(?:\/[A-Za-z0-9_.@~-]+){2,}$/
 
 function spanIsPathTokenList(dewrappedSpan: readonly string[]): boolean {
   return dewrappedSpan.every((unit) => PATH_TOKEN_UNIT.test(unit))
+}
+
+/**
+ * ── FR-012: THE ENTROPY RULE MEASURES A TOKEN, BUT IT IS HUNTING MATERIAL ──
+ *
+ * REPRODUCED FIELD FAILURE (live session `ses_0254e14e`, shipped build). The
+ * verifier was handed a plan digest with 18 of 63 units missing
+ * (`verifier:field-partial-drop {plan, kept:45, dropped:18}`) and NO verifier
+ * summaries at all, then produced verdicts that were rejected as
+ * unsubstantiated. Re-running a realistic digest through the real
+ * `buildVerifierPayload` reproduces it, and the units it deletes are these:
+ *
+ *   "Worktree root (all paths below are relative to this):
+ *      /home/dev/elicify-vertex/.claude/worktrees/agent-a1f93fa89de9fb437"
+ *                                     66 chars, 4.563 bits/char -> DROPPED
+ *   "  A3: docs/VERIFIER-RELIABILITY-FIXES-SPEC.md records the drop rate"
+ *                                     39 chars, 4.141 bits/char -> DROPPED
+ *   "> @elicify-ai/elicify-vertex@0.14.1 test"
+ *                                     33 chars, 3.965 bits/char -> DROPPED
+ *
+ * The first is the FR-011 line the digest is REQUIRED to open with — the one
+ * piece of context that makes every relative path in the plan resolvable, and
+ * whose absence is the documented cause of the verifier's signature
+ * fabrication ("research/x.json does not exist" about a file that did).
+ * Nothing in any of the three is a secret. Measured over 680 innocent evidence
+ * corpora, the per-unit entropy rule accounted for **558 of 791 deleted lines
+ * (71%)**, every one of them a file path, a URL, a stack frame or a package
+ * spec.
+ *
+ * WHY: Shannon entropy is bits per character over the token's OWN symbol
+ * distribution, so it rewards SYMBOL VARIETY. A path mixes `/`, `.`, `-`, `@`,
+ * upper case, lower case and digits and repeats almost nothing, which is a
+ * high-variety string — and `log2` does not care that the variety comes from
+ * punctuation rather than from randomness. This is the overlap
+ * `ENTROPY_MIN_TOKEN_LENGTH`'s comment already states outright ("an ordinary
+ * path token measures ~3.89 bits/char" and "there is no threshold between
+ * 'catches a low-entropy base32 key' and 'eats a file path': they overlap").
+ * The conclusion drawn there was that the THRESHOLD cannot separate them. That
+ * is true, and it is not the only dial: what separates them is whether the
+ * token contains a run of material that could BE an encoded key at all.
+ *
+ * So this is a PRECONDITION on the entropy rule, not a new threshold. A token
+ * is admitted to the entropy test only when it carries a `core` — its longest
+ * run of characters from ONE key-encoding class (`KEY_ENCODING_CLASSES`, the
+ * same two classes `spanKeyCore` already stakes the span pass on) — that is
+ * plausibly key material:
+ *
+ *  1. The core must be LONG ENOUGH TO MATTER, or else DOMINANT. A canonical
+ *     encoding of >= `ENTROPY_MIN_TOKEN_LENGTH` characters IS one such run by
+ *     definition, so any whole key the rule is meant to catch passes clause 1
+ *     unconditionally — measured, 0 of 60,000 framed keys of 32-64 characters
+ *     across 5 alphabets are excluded by it. The `|| dominant` half is what
+ *     keeps the SHORTER framed keys the rule catches today: `--blob="<24-char
+ *     key>"` is a 33-character token whose 24-character core is 73% of it,
+ *     whereas the worktree-root path's longest core is 22 characters of 66
+ *     (33%) — the path's entropy comes from its punctuation, the framed key's
+ *     from its material. Dropping the dominance half and keeping only the
+ *     length half was measured first and rejected: it re-opened 23,372 of
+ *     50,000 short-key probes, i.e. it would have traded this availability bug
+ *     for a confidentiality one an order of magnitude larger.
+ *  2. The core must not be a PATH. `PATH_TOKEN_UNIT` (three or more
+ *     slash-joined segments, no `+`, no `=`, no quoting) is the same
+ *     already-measured test the span pass uses to keep a changed-file list
+ *     alive, and it is needed here for the deepest paths and URLs, whose
+ *     class-1 core does reach 32 characters (`/home/dev/app/components/payload`,
+ *     `vertex/blob/main/components/gate`). Its own comment records the
+ *     measurement: adding it changed the whole-key leak count by zero.
+ *
+ * WHAT IT DELIBERATELY DOES NOT DO: it does not exonerate a core for reading
+ * as words. `coreReadsAsStructuredText` is the span pass's exoneration and it
+ * is the entire remaining wrapped-key residual (see its comment); extending it
+ * to single-line tokens would hand every key that happens to fragment into
+ * word-shaped segments a free pass in the COMMON case, where the leak count is
+ * currently zero. A UUID list stays redacted here for exactly that reason —
+ * `4fe1d62d-ecbf-4a82-a3e4-273950bb9109` is a 36-character single-class run
+ * and nothing about its shape distinguishes it from key material.
+ */
+function isBase64ClassChar(code: number): boolean {
+  return (
+    (code >= 48 && code <= 57) || // 0-9
+    (code >= 65 && code <= 90) || // A-Z
+    (code >= 97 && code <= 122) || // a-z
+    code === 43 || // +
+    code === 47 // /
+  )
+}
+
+function isBase64UrlClassChar(code: number): boolean {
+  return (
+    (code >= 48 && code <= 57) || // 0-9
+    (code >= 65 && code <= 90) || // A-Z
+    (code >= 97 && code <= 122) || // a-z
+    code === 45 || // -
+    code === 95 // _
+  )
+}
+
+/**
+ * The token's longest run of characters from a single key-encoding class —
+ * the most key material it could possibly be carrying in one piece.
+ *
+ * Character codes rather than the `KEY_ENCODING_CLASSES` regexes because this
+ * runs once per >= 32-character token on every unit of every field, and on the
+ * worst field the raw-field safety cap admits that is ~7,600 tokens per pass
+ * against a ~300 ms budget. Same two classes, same membership.
+ */
+const KEY_CLASS_MEMBERSHIP: readonly ((code: number) => boolean)[] = [isBase64ClassChar, isBase64UrlClassChar]
+
+function longestKeyClassRun(token: string): string {
+  let bestStart = 0
+  let bestLength = 0
+  for (const inClass of KEY_CLASS_MEMBERSHIP) {
+    let start = -1
+    for (let i = 0; i <= token.length; i++) {
+      if (i < token.length && inClass(token.charCodeAt(i))) {
+        if (start < 0) start = i
+        continue
+      }
+      if (start >= 0) {
+        if (i - start > bestLength) {
+          bestStart = start
+          bestLength = i - start
+        }
+        start = -1
+      }
+    }
+  }
+  return token.slice(bestStart, bestStart + bestLength)
+}
+
+/**
+ * A path whose last segment carries a FILE EXTENSION — `docs/SPEC.md`,
+ * `src/v2/verifier.ts`, `out/s1.json`. Only path characters, so no `+`, no
+ * `=`, no quoting or bracketing of any kind; and the extension must be short
+ * and alphabetic, per `LEFT_ENDS_IN_PATH`'s reasoning ("so a version string or
+ * a sentence-ending period does not qualify").
+ *
+ * `PATH_TOKEN_UNIT`'s three-segment bar cannot see this shape:
+ * `docs/VERIFIER-RELIABILITY-FIXES-SPEC.md` is TWO segments, and its
+ * 31-character SCREAMING-KEBAB filename is a dominant single-class core — the
+ * one plan-digest line still deleted after clause 1 landed. Any long
+ * hyphenated filename is in this class, which makes it a recurring cost on
+ * exactly the acceptance-item text a digest is made of.
+ *
+ * Applied ONLY where the core is under `ENTROPY_MIN_TOKEN_LENGTH` — see
+ * `tokenCouldHoldKeyMaterial`. A base64url key IS drawn from path characters,
+ * so a >= 32-character core with a `.md` glued on must never be exonerated by
+ * a filename shape, and it is not: that case never reaches this test. The
+ * residual this leaves is a key SHORTER than 32 characters wearing a file
+ * extension (`<30 chars>.md`), which is both contrived and already inside the
+ * documented sub-32 residual `ENTROPY_MIN_TOKEN_LENGTH` owns.
+ */
+const FILENAME_TOKEN = /^\/?[A-Za-z0-9_.@~-]+(?:\/[A-Za-z0-9_.@~-]+)*\.[A-Za-z][A-Za-z0-9]{0,7}$/
+
+/**
+ * Is a >= 32-character core an actual PATH, or merely something with slashes in
+ * it? Both halves are required, and the second half was bought with a measured
+ * regression.
+ *
+ * `PATH_TOKEN_UNIT` ALONE is safe where the span pass uses it — there, EVERY
+ * UNIT of the span must match, which is the conjunction its comment relies on
+ * ("a wrapped key chunk would have to contain two `/` characters by chance in
+ * every one of its pieces"). Applied to ONE core that conjunction is gone, and
+ * `/` is a base64 character: a base64 key with two slashes in it IS a
+ * three-segment "path". Measured, this exact mistake shipped in the first cut
+ * of this function and cost **690 of 180,000 uniform-wrap probes and 1,059 of
+ * 180,000 adversarial-split probes**, up from 18 and 24. Every single leaked
+ * key was base64 — the one alphabet of the five that contains `/` — e.g.
+ *
+ *     tJO4XUrAmnL4teQbd/Pv/GoXEfvzHTIg   (32 chars, "three segments")
+ *
+ * So the segments must also READ as a path. `coreReadsAsStructuredText` is the
+ * discriminator the span pass already measured for precisely this job, and
+ * behind `PATH_TOKEN_UNIT` it is a conjunction, not the loosening its own
+ * comment warns about: a key must now carry two chance slashes AND fragment
+ * into word-shaped segments. `Pv`, `tJO4XUrAmnL4teQbd` and `GoXEfvzHTIg` do
+ * not; `vertex/blob/main/components/gate` and `/home/dev/app/components/payload`
+ * do.
+ */
+function coreIsRealPath(core: string): boolean {
+  return PATH_TOKEN_UNIT.test(core) && coreReadsAsStructuredText(core)
+}
+
+function tokenCouldHoldKeyMaterial(token: string): boolean {
+  const core = longestKeyClassRun(token)
+  if (core.length >= ENTROPY_MIN_TOKEN_LENGTH) {
+    // Long enough to BE a key. The only way out is clause 2, and it takes BOTH
+    // halves — see `coreIsRealPath` for the 690-leak regression that measured
+    // what happens when only the first half is asked for.
+    return !coreIsRealPath(core)
+  }
+  // A core of 16+ characters drawn from NOTHING BUT hex digits is secret-shaped
+  // regardless of how much of the token it occupies — `LONG_HEX_RUN`'s own
+  // comment makes the argument ("An English word 16+ characters long drawn
+  // solely from a-f and digits does not occur"), and `looksLikeSecretFragment`
+  // already decides on it ahead of every structural test for the same reason.
+  //
+  // Measured need: without this the change cost 24 of 12,500 short-key probes,
+  // every one of them a 16-character lowercase-hex key framed as
+  // `id,blob,<hex>,end`, which the pre-change scan caught only because fusing
+  // the line with its innocent neighbours manufactured a 39-character token
+  // over the entropy bar. Asking for the core to be pure hex recovers all 24
+  // without admitting the token that carries a hex-looking SUFFIX inside a
+  // longer run: the worktree-root path's `agent-a1f93fa89de9fb437` is 22
+  // characters of core and is not pure hex, so it stays exonerated.
+  if (LONG_HEX_RUN.test(core)) return true
+  // Shorter than any key this rule is meant to catch. It counts only when it
+  // DOMINATES the token — "a key plus framing", not "structure plus
+  // punctuation" — and even then not when the whole token is a filename.
+  if (core.length * 2 < token.length) return false
+  return !FILENAME_TOKEN.test(token)
 }
 
 /**
@@ -1519,6 +1745,41 @@ function logPartialDrop(
  * trailing line, but that line was already proven secret-free before
  * truncation ever touched it, so this is a purely cosmetic detail (see
  * `truncateField`'s doc comment for the rationale in full).
+ *
+ * ── FR-012: A MULTI-LINE ENTRY IS MANY UNITS, NOT ONE ─────────────────────
+ * REPRODUCED FIELD FAILURE (live session `ses_0254e14e`):
+ * `verifier:field-dropped {verifierSummaries}` — the field gone ENTIRELY, not
+ * partially. `criteria` and `verifierSummaries` were the last two fields whose
+ * removal UNIT was the caller's ARRAY ENTRY rather than a line, and
+ * `plugin.ts`'s `recentVerifierSummaries` returns exactly one entry: the last
+ * 2000 characters of the last verifier command's real stdout. One entry, 22
+ * lines, ONE unit — so a single suspicious token anywhere in that output made
+ * `kept.length === 0` and deleted the whole thing.
+ *
+ * In the reproduced case the trigger was a bare `git rev-parse HEAD` line, a
+ * 40-character hex SHA. That is a DOCUMENTED, ACCEPTED false positive of the
+ * C-15 hex-run backstop ("the realistic false-positive cost is git
+ * full-SHA/hash-shaped IDs being dropped when they appear in evidence text —
+ * accepted"), and it stays accepted: the SHA line still goes. What is not
+ * acceptable is that it took the 21 innocent lines around it — the test
+ * counts, the build output, the `--stat` — and left the verifier with no
+ * verifier evidence at all, which is B-3's evidence-starvation disease exactly.
+ *
+ * The fix is the one B-3 (c) already applied to `splitDiffIntoHunks` for a
+ * hunk-less `diffSummary`, and that `scanProseField` has always used for the
+ * three prose fields: split on `\n` so the blast radius of one hit is ONE LINE.
+ * It changes the removal unit only — never a threshold, never a pattern, never
+ * what counts as suspicious — and a secret split ACROSS those lines is still
+ * caught by `scanUnits`' adjacent-pair and span passes, which reassemble
+ * neighbours with their newlines stripped. The payload shape is unchanged too:
+ * this function already returned `truncated.split("\n")`, so a multi-line entry
+ * always came back as several array elements.
+ *
+ * The residual is stated: a secret hard-wrapped across MORE than
+ * `SPAN_MAX_UNITS` lines inside one entry was previously fused by the
+ * whole-entry unit and is now out of the span window. That is the same bound
+ * every other field already carries (see `SPAN_MAX_UNITS`), and the price of
+ * not carrying it is a field that deletes itself over a git SHA.
  */
 function scanLineField(rawLines: string[], field: "criteria" | "verifierSummaries", logger: EventLogger): string[] | undefined {
   const rawLength = rawLines.reduce((n, l) => n + l.length + 1, 0)
@@ -1526,7 +1787,7 @@ function scanLineField(rawLines: string[], field: "criteria" | "verifierSummarie
     logger("verifier:field-oversized", { field, rawLength, cap: VERIFIER_PAYLOAD_RAW_FIELD_SAFETY_CAP })
     return undefined
   }
-  const units = rawLines
+  const units = rawLines.flatMap((entry) => (entry.includes("\n") ? entry.split("\n") : [entry]))
   const { kept, anyDropped } = scanUnits(units)
   if (units.length > 0 && kept.length === 0) {
     logger("verifier:field-dropped", { field })
