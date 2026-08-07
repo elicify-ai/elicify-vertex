@@ -34,6 +34,7 @@ vi.mock("../../src/goals.js", async (importOriginal) => {
   }
 })
 
+import { EvidenceLedger } from "../../src/index.js"
 import { eventsPath } from "../../src/measurement.js"
 import { server } from "../../src/plugin.js"
 import { ElicifyVertexPluginV2 } from "../../src/v2/plugin.js"
@@ -882,6 +883,169 @@ describe("D1 regression: a covering verifier mints a receipt", () => {
     )
 
     expect(toolOutput.output).not.toMatch(/verification-receipt/)
+  })
+})
+
+// ===========================================================================
+// BACKLOG R-4 — a relevance gap is not a failure.
+//
+// `plugin.ts` used to compute `success = rawSuccess && !relevanceGap` and then
+// hand that single bit to `recordVerification(..., success ? outcome :
+// "failed")`. Both branches below run the SAME command, with the SAME exit
+// code and the SAME output — the only difference is whether a prescription
+// existed for it to miss. Measured on the pre-fix code:
+//
+//   no prescription      -> outcome "verified", summary "verified: 1",   receipt
+//   imperfect prescription -> outcome "failed",   summary "... failed: 1", none
+//
+// i.e. the harness was most punitive exactly where its own resolution was
+// weakest, and the evidence ledger recorded a passing command as a failure.
+// ===========================================================================
+
+describe("R-4: an off-target pass is recorded as a pass, not a failure", () => {
+  const CMD = "npx vitest run"
+  const OUT = "Test Files  45 passed (45)\nTests  2114 passed (2114)"
+
+  async function planWithVerifier(hooks: Hooks, sid: string, verifier: string) {
+    await hooks.tool!.elicify_vertex_plan_create!.execute!(
+      {
+        stories: [
+          {
+            text: "do the work",
+            acceptanceItems: ["it works"],
+            scopeGlobs: ["internal/**"],
+            verifiers: [verifier],
+            tasks: [{ text: "do the work" }],
+          },
+        ],
+      } as never,
+      { sessionID: sid } as never,
+    )
+  }
+
+  async function runVerifier(hooks: Hooks, sid: string) {
+    const toolOutput = { title: "bash", output: OUT, metadata: { exit: 0 } }
+    await hooks["tool.execute.after"]!(
+      { tool: "bash", sessionID: sid, callID: `bash-${sid}`, args: { command: CMD } } as never,
+      toolOutput as never,
+    )
+    return toolOutput
+  }
+
+  /** The exact `(outcome, options)` pair `plugin.ts` handed the ledger. */
+  function recordedFor(spy: ReturnType<typeof vi.spyOn>, command: string) {
+    const call = (spy.mock.calls as unknown[][]).find((c) => c[1] === command)
+    return { outcome: call?.[3] as string | undefined, options: call?.[4] as { coversPrescribed?: boolean } | undefined }
+  }
+
+  it("records the honest outcome when the passing command misses the prescription", async () => {
+    const spy = vi.spyOn(EvidenceLedger.prototype, "recordVerification")
+    const hooks = await ElicifyVertexPluginV2(pluginInput(makeStubClient()), undefined)
+    const sid = "r4-off-target"
+
+    await activate(hooks, sid, "/elicify-vertex\n\nimplement the mcp server changes")
+    await planWithVerifier(hooks, sid, "go test ./internal/mcpserver/...")
+    await toolAfter(hooks, sid, "edit", { filePath: "internal/mcpserver/server.go" }, "updated")
+    await runVerifier(hooks, sid)
+
+    const { outcome, options } = recordedFor(spy, CMD)
+    // The command passed. That is a fact about the command, and the ledger
+    // now says so. Pre-fix this read "failed".
+    expect(outcome).toBe("verified")
+    // The gap is not discarded — it moved to its own axis.
+    expect(options?.coversPrescribed).toBe(false)
+  })
+
+  it("records the identical outcome for the identical command when no prescription exists", async () => {
+    // The other half of the asymmetry: same command, same exit code, no plan.
+    const spy = vi.spyOn(EvidenceLedger.prototype, "recordVerification")
+    const hooks = await ElicifyVertexPluginV2(pluginInput(makeStubClient()), undefined)
+    const sid = "r4-no-prescription"
+
+    await activate(hooks, sid, "/elicify-vertex\n\ndo the work")
+    const toolOutput = await runVerifier(hooks, sid)
+
+    const { outcome, options } = recordedFor(spy, CMD)
+    expect(outcome).toBe("verified")
+    expect(options?.coversPrescribed).toBe(true)
+    // Unchanged: with nothing to contradict it, a pass is citable evidence.
+    expect(toolOutput.output).toMatch(/\[vertex:verification-receipt\] \S+/)
+  })
+
+  it("keeps the verify-gap signal alive after an off-target pass", async () => {
+    // The whole point of the coverage bit. If the fix had let an off-target
+    // pass count as verification, verify-gap — the one directive family with
+    // measured field compliance — would go quiet on exactly the runs it
+    // exists for.
+    const hooks = await ElicifyVertexPluginV2(pluginInput(makeStubClient()), undefined)
+    const sid = "r4-verify-gap-survives"
+
+    await activate(hooks, sid, "/elicify-vertex\n\nimplement the mcp server changes")
+    await planWithVerifier(hooks, sid, "go test ./internal/mcpserver/...")
+    await toolAfter(hooks, sid, "edit", { filePath: "internal/mcpserver/server.go" }, "updated")
+    await runVerifier(hooks, sid)
+
+    const { system } = await transform(hooks, sid)
+    expect(system.join("\n")).toContain("Run go test ./internal/mcpserver/... and cite its observed result.")
+  })
+
+  it("tells the MODEL what it ran versus what was prescribed, instead of failing silently", async () => {
+    // Receipt decision: an off-target pass still mints nothing (a receipt is
+    // citable at `gate.ts`'s criteria replay, which never re-checks
+    // coverage). What changes is that the refusal is no longer invisible —
+    // `visibility.notify` only reaches the operator's toast.
+    const hooks = await ElicifyVertexPluginV2(pluginInput(makeStubClient()), undefined)
+    const sid = "r4-gap-diagnostic"
+
+    await activate(hooks, sid, "/elicify-vertex\n\nimplement the mcp server changes")
+    await planWithVerifier(hooks, sid, "go test ./internal/mcpserver/...")
+    await toolAfter(hooks, sid, "edit", { filePath: "internal/mcpserver/server.go" }, "updated")
+    const toolOutput = await runVerifier(hooks, sid)
+
+    expect(toolOutput.output).toContain("[vertex:verify-relevance-gap]")
+    expect(toolOutput.output).toContain(CMD)
+    expect(toolOutput.output).toContain("go test ./internal/mcpserver/...")
+    // Still not a receipt, and the diagnostic must never be mistaken for one.
+    expect(toolOutput.output).not.toMatch(/\[vertex:verification-receipt\]/)
+    // The real verifier output survives underneath the appended line.
+    expect(toolOutput.output).toContain("Tests  2114 passed (2114)")
+  })
+
+  it("explains the OTHER relevance-gap source too — a command that executes nothing", async () => {
+    // `relevanceGap` is set in exactly two places; this is the one where
+    // `prescribed` is null, so the diagnostic has to give a different reason
+    // rather than name a prescription that does not exist.
+    const hooks = await ElicifyVertexPluginV2(pluginInput(makeStubClient()), undefined)
+    const sid = "r4-non-executing"
+
+    await activate(hooks, sid, "/elicify-vertex\n\nrun the python tests")
+    const toolOutput = { title: "bash", output: "collected 0 items", metadata: { exit: 0 } }
+    await hooks["tool.execute.after"]!(
+      {
+        tool: "bash",
+        sessionID: sid,
+        callID: "bash-collect-only",
+        args: { command: "python3 -m pytest --collect-only" },
+      } as never,
+      toolOutput as never,
+    )
+
+    expect(toolOutput.output).toContain("[vertex:verify-relevance-gap]")
+    expect(toolOutput.output).toContain("executes no tests")
+    expect(toolOutput.output).not.toMatch(/\[vertex:verification-receipt\]/)
+  })
+
+  it("says nothing extra when the command DID cover the prescription", async () => {
+    const hooks = await ElicifyVertexPluginV2(pluginInput(makeStubClient()), undefined)
+    const sid = "r4-covering-quiet"
+
+    await activate(hooks, sid, "/elicify-vertex\n\nimplement the mcp server changes")
+    await planWithVerifier(hooks, sid, CMD)
+    await toolAfter(hooks, sid, "edit", { filePath: "internal/mcpserver/server.go" }, "updated")
+    const toolOutput = await runVerifier(hooks, sid)
+
+    expect(toolOutput.output).not.toContain("[vertex:verify-relevance-gap]")
+    expect(toolOutput.output).toMatch(/\[vertex:verification-receipt\] \S+/)
   })
 })
 

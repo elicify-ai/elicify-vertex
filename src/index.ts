@@ -81,12 +81,33 @@ interface SessionLedger {
   /** Set per-prompt to the classified mode (normal/deep) — stop-mode classifier */
   taskMode: StopMode
   riskFlags: Set<RiskFlag>
-  verificationResults: Array<{ command: string; exitCode: number; success: boolean }>
+  /**
+   * `success` answers "did the command pass?"; `coversPrescribed` answers
+   * "was it the command we were waiting for?". BACKLOG R-4: these used to be
+   * the same bit. A passing verifier that did not cover the prescribed one
+   * was recorded with `outcome: "failed"` — so a command that really did exit
+   * 0 was written into the evidence ledger as a failure, and `summary()`
+   * reported "failed: 1" back to the model that had just watched it pass.
+   * Splitting them keeps the coverage signal (every consumer below still
+   * requires BOTH, so verify-gap/stop-block behaviour is unchanged) without
+   * the ledger asserting something untrue about the command itself.
+   */
+  verificationResults: Array<{ command: string; exitCode: number; success: boolean; coversPrescribed: boolean }>
   failures: Array<{ signature: string; timestamp: string }>
   /** Signatures whose repeat-failure directive already fired this turn (cooldown). */
   repeatSignaturesFired: Set<string>
   stopBlocks: number
   promiseBlocks: number
+}
+
+/**
+ * The single definition of "this session has been verified". A result must
+ * have PASSED and have covered what was prescribed. Every gate that used to
+ * read `v.success` alone routes through here, so the coverage signal that
+ * drives verify-gap survives R-4's split of the two bits unchanged.
+ */
+function countsAsVerification(v: SessionLedger["verificationResults"][number]): boolean {
+  return v.success && v.coversPrescribed
 }
 
 export class EvidenceLedger {
@@ -137,18 +158,33 @@ export class EvidenceLedger {
     l.verificationResults = l.verificationResults.filter((v) => !v.success)
   }
 
+  /**
+   * @param options.coversPrescribed  false when the command passed but did
+   *   NOT cover the verifier the harness prescribed for the current changes
+   *   (a "relevance gap"). Defaults to true, so every existing call site
+   *   keeps its exact previous meaning. An off-target pass counts as
+   *   verification NOWHERE — `hasVerification`, `shouldBlockStop` and
+   *   `actionableSummary` all require both bits — it is simply no longer
+   *   recorded as if the command had failed.
+   */
   recordVerification(
     sessionID: string,
     command: string,
     exitCode: number,
     outcome: VerificationOutcome,
+    options: { coversPrescribed?: boolean } = {},
   ): void {
     if (!Number.isSafeInteger(exitCode)) {
       throw new TypeError("exitCode must be a safe integer")
     }
     const l = this.ledgers.get(sessionID)
     if (!l) return
-    l.verificationResults.push({ command, exitCode, success: outcome === "verified" })
+    l.verificationResults.push({
+      command,
+      exitCode,
+      success: outcome === "verified",
+      coversPrescribed: options.coversPrescribed !== false,
+    })
   }
 
   recordFailure(sessionID: string, signature: string): void {
@@ -159,7 +195,7 @@ export class EvidenceLedger {
 
   hasVerification(sessionID: string): boolean {
     const l = this.ledgers.get(sessionID)
-    return !!l && l.verificationResults.some((v) => v.success)
+    return !!l && l.verificationResults.some(countsAsVerification)
   }
 
   hasChangedFiles(sessionID: string): boolean {
@@ -246,14 +282,20 @@ export class EvidenceLedger {
   summary(sessionID: string): string | null {
     const l = this.ledgers.get(sessionID)
     if (!l) return null
-    const verified = l.verificationResults.filter((v) => v.success).length
+    const verified = l.verificationResults.filter(countsAsVerification).length
     const failed = l.verificationResults.filter((v) => !v.success).length
-    if (verified === 0 && failed === 0 && !l.changedFilesSeen && l.riskFlags.size === 0) return null
+    // BACKLOG R-4: an off-target pass is neither. Counting it under "failed"
+    // told the model its own passing command had failed; counting it under
+    // "verified" would claim the prescribed suite had run. It gets its own
+    // word.
+    const offTarget = l.verificationResults.filter((v) => v.success && !v.coversPrescribed).length
+    if (verified === 0 && failed === 0 && offTarget === 0 && !l.changedFilesSeen && l.riskFlags.size === 0) return null
     const parts: string[] = []
     if (l.changedFilesSeen) parts.push("files changed: yes")
     if (l.riskFlags.size > 0) parts.push(`risks: ${[...l.riskFlags].join(", ")}`)
     if (verified > 0) parts.push(`verified: ${verified}`)
     if (failed > 0) parts.push(`failed: ${failed}`)
+    if (offTarget > 0) parts.push(`passed but off-target: ${offTarget}`)
     return parts.join(" · ")
   }
 
@@ -266,7 +308,7 @@ export class EvidenceLedger {
   actionableSummary(sessionID: string): string | null {
     const l = this.ledgers.get(sessionID)
     if (!l) return null
-    const unverifiedChanges = l.changedFilesSeen && !l.verificationResults.some((v) => v.success)
+    const unverifiedChanges = l.changedFilesSeen && !l.verificationResults.some(countsAsVerification)
     if (!unverifiedChanges && l.riskFlags.size === 0) return null
     return this.summary(sessionID)
   }
@@ -288,7 +330,7 @@ export class EvidenceLedger {
     // docs-only → never block.
     if (l.changedFileKinds.size > 0 && [...l.changedFileKinds].every((k) => k === "docs")) return false
     // deep AND changed AND not verified → block.
-    return l.changedFilesSeen && !l.verificationResults.some((v) => v.success)
+    return l.changedFilesSeen && !l.verificationResults.some(countsAsVerification)
   }
 
   getMode(sessionID: string): StopMode | null {

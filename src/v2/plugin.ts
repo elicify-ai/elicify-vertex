@@ -1077,15 +1077,32 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
           }
         }
         // `success` folds the relevance gap in: a relevance-gap pass must
-        // not suppress verify-gap, attach evidence, drive elevate, or count
-        // as a story going green. EXPECT/anomaly/failure-classification
-        // below intentionally use `rawSuccess` instead — whether the
-        // OBSERVED COMMAND itself passed or failed is a different question
-        // than whether it covers the right paths, and EXPECT is about the
-        // former.
+        // not attach evidence, drive elevate, or count as a story going
+        // green. EXPECT/anomaly/failure-classification below intentionally
+        // use `rawSuccess` instead — whether the OBSERVED COMMAND itself
+        // passed or failed is a different question than whether it covers
+        // the right paths, and EXPECT is about the former.
+        //
+        // BACKLOG R-4: the EVIDENCE LEDGER no longer reads this bit. It used
+        // to, and that is precisely how a passing command came to be recorded
+        // as a failure — see the call below. Verify-gap is still suppressed
+        // by a relevance gap, but via the ledger's own coverage bit rather
+        // than by mislabelling the run.
         const success = rawSuccess && !relevanceGap
         if (exitCode !== undefined) {
-          evidenceLedger.recordVerification(sid, command, exitCode, success ? verification.outcome : "failed")
+          // BACKLOG R-4: this used to be
+          // `success ? verification.outcome : "failed"`, which folded the
+          // relevance gap into the FAILURE axis: a command that exited 0 and
+          // really did pass was written into the ledger as a failure purely
+          // because it did not match the prescription, and the model was then
+          // shown "failed: 1" for a run it had just watched succeed. Failure
+          // means the command failed. The coverage question is now carried by
+          // its own bit — every gate (`hasVerification`, `shouldBlockStop`,
+          // `actionableSummary`) still requires both, so verify-gap keeps
+          // firing on exactly the same runs as before.
+          evidenceLedger.recordVerification(sid, command, exitCode, verification.outcome, {
+            coversPrescribed: !relevanceGap,
+          })
         }
 
         // FIX #7: keep the most recent verifier command's real output text
@@ -1195,6 +1212,45 @@ export const ElicifyVertexPluginV2 = async (input: PluginInput, options?: Plugin
             message: `a passing verifier produced no receipt: ${command}`,
             variant: "warning",
           })
+          // BACKLOG R-4, receipt decision. An uncovered-but-successful run
+          // does NOT mint a receipt, and this is the deliberate half of that
+          // choice rather than an oversight:
+          //
+          //   * A receipt is not a diary entry, it is a citable certificate —
+          //     `gate.ts`'s criteria replay closes a pinned criterion on
+          //     `isValidReceipt` alone and never re-asks about coverage. Mint
+          //     one here and "ran eslint, cited it, closed 'auth service
+          //     tests pass'" becomes a supported move.
+          //   * Minting-but-refusing-at-lookup is not the alternative: this
+          //     file already learned that lesson on the scope-unverifiable
+          //     path ("mint, print the id, then refuse that id forever" —
+          //     see `receipt.scope.complete === false` above), and the
+          //     resolution there was to refuse at mint time and SAY SO.
+          //   * Withholding on a positive, checkable "you did not run what
+          //     was prescribed" is not the same as withholding out of
+          //     ignorance, which is why the no-prescription branch still
+          //     mints. What was never defensible was ALSO recording the run
+          //     as a failure — fixed at `recordVerification` above.
+          //
+          // What is not defensible either is doing it in silence.
+          // `visibility.notify` reaches `client.tui.showToast`, a
+          // human-operator channel the model never reads (C-2), so until now
+          // a passing verifier could produce nothing at all with no
+          // explanation the model could act on. Same treatment as
+          // `verify:ambiguous-exit` and `receipt:scope-unverifiable`: state
+          // what was run versus what was prescribed, in the tool's own
+          // output, with a prefix that cannot be mistaken for a receipt id.
+          const gapMessage = prescribed
+            ? `"${command.slice(0, 120)}" passed, but it does not cover the prescribed verifier ` +
+              `"${prescribed.slice(0, 120)}" — no receipt was minted. Run the prescribed verifier ` +
+              `to turn this into citable evidence.`
+            : // `prescribed` can only be null here: `relevanceGap` is set in
+              // exactly two places, and the other one (`prescribed &&
+              // !observedCoversPrescribed(...)`) cannot fire without it.
+              `"${command.slice(0, 120)}" exited 0 but executes no tests, so it is not evidence — ` +
+              `no receipt was minted.`
+          const gapText = `[vertex:verify-relevance-gap] ${gapMessage}`
+          toolOutput.output = `${out}${out && !out.endsWith("\n") ? "\n" : ""}${gapText}`
         }
 
         // FIX #1: same resolveStoryIdForPhase fallback as the mutation site
