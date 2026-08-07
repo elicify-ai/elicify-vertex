@@ -123,6 +123,57 @@ describe("EvidenceLedger", () => {
     l.recordVerification("s1", "true", 0, "verified")
     expect(l.shouldBlockStop("s1")).toBe(false)
   })
+
+  // -------------------------------------------------------------------------
+  // BACKLOG R-4 — "passed" and "covered the prescription" are two bits.
+  //
+  // Before this split, `src/v2/plugin.ts` reported an off-target pass by
+  // calling `recordVerification(..., "failed")`, so a command that exited 0
+  // was stored as a failure and `summary()` handed the model "failed: 1" for
+  // a run it had just watched succeed. These pin the new shape from both
+  // directions: the honesty (it is NOT a failure) and the signal that must
+  // survive it (it is NOT verification either).
+  // -------------------------------------------------------------------------
+  it("R-4: a passing but off-target verifier is not recorded as a failure", () => {
+    const l = new EvidenceLedger()
+    l.reset("s1")
+    l.recordChangedFiles("s1", "internal/mcpserver/server.go")
+    l.recordVerification("s1", "npx vitest run", 0, "verified", { coversPrescribed: false })
+    expect(l.summary("s1")).toBe("files changed: yes · passed but off-target: 1")
+    expect(l.summary("s1")).not.toContain("failed")
+  })
+
+  it("R-4: an off-target pass still does not count as verification", () => {
+    // The coverage signal is what drives verify-gap and the stop gate. It has
+    // to survive the split intact, or the fix would trade a false failure for
+    // a false pass — strictly the worse of the two.
+    const l = new EvidenceLedger()
+    l.reset("s1", "deep")
+    l.recordChangedFiles("s1", "internal/mcpserver/server.go")
+    l.recordVerification("s1", "npx vitest run", 0, "verified", { coversPrescribed: false })
+    expect(l.hasVerification("s1")).toBe(false)
+    expect(l.shouldBlockStop("s1")).toBe(true)
+    expect(l.actionableSummary("s1")).toBe("files changed: yes · passed but off-target: 1")
+  })
+
+  it("R-4: omitting the coverage flag still means 'covered' (every v1 call site)", () => {
+    const l = new EvidenceLedger()
+    l.reset("s1", "deep")
+    l.recordChangedFiles("s1", "src/index.ts")
+    l.recordVerification("s1", "npm test", 0, "verified")
+    expect(l.hasVerification("s1")).toBe(true)
+    expect(l.shouldBlockStop("s1")).toBe(false)
+    expect(l.summary("s1")).toBe("files changed: yes · verified: 1")
+  })
+
+  it("R-4: a genuine failure is still a failure, flag or not", () => {
+    const l = new EvidenceLedger()
+    l.reset("s1")
+    l.recordVerification("s1", "npm test", 1, "failed", { coversPrescribed: true })
+    l.recordVerification("s1", "npm test", 1, "failed", { coversPrescribed: false })
+    expect(l.summary("s1")).toBe("failed: 2")
+    expect(l.hasVerification("s1")).toBe(false)
+  })
 })
 
 // ---------------------------------------------------------------------------

@@ -715,20 +715,52 @@ the worker resumed after idle fired.
 
 ---
 
-## R-4 — Open: `relevanceGap` is folded into `success` (reported by the B-4 fix agent, not fixed)
+## R-4 — Closed: `relevanceGap` is no longer folded into `success`
 
-`src/v2/plugin.ts:1043` folds `relevanceGap` into `success`, so ANY uncovered
-prescription both suppresses the receipt and records a passing command as
-`"failed"`. The coverage-equivalence work removed the common spelling-driven
-cause, but the asymmetry itself remains a plugin-level design choice:
+`src/v2/plugin.ts` folded `relevanceGap` into `success` and handed that one bit
+to `recordVerification(..., success ? outcome : "failed")`. Reproduced end to
+end before the fix — the SAME command (`npx vitest run`, exit 0, "Tests 2114
+passed"), the only difference being whether a prescription existed to miss:
 
-- no prescription at all → the run mints a receipt;
-- an imperfect prescription → the same run is recorded as a failure.
+| | recorded outcome | `summary()` | receipt |
+|---|---|---|---|
+| no prescription | `"verified"` | `verified: 1` | minted |
+| imperfect prescription | **`"failed"`** | **`files changed: yes · failed: 1`** | none |
 
-That is backwards: the harness is most punitive exactly when its own
-resolution was weakest. Not fixed — it sits in a file another workstream owned
-this round, and changing receipt semantics deserves its own change with its own
-evidence.
+**Fix.** "Did it pass?" and "was it the command we were waiting for?" are now
+two bits. `EvidenceLedger.recordVerification` takes `{ coversPrescribed }`
+(default `true`, so every v1 call site is unchanged) and stores it alongside
+`success`; `hasVerification`, `shouldBlockStop` and `actionableSummary` all
+require BOTH, so verify-gap and the stop gate fire on exactly the same runs as
+before. `summary()` reports an off-target pass as `passed but off-target: N`
+rather than lying in either direction. After: the same command records
+`"verified"` in both branches; the imperfect-prescription branch reads
+`files changed: yes · passed but off-target: 1`.
+
+**Receipt decision — an off-target pass still mints nothing, deliberately.** A
+receipt is a citable certificate, not a diary entry: `gate.ts`'s criteria
+replay closes a pinned criterion on `isValidReceipt` alone and never re-asks
+about coverage, so minting here would make "ran eslint, cited it, closed 'auth
+service tests pass'" a supported move. Minting-but-refusing-at-lookup is not
+the alternative either — this file already learned that on the
+scope-unverifiable path ("mint, print the id, then refuse that id forever"),
+and the resolution there was to refuse at mint time and say so. Withholding on
+a positive, checkable "you did not run what was prescribed" is not the same as
+withholding out of ignorance, which is why the no-prescription branch still
+mints. What was never defensible was ALSO recording the run as a failure.
+
+What WAS silent is now not: `visibility.notify` reaches only the operator's
+toast, so the model previously watched a passing verifier produce nothing with
+no explanation. The tool's own output now carries
+`[vertex:verify-relevance-gap] "<observed>" passed, but it does not cover the
+prescribed verifier "<prescribed>" — no receipt was minted.`, matching the C-2
+treatment of `verify:ambiguous-exit` and `receipt:scope-unverifiable`.
+
+No existing test encoded the wrong behaviour — the whole 2114-test baseline
+still passed before a single new test was written. 9 new tests, 10/10 mutants
+killed (fold the bit back, drop coverage from each of the three gates, count
+off-target as verified/failed, flip the default, drop the diagnostic, drop the
+prescription from it, emit it when the command DID cover).
 
 ## R-5 — Open: one residual 3-way span leak
 
@@ -776,9 +808,9 @@ absence is the shape most likely to be vacuous. Mutate it before trusting it.
 
 ## Still open
 
-- **R-4** `relevanceGap` folded into `success` (plugin.ts): an imperfect
-  prescription is more punitive than no prescription at all. Needs its own
-  change with its own evidence.
+- ~~**R-4** `relevanceGap` folded into `success` (plugin.ts)~~ — closed, see
+  the R-4 entry above. Passing and covering are two bits now; an off-target
+  pass is no longer recorded as a failure, and still mints no receipt.
 - **R-5** residual wrapped-key leaks: 12,532 -> 42 over 180,000 probes. 181 of
   the surviving 223 also leak with the key on ONE line, i.e. the entropy floor,
   not the span pass. Recorded rather than rounded to zero.
