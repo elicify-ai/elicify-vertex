@@ -62,7 +62,7 @@ job:
 - **Technical checks** (`verifiers`, verification receipts in
   `src/v2/coverage.ts`) are **evidence**. A receipt asserts exactly one thing —
   this command ran and exited 0 — and may be credited loosely.
-- **Acceptance criteria** are settled by **verifierment** against the worktree.
+- **Acceptance criteria** are settled by **judgement** against the worktree.
   Acceptance items carry no receipt requirement; the completion verifier is the
   sole arbiter of whether a checkpoint's claim was real.
 

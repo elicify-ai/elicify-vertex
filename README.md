@@ -64,7 +64,7 @@ When the model says a story is finished, a **separate verifier session** opens y
 
 Layer 1 is a prompt. Layer 2 is a control loop. Layer 3 is an audit. Together they make the loop **self-validating**: the model proposes, the harness observes, and an independent verifier decides.
 
-> **Checks vs. criteria.** Technical checks (did the command pass?) are *evidence* and can be loose. Acceptance criteria (is the story actually delivered?) are settled by **verifierment**, against your repo. Vertex keeps those two things apart on purpose.
+> **Checks vs. criteria.** Technical checks (did the command pass?) are *evidence* and can be loose. Acceptance criteria (is the story actually delivered?) are settled by **judgement**, against your repo. Vertex keeps those two things apart on purpose.
 
 ---
 
@@ -98,7 +98,7 @@ Details: [docs/USAGE.md](./docs/USAGE.md) · [docs/ARCHITECTURE.md](./docs/ARCHI
 npm install @elicify-ai/elicify-vertex
 ```
 
-Requires Node **≥ 20**. Current package: **`@elicify-ai/elicify-vertex@0.13.4`**.
+Requires Node **≥ 20**. Current package: **`@elicify-ai/elicify-vertex@0.14.0`**.
 
 > ### Upgrading from 0.9.x — the Judge is now the **Verifier**
 >

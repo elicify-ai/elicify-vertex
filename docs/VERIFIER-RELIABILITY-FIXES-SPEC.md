@@ -1020,7 +1020,7 @@ findings; 3 were already closed by round 5, 12 were live.
   items carry no receipt requirement (`AcceptanceItem.evidence` is deprecated
   and read by nothing), and `story.ts` names the completion verifier the "sole
   arbiter of whether a checkpoint's claim was real". Verifier output reaches
-  the verifier as `verifierSummaries` — input to its verifierment, never a
+  the verifier as `verifierSummaries` — input to its judgement, never a
   substitute for it.
 
   Demanding that one observed command cover ALL of a story's verifiers applied

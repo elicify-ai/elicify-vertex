@@ -143,7 +143,7 @@ rather than looping.
 | | What it is | How strict |
 |---|---|---|
 | **Technical checks** (`verifiers`, receipts) | Evidence: "this command ran and exited 0" | Loose — any declared verifier the observed command covers counts |
-| **Acceptance criteria** | Whether the story was actually delivered | Settled by **verifierment**, against the repo |
+| **Acceptance criteria** | Whether the story was actually delivered | Settled by **judgement**, against the repo |
 
 A passing check never approves a story. That is the verifier's job, and only the
 verifier's.
